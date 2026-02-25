@@ -1,0 +1,8 @@
+[package]
+name = "winemu-shared"
+version = "0.1.0"
+edition = "2021"
+
+# no_std: 可用于裸机 guest kernel 和 host VMM
+[features]
+default = []

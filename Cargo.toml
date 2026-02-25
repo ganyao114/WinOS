@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "crates/winemu-shared",
+    "crates/winemu-core",
+    "crates/winemu-hypervisor",
+    "crates/winemu-vmm",
+    "crates/winemu-cli",
+    "crates/winereg",
+]
+exclude = [
+    "winemu-kernel",  # 裸机目标，单独编译
+]
+resolver = "2"
+
+[workspace.dependencies]
+# 错误处理
+thiserror = "1"
+anyhow = "1"
+# 日志
+log = "0.4"
+env_logger = "0.11"
+# 并发
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+# 内存映射
+memmap2 = "0.9"
+# 位标志
+bitflags = "2"
+# KVM (Linux only)
+kvm-ioctls = "0.16"
+vmm-sys-util = "0.12"
+# 序列化
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+# 异步
+tokio = { version = "1", features = ["full"] }
+# CPU 数量
+num_cpus = "1"

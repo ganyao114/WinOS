@@ -1,0 +1,11 @@
+[package]
+name = "winemu-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winemu-shared = { path = "../winemu-shared" }
+thiserror = { workspace = true }
+bitflags = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }

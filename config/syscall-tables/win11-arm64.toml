@@ -1,0 +1,52 @@
+[meta]
+os = "Windows 11"
+arch = "ARM64"
+build = 22621
+
+[nt]
+NtClose                   = 0x000F
+NtCreateFile              = 0x0055
+NtOpenFile                = 0x0030
+NtReadFile                = 0x0006
+NtWriteFile               = 0x0008
+NtQueryInformationFile    = 0x0011
+NtSetInformationFile      = 0x0027
+NtQueryDirectoryFile      = 0x004E
+NtAllocateVirtualMemory   = 0x0015
+NtFreeVirtualMemory       = 0x001E
+NtProtectVirtualMemory    = 0x004D
+NtQueryVirtualMemory      = 0x0023
+NtMapViewOfSection        = 0x0028
+NtUnmapViewOfSection      = 0x002A
+NtCreateProcessEx         = 0x004B
+NtCreateThreadEx          = 0x00C1
+NtTerminateProcess        = 0x002C
+NtTerminateThread         = 0x0053
+NtQueryInformationProcess = 0x0019
+NtQueryInformationThread  = 0x0025
+NtSetInformationThread    = 0x000D
+NtWaitForSingleObject     = 0x0004
+NtWaitForMultipleObjects  = 0x0040
+NtCreateEvent             = 0x0048
+NtSetEvent                = 0x000E
+NtResetEvent              = 0x0034
+NtCreateMutant            = 0x00A9
+NtReleaseMutant           = 0x001C
+NtCreateSemaphore         = 0x00C3
+NtReleaseSemaphore        = 0x0033
+NtOpenKey                 = 0x0012
+NtCreateKey               = 0x001D
+NtQueryValueKey           = 0x0016
+NtSetValueKey             = 0x003D
+NtDeleteKey               = 0x000C
+NtEnumerateKey            = 0x0032
+NtEnumerateValueKey       = 0x0010
+NtDuplicateObject         = 0x003C
+
+[win32k]
+NtGdiCreateCompatibleDC   = 0x1012
+NtGdiBitBlt               = 0x1001
+NtUserCreateWindowEx      = 0x1056
+NtUserShowWindow          = 0x10C3
+NtUserMessageCall         = 0x1069
+NtUserDestroyWindow       = 0x1025

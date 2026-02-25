@@ -1,0 +1,16 @@
+[package]
+name = "winemu-hypervisor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winemu-core = { path = "../winemu-core" }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-ioctls = { workspace = true }
+vmm-sys-util = { workspace = true }
+
+[build-dependencies]
+# macOS: 链接 Hypervisor.framework (见 build.rs)

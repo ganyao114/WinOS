@@ -1,0 +1,15 @@
+[package]
+name = "winemu-vmm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winemu-core = { path = "../winemu-core" }
+winemu-shared = { path = "../winemu-shared" }
+winemu-hypervisor = { path = "../winemu-hypervisor" }
+winereg = { path = "../winereg" }
+thiserror = { workspace = true }
+log = { workspace = true }
+memmap2 = { workspace = true }
+num_cpus = { workspace = true }
+tokio = { workspace = true }

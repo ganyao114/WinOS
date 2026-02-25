@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(RUST_LOG=debug cargo run -p winemu-cli --release -- tests/hello_win/target/aarch64-pc-windows-msvc/release/hello_win.exe)"
+    ]
+  }
+}

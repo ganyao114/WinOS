@@ -1,0 +1,21 @@
+[package]
+name = "winemu-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "winemu-kernel"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "s"
+
+[profile.dev]
+panic = "abort"
+
+[dependencies]
+winemu-shared = { path = "../crates/winemu-shared" }
+
+[workspace]

@@ -1,0 +1,16 @@
+[package]
+name = "winemu-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "winemu"
+path = "src/main.rs"
+
+[dependencies]
+winemu-core = { path = "../winemu-core" }
+winemu-hypervisor = { path = "../winemu-hypervisor" }
+winemu-vmm = { path = "../winemu-vmm" }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
