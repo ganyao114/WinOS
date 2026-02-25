@@ -444,23 +444,6 @@ impl HypercallManager {
             nr::NT_YIELD_EXECUTION => {
                 HypercallResult::Sched(SchedResult::Yield)
             }
-            nr::NT_SYSCALL => {
-                // args[0]=syscall_nr, args[1]=table_nr, args[2-5]=arg0-3
-                // args[5] = guest SP (injected by vcpu.rs before dispatch)
-                let guest_sp = args[5];
-                let result = self.syscall_disp.dispatch(
-                    args, tid,
-                    &self.memory,
-                    &self.files,
-                    &self.sched,
-                    &self.vaspace,
-                    guest_sp,
-                );
-                match result {
-                    DispatchResult::Sync(v)  => HypercallResult::Sync(v),
-                    DispatchResult::Sched(s) => HypercallResult::Sched(s),
-                }
-            }
             _ => {
                 log::warn!("unhandled hypercall nr={:#x}", hypercall_nr);
                 HypercallResult::Sync(u32::MAX as u64)

@@ -60,6 +60,10 @@ pub fn vcpu_thread(
     let mut current: Option<ThreadId> = None;
 
     'run: loop {
+        if sched.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            log::info!("vcpu{} all threads terminated — shutting down", vcpu_id);
+            break 'run;
+        }
         if current.is_none() {
             current = sched.pop_ready();
             if current.is_none() {

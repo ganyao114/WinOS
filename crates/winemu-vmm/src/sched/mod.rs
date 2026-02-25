@@ -2,7 +2,7 @@ pub mod sync;
 pub mod wait;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, atomic::{AtomicU32, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicU32, AtomicBool, Ordering}};
 use std::time::Instant;
 
 pub use sync::{SyncHandle, SyncObject};
@@ -93,6 +93,7 @@ pub struct Scheduler {
     next_handle: AtomicU32,
     pub vcpu_count: u32,
     vcpu_threads: Mutex<Vec<std::thread::Thread>>,
+    pub shutdown: AtomicBool,
 }
 
 impl Scheduler {
@@ -105,6 +106,7 @@ impl Scheduler {
             next_handle:  AtomicU32::new(1),
             vcpu_count,
             vcpu_threads: Mutex::new(Vec::new()),
+            shutdown:     AtomicBool::new(false),
         })
     }
 
@@ -247,6 +249,15 @@ impl Scheduler {
     }
 
     fn notify_thread_exit(&self, _tid: ThreadId) {
-        // Phase 3: 唤醒 WaitKind::Single(thread_handle) 的 waiter
+        // Check if all threads are terminated — if so, signal shutdown
+        let all_done = self.threads.iter().all(|shard| {
+            shard.lock().unwrap().values().all(|t| matches!(t.state, ThreadState::Terminated(_)))
+        });
+        if all_done {
+            self.shutdown.store(true, Ordering::Release);
+            for t in self.vcpu_threads.lock().unwrap().iter() {
+                t.unpark();
+            }
+        }
     }
 }
