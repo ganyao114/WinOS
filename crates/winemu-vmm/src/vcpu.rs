@@ -106,9 +106,9 @@ pub fn vcpu_thread(
                     let sp_el0 = vcpu.sp_el0().unwrap_or(0); // user stack — for reading stack args
                     // Read original x9/x10/x11/x12/x29/x30 from SVC stack (SP_EL1)
                     // before dispatching (dispatch may modify memory).
-                    // SVC stack layout: [sp+0]=x11_orig,[sp+8]=x12_orig,[sp+16]=x9_orig,[sp+24]=x10_orig,[sp+32]=x29_orig,[sp+40]=x30_orig
+                    // SVC stack layout: [sp+0]=elr_orig,[sp+8]=spsr_orig,[sp+16]=x11_orig,[sp+24]=x12_orig,[sp+32]=x9_orig,[sp+40]=x10_orig,[sp+48]=x29_orig,[sp+56]=x30_orig
                     let svc_stack_saved = hc_mgr.read_svc_stack(sp_el1);
-                    log::debug!("svc_stack: sp_el1={:#x} saved={:x?}", sp_el1, svc_stack_saved);
+                    log::debug!("svc_stack: sp_el1={:#x} elr={:#x} spsr={:#x}", sp_el1, svc_stack_saved[0], svc_stack_saved[1]);
                     let full_args = [syscall_nr, table_nr, x0, x1, x2, x3, x4, x5, x6, x7];
                     let result = hc_mgr.dispatch_nt_syscall(full_args, sp_el0, tid);
                     match result {
@@ -223,32 +223,27 @@ fn set_x0(vcpu: &mut dyn Vcpu, val: u64) {
 }
 
 /// Save EL0 thread context from inside the SVC handler (vCPU is at EL1).
-/// Uses ELR_EL1 as PC and SPSR_EL1 as pstate to reconstruct the EL0 state.
-/// Reads original x9/x10/x11/x12/x29/x30 from the SVC stack (SP_EL1).
-fn save_ctx_el0(vcpu: &mut dyn Vcpu, svc_stack: &[u64; 6]) -> ThreadContext {
+/// ELR_EL1/SPSR_EL1 are read from the SVC stack snapshot (hvc clobbers them).
+/// Stack layout: [0]=elr_orig,[1]=spsr_orig,[2]=x11_orig,[3]=x12_orig,[4]=x9_orig,[5]=x10_orig,[6]=x29_orig,[7]=x30_orig
+fn save_ctx_el0(vcpu: &mut dyn Vcpu, svc_stack: &[u64; 8]) -> ThreadContext {
     let mut ctx = ThreadContext::default();
     #[cfg(target_arch = "aarch64")]
     {
         let regs = vcpu.regs().unwrap();
         ctx.gpr[..31].copy_from_slice(&regs.x[..31]);
         ctx.gpr[31] = vcpu.sp_el0().unwrap_or(regs.sp);
-        // ELR_EL1 for SVC = address of instruction AFTER svc (ARM spec).
-        // Do NOT add +4 here; ELR_EL1 already points past the svc instruction.
-        ctx.gpr[32] = vcpu.elr_el1().unwrap_or(regs.pc);
-        ctx.pstate   = vcpu.spsr_el1().unwrap_or(0);
+        // ELR and SPSR saved on stack before hvc (hvc clobbers live ELR_EL1/SPSR_EL1)
+        ctx.gpr[32] = svc_stack[0]; // elr_orig = SVC return PC
+        ctx.pstate   = svc_stack[1]; // spsr_orig = EL0 pstate
         ctx.fp_dirty = false;
-        log::debug!("save_ctx_el0: elr={:#x} return_pc={:#x} sp_el0={:#x} x30={:#x} spsr={:#x}",
-            vcpu.elr_el1().unwrap_or(0), ctx.gpr[32], ctx.gpr[31], ctx.gpr[30], ctx.pstate);
+        log::debug!("save_ctx_el0: elr={:#x} spsr={:#x} sp_el0={:#x}",
+            ctx.gpr[32], ctx.pstate, ctx.gpr[31]);
         // Restore original x9/x10/x11/x12 from SVC stack snapshot
-        // (SVC handler overwrites these before hvc).
-        // x29/x30 are NOT modified by the SVC handler → regs.x[29/30] already correct.
-        // TPIDR_EL1 is used as per-CPU scratch so x9 and x12 are both saved correctly.
-        // Stack layout: [0]=x11_orig,[1]=x12_orig,[2]=x9_orig,[3]=x10_orig,[4]=x29_orig,[5]=x30_orig
-        ctx.gpr[11] = svc_stack[0];
-        ctx.gpr[12] = svc_stack[1];
-        ctx.gpr[9]  = svc_stack[2];
-        ctx.gpr[10] = svc_stack[3];
-        // ctx.gpr[29] and ctx.gpr[30] already set correctly from regs.x[29/30]
+        ctx.gpr[11] = svc_stack[2];
+        ctx.gpr[12] = svc_stack[3];
+        ctx.gpr[9]  = svc_stack[4];
+        ctx.gpr[10] = svc_stack[5];
+        // x29/x30 already correct in regs (SVC handler doesn't modify them)
     }
     ctx
 }

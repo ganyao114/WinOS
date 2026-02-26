@@ -499,12 +499,12 @@ impl HypercallManager {
         }
     }
 
-    /// Read the 6 saved registers from the SVC stack (SP_EL1 at hvc time).
-    /// Layout: [x11_orig, x12_orig, x9_orig, x10_orig, x29_orig, x30_orig]
-    pub fn read_svc_stack(&self, svc_sp: u64) -> [u64; 6] {
+    /// Read the 8 saved values from the SVC stack (SP_EL1 at hvc time).
+    /// Layout: [elr_orig, spsr_orig, x11_orig, x12_orig, x9_orig, x10_orig, x29_orig, x30_orig]
+    pub fn read_svc_stack(&self, svc_sp: u64) -> [u64; 8] {
         let mem = self.memory.read().unwrap();
-        let mut out = [0u64; 6];
-        for (i, off) in [0u64, 8, 16, 24, 32, 40].iter().enumerate() {
+        let mut out = [0u64; 8];
+        for (i, off) in [0u64, 8, 16, 24, 32, 40, 48, 56].iter().enumerate() {
             let b = mem.read_bytes(winemu_core::addr::Gpa(svc_sp + off), 8);
             out[i] = u64::from_le_bytes(b.try_into().unwrap_or([0; 8]));
         }

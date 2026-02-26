@@ -18,6 +18,18 @@
 
 use core::arch::global_asm;
 
+// Dedicated SVC stack in .bss — lives well below __heap_start,
+// so it never overlaps with exe/dll images allocated from the heap.
+global_asm!(
+    ".section .bss",
+    ".balign 16",
+    ".global __svc_stack_bottom",
+    "__svc_stack_bottom:",
+    ".space 16384",
+    ".global __svc_stack_top",
+    "__svc_stack_top:",
+);
+
 global_asm!(
     // 2KB 对齐，放在 .text.vectors section
     ".section .text.vectors",
@@ -67,20 +79,33 @@ global_asm!(
     //   x11 = orig_x0    (FileHandle / arg0)
     //   x1-x7 = original syscall args 1-7 (untouched)
     // Reset SP_EL1 to fixed SVC stack top each entry (avoids SP_EL1 leak)
-    // Use TPIDR_EL1 as per-CPU scratch to save x9 before overwriting it,
-    // so ALL registers (x9/x10/x11/x12/x29/x30) are correctly preserved.
+    // Use TPIDR_EL1 as per-CPU scratch to save x9 before overwriting it.
+    // SVC stack layout (SP_EL1 after all pushes, low addr first):
+    //   [sp+ 0] = elr_el1_orig  (SVC return PC, hvc would clobber it)
+    //   [sp+ 8] = spsr_el1_orig (EL0 pstate)
+    //   [sp+16] = x11_orig
+    //   [sp+24] = x12_orig
+    //   [sp+32] = x9_orig
+    //   [sp+40] = x10_orig
+    //   [sp+48] = x29_orig
+    //   [sp+56] = x30_orig
     "msr tpidr_el1, x9",               // save user's x9 to EL1 system register
-    "adr x9, __kernel_svc_stack_top",  // x9 = SVC stack top
+    "adr x9, __svc_stack_top",         // x9 = SVC stack top (BSS, below heap)
     "mov sp, x9",
-    // Save scratch regs: all values correct at time of stp
-    // Stack layout at SP_EL1 after all stps:
-    //   [sp+0]=x11_orig, [sp+8]=x12_orig(correct)
-    //   [sp+16]=x9_orig(correct), [sp+24]=x10_orig
-    //   [sp+32]=x29_orig, [sp+40]=x30_orig
+    // Save scratch regs (push order: x29/x30, x9/x10, x11/x12, then elr/spsr)
+    // Final SP_EL1 layout (low addr = top of stack):
+    //   [sp+ 0]=elr_orig, [sp+ 8]=spsr_orig (pushed last → lowest addr)
+    //   [sp+16]=x11_orig, [sp+24]=x12_orig
+    //   [sp+32]=x9_orig,  [sp+40]=x10_orig
+    //   [sp+48]=x29_orig, [sp+56]=x30_orig
     "stp x29, x30, [sp, #-16]!",
     "mrs x9, tpidr_el1",               // restore user's x9 from system register
     "stp x9,  x10, [sp, #-16]!",
     "stp x11, x12, [sp, #-16]!",
+    // Save ELR_EL1 and SPSR_EL1 — hvc will overwrite them
+    "mrs x9,  elr_el1",
+    "mrs x10, spsr_el1",
+    "stp x9,  x10, [sp, #-16]!",
     // Extract syscall_nr (x9) and table_nr (x10) from x8
     "and x9,  x8, #0xFFF",
     "lsr x10, x8, #12",
@@ -89,14 +114,14 @@ global_asm!(
     "mov x11, x0",
     "mov x0, #0x0700",          // HVC x0 = NT_SYSCALL
     "hvc #0",
+    // Restore ELR_EL1 and SPSR_EL1 (hvc clobbered them)
+    "ldp x9,  x10, [sp], #16",
+    "msr elr_el1,  x9",
+    "msr spsr_el1, x10",
     // Restore scratch regs
     "ldp x11, x12, [sp], #16",
     "ldp x9,  x10, [sp], #16",
     "ldp x29, x30, [sp], #16",
-    // Advance ELR_EL1 past the svc instruction
-    "mrs x9, elr_el1",
-    "add x9, x9, #4",
-    "msr elr_el1, x9",
     "eret",
     ".balign 128",
 
@@ -125,6 +150,8 @@ global_asm!(
 
 extern "C" {
     pub static __exception_vectors: u8;
+    pub static __svc_stack_top: u8;
+    pub static __svc_stack_bottom: u8;
 }
 
 /// 安装异常向量表到 VBAR_EL1

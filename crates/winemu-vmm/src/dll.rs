@@ -67,26 +67,26 @@ impl DllLoader {
         use winemu_shared::pe;
 
         let mem = memory.read().unwrap();
-        let mem_base = mem.base_gpa().0;
 
         // 读 PE 头，找 export directory
-        let dos_sig = read_u16(&mem, mem_base + guest_base);
+        // guest_base is already a GPA; read_u16/read_u32 take raw GPAs
+        let dos_sig = read_u16(&mem, guest_base);
         if dos_sig != pe::MZ_MAGIC { return None; }
-        let lfanew = read_u32(&mem, mem_base + guest_base + 60) as u64;
-        if read_u32(&mem, mem_base + guest_base + lfanew) != pe::PE_MAGIC { return None; }
+        let lfanew = read_u32(&mem, guest_base + 60) as u64;
+        if read_u32(&mem, guest_base + lfanew) != pe::PE_MAGIC { return None; }
 
         let oh = guest_base + lfanew + 24;
-        let exp_rva  = read_u32(&mem, mem_base + oh + 96) as u64;
-        let exp_size = read_u32(&mem, mem_base + oh + 100);
+        let exp_rva  = read_u32(&mem, oh + 96) as u64;
+        let exp_size = read_u32(&mem, oh + 100);
         if exp_rva == 0 || exp_size == 0 { return None; }
 
         let exp = guest_base + exp_rva;
-        let exp_base   = read_u32(&mem, mem_base + exp + 16) as u64; // OrdinalBase
-        let num_funcs  = read_u32(&mem, mem_base + exp + 20) as u64;
-        let num_names  = read_u32(&mem, mem_base + exp + 24) as u64;
-        let fn_rva_tbl = guest_base + read_u32(&mem, mem_base + exp + 28) as u64;
-        let name_tbl   = guest_base + read_u32(&mem, mem_base + exp + 32) as u64;
-        let ord_tbl    = guest_base + read_u32(&mem, mem_base + exp + 36) as u64;
+        let exp_base   = read_u32(&mem, exp + 16) as u64; // OrdinalBase
+        let num_funcs  = read_u32(&mem, exp + 20) as u64;
+        let num_names  = read_u32(&mem, exp + 24) as u64;
+        let fn_rva_tbl = guest_base + read_u32(&mem, exp + 28) as u64;
+        let name_tbl   = guest_base + read_u32(&mem, exp + 32) as u64;
+        let ord_tbl    = guest_base + read_u32(&mem, exp + 36) as u64;
 
         // Ordinal lookup: "#NNN" or pure numeric string
         let ordinal_req: Option<u64> = if let Some(rest) = name.strip_prefix('#') {
@@ -99,7 +99,7 @@ impl DllLoader {
             // ordinal is the raw export ordinal; index = ordinal - OrdinalBase
             let idx = ordinal.wrapping_sub(exp_base);
             if idx < num_funcs {
-                let fn_rva = read_u32(&mem, mem_base + fn_rva_tbl + idx * 4) as u64;
+                let fn_rva = read_u32(&mem, fn_rva_tbl + idx * 4) as u64;
                 if fn_rva != 0 {
                     return Some(guest_base + fn_rva);
                 }
@@ -109,12 +109,12 @@ impl DllLoader {
 
         // Name-based lookup
         for i in 0..num_names {
-            let name_rva = read_u32(&mem, mem_base + name_tbl + i * 4) as u64;
-            let export_name = read_cstr(&mem, mem_base + guest_base + name_rva);
+            let name_rva = read_u32(&mem, name_tbl + i * 4) as u64;
+            let export_name = read_cstr(&mem, guest_base + name_rva);
             if export_name == name {
-                let ord = read_u16(&mem, mem_base + ord_tbl + i * 2) as u64;
+                let ord = read_u16(&mem, ord_tbl + i * 2) as u64;
                 if ord < num_funcs {
-                    let fn_rva = read_u32(&mem, mem_base + fn_rva_tbl + ord * 4) as u64;
+                    let fn_rva = read_u32(&mem, fn_rva_tbl + ord * 4) as u64;
                     return Some(guest_base + fn_rva);
                 }
             }
