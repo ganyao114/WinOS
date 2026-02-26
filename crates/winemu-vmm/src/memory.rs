@@ -22,12 +22,16 @@ impl GuestMemory {
     }
 
     pub fn write_bytes(&mut self, gpa: Gpa, data: &[u8]) {
+        if gpa.0 < self.base_gpa.0 { return; }
         let offset = (gpa.0 - self.base_gpa.0) as usize;
+        if offset + data.len() > self.size { return; }
         self.mmap[offset..offset + data.len()].copy_from_slice(data);
     }
 
     pub fn read_bytes(&self, gpa: Gpa, len: usize) -> &[u8] {
+        if gpa.0 < self.base_gpa.0 { return &[]; }
         let offset = (gpa.0 - self.base_gpa.0) as usize;
+        if offset + len > self.size { return &[]; }
         &self.mmap[offset..offset + len]
     }
 }

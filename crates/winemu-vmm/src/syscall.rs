@@ -12,6 +12,7 @@ use std::sync::{Mutex, RwLock};
 use winemu_core::addr::Gpa;
 use crate::memory::GuestMemory;
 use crate::file_io::FileTable;
+use crate::section::SectionTable;
 use crate::sched::{Scheduler, ThreadId, SchedResult};
 use crate::sched::sync::{SyncHandle, SyncObject, EventObj};
 use winemu_shared::status;
@@ -173,11 +174,12 @@ impl SyscallDispatcher {
         tid: ThreadId,
         memory: &std::sync::Arc<std::sync::RwLock<GuestMemory>>,
         files: &FileTable,
+        sections: &SectionTable,
         sched: &std::sync::Arc<Scheduler>,
         vaspace: &std::sync::Arc<std::sync::Mutex<crate::vaspace::VaSpace>>,
         guest_sp: u64,
     ) -> DispatchResult {
-        self.dispatch_full(args, [0u64; 4], tid, memory, files, sched, vaspace, guest_sp)
+        self.dispatch_full(args, [0u64; 4], tid, memory, files, sections, sched, vaspace, guest_sp)
     }
 
     /// Full dispatch with x4-x7 passed directly from vCPU registers.
@@ -190,6 +192,7 @@ impl SyscallDispatcher {
         tid: ThreadId,
         memory: &std::sync::Arc<std::sync::RwLock<GuestMemory>>,
         files: &FileTable,
+        sections: &SectionTable,
         sched: &std::sync::Arc<Scheduler>,
         vaspace: &std::sync::Arc<std::sync::Mutex<crate::vaspace::VaSpace>>,
         guest_sp: u64,
@@ -253,6 +256,7 @@ impl SyscallDispatcher {
                 let buf_gpa = Gpa(extra(5));
                 let length  = extra(6) as usize;
                 let offset  = if extra(7) == u64::MAX { None } else { Some(extra(7)) };
+                log::debug!("NtWriteFile: handle={:#x} buf={:#x} len={}", handle, buf_gpa.0, length);
                 if length == 0 || length > 64 * 1024 * 1024 {
                     return DispatchResult::Sync(status::INVALID_PARAMETER as u64);
                 }
@@ -329,12 +333,15 @@ impl SyscallDispatcher {
                 }
                 match vaspace.lock().unwrap().alloc(hint, size, prot) {
                     Some(va) => {
+                        // Zero-initialize committed memory (Windows guarantee)
+                        let aligned = (size + 0xFFFF) & !0xFFFF;
+                        let zero = vec![0u8; aligned as usize];
+                        memory.write().unwrap().write_bytes(Gpa(va), &zero);
                         // Write back allocated base and size
                         if base_ptr_gpa != 0 {
                             memory.write().unwrap().write_bytes(Gpa(base_ptr_gpa), &va.to_le_bytes());
                         }
                         if size_ptr_gpa != 0 {
-                            let aligned = (size + 0xFFFF) & !0xFFFF;
                             memory.write().unwrap().write_bytes(Gpa(size_ptr_gpa), &aligned.to_le_bytes());
                         }
                         DispatchResult::Sync(status::SUCCESS as u64)
@@ -714,15 +721,78 @@ impl SyscallDispatcher {
             }
             // ── Section / 映射 ────────────────────────────────
             "NtCreateSection" => {
-                log::debug!("NtCreateSection: stub");
-                DispatchResult::Sync(status::NOT_IMPLEMENTED as u64)
+                let handle_out_gpa = extra(0);
+                let prot            = extra(4) as u32;
+                let file_handle     = extra(6);
+                log::debug!("NtCreateSection args: handle_out_gpa={:#x} prot={:#x} file={:#x} a={:?}",
+                    handle_out_gpa, prot, file_handle, &a[..]);
+                let size = if extra(3) != 0 {
+                    let mem = memory.read().unwrap();
+                    let b = mem.read_bytes(Gpa(extra(3)), 8);
+                    u64::from_le_bytes(b.try_into().unwrap_or([0;8]))
+                } else { 0 };
+                let (st, h) = sections.create(file_handle, size, prot, files);
+                if st == status::SUCCESS as u64 && handle_out_gpa != 0 {
+                    memory.write().unwrap()
+                        .write_bytes(Gpa(handle_out_gpa), &h.to_le_bytes());
+                }
+                log::debug!("NtCreateSection: status={:#x} handle={:#x}", st, h);
+                DispatchResult::Sync(st)
             }
             "NtMapViewOfSection" => {
-                log::debug!("NtMapViewOfSection: stub");
-                DispatchResult::Sync(status::NOT_IMPLEMENTED as u64)
+                // a[0]=SectionHandle, a[1]=ProcessHandle, a[2]=*BaseAddress
+                // a[3]=ZeroBits, a[4]=CommitSize, a[5]=SectionOffset*
+                // a[6]=ViewSize*, a[7]=InheritDisposition, a[8]=AllocationType
+                // a[9]=Win32Protect
+                let section_handle  = extra(0);
+                log::debug!("NtMapViewOfSection: section_handle={:#x} args={:?}", section_handle, &args[..]);
+                let base_ptr_gpa    = extra(2);
+                let offset_ptr_gpa  = extra(5);
+                let size_ptr_gpa    = extra(6);
+                let prot            = extra(9) as u32;
+
+                let base_hint = if base_ptr_gpa != 0 {
+                    let mem = memory.read().unwrap();
+                    let b = mem.read_bytes(Gpa(base_ptr_gpa), 8);
+                    u64::from_le_bytes(b.try_into().unwrap_or([0;8]))
+                } else { 0 };
+                let offset = if offset_ptr_gpa != 0 {
+                    let mem = memory.read().unwrap();
+                    let b = mem.read_bytes(Gpa(offset_ptr_gpa), 8);
+                    u64::from_le_bytes(b.try_into().unwrap_or([0;8]))
+                } else { 0 };
+                let map_size = if size_ptr_gpa != 0 {
+                    let mem = memory.read().unwrap();
+                    let b = mem.read_bytes(Gpa(size_ptr_gpa), 8);
+                    u64::from_le_bytes(b.try_into().unwrap_or([0;8]))
+                } else { 0 };
+
+                let mut vs = vaspace.lock().unwrap();
+                let mut mem = memory.write().unwrap();
+                let (st, va) = sections.map_view(
+                    section_handle, base_hint, map_size, offset, prot,
+                    &mut vs, &mut mem,
+                );
+                drop(vs);
+                drop(mem);
+                if st == status::SUCCESS as u64 {
+                    if base_ptr_gpa != 0 {
+                        memory.write().unwrap()
+                            .write_bytes(Gpa(base_ptr_gpa), &va.to_le_bytes());
+                    }
+                    if size_ptr_gpa != 0 {
+                        // write back actual mapped size (we don't track it here, leave as-is)
+                    }
+                }
+                log::debug!("NtMapViewOfSection: status={:#x} va={:#x}", st, va);
+                DispatchResult::Sync(st)
             }
             "NtUnmapViewOfSection" => {
-                DispatchResult::Sync(status::SUCCESS as u64)
+                // a[0]=ProcessHandle, a[1]=BaseAddress
+                let base_va = extra(1);
+                let st = sections.unmap_view(base_va, &mut vaspace.lock().unwrap());
+                log::debug!("NtUnmapViewOfSection: status={:#x} va={:#x}", st, base_va);
+                DispatchResult::Sync(st)
             }
             // ── 进程/线程创建 ─────────────────────────────────
             "NtCreateProcessEx" | "NtCreateProcess" => {

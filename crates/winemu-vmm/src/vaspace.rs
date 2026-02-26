@@ -28,6 +28,20 @@ pub struct VaSpace {
 }
 
 impl VaSpace {
+    /// 在 KERNEL_READY 时用实际 heap_start 重置 VaSpace
+    pub fn set_base(&mut self, heap_start: u64) {
+        // Align up to 64KB
+        let base = (heap_start + 0xFFFF) & !0xFFFF;
+        // GuestMemory is 512MB: [0x40000000, 0x60000000)
+        let end = 0x6000_0000u64;
+        self.regions.clear();
+        self.regions.insert(base, Region {
+            base,
+            size: end - base,
+            state: RegionState::Free,
+            prot: 0,
+        });
+    }
     pub fn new() -> Self {
         let mut regions = BTreeMap::new();
         regions.insert(USER_BASE, Region {

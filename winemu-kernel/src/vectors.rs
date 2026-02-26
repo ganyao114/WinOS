@@ -67,10 +67,18 @@ global_asm!(
     //   x11 = orig_x0    (FileHandle / arg0)
     //   x1-x7 = original syscall args 1-7 (untouched)
     // Reset SP_EL1 to fixed SVC stack top each entry (avoids SP_EL1 leak)
-    "adr x9, __kernel_svc_stack_top",
+    // Use TPIDR_EL1 as per-CPU scratch to save x9 before overwriting it,
+    // so ALL registers (x9/x10/x11/x12/x29/x30) are correctly preserved.
+    "msr tpidr_el1, x9",               // save user's x9 to EL1 system register
+    "adr x9, __kernel_svc_stack_top",  // x9 = SVC stack top
     "mov sp, x9",
-    // Save scratch regs (restored after hvc)
+    // Save scratch regs: all values correct at time of stp
+    // Stack layout at SP_EL1 after all stps:
+    //   [sp+0]=x11_orig, [sp+8]=x12_orig(correct)
+    //   [sp+16]=x9_orig(correct), [sp+24]=x10_orig
+    //   [sp+32]=x29_orig, [sp+40]=x30_orig
     "stp x29, x30, [sp, #-16]!",
+    "mrs x9, tpidr_el1",               // restore user's x9 from system register
     "stp x9,  x10, [sp, #-16]!",
     "stp x11, x12, [sp, #-16]!",
     // Extract syscall_nr (x9) and table_nr (x10) from x8

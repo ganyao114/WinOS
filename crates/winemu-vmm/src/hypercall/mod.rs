@@ -7,6 +7,7 @@ use crate::dll::DllLoader;
 use crate::sched::{Scheduler, ThreadId, SchedResult};
 use crate::sched::sync::{SyncHandle, SyncObject, EventObj, MutexObj, SemaphoreObj};
 use crate::syscall::{SyscallDispatcher, DispatchResult};
+use crate::section::SectionTable;
 
 pub enum HypercallResult {
     Sync(u64),
@@ -19,6 +20,7 @@ pub struct HypercallManager {
     memory: Arc<RwLock<GuestMemory>>,
     vaspace: Arc<Mutex<VaSpace>>,
     files: FileTable,
+    sections: SectionTable,
     pub sched: Arc<Scheduler>,
     syscall_disp: SyscallDispatcher,
     dll_loader: DllLoader,
@@ -41,6 +43,7 @@ impl HypercallManager {
             memory,
             vaspace: Arc::new(Mutex::new(VaSpace::new())),
             files: FileTable::new(root),
+            sections: SectionTable::new(),
             sched,
             syscall_disp,
             dll_loader: DllLoader::new(dll_search_paths),
@@ -50,12 +53,18 @@ impl HypercallManager {
     pub fn dispatch(&self, hypercall_nr: u64, args: [u64; 6], tid: ThreadId) -> HypercallResult {
         match hypercall_nr {
             nr::KERNEL_READY => {
-                // args[0] = entry_va, args[1] = stack_va, args[2] = teb_gva
-                let entry_va = args[0];
-                let stack_va = args[1];
-                let teb_gva  = args[2];
-                log::info!("Guest kernel ready: entry={:#x} stack={:#x} teb={:#x}",
-                    entry_va, stack_va, teb_gva);
+                // args[0] = entry_va, args[1] = stack_va, args[2] = teb_gva, args[3] = heap_start
+                let entry_va   = args[0];
+                let stack_va   = args[1];
+                let teb_gva    = args[2];
+                let heap_start = args[3];
+                log::info!("Guest kernel ready: entry={:#x} stack={:#x} teb={:#x} heap={:#x}",
+                    entry_va, stack_va, teb_gva, heap_start);
+
+                // Initialize user VaSpace from heap_start
+                if heap_start != 0 {
+                    self.vaspace.lock().unwrap().set_base(heap_start);
+                }
 
                 if entry_va == 0 {
                     // 内核就绪但无 EXE，等待（Phase 3 改为接收 EXE 路径）
@@ -309,8 +318,47 @@ impl HypercallManager {
             }
             nr::NT_CLOSE => {
                 let handle = args[0];
-                let status = self.files.close(handle);
-                log::debug!("NT_CLOSE: handle={} status={:#x}", handle, status);
+                // Try section handle first, then file handle
+                if !self.sections.close(handle) {
+                    let status = self.files.close(handle);
+                    log::debug!("NT_CLOSE: handle={} status={:#x}", handle, status);
+                    HypercallResult::Sync(status)
+                } else {
+                    log::debug!("NT_CLOSE: section handle={:#x}", handle);
+                    HypercallResult::Sync(0)
+                }
+            }
+            nr::NT_CREATE_SECTION => {
+                // args: [file_handle, size, prot, 0, 0, 0]
+                let file_handle = args[0];
+                let size        = args[1];
+                let prot        = args[2] as u32;
+                let (status, handle) = self.sections.create(file_handle, size, prot, &self.files);
+                log::debug!("NT_CREATE_SECTION: status={:#x} handle={:#x}", status, handle);
+                HypercallResult::Sync((status << 32) | handle)
+            }
+            nr::NT_MAP_VIEW_OF_SECTION => {
+                // args: [section_handle, base_hint, size, offset, prot, 0]
+                let section_handle = args[0];
+                let base_hint      = args[1];
+                let map_size       = args[2];
+                let offset         = args[3];
+                let prot           = args[4] as u32;
+                let mut vaspace = self.vaspace.lock().unwrap();
+                let mut mem     = self.memory.write().unwrap();
+                let (status, va) = self.sections.map_view(
+                    section_handle, base_hint, map_size, offset, prot,
+                    &mut vaspace, &mut mem,
+                );
+                log::debug!("NT_MAP_VIEW_OF_SECTION: status={:#x} va={:#x}", status, va);
+                HypercallResult::Sync((status << 32) | va)
+            }
+            nr::NT_UNMAP_VIEW_OF_SECTION => {
+                // args: [base_va, 0, 0, 0, 0, 0]
+                let base_va = args[0];
+                let mut vaspace = self.vaspace.lock().unwrap();
+                let status = self.sections.unmap_view(base_va, &mut vaspace);
+                log::debug!("NT_UNMAP_VIEW_OF_SECTION: status={:#x} va={:#x}", status, base_va);
                 HypercallResult::Sync(status)
             }
             nr::NT_QUERY_INFO_FILE => {
@@ -451,6 +499,18 @@ impl HypercallManager {
         }
     }
 
+    /// Read the 6 saved registers from the SVC stack (SP_EL1 at hvc time).
+    /// Layout: [x11_orig, x12_orig, x9_orig, x10_orig, x29_orig, x30_orig]
+    pub fn read_svc_stack(&self, svc_sp: u64) -> [u64; 6] {
+        let mem = self.memory.read().unwrap();
+        let mut out = [0u64; 6];
+        for (i, off) in [0u64, 8, 16, 24, 32, 40].iter().enumerate() {
+            let b = mem.read_bytes(winemu_core::addr::Gpa(svc_sp + off), 8);
+            out[i] = u64::from_le_bytes(b.try_into().unwrap_or([0; 8]));
+        }
+        out
+    }
+
     /// NT_SYSCALL with full register layout:
     /// args = [syscall_nr, table_nr, x0, x1, x2, x3, x4, x5, x6, x7]
     /// guest_sp = user stack pointer at SVC time
@@ -464,6 +524,7 @@ impl HypercallManager {
             tid,
             &self.memory,
             &self.files,
+            &self.sections,
             &self.sched,
             &self.vaspace,
             guest_sp,

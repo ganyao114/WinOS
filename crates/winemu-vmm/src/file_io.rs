@@ -143,10 +143,18 @@ impl FileTable {
 
     /// NtWriteFile — returns (status, bytes_written)
     pub fn write(&self, handle: u64, buf: &[u8], offset: Option<u64>) -> (u64, usize) {
-        // Windows console handles: 0x14=stdout, 0x18=stderr (from TEB)
-        if handle == 0x14 || handle == 0x18 {
+        // Windows console pseudo-handles:
+        //   STD_OUTPUT_HANDLE = -11 (0xFFFFFFF5), legacy TEB handle = 0x14
+        //   STD_ERROR_HANDLE  = -12 (0xFFFFFFF4), legacy TEB handle = 0x18
+        if handle == 0xFFFF_FFFF_FFFF_FFF5 || handle == 0x14 {
             use std::io::Write;
             let _ = std::io::stdout().write_all(buf);
+            let _ = std::io::stdout().flush();
+            return (STATUS_SUCCESS, buf.len());
+        }
+        if handle == 0xFFFF_FFFF_FFFF_FFF4 || handle == 0x18 {
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(buf);
             return (STATUS_SUCCESS, buf.len());
         }
         let mut handles = self.handles.lock().unwrap();

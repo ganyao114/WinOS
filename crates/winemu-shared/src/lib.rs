@@ -49,6 +49,19 @@ pub mod nr {
     /// args: [handle, buf_gpa, buf_len, 0, 0, 0]
     pub const NT_QUERY_DIR_FILE:  u64 = 0x0406;
 
+    // ── NT Section/映射: 0x0510 - 0x051F ────────────────────
+    /// NtCreateSection
+    /// args: [file_handle(0=pagefile), size, prot, 0, 0, 0]
+    /// returns: section_handle
+    pub const NT_CREATE_SECTION:    u64 = 0x0510;
+    /// NtMapViewOfSection
+    /// args: [section_handle, base_hint(0=any), size, offset, prot, 0]
+    /// returns: mapped_va (0 on error)
+    pub const NT_MAP_VIEW_OF_SECTION: u64 = 0x0511;
+    /// NtUnmapViewOfSection
+    /// args: [base_va, 0, 0, 0, 0, 0]
+    pub const NT_UNMAP_VIEW_OF_SECTION: u64 = 0x0512;
+
     // ── NT 虚拟内存: 0x0500 - 0x05FF ────────────────────────
     /// args: [hint_va(0=any), size, prot, 0, 0, 0]
     pub const NT_ALLOC_VIRTUAL:   u64 = 0x0500;

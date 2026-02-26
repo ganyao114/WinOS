@@ -26,8 +26,13 @@ pub trait Vcpu: Send {
     fn special_regs(&self) -> Result<SpecialRegs>;
     fn set_special_regs(&mut self, sr: &SpecialRegs) -> Result<()>;
     fn advance_pc(&mut self, bytes: u64) -> Result<()>;
-    /// Set only the return value register (x0/rax) without touching CPSR/PSTATE
     fn set_return_value(&mut self, val: u64) -> Result<()>;
+    /// ELR_EL1 — EL0 return PC saved by SVC entry
+    fn elr_el1(&self) -> Result<u64>;
+    /// SPSR_EL1 — EL0 pstate saved by SVC entry
+    fn spsr_el1(&self) -> Result<u64>;
+    /// SP_EL0 — user stack pointer
+    fn sp_el0(&self) -> Result<u64>;
 }
 
 /// 根据当前平台创建默认 Hypervisor 实例

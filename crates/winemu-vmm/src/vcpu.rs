@@ -89,16 +89,12 @@ pub fn vcpu_thread(
             VmExit::Hypercall { nr, mut args } => {
                 if nr == winemu_shared::nr::NT_SYSCALL {
                     let regs = vcpu.regs().unwrap();
-                    // SVC handler layout at HVC time:
-                    //   HVC x0 = NT_SYSCALL (nr)
-                    //   vCPU x9  = syscall_nr (x8 & 0xFFF)
-                    //   vCPU x10 = table_nr   (x8 >> 12 & 0x3)
-                    //   HVC x3 = orig_x0     (args[2])
-                    //   vCPU x1-x2 = orig x1-x2 (untouched)
-                    //   vCPU x4-x7 = orig x4-x7 (never clobbered)
+                    log::debug!("NT_SYSCALL hvc: x0={:#x} x8={:#x} x9={:#x} x10={:#x} x11={:#x} x12={:#x} x30={:#x} pc={:#x} sp={:#x}",
+                        regs.x[0], regs.x[8], regs.x[9], regs.x[10], regs.x[11], regs.x[12], regs.x[30], regs.pc, regs.sp);
                     let syscall_nr = regs.x[9];
                     let table_nr   = regs.x[10];
-                    let x0 = regs.x[11]; // orig_x0 saved in x11 by SVC handler
+                    // x11 = orig_x0: SVC handler does `mov x11, x0` before hvc
+                    let x0 = regs.x[11];
                     let x1 = regs.x[1];
                     let x2 = regs.x[2];
                     let x3 = regs.x[3];
@@ -106,29 +102,35 @@ pub fn vcpu_thread(
                     let x5 = regs.x[5];
                     let x6 = regs.x[6];
                     let x7 = regs.x[7];
-                    let sp = regs.sp;
+                    let sp_el1 = regs.sp; // SVC stack (SP_EL1) — for reading saved regs
+                    let sp_el0 = vcpu.sp_el0().unwrap_or(0); // user stack — for reading stack args
+                    // Read original x9/x10/x11/x12/x29/x30 from SVC stack (SP_EL1)
+                    // before dispatching (dispatch may modify memory).
+                    // SVC stack layout: [sp+0]=x11_orig,[sp+8]=x12_orig,[sp+16]=x9_orig,[sp+24]=x10_orig,[sp+32]=x29_orig,[sp+40]=x30_orig
+                    let svc_stack_saved = hc_mgr.read_svc_stack(sp_el1);
+                    log::debug!("svc_stack: sp_el1={:#x} saved={:x?}", sp_el1, svc_stack_saved);
                     let full_args = [syscall_nr, table_nr, x0, x1, x2, x3, x4, x5, x6, x7];
-                    let result = hc_mgr.dispatch_nt_syscall(full_args, sp, tid);
+                    let result = hc_mgr.dispatch_nt_syscall(full_args, sp_el0, tid);
                     match result {
                         HypercallResult::Sync(ret) | HypercallResult::Sched(SchedResult::Sync(ret)) => {
                             set_x0(&mut *vcpu, ret);
-                            let ctx = save_ctx(&mut *vcpu);
+                            let ctx = save_ctx_el0(&mut *vcpu, &svc_stack_saved);
                             sched.save_ctx(tid, ctx);
                         }
                         HypercallResult::Sched(SchedResult::Block(req)) => {
-                            let ctx = save_ctx(&mut *vcpu);
+                            let ctx = save_ctx_el0(&mut *vcpu, &svc_stack_saved);
                             sched.save_ctx(tid, ctx);
                             sched.set_waiting(tid, req);
                             current = None;
                         }
                         HypercallResult::Sched(SchedResult::Yield) => {
-                            let ctx = save_ctx(&mut *vcpu);
+                            let ctx = save_ctx_el0(&mut *vcpu, &svc_stack_saved);
                             sched.save_ctx(tid, ctx);
                             sched.push_ready(tid);
                             current = None;
                         }
                         HypercallResult::Sched(SchedResult::Exit(code)) => {
-                            let ctx = save_ctx(&mut *vcpu);
+                            let ctx = save_ctx_el0(&mut *vcpu, &svc_stack_saved);
                             sched.save_ctx(tid, ctx);
                             sched.terminate(tid, code);
                             current = None;
@@ -191,6 +193,10 @@ fn restore_ctx(vcpu: &mut dyn Vcpu, ctx: &ThreadContext) {
         regs.pc    = ctx.gpr[32];
         regs.pstate = ctx.pstate;
         vcpu.set_regs(&regs).unwrap();
+        // Verify SP was set correctly
+        let check = vcpu.regs().unwrap();
+        log::debug!("restore_ctx: pc={:#x} sp={:#x} pstate={:#x} (wanted sp={:#x})",
+            check.pc, check.sp, check.pstate, ctx.gpr[31]);
         if ctx.fp_dirty {
             // TODO: vcpu FP register API (Phase 3)
         }
@@ -214,4 +220,35 @@ fn save_ctx(vcpu: &mut dyn Vcpu) -> ThreadContext {
 
 fn set_x0(vcpu: &mut dyn Vcpu, val: u64) {
     vcpu.set_return_value(val).unwrap();
+}
+
+/// Save EL0 thread context from inside the SVC handler (vCPU is at EL1).
+/// Uses ELR_EL1 as PC and SPSR_EL1 as pstate to reconstruct the EL0 state.
+/// Reads original x9/x10/x11/x12/x29/x30 from the SVC stack (SP_EL1).
+fn save_ctx_el0(vcpu: &mut dyn Vcpu, svc_stack: &[u64; 6]) -> ThreadContext {
+    let mut ctx = ThreadContext::default();
+    #[cfg(target_arch = "aarch64")]
+    {
+        let regs = vcpu.regs().unwrap();
+        ctx.gpr[..31].copy_from_slice(&regs.x[..31]);
+        ctx.gpr[31] = vcpu.sp_el0().unwrap_or(regs.sp);
+        // ELR_EL1 for SVC = address of instruction AFTER svc (ARM spec).
+        // Do NOT add +4 here; ELR_EL1 already points past the svc instruction.
+        ctx.gpr[32] = vcpu.elr_el1().unwrap_or(regs.pc);
+        ctx.pstate   = vcpu.spsr_el1().unwrap_or(0);
+        ctx.fp_dirty = false;
+        log::debug!("save_ctx_el0: elr={:#x} return_pc={:#x} sp_el0={:#x} x30={:#x} spsr={:#x}",
+            vcpu.elr_el1().unwrap_or(0), ctx.gpr[32], ctx.gpr[31], ctx.gpr[30], ctx.pstate);
+        // Restore original x9/x10/x11/x12 from SVC stack snapshot
+        // (SVC handler overwrites these before hvc).
+        // x29/x30 are NOT modified by the SVC handler → regs.x[29/30] already correct.
+        // TPIDR_EL1 is used as per-CPU scratch so x9 and x12 are both saved correctly.
+        // Stack layout: [0]=x11_orig,[1]=x12_orig,[2]=x9_orig,[3]=x10_orig,[4]=x29_orig,[5]=x30_orig
+        ctx.gpr[11] = svc_stack[0];
+        ctx.gpr[12] = svc_stack[1];
+        ctx.gpr[9]  = svc_stack[2];
+        ctx.gpr[10] = svc_stack[3];
+        // ctx.gpr[29] and ctx.gpr[30] already set correctly from regs.x[29/30]
+    }
+    ctx
 }

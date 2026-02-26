@@ -3,6 +3,7 @@ pub mod file_io;
 pub mod hypercall;
 pub mod memory;
 pub mod sched;
+pub mod section;
 pub mod syscall;
 pub mod vaspace;
 pub mod vcpu;

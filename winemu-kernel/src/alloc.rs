@@ -33,6 +33,12 @@ pub fn alloc(size: usize, align: usize) -> Option<*mut u8> {
     }
 }
 
+pub fn heap_end() -> u64 {
+    let base = core::ptr::addr_of!(__heap_start) as usize;
+    let base = (base + 15) & !15;
+    (base + HEAP_SIZE) as u64
+}
+
 pub fn alloc_zeroed(size: usize, align: usize) -> Option<*mut u8> {
     let ptr = alloc(size, align)?;
     unsafe { core::ptr::write_bytes(ptr, 0, size); }

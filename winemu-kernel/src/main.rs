@@ -65,7 +65,7 @@ pub extern "C" fn kernel_main() -> ! {
 
     if written == 0 || written > EXE_LOAD_BUF_SIZE {
         hypercall::debug_print("kernel: no exe image\n");
-        hypercall::kernel_ready(0, 0, 0);
+        hypercall::kernel_ready(0, 0, 0, 0);
         loop { core::hint::spin_loop(); }
     }
 
@@ -126,7 +126,7 @@ pub extern "C" fn kernel_main() -> ! {
     // ── 4. 通知 VMM 创建 Thread 0 ───────────────────────────
     let entry_va = loaded.base + loaded.entry_rva as u64;
     hypercall::debug_print("kernel: calling kernel_ready\n");
-    hypercall::kernel_ready(entry_va, teb_peb.stack_base, teb_peb.teb_va);
+    hypercall::kernel_ready(entry_va, teb_peb.stack_base, teb_peb.teb_va, crate::alloc::heap_end());
 
     loop { core::hint::spin_loop(); }
 }

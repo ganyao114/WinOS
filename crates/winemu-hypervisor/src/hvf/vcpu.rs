@@ -236,7 +236,18 @@ impl Vcpu for HvfVcpu {
     }
 
     fn set_return_value(&mut self, val: u64) -> Result<()> {
-        // Set x0 directly without touching CPSR/PSTATE
         self.set_reg(0, val)
+    }
+
+    fn elr_el1(&self) -> Result<u64> {
+        self.get_sys_reg(ffi::HV_SYS_REG_ELR_EL1)
+    }
+
+    fn spsr_el1(&self) -> Result<u64> {
+        self.get_sys_reg(ffi::HV_SYS_REG_SPSR_EL1)
+    }
+
+    fn sp_el0(&self) -> Result<u64> {
+        self.get_sys_reg(ffi::HV_SYS_REG_SP_EL0)
     }
 }
