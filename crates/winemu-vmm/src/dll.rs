@@ -160,76 +160,81 @@ impl DllLoader {
         log::info!("DllLoader: loading {} from {}", name, path.display());
 
         let data = std::fs::read(&path)?;
-        let dll = self.load_bytes(name, &data, memory, vaspace)?;
+        let hdrs = PeHeaders::from_slice(&data).map_err(DllError::Pe)?;
 
-        self.loaded.lock().unwrap().insert(key, dll.clone());
-        Ok(dll)
-    }
-
-    /// 从字节数组加载（不缓存，供内部使用）
-    fn load_bytes(
-        &self,
-        name: &str,
-        data: &[u8],
-        memory: &Arc<RwLock<GuestMemory>>,
-        vaspace: &Mutex<VaSpace>,
-    ) -> Result<LoadedDll, DllError> {
-        let hdrs = PeHeaders::from_slice(data)?;
+        // 收集导入的 DLL 名称（在分配 guest 内存前，避免持锁递归）
+        let import_dll_names = collect_import_dll_names(&hdrs, &data);
 
         let img_size = hdrs.size_of_image as usize;
+        let image_base = hdrs.image_base;
+        let entry_rva = hdrs.entry_rva;
+        let reloc_dir = hdrs.data_dir(pe::DIR_BASERELOC);
+        let import_dir = hdrs.data_dir(pe::DIR_IMPORT);
 
         // 在 guest VA 空间分配
         let guest_base = {
             let mut va = vaspace.lock().unwrap();
-            // 优先使用 PE 首选基址
-            let hint = hdrs.image_base;
-            va.alloc(hint, img_size as u64, 0x20) // PAGE_EXECUTE_READ
+            va.alloc(image_base, img_size as u64, 0x20)
                 .ok_or(DllError::NoMemory)?
         };
 
-        // 写入 guest 内存
+        // 写入 guest 内存（sections + 重定位）
         {
             let mut mem = memory.write().unwrap();
-            let base_gpa = mem.base_gpa();
+            let base_gpa = mem.base_gpa().0;
 
-            // 复制 PE 头
-            let hdr_size = hdrs.size_of_headers as usize;
-            let hdr_size = hdr_size.min(data.len());
-            write_guest(&mut mem, base_gpa.0 + guest_base, &data[..hdr_size]);
+            let hdr_size = (hdrs.size_of_headers as usize).min(data.len());
+            write_guest(&mut mem, base_gpa + guest_base, &data[..hdr_size]);
 
-            // 复制各 section
             for sec in hdrs.sections() {
                 if sec.raw_size == 0 { continue; }
                 let src_off  = sec.raw_off as usize;
                 let dst_va   = guest_base + sec.vaddr as u64;
                 let copy_len = (sec.raw_size as usize).min(sec.vsize as usize);
                 if src_off + copy_len > data.len() { continue; }
-                write_guest(&mut mem, base_gpa.0 + dst_va, &data[src_off..src_off + copy_len]);
+                write_guest(&mut mem, base_gpa + dst_va, &data[src_off..src_off + copy_len]);
             }
 
-            // 基址重定位
-            let delta = guest_base.wrapping_sub(hdrs.image_base) as i64;
+            let delta = guest_base.wrapping_sub(image_base) as i64;
             if delta != 0 {
-                if let Some(dir) = hdrs.data_dir(pe::DIR_BASERELOC) {
+                if let Some(dir) = reloc_dir {
                     if dir.is_present() {
-                        apply_relocs(
-                            &mut mem, base_gpa.0, guest_base,
-                            dir.rva as usize, dir.size as usize, delta,
-                        );
+                        apply_relocs(&mut mem, base_gpa, guest_base,
+                            dir.rva as usize, dir.size as usize, delta);
                     }
                 }
             }
         }
 
-        log::info!("DllLoader: {} loaded at guest_base={:#x} size={:#x}",
-            name, guest_base, img_size);
+        let dll = LoadedDll { name: name.to_string(), guest_base, size: img_size, entry_rva };
 
-        Ok(LoadedDll {
-            name:       name.to_string(),
-            guest_base,
-            size:       img_size,
-            entry_rva:  hdrs.entry_rva,
-        })
+        // 插入缓存（在递归加载依赖前，防止循环依赖）
+        self.loaded.lock().unwrap().insert(key, dll.clone());
+
+        // 递归加载依赖 DLL，然后填充 IAT
+        if let Some(imp_dir) = import_dir {
+            if imp_dir.is_present() {
+                // 先递归加载所有依赖（不持有 memory 锁）
+                for dep in &import_dll_names {
+                    if let Err(e) = self.load(dep, memory, vaspace) {
+                        log::warn!("DllLoader: failed to load dep {} for {}: {:?}", dep, name, e);
+                    }
+                }
+                // 填充 IAT：先快照 cache，再持有 memory 写锁
+                let cache_snapshot: HashMap<String, LoadedDll> =
+                    self.loaded.lock().unwrap().clone();
+                let mut mem = memory.write().unwrap();
+                let base_gpa = mem.base_gpa().0;
+                apply_imports_guest(
+                    &mut mem, base_gpa, guest_base,
+                    imp_dir.rva as usize,
+                    &cache_snapshot,
+                );
+            }
+        }
+
+        log::info!("DllLoader: {} loaded at guest_base={:#x} size={:#x}", name, guest_base, img_size);
+        Ok(dll)
     }
 
     fn find(&self, name: &str) -> Option<PathBuf> {
@@ -321,4 +326,133 @@ fn read_cstr(mem: &GuestMemory, gpa: u64) -> String {
         if off > 512 { break; }
     }
     String::from_utf8_lossy(&result).into_owned()
+}
+
+/// 从 PE 原始字节中收集 Import Directory 里的 DLL 名称（不需要 guest 内存）
+fn collect_import_dll_names(hdrs: &PeHeaders, data: &[u8]) -> Vec<String> {
+    let dir = match hdrs.data_dir(pe::DIR_IMPORT) {
+        Some(d) if d.is_present() => d,
+        _ => return Vec::new(),
+    };
+    let mut names = Vec::new();
+    let mut off = dir.rva as usize;
+    loop {
+        if off + 20 > data.len() { break; }
+        let name_rva = u32::from_le_bytes(data[off+12..off+16].try_into().unwrap_or([0;4])) as usize;
+        if name_rva == 0 { break; }
+        if name_rva < data.len() {
+            let end = data[name_rva..].iter().position(|&b| b == 0).unwrap_or(0);
+            if let Ok(s) = std::str::from_utf8(&data[name_rva..name_rva+end]) {
+                names.push(s.to_string());
+            }
+        }
+        off += 20;
+    }
+    names
+}
+
+/// 填充已加载到 guest 内存中的 DLL 的 IAT。
+/// `cache` 是已加载 DLL 的映射（lowercase name → LoadedDll）。
+fn apply_imports_guest(
+    mem: &mut GuestMemory,
+    base_gpa: u64,
+    image_base: u64,
+    imp_rva: usize,
+    cache: &HashMap<String, LoadedDll>,
+) {
+    use winemu_core::addr::Gpa;
+
+    let mut desc_off = imp_rva;
+    loop {
+        let desc_gpa = base_gpa + image_base + desc_off as u64;
+        let name_rva = read_u32(mem, desc_gpa + 12) as usize;
+        if name_rva == 0 { break; }
+
+        let dll_name = read_cstr(mem, base_gpa + image_base + name_rva as u64)
+            .to_ascii_lowercase();
+        let dep_base = match cache.get(&dll_name) {
+            Some(d) => d.guest_base,
+            None => { desc_off += 20; continue; }
+        };
+
+        let iat_rva = read_u32(mem, desc_gpa + 16) as u64;
+        let oft_rva = {
+            let v = read_u32(mem, desc_gpa) as u64;
+            if v != 0 { v } else { iat_rva }
+        };
+
+        let mut slot = 0u64;
+        loop {
+            let thunk_gpa = base_gpa + image_base + oft_rva + slot * 8;
+            let thunk = read_u64(mem, thunk_gpa);
+            if thunk == 0 { break; }
+
+            let fn_va = if thunk & (1u64 << 63) != 0 {
+                // Import by ordinal
+                let ordinal = (thunk & 0xFFFF) as u64;
+                resolve_export_by_ordinal(mem, base_gpa, dep_base, ordinal)
+            } else {
+                // Import by name (skip 2-byte hint)
+                let ibn_rva = (thunk & 0x7FFF_FFFF_FFFF_FFFF) as u64;
+                let fn_name = read_cstr(mem, base_gpa + image_base + ibn_rva + 2);
+                resolve_export_by_name(mem, base_gpa, dep_base, &fn_name)
+            };
+
+            if fn_va != 0 {
+                let iat_slot_gpa = base_gpa + image_base + iat_rva + slot * 8;
+                mem.write_bytes(Gpa(iat_slot_gpa), &fn_va.to_le_bytes());
+            } else {
+                log::warn!("apply_imports_guest: unresolved import from {} slot={}", dll_name, slot);
+            }
+            slot += 1;
+        }
+        desc_off += 20;
+    }
+}
+
+fn resolve_export_by_name(mem: &GuestMemory, base_gpa: u64, dll_base: u64, name: &str) -> u64 {
+    let (fn_rva_tbl, name_tbl, ord_tbl, num_names, num_funcs, _exp_base) =
+        read_export_dir(mem, base_gpa, dll_base);
+    for i in 0..num_names {
+        let name_rva = read_u32(mem, base_gpa + name_tbl + i * 4) as u64;
+        let export_name = read_cstr(mem, base_gpa + dll_base + name_rva);
+        if export_name == name {
+            let ord = read_u16(mem, base_gpa + ord_tbl + i * 2) as u64;
+            if ord < num_funcs {
+                let fn_rva = read_u32(mem, base_gpa + fn_rva_tbl + ord * 4) as u64;
+                if fn_rva != 0 { return dll_base + fn_rva; }
+            }
+        }
+    }
+    0
+}
+
+fn resolve_export_by_ordinal(mem: &GuestMemory, base_gpa: u64, dll_base: u64, ordinal: u64) -> u64 {
+    let (fn_rva_tbl, _, _, _, num_funcs, exp_base) =
+        read_export_dir(mem, base_gpa, dll_base);
+    let idx = ordinal.wrapping_sub(exp_base);
+    if idx < num_funcs {
+        let fn_rva = read_u32(mem, base_gpa + fn_rva_tbl + idx * 4) as u64;
+        if fn_rva != 0 { return dll_base + fn_rva; }
+    }
+    0
+}
+
+/// Returns (fn_rva_tbl, name_tbl, ord_tbl, num_names, num_funcs, ordinal_base)
+fn read_export_dir(mem: &GuestMemory, base_gpa: u64, dll_base: u64) -> (u64, u64, u64, u64, u64, u64) {
+    let dos_sig = read_u16(mem, base_gpa + dll_base);
+    if dos_sig != pe::MZ_MAGIC { return (0,0,0,0,0,0); }
+    let lfanew = read_u32(mem, base_gpa + dll_base + 60) as u64;
+    let oh = dll_base + lfanew + 24;
+    let exp_rva  = read_u32(mem, base_gpa + oh + 96) as u64;
+    let exp_size = read_u32(mem, base_gpa + oh + 100);
+    if exp_rva == 0 || exp_size == 0 { return (0,0,0,0,0,0); }
+    let exp = dll_base + exp_rva;
+    let exp_base  = read_u32(mem, base_gpa + exp + 16) as u64;
+    let num_funcs = read_u32(mem, base_gpa + exp + 20) as u64;
+    let num_names = read_u32(mem, base_gpa + exp + 24) as u64;
+    let fn_rva_tbl = dll_base + read_u32(mem, base_gpa + exp + 28) as u64;
+    let name_tbl   = dll_base + read_u32(mem, base_gpa + exp + 32) as u64;
+    let ord_tbl    = dll_base + read_u32(mem, base_gpa + exp + 36) as u64;
+    (fn_rva_tbl, name_tbl, ord_tbl, num_names, num_funcs, exp_base)
 }
