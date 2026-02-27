@@ -2,3 +2,7 @@
 **/target/
 *.bin
 winemu-kernel.bin
+
+# Generated guest runtime artifacts (build via `make -C guest`).
+guest/sysroot/**
+!guest/sysroot/.gitkeep
