@@ -34,6 +34,20 @@ pub extern "C" fn el0_page_fault(far: u64, esr: u64, elr: u64) -> u64 {
     0
 }
 
+/// EL1 synchronous exception handler for kernel faults.
+/// Called from vectors with: far=fault address, esr=syndrome, elr=faulting PC.
+#[no_mangle]
+pub extern "C" fn el1_sync_fault(far: u64, esr: u64, elr: u64) -> ! {
+    hypercall::debug_print("KERNEL_FAULT: FAR=");
+    hypercall::debug_u64(far);
+    hypercall::debug_print(" ESR=");
+    hypercall::debug_u64(esr);
+    hypercall::debug_print(" ELR=");
+    hypercall::debug_u64(elr);
+    hypercall::debug_print("\n");
+    loop { core::hint::spin_loop(); }
+}
+
 use core::arch::global_asm;
 
 global_asm!(
@@ -61,10 +75,11 @@ global_asm!(
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
     hypercall::debug_print("kernel_main: start\n");
+    // Install vectors early so MMU-init faults can be diagnosed.
+    vectors::install();
     mm::init();
     hypercall::debug_print("kernel_main: mmu ok\n");
     alloc::init();
-    vectors::install();
 
     // ── 1. 通过 host fd 加载 EXE ─────────────────────────────
     let (exe_fd, exe_size) = hypercall::query_exe_info();

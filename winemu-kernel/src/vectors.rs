@@ -38,7 +38,7 @@ global_asm!(
     "__exception_vectors:",
 
     // ── Slot 0: Current EL SP_EL0 Sync (128 bytes) ──────────
-    "b .",   // hang
+    "b __el1_sync",
     ".balign 128",
 
     // ── Slot 1: Current EL SP_EL0 IRQ ───────────────────────
@@ -54,8 +54,7 @@ global_asm!(
     ".balign 128",
 
     // ── Slot 4: Current EL SP_EL1 Sync (kernel fault) ───────
-    // 内核自身 fault — 打印调试信息后 hang
-    "b .",
+    "b __el1_sync",
     ".balign 128",
 
     // ── Slot 5: Current EL SP_EL1 IRQ ───────────────────────
@@ -76,12 +75,18 @@ global_asm!(
     "mrs x9, esr_el1",
     "lsr x9, x9, #26",            // EC = bits[31:26]
     "cmp x9, #0x15",              // EC=0x15 → SVC from AArch64
-    "b.eq __el0_svc",
+    "b.ne 90f",
+    "b __el0_svc",
+    "90:",
     "cmp x9, #0x24",              // EC=0x24 → Data Abort from lower EL
-    "b.eq __el0_da",
+    "b.ne 91f",
+    "b __el0_da",
+    "91:",
     "cmp x9, #0x20",              // EC=0x20 → Instruction Abort from lower EL
-    "b.eq __el0_da",
-    "b .",                          // unknown exception — hang
+    "b.ne 92f",
+    "b __el0_da",
+    "92:",
+    "b __el1_sync",                 // unknown exception — print ESR/FAR/ELR
     ".balign 128",
 
     // ── Slot 9: Lower EL AArch64 IRQ ────────────────────────
@@ -109,6 +114,17 @@ global_asm!(
     // ════════════════════════════════════════════════════════════
     // Out-of-line handlers (no 128-byte limit)
     // ════════════════════════════════════════════════════════════
+
+    // ── Sync exception from EL1 (kernel fault) ────────────────
+    "__el1_sync:",
+    "ldr x9, =__svc_stack_top",
+    "mov sp, x9",
+    "stp x29, x30, [sp, #-16]!",
+    "mrs x0, far_el1",
+    "mrs x1, esr_el1",
+    "mrs x2, elr_el1",
+    "bl el1_sync_fault",
+    "b .",
 
     // ── SVC from EL0 ───────────────────────────────────────────
     // x9 was already saved to tpidr_el1 by the Slot 8 dispatch above.

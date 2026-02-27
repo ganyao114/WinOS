@@ -7,6 +7,8 @@ pub type hv_reg_t = u32;
 pub type hv_sys_reg_t = u16;
 
 pub const HV_SUCCESS: hv_return_t = 0;
+pub const HV_EXIT_REASON_CANCELED: u32 = 0;
+pub const HV_EXIT_REASON_EXCEPTION: u32 = 1;
 pub const HV_MEMORY_READ:  hv_memory_flags_t = 1 << 0;
 pub const HV_MEMORY_WRITE: hv_memory_flags_t = 1 << 1;
 pub const HV_MEMORY_EXEC:  hv_memory_flags_t = 1 << 2;
@@ -58,6 +60,7 @@ extern "C" {
     ) -> hv_return_t;
     pub fn hv_vcpu_destroy(vcpu: hv_vcpuid_t) -> hv_return_t;
     pub fn hv_vcpu_run(vcpu: hv_vcpuid_t) -> hv_return_t;
+    pub fn hv_vcpus_exit(vcpus: *mut hv_vcpuid_t, vcpu_count: u32) -> hv_return_t;
 
     pub fn hv_vcpu_get_reg(
         vcpu: hv_vcpuid_t,

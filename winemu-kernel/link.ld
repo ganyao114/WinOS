@@ -32,6 +32,9 @@ SECTIONS {
     __kernel_svc_stack_top = . + 0x4000; /* 16KB SVC stack */
     . = __kernel_svc_stack_top;
 
+    /* Keep kernel image/stacks in low 2MB and start heap at 0x4020_0000
+       so user allocations live in a separate MMU permission region. */
+    . = 0x40200000;
     __heap_start = .;
 
     /DISCARD/ : {

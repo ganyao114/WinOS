@@ -297,7 +297,17 @@ impl SyscallDispatcher {
             "NtWaitForSingleObject" => {
                 let handle  = SyncHandle(extra(0) as u32);
                 let alertable = extra(1) != 0;
-                let timeout = extra(2) as i64;
+                // NT API passes PLARGE_INTEGER Timeout (pointer), not raw value.
+                // NULL means infinite wait.
+                let timeout_ptr = extra(2);
+                let timeout = if timeout_ptr == 0 {
+                    i64::MIN
+                } else {
+                    let mem = memory.read().unwrap();
+                    let bytes = mem.read_bytes(Gpa(timeout_ptr), 8);
+                    let raw: [u8; 8] = bytes.try_into().unwrap_or([0; 8]);
+                    i64::from_le_bytes(raw)
+                };
                 let _ = alertable; // Phase 3: APC
                 DispatchResult::Sched(sched.wait_single(tid, handle, timeout))
             }
@@ -346,7 +356,17 @@ impl SyscallDispatcher {
                 let count    = extra(0) as usize;
                 let arr_gpa  = Gpa(extra(1));
                 let wait_all = extra(2) != 0;
-                let timeout  = extra(4) as i64;
+                // NT API passes PLARGE_INTEGER Timeout (pointer), not raw value.
+                // NULL means infinite wait.
+                let timeout_ptr = extra(4);
+                let timeout = if timeout_ptr == 0 {
+                    i64::MIN
+                } else {
+                    let mem = memory.read().unwrap();
+                    let bytes = mem.read_bytes(Gpa(timeout_ptr), 8);
+                    let raw: [u8; 8] = bytes.try_into().unwrap_or([0; 8]);
+                    i64::from_le_bytes(raw)
+                };
                 if count == 0 || count > 64 {
                     return DispatchResult::Sync(status::INVALID_PARAMETER as u64);
                 }

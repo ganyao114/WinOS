@@ -1,15 +1,13 @@
-// MMU 初始化 — ARM64 EL1
-// 参考值来自 Ryujinx AppleHv (HvAddressSpace.cs)
+// MMU 初始化 — ARM64 EL1 (4KB granule)
 
 #[repr(C, align(4096))]
 struct PageTable([u64; 512]);
 
 static mut L0_TABLE: PageTable = PageTable([0u64; 512]);
 static mut L1_TABLE: PageTable = PageTable([0u64; 512]);
+static mut L2_TABLE: PageTable = PageTable([0u64; 512]);
 
 pub fn init() {
-    // Enable MMU with identity mapping for the kernel/user memory range.
-    // LDXR/STXR (atomics) require MMU to be enabled on Apple Silicon / HVF.
     crate::hypercall::debug_print("mm::init: setup_mapping\n");
     unsafe { setup_kernel_mapping(); }
     crate::hypercall::debug_print("mm::init: enable_mmu\n");
@@ -18,68 +16,129 @@ pub fn init() {
 }
 
 unsafe fn setup_kernel_mapping() {
-    // With T0SZ=25 (39-bit VA, 4KB granule), translation starts at level 1.
-    // TTBR0 points directly to L1_TABLE (512 entries, each covers 1GB).
+    // Use a 48-bit VA layout (T0SZ=16) with TTBR0 -> L0 -> L1 -> L2.
     //
-    // L1[1] → 1GB block covering 0x4000_0000–0x7FFF_FFFF
-    //   (kernel at 0x40000000, HVF guest memory 0x40000000–0x60000000)
-    //
-    // Block descriptor bits:
-    //   [1:0]  = 0b01  block descriptor
-    //   [4:2]  = 0b000 AttrIdx=0 → MAIR attr0 = 0xFF (normal WB)
-    //   [7:6]  = 0b01  AP: RW at EL0 and EL1  ← must allow EL0 access
-    //   [9:8]  = 0b11  SH: inner-shareable
-    //   [10]   = 1     AF: access flag (avoid AF fault)
-    //   [47:30]= output address (1GB aligned)
-    let block_addr: u64 = 0x4000_0000;
-    let desc = block_addr | (1 << 10) | (0b11 << 8) | (0b01 << 6) | 0b01;
-    (*core::ptr::addr_of_mut!(L1_TABLE)).0[1] = desc;
+    // L0[0] -> L1 table
+    // L1[1] -> L2 table for VA 0x4000_0000..0x7fff_ffff (1GB window)
+    // L2[i] -> 2MB block identity map
+    //   i=0  : EL1 RW only (kernel image/early stacks)
+    //   i>0  : EL0+EL1 RW (user image/stack/TEB/PEB/heap)
+    let l1_addr = core::ptr::addr_of!(L1_TABLE) as u64;
+    let l2_addr = core::ptr::addr_of!(L2_TABLE) as u64;
+    let l0_desc = (l1_addr & !0xfffu64) | 0b11; // next-level table descriptor
+    (*core::ptr::addr_of_mut!(L0_TABLE)).0[0] = l0_desc;
+    let l1_desc = (l2_addr & !0xfffu64) | 0b11; // next-level table descriptor
+    (*core::ptr::addr_of_mut!(L1_TABLE)).0[1] = l1_desc;
+
+    for i in 0..512usize {
+        let block_addr = 0x4000_0000u64 + ((i as u64) << 21); // 2MB per L2 entry
+        // [1:0]=01 block, AttrIdx=0, SH=inner-shareable, AF=1
+        let mut desc = block_addr | (1 << 10) | (0b11 << 8) | 0b01;
+        if i != 0 {
+            desc |= 0b01 << 6; // AP=01: EL0+EL1 RW
+        }
+        (*core::ptr::addr_of_mut!(L2_TABLE)).0[i] = desc;
+    }
 }
 
 unsafe fn enable_mmu() {
     use core::arch::asm;
 
-    // Ensure page table writes are visible to the page table walker
-    asm!("dsb ish", options(nostack));
-
-    // Invalidate all TLB entries for EL1 (both EL0 and EL1 translations)
-    asm!("tlbi vmalle1", options(nostack));
+    asm!("dsb ishst", options(nostack));
+    asm!("tlbi vmalle1is", options(nostack));
     asm!("dsb ish", options(nostack));
     asm!("isb", options(nostack));
-
     crate::hypercall::debug_print("mmu: tlbi done\n");
 
-    // MAIR_EL1: attr0 = normal memory (inner/outer WB WA)
-    let mair: u64 = 0x00FF;
+    // MAIR_EL1 attr0 = normal memory (inner/outer WB WA)
+    let mair: u64 = 0x00ff;
     asm!("msr mair_el1, {}", in(reg) mair, options(nostack));
-
     crate::hypercall::debug_print("mmu: mair done\n");
 
-    // TCR_EL1: T0SZ=25 (39-bit VA), TG0=4KB, inner/outer WB WA, inner-shareable
-    // EPD1=1 to disable TTBR1 walks (kernel uses low addresses only)
-    // IPS=010 (40-bit PA) to match Apple Silicon
-    let tcr: u64 = (0x0000_0011_B519_3519 & !0x7_0000_0000u64)  // clear IPS
-                 | (0b010u64 << 32)   // IPS = 40-bit PA
-                 | (1 << 23);         // EPD1 = 1
-    asm!("msr tcr_el1, {}", in(reg) tcr, options(nostack));
+    let mmfr0: u64;
+    asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0, options(nostack));
+    let parange = mmfr0 & 0xf;
+    let tgran4 = (mmfr0 >> 28) & 0xf;
+    let tgran64 = (mmfr0 >> 24) & 0xf;
 
+    // TCR_EL1:
+    //   T0SZ=16 (48-bit VA)
+    //   IRGN0/ORGN0=WB WA
+    //   SH0=inner-shareable
+    //   TG0=0b00 (4KB granule)
+    //   EPD1=1
+    //   IPS=PARange from ID_AA64MMFR0_EL1
+    let tcr: u64 = 16
+        | (0b01u64 << 8)
+        | (0b01u64 << 10)
+        | (0b11u64 << 12)
+        | (0b00u64 << 14)
+        | (1u64 << 23)
+        | (parange << 32);
+
+    crate::hypercall::debug_print("mmu: mmfr0=");
+    crate::hypercall::debug_u64(mmfr0);
+    crate::hypercall::debug_print(" tgran4=");
+    crate::hypercall::debug_u64(tgran4);
+    crate::hypercall::debug_print(" tgran64=");
+    crate::hypercall::debug_u64(tgran64);
+    crate::hypercall::debug_print(" tcr=");
+    crate::hypercall::debug_u64(tcr);
+    crate::hypercall::debug_print("\n");
+    asm!("msr tcr_el1, {}", in(reg) tcr, options(nostack));
     crate::hypercall::debug_print("mmu: tcr done\n");
 
-    // TTBR0_EL1 → L1_TABLE (level-1 root for 39-bit VA)
-    let ttbr0 = core::ptr::addr_of!(L1_TABLE) as u64;
+    let ttbr0 = core::ptr::addr_of!(L0_TABLE) as u64;
     asm!("msr ttbr0_el1, {}", in(reg) ttbr0, options(nostack));
-
     crate::hypercall::debug_print("mmu: ttbr0 done\n");
 
-    // Ensure all system register writes complete before enabling MMU
+    asm!("dsb ish", options(nostack));
     asm!("isb", options(nostack));
 
-    crate::hypercall::debug_print("mmu: isb done, enabling...\n");
+    let l0_addr = core::ptr::addr_of!(L0_TABLE) as u64;
+    let l1_addr = core::ptr::addr_of!(L1_TABLE) as u64;
+    let l2_addr = core::ptr::addr_of!(L2_TABLE) as u64;
+    let l0e0 = (*core::ptr::addr_of!(L0_TABLE)).0[0];
+    let l1e1 = (*core::ptr::addr_of!(L1_TABLE)).0[1];
+    let l2e0 = (*core::ptr::addr_of!(L2_TABLE)).0[0];
+    let l2e1 = (*core::ptr::addr_of!(L2_TABLE)).0[1];
+    crate::hypercall::debug_print("mmu: L0_TABLE @ ");
+    crate::hypercall::debug_u64(l0_addr);
+    crate::hypercall::debug_print("\n");
+    crate::hypercall::debug_print("mmu: L1_TABLE @ ");
+    crate::hypercall::debug_u64(l1_addr);
+    crate::hypercall::debug_print("\n");
+    crate::hypercall::debug_print("mmu: L2_TABLE @ ");
+    crate::hypercall::debug_u64(l2_addr);
+    crate::hypercall::debug_print("\n");
+    crate::hypercall::debug_print("mmu: L0[0]=");
+    crate::hypercall::debug_u64(l0e0);
+    crate::hypercall::debug_print(" L1[1]=");
+    crate::hypercall::debug_u64(l1e1);
+    crate::hypercall::debug_print(" L2[0]=");
+    crate::hypercall::debug_u64(l2e0);
+    crate::hypercall::debug_print(" L2[1]=");
+    crate::hypercall::debug_u64(l2e1);
+    crate::hypercall::debug_print("\n");
 
-    // SCTLR_EL1: enable MMU (M=1), I-cache (I=1), D-cache (C=1)
-    let sctlr: u64 = 0x0000_0000_00C5_0835 | 1;
+    let mut sctlr: u64;
+    asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nostack));
+    crate::hypercall::debug_print("mmu: sctlr before ");
+    crate::hypercall::debug_u64(sctlr);
+    crate::hypercall::debug_print("\n");
+
+    // Enable MMU + caches.
+    // Clear SA/SA0 for bring-up and clear control bits that can restrict
+    // execution on writable/user-accessible mappings during early boot.
+    sctlr |= 1 | (1 << 2) | (1 << 12); // M=1, C=1, I=1
+    sctlr &= !((1 << 3) | (1 << 4) | (1 << 19) | (1 << 20) | (1 << 22) | (1 << 23));
+    crate::hypercall::debug_print("mmu: sctlr target ");
+    crate::hypercall::debug_u64(sctlr);
+    crate::hypercall::debug_print("\n");
+    crate::hypercall::debug_print("mmu: enabling MMU...\n");
+    crate::hypercall::debug_print("mmu: write sctlr\n");
     asm!("msr sctlr_el1, {}", in(reg) sctlr, options(nostack));
-
-    // Synchronize after MMU enable — required by ARM spec
+    crate::hypercall::debug_print("mmu: wrote sctlr\n");
     asm!("isb", options(nostack));
+    crate::hypercall::debug_print("mmu: isb after sctlr\n");
 }

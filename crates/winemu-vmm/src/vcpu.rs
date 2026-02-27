@@ -86,7 +86,7 @@ pub fn vcpu_thread(
         };
 
         match exit {
-            VmExit::Hypercall { nr, mut args } => {
+            VmExit::Hypercall { nr, args } => {
                 if nr == winemu_shared::nr::NT_SYSCALL {
                     let regs = vcpu.regs().unwrap();
                     log::debug!("NT_SYSCALL hvc: x0={:#x} x8={:#x} x9={:#x} x10={:#x} x11={:#x} x12={:#x} x30={:#x} pc={:#x} sp={:#x}",

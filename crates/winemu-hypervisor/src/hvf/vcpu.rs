@@ -96,8 +96,19 @@ impl HvfVcpu {
         log::debug!("parse_exit: reason={} syndrome={:#x} va={:#x} pa={:#x}",
             exit.reason, exit.exception.syndrome,
             exit.exception.virtual_address, exit.exception.physical_address);
+        if exit.reason == ffi::HV_EXIT_REASON_CANCELED {
+            let pc = self.get_reg(ffi::HV_REG_PC).unwrap_or(0);
+            let pstate = self.get_reg(ffi::HV_REG_CPSR).unwrap_or(0);
+            let elr = self.get_sys_reg(ffi::HV_SYS_REG_ELR_EL1).unwrap_or(0);
+            let esr = self.get_sys_reg(ffi::HV_SYS_REG_ESR_EL1).unwrap_or(0);
+            let far = self.get_sys_reg(ffi::HV_SYS_REG_FAR_EL1).unwrap_or(0);
+            return Err(WinemuError::Hypervisor(format!(
+                "hv_vcpu_run canceled: pc={:#x} pstate={:#x} elr_el1={:#x} esr_el1={:#x} far_el1={:#x}",
+                pc, pstate, elr, esr, far
+            )));
+        }
         // reason == 1 means Exception on HVF ARM64
-        if exit.reason != 1 {
+        if exit.reason != ffi::HV_EXIT_REASON_EXCEPTION {
             return Ok(VmExit::Unknown(exit.reason));
         }
         let esr = exit.exception.syndrome;
@@ -162,7 +173,31 @@ impl Drop for HvfVcpu {
 
 impl Vcpu for HvfVcpu {
     fn run(&mut self) -> Result<VmExit> {
-        let ret = unsafe { ffi::hv_vcpu_run(self.id) };
+        let timeout_ms = std::env::var("WINEMU_HVF_RUN_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&v| v > 0);
+        let ret = if let Some(ms) = timeout_ms {
+            use std::sync::mpsc;
+            use std::time::Duration;
+
+            let (tx, rx) = mpsc::channel::<()>();
+            let id = self.id;
+            let handle = std::thread::spawn(move || {
+                if rx.recv_timeout(Duration::from_millis(ms)).is_err() {
+                    let mut ids = [id];
+                    let r = unsafe { ffi::hv_vcpus_exit(ids.as_mut_ptr(), 1) };
+                    log::warn!("hvf watchdog: forced vcpu exit id={} ret={:#x}", id, r);
+                }
+            });
+
+            let ret = unsafe { ffi::hv_vcpu_run(self.id) };
+            let _ = tx.send(());
+            let _ = handle.join();
+            ret
+        } else {
+            unsafe { ffi::hv_vcpu_run(self.id) }
+        };
         if ret != ffi::HV_SUCCESS {
             return Err(WinemuError::Hypervisor(format!("hv_vcpu_run failed: {:#x}", ret)));
         }
