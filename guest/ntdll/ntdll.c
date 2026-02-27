@@ -14,6 +14,7 @@
 #define NR_CREATE_SECTION       0x004A
 #define NR_MAP_VIEW_OF_SECTION  0x0028
 #define NR_UNMAP_VIEW_OF_SECTION 0x002A
+#define NR_DELETE_VALUE_KEY     0x006A
 
 typedef uint32_t NTSTATUS;
 typedef uint32_t ULONG;
@@ -292,6 +293,12 @@ EXPORT NTSTATUS NtMapViewOfSection(
 
 EXPORT NTSTATUS NtUnmapViewOfSection(void* process, void* base) {
     return syscall2(NR_UNMAP_VIEW_OF_SECTION, (uint64_t)process, (uint64_t)base);
+}
+
+/* ── Registry ────────────────────────────────────────────────── */
+
+EXPORT NTSTATUS NtDeleteValueKey(HANDLE key_handle, void* value_name) {
+    return syscall2(NR_DELETE_VALUE_KEY, (uint64_t)key_handle, (uint64_t)value_name);
 }
 
 /* ── DLL entry point ─────────────────────────────────────────── */

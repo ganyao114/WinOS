@@ -18,6 +18,7 @@ const NR_ENUMERATE_KEY: u64         = 0x0032;
 const NR_SET_VALUE_KEY: u64         = 0x003D;
 
 const STATUS_SUCCESS: u64 = 0x0000_0000;
+const STATUS_INVALID_HANDLE: u64 = 0xC000_0008;
 const STATUS_OBJECT_NAME_NOT_FOUND: u64 = 0xC000_0034;
 
 const REG_DWORD: u32 = 4;
@@ -27,6 +28,7 @@ static mut FAIL_COUNT: u32 = 0;
 static mut PARENT_PATH_BUF: [u16; 96] = [0; 96];
 static mut SUB_PATH_BUF: [u16; 32] = [0; 32];
 static mut VALUE_NAME_BUF: [u16; 32] = [0; 32];
+static mut EMPTY_VALUE_NAME_BUF: [u16; 2] = [0; 2];
 static mut KEY_INFO_BUF: [u8; 128] = [0; 128];
 static mut VALUE_INFO_BUF: [u8; 64] = [0; 64];
 static mut ENUM_VALUE_INFO_BUF: [u8; 128] = [0; 128];
@@ -343,6 +345,22 @@ unsafe fn test_registry_syscalls() {
     let value_data: u32 = 0x1234_5678;
 
     let st = svc(
+        NR_DELETE_VALUE_KEY,
+        0xFFFF_FFFF_FFFF_FF00,
+        &mut value_us as *mut _ as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    check(
+        b"NtDeleteValueKey(invalid handle) returns INVALID_HANDLE",
+        st == STATUS_INVALID_HANDLE,
+    );
+
+    let st = svc(
         NR_SET_VALUE_KEY,
         sub_handle,
         &mut value_us as *mut _ as u64,
@@ -474,6 +492,74 @@ unsafe fn test_registry_syscalls() {
     );
     check(
         b"NtDeleteValueKey(nonexistent) returns OBJECT_NAME_NOT_FOUND",
+        st == STATUS_OBJECT_NAME_NOT_FOUND,
+    );
+
+    let mut empty_value_us = init_unicode(&mut EMPTY_VALUE_NAME_BUF, "");
+    let default_value_data: u32 = 0xA55A_5AA5;
+
+    let st = svc(
+        NR_SET_VALUE_KEY,
+        sub_handle,
+        &mut empty_value_us as *mut _ as u64,
+        0,
+        REG_DWORD as u64,
+        &default_value_data as *const u32 as u64,
+        4,
+        0,
+        0,
+    );
+    check(
+        b"NtSetValueKey(empty name) returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+
+    let st = svc(
+        NR_DELETE_VALUE_KEY,
+        sub_handle,
+        &mut empty_value_us as *mut _ as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    check(
+        b"NtDeleteValueKey(empty name) returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+
+    let mut empty_value_ret_len: u32 = 0;
+    let st = svc(
+        NR_QUERY_VALUE_KEY,
+        sub_handle,
+        &mut empty_value_us as *mut _ as u64,
+        2,
+        VALUE_INFO_BUF.as_mut_ptr() as u64,
+        VALUE_INFO_BUF.len() as u64,
+        &mut empty_value_ret_len as *mut u32 as u64,
+        0,
+        0,
+    );
+    check(
+        b"NtQueryValueKey(empty name) after delete returns OBJECT_NAME_NOT_FOUND",
+        st == STATUS_OBJECT_NAME_NOT_FOUND,
+    );
+
+    let st = svc(
+        NR_DELETE_VALUE_KEY,
+        sub_handle,
+        &mut empty_value_us as *mut _ as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    check(
+        b"NtDeleteValueKey(empty name, nonexistent) returns OBJECT_NAME_NOT_FOUND",
         st == STATUS_OBJECT_NAME_NOT_FOUND,
     );
 
