@@ -726,8 +726,18 @@ impl SyscallDispatcher {
                 DispatchResult::Sched(SchedResult::Exit(code))
             }
             "NtTerminateThread" => {
+                // a[0]=ThreadHandle (-1 or -2 = current thread), a[1]=ExitStatus
+                let handle = extra(0);
                 let code = extra(1) as u32;
-                DispatchResult::Sched(SchedResult::Exit(code))
+                let is_self = handle == 0xFFFFFFFFFFFFFFFF || handle == 0xFFFFFFFFFFFFFFFE || handle == 0;
+                if is_self {
+                    // Terminate calling thread only
+                    DispatchResult::Sched(SchedResult::Exit(code))
+                } else {
+                    // TODO: terminate other thread by handle
+                    log::warn!("NtTerminateThread: remote thread termination not implemented");
+                    DispatchResult::Sync(status::SUCCESS as u64)
+                }
             }
             "NtYieldExecution" => {
                 DispatchResult::Sched(SchedResult::Yield)
@@ -850,8 +860,98 @@ impl SyscallDispatcher {
                 DispatchResult::Sync(status::NOT_IMPLEMENTED as u64)
             }
             "NtCreateThreadEx" | "NtCreateThread" => {
-                log::warn!("NtCreateThreadEx: not supported in Phase 2");
-                DispatchResult::Sync(status::NOT_IMPLEMENTED as u64)
+                // NtCreateThreadEx(OUT PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, HANDLE ProcessHandle,
+                //   PVOID StartRoutine, PVOID Argument, ULONG CreateFlags, SIZE_T ZeroBits,
+                //   SIZE_T StackSize, SIZE_T MaxStackSize, PPS_ATTRIBUTE_LIST)
+                // x0=ThreadHandle out, x1=DesiredAccess, x2=ObjAttrs, x3=ProcessHandle
+                // x4=StartRoutine, x5=Argument, x6=CreateFlags, x7=ZeroBits
+                // stack[0]=StackSize, stack[1]=MaxStackSize, stack[2]=AttrList
+                let handle_gpa   = extra(0);
+                let start_routine = extra(4);
+                let argument     = extra(5);
+                let create_flags = extra(6) as u32;
+                let stack_size   = {
+                    let s = extra(8);
+                    if s == 0 { 0x10000u64 } else { (s + 0xFFFF) & !0xFFFF } // default 64KB, align to 64KB
+                };
+
+                if start_routine == 0 {
+                    return DispatchResult::Sync(status::INVALID_PARAMETER as u64);
+                }
+
+                // Allocate stack
+                let stack_base = match vaspace.lock().unwrap().alloc(0, stack_size, 0x04 /* PAGE_READWRITE */) {
+                    Some(va) => va,
+                    None => return DispatchResult::Sync(status::NO_MEMORY as u64),
+                };
+                // Zero-initialize stack
+                let zero = vec![0u8; stack_size as usize];
+                memory.write().unwrap().write_bytes(Gpa(stack_base), &zero);
+                let stack_top = stack_base + stack_size;
+
+                // Allocate TEB (1 page = 4KB, but aligned to 64KB by VaSpace)
+                let teb_va = match vaspace.lock().unwrap().alloc(0, 0x1000, 0x04) {
+                    Some(va) => va,
+                    None => return DispatchResult::Sync(status::NO_MEMORY as u64),
+                };
+
+                // Read PEB VA from the calling thread's TEB
+                let caller_teb = sched.get_teb(tid).unwrap_or(0);
+                let peb_va = if caller_teb != 0 {
+                    let mem = memory.read().unwrap();
+                    let b = mem.read_bytes(Gpa(caller_teb + winemu_shared::teb::PEB as u64), 8);
+                    u64::from_le_bytes(b.try_into().unwrap_or([0;8]))
+                } else { 0 };
+
+                // Initialize TEB
+                let new_tid = sched.alloc_tid();
+                {
+                    let mut mem = memory.write().unwrap();
+                    let teb_buf = vec![0u8; winemu_shared::teb::SIZE];
+                    mem.write_bytes(Gpa(teb_va), &teb_buf);
+                    // TEB fields
+                    mem.write_bytes(Gpa(teb_va + winemu_shared::teb::EXCEPTION_LIST as u64), &u64::MAX.to_le_bytes());
+                    mem.write_bytes(Gpa(teb_va + winemu_shared::teb::STACK_BASE as u64), &stack_top.to_le_bytes());
+                    mem.write_bytes(Gpa(teb_va + winemu_shared::teb::STACK_LIMIT as u64), &stack_base.to_le_bytes());
+                    mem.write_bytes(Gpa(teb_va + winemu_shared::teb::SELF as u64), &teb_va.to_le_bytes());
+                    mem.write_bytes(Gpa(teb_va + winemu_shared::teb::PEB as u64), &peb_va.to_le_bytes());
+                    // CLIENT_ID: pid=1, tid=new_tid
+                    mem.write_bytes(Gpa(teb_va + winemu_shared::teb::CLIENT_ID as u64), &1u64.to_le_bytes());
+                    mem.write_bytes(Gpa(teb_va + winemu_shared::teb::CLIENT_ID as u64 + 8), &(new_tid.0 as u64).to_le_bytes());
+                }
+
+                // Create thread context
+                let mut ctx = crate::sched::ThreadContext::default();
+                ctx.gpr[32] = start_routine;  // pc
+                ctx.gpr[31] = stack_top;      // sp
+                ctx.gpr[0]  = argument;       // x0 = arg
+                ctx.gpr[18] = teb_va;         // x18 = TEB (ARM64 thread register)
+                ctx.pstate  = 0x0;            // EL0t
+
+                // CREATE_SUSPENDED (0x1) — don't push to ready queue yet
+                let suspended = (create_flags & 1) != 0;
+
+                // Register as sync object so other threads can wait on it
+                let thread_handle = sched.alloc_handle();
+                sched.insert_object(thread_handle, SyncObject::Thread(new_tid));
+
+                if suspended {
+                    // Spawn but don't push to ready — leave in a "suspended" state
+                    // For now, just spawn normally (TODO: proper suspend support)
+                    sched.spawn(new_tid, ctx, teb_va);
+                } else {
+                    sched.spawn(new_tid, ctx, teb_va);
+                }
+
+                log::info!("NtCreateThreadEx: tid={} entry={:#x} stack=[{:#x},{:#x}) teb={:#x} handle={}",
+                    new_tid.0, start_routine, stack_base, stack_top, teb_va, thread_handle.0);
+
+                // Write handle back
+                if handle_gpa != 0 {
+                    memory.write().unwrap()
+                        .write_bytes(Gpa(handle_gpa), &(thread_handle.0 as u64).to_le_bytes());
+                }
+                DispatchResult::Sync(status::SUCCESS as u64)
             }
             // ── 句柄复制 ──────────────────────────────────────
             "NtDuplicateObject" => {

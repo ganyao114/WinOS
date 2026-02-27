@@ -60,7 +60,9 @@ global_asm!(
 
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
+    hypercall::debug_print("kernel_main: start\n");
     mm::init();
+    hypercall::debug_print("kernel_main: mmu ok\n");
     alloc::init();
     vectors::install();
 

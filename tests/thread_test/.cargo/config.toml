@@ -1,0 +1,12 @@
+[build]
+target = "aarch64-pc-windows-msvc"
+
+[target.aarch64-pc-windows-msvc]
+linker = "/Users/swift/WinEmu/tests/thread_test/lld-link-wrapper.sh"
+rustflags = [
+    "-C", "panic=abort",
+    "-C", "link-arg=/NODEFAULTLIB",
+    "-C", "link-arg=/SUBSYSTEM:CONSOLE",
+    "-C", "link-arg=/ENTRY:mainCRTStartup",
+    "-C", "link-arg=/FORCE:UNRESOLVED",
+]
