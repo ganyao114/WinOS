@@ -1,11 +1,13 @@
 use crate::sched::sync::{
     self, close_handle, HANDLE_TYPE_EVENT, HANDLE_TYPE_FILE, HANDLE_TYPE_MUTEX,
-    HANDLE_TYPE_SECTION, HANDLE_TYPE_SEMAPHORE, HANDLE_TYPE_THREAD, STATUS_SUCCESS,
+    HANDLE_TYPE_KEY, HANDLE_TYPE_SECTION, HANDLE_TYPE_SEMAPHORE, HANDLE_TYPE_THREAD,
+    STATUS_SUCCESS,
 };
 use winemu_shared::status;
 
 use super::common::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
 use super::file;
+use super::registry;
 use super::section;
 use super::state::duplicate_handle;
 use super::SvcFrame;
@@ -50,6 +52,14 @@ pub(crate) fn handle_close(frame: &mut SvcFrame) -> bool {
     if htype == HANDLE_TYPE_SECTION {
         section::close_section_handle(h);
         frame.x[0] = STATUS_SUCCESS as u64;
+        return true;
+    }
+    if htype == HANDLE_TYPE_KEY {
+        if registry::close_key_handle(h) {
+            frame.x[0] = STATUS_SUCCESS as u64;
+            return true;
+        }
+        frame.x[0] = status::INVALID_HANDLE as u64;
         return true;
     }
 

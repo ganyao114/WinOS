@@ -2,10 +2,11 @@
 // KEvent, KMutex, KSemaphore, HandleTable
 // 所有状态机在 guest 内完成，不走 HVC。
 
-use super::{sched_lock_acquire, sched_lock_release, wake, block_current, current_tid, vcpu_id, with_thread, with_thread_mut};
+use super::{current_tid, sched_lock_acquire, sched_lock_release, wake, with_thread, with_thread_mut, ThreadState};
 
 // ── NTSTATUS 常量 ─────────────────────────────────────────────
 pub const STATUS_SUCCESS:           u32 = 0x0000_0000;
+pub const STATUS_PENDING:           u32 = 0x0000_0103;
 pub const STATUS_TIMEOUT:           u32 = 0x0000_0102;
 pub const STATUS_ABANDONED:         u32 = 0x0000_0080;
 pub const STATUS_INVALID_HANDLE:    u32 = 0xC000_0008;
@@ -176,15 +177,16 @@ pub fn event_wait(idx: u16, deadline: u64) -> u32 {
             sched_lock_release();
             return STATUS_SUCCESS;
         }
-        // slow path: block
+        // slow path: enqueue and mark current thread waiting.
         let cur = current_tid();
         ev.waiters.enqueue(cur);
-        let (_, next) = block_current(vcpu_id(), deadline);
+        with_thread_mut(cur, |t| {
+            t.state = ThreadState::Waiting;
+            t.wait_deadline = deadline;
+            t.wait_result = STATUS_PENDING;
+        });
         sched_lock_release();
-        if next == 0 {
-            // no runnable thread — caller must handle BLOCK_THREAD hvc
-        }
-        with_thread_mut(cur, |t| t.wait_result)
+        STATUS_PENDING
     }
 }
 
@@ -249,9 +251,13 @@ pub fn mutex_acquire(idx: u16, deadline: u64) -> u32 {
             if cur_prio > t.priority { t.priority = cur_prio; }
         });
         m.waiters.enqueue(cur);
-        let (_, _next) = block_current(vcpu_id(), deadline);
+        with_thread_mut(cur, |t| {
+            t.state = ThreadState::Waiting;
+            t.wait_deadline = deadline;
+            t.wait_result = STATUS_PENDING;
+        });
         sched_lock_release();
-        with_thread_mut(cur, |t| t.wait_result)
+        STATUS_PENDING
     }
 }
 
@@ -334,9 +340,13 @@ pub fn semaphore_wait(idx: u16, deadline: u64) -> u32 {
         }
         let cur = current_tid();
         s.waiters.enqueue(cur);
-        let (_, _) = block_current(vcpu_id(), deadline);
+        with_thread_mut(cur, |t| {
+            t.state = ThreadState::Waiting;
+            t.wait_deadline = deadline;
+            t.wait_result = STATUS_PENDING;
+        });
         sched_lock_release();
-        with_thread_mut(cur, |t| t.wait_result)
+        STATUS_PENDING
     }
 }
 
@@ -378,6 +388,10 @@ pub fn semaphore_free(idx: u16) {
 pub const HANDLE_TYPE_EVENT:     u64 = 1;
 pub const HANDLE_TYPE_MUTEX:     u64 = 2;
 pub const HANDLE_TYPE_SEMAPHORE: u64 = 3;
+pub const HANDLE_TYPE_THREAD:    u64 = 4;
+pub const HANDLE_TYPE_FILE:      u64 = 5;
+pub const HANDLE_TYPE_SECTION:   u64 = 6;
+pub const HANDLE_TYPE_KEY:       u64 = 7;
 
 pub fn make_handle(htype: u64, idx: u16) -> u64 {
     ((htype & 0xF) << 12) | (idx as u64 & 0xFFF)
@@ -401,6 +415,7 @@ pub fn close_handle(h: u64) -> u32 {
         HANDLE_TYPE_EVENT     => { event_free(handle_idx(h));     STATUS_SUCCESS }
         HANDLE_TYPE_MUTEX     => { mutex_free(handle_idx(h));     STATUS_SUCCESS }
         HANDLE_TYPE_SEMAPHORE => { semaphore_free(handle_idx(h)); STATUS_SUCCESS }
+        HANDLE_TYPE_THREAD    => STATUS_SUCCESS,
         _                     => STATUS_INVALID_HANDLE,
     }
 }

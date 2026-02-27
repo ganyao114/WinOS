@@ -4,6 +4,7 @@ pub mod file;
 pub mod memory;
 pub mod object;
 pub mod process;
+pub mod registry;
 pub mod section;
 pub mod state;
 pub mod sync;

@@ -5,11 +5,18 @@
 use crate::hypercall;
 use crate::sched::{current_tid, register_thread0, schedule, vcpu_id, with_thread_mut};
 
-use super::{file, memory, object, process, section, sync, thread, SvcFrame};
+use super::{file, memory, object, process, registry, section, sync, thread, SvcFrame};
 
 // Table 0 = Nt*, Table 1 = Win32k (ignored here)
 const NR_CREATE_EVENT: u16 = 0x0048;
 const NR_SET_INFORMATION_THREAD: u16 = 0x000D;
+const NR_DELETE_KEY: u16 = 0x000C;
+const NR_ENUMERATE_VALUE_KEY: u16 = 0x0010;
+const NR_OPEN_KEY: u16 = 0x0012;
+const NR_QUERY_VALUE_KEY: u16 = 0x0016;
+const NR_CREATE_KEY: u16 = 0x001D;
+const NR_ENUMERATE_KEY: u16 = 0x0032;
+const NR_SET_VALUE_KEY: u16 = 0x003D;
 const NR_READ_FILE: u16 = 0x0006;
 const NR_WRITE_FILE: u16 = 0x0008;
 const NR_SET_EVENT: u16 = 0x000E;
@@ -75,6 +82,14 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         NR_RELEASE_MUTANT => sync::handle_release_mutant(frame),
         NR_CREATE_SEMAPHORE => sync::handle_create_semaphore(frame),
         NR_RELEASE_SEMAPHORE => sync::handle_release_semaphore(frame),
+
+        NR_OPEN_KEY => registry::handle_open_key(frame),
+        NR_CREATE_KEY => registry::handle_create_key(frame),
+        NR_QUERY_VALUE_KEY => registry::handle_query_value_key(frame),
+        NR_SET_VALUE_KEY => registry::handle_set_value_key(frame),
+        NR_DELETE_KEY => registry::handle_delete_key(frame),
+        NR_ENUMERATE_KEY => registry::handle_enumerate_key(frame),
+        NR_ENUMERATE_VALUE_KEY => registry::handle_enumerate_value_key(frame),
 
         NR_ALLOCATE_VIRTUAL_MEMORY => memory::handle_allocate_virtual_memory(frame),
         NR_FREE_VIRTUAL_MEMORY => memory::handle_free_virtual_memory(frame),

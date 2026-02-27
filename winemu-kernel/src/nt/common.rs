@@ -91,6 +91,27 @@ pub(crate) fn read_oa_path(oa_ptr: u64, out: &mut [u8]) -> usize {
     normalize_nt_path(out, count)
 }
 
+pub(crate) fn read_unicode_direct(us_ptr: u64, out: &mut [u8]) -> usize {
+    if us_ptr == 0 || out.is_empty() {
+        return 0;
+    }
+    let byte_len = unsafe { (us_ptr as *const u16).read_volatile() as usize };
+    let buf_ptr = unsafe { ((us_ptr + 8) as *const u64).read_volatile() };
+    if byte_len == 0 || buf_ptr == 0 {
+        return 0;
+    }
+    let count = core::cmp::min(byte_len / 2, out.len());
+    for i in 0..count {
+        let wc = unsafe { ((buf_ptr + (i as u64 * 2)) as *const u16).read_volatile() };
+        let mut ch = if wc < 0x80 { wc as u8 } else { b'?' };
+        if ch == b'\\' {
+            ch = b'/';
+        }
+        out[i] = ch;
+    }
+    count
+}
+
 pub(crate) fn map_open_flags(access: u32, disposition: u32) -> u64 {
     let can_read = (access & (0x8000_0000 | 0x0001)) != 0;
     let can_write = (access & (0x4000_0000 | 0x0002)) != 0;
