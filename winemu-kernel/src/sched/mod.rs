@@ -233,7 +233,6 @@ fn spinlock_acquire() {
         let p = SCHED.spinlock.get();
         loop {
             // STXR/LDXR 自旋
-            let old: u32;
             core::arch::asm!(
                 "1: ldaxr {old:w}, [{p}]",
                 "   cbnz  {old:w}, 1b",
@@ -305,6 +304,7 @@ pub fn spawn(pc: u64, sp: u64, arg: u64, teb_va: u64, priority: u8) -> u32 {
         t.ctx.pc        = pc;
         t.ctx.sp        = sp;
         t.ctx.x[0]      = arg;
+        t.ctx.x[18]     = teb_va;
         t.ctx.pstate    = 0x0; // EL0t
         t.ctx.tpidr     = teb_va;
         t.sched_next    = 0;
@@ -390,6 +390,8 @@ pub fn wake(tid: u32, result: u32) {
             t.state         = ThreadState::Ready;
             t.wait_result   = result;
             t.wait_deadline = 0;
+            // Resume point for blocked NtWait* should return wake result in x0.
+            t.ctx.x[0] = result as u64;
             (*SCHED.ready.get()).push(t);
         });
     }
@@ -455,6 +457,7 @@ pub fn check_timeouts(now_filetime: u64) {
                 t.state         = ThreadState::Ready;
                 t.wait_result   = 0x0000_0102; // STATUS_TIMEOUT
                 t.wait_deadline = 0;
+                t.ctx.x[0]      = 0x0000_0102; // x0 = STATUS_TIMEOUT
                 unsafe { (*SCHED.ready.get()).push(t); }
             }
         });
