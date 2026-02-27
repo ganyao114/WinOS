@@ -1179,15 +1179,8 @@ fn handle_close(frame: &mut SvcFrame) {
 // ── NtYieldExecution ──────────────────────────────────────────
 
 fn handle_yield(frame: &mut SvcFrame) {
-    // Mark current thread as Ready so schedule() will pick another thread.
-    // maybe_preempt (called by svc_dispatch) will do the actual switch.
-    let cur = current_tid();
-    with_thread_mut(cur, |t| {
-        if t.state == ThreadState::Running {
-            t.state = ThreadState::Ready;
-            unsafe { (*crate::sched::SCHED.ready.get()).push(t); }
-        }
-    });
+    // maybe_preempt (called by svc_dispatch) will perform the actual switch.
+    crate::sched::yield_current_thread();
     frame.x[0] = STATUS_SUCCESS as u64;
 }
 

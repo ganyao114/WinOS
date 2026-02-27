@@ -4,7 +4,6 @@
 // vCPU 空闲时执行 WFI → VM exit → VMM park 宿主线程。
 
 pub mod sync;
-pub mod dispatch;
 
 use core::cell::UnsafeCell;
 
@@ -395,6 +394,17 @@ pub fn wake(tid: u32, result: u32) {
             (*SCHED.ready.get()).push(t);
         });
     }
+}
+
+/// Put the current running thread back to ready queue.
+pub fn yield_current_thread() {
+    let cur = current_tid();
+    with_thread_mut(cur, |t| {
+        if t.state == ThreadState::Running {
+            t.state = ThreadState::Ready;
+            unsafe { (*SCHED.ready.get()).push(t); }
+        }
+    });
 }
 
 /// Initialize the first thread on a vCPU (called from kernel_main).

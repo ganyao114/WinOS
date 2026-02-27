@@ -6,6 +6,8 @@ mod alloc;
 mod hypercall;
 mod ldr;
 mod mm;
+mod nt;
+mod sched;
 mod teb;
 mod vectors;
 
