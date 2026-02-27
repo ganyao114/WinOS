@@ -3,7 +3,10 @@
 // 若需要线程切换，直接修改 SvcFrame 中的寄存器，ERET 后进入新线程。
 
 use crate::hypercall;
-use crate::sched::{current_tid, register_thread0, schedule, vcpu_id, with_thread_mut};
+use crate::sched::{
+    check_timeouts, current_tid, now_ticks, register_thread0, sched_lock_acquire,
+    sched_lock_release, schedule, vcpu_id, with_thread_mut,
+};
 
 use super::{file, memory, object, process, registry, section, sync, thread, SvcFrame};
 
@@ -148,18 +151,22 @@ fn restore_ctx_to_frame(tid: u32, frame: &mut SvcFrame) {
 fn maybe_preempt(frame: &mut SvcFrame) {
     let vid = vcpu_id();
     let from = current_tid();
+    sched_lock_acquire();
+    check_timeouts(now_ticks());
     let (_, to) = schedule(vid);
     if to == 0 {
+        sched_lock_release();
         if crate::sched::all_threads_done() {
             hypercall::process_exit(0);
         }
         unsafe { core::arch::asm!("wfi", options(nostack, nomem)) };
         return;
     }
-    if from != to {
+    if from != 0 && from != to {
         save_ctx_for(from, frame);
         restore_ctx_to_frame(to, frame);
     }
+    sched_lock_release();
 }
 
 #[no_mangle]

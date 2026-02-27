@@ -10,18 +10,24 @@ use core::cell::UnsafeCell;
 // ── 常量 ─────────────────────────────────────────────────────
 
 pub const MAX_THREADS: usize = 64;
-pub const MAX_VCPUS:   usize = 8;
-pub const IDLE_TID:    u32   = 0;
+pub const MAX_VCPUS: usize = 8;
+pub const IDLE_TID: u32 = 0;
+pub const MAX_WAIT_HANDLES: usize = 64;
+
+pub const WAIT_KIND_NONE: u8 = 0;
+pub const WAIT_KIND_SINGLE: u8 = 1;
+pub const WAIT_KIND_MULTI_ANY: u8 = 2;
+pub const WAIT_KIND_MULTI_ALL: u8 = 3;
 
 // ── 线程状态 ──────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum ThreadState {
-    Free       = 0,
-    Ready      = 1,
-    Running    = 2,
-    Waiting    = 3,
+    Free = 0,
+    Ready = 1,
+    Running = 2,
+    Waiting = 3,
     Terminated = 4,
 }
 
@@ -30,49 +36,61 @@ pub enum ThreadState {
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct ThreadContext {
-    pub x:      [u64; 31],   // x0–x30
-    pub sp:     u64,          // SP_EL0
-    pub pc:     u64,          // ELR_EL1 (return address)
-    pub pstate: u64,          // SPSR_EL1
-    pub tpidr:  u64,          // TPIDR_EL0 (TEB pointer)
+    pub x: [u64; 31], // x0–x30
+    pub sp: u64,      // SP_EL0
+    pub pc: u64,      // ELR_EL1 (return address)
+    pub pstate: u64,  // SPSR_EL1
+    pub tpidr: u64,   // TPIDR_EL0 (TEB pointer)
 }
 
 // ── KThread ───────────────────────────────────────────────────
 
 #[repr(C)]
 pub struct KThread {
-    pub state:         ThreadState,
-    pub priority:      u8,       // NT priority 0–31 (31 = highest)
+    pub state: ThreadState,
+    pub priority: u8, // NT priority 0–31 (31 = highest)
     pub base_priority: u8,
-    pub tid:           u32,
-    pub teb_va:        u64,
+    pub tid: u32,
+    pub teb_va: u64,
 
-    pub ctx:           ThreadContext,
+    pub ctx: ThreadContext,
 
     // 等待信息
-    pub wait_result:   u32,      // NTSTATUS written on wake
-    pub wait_deadline: u64,      // FILETIME (0 = no timeout)
+    pub wait_result: u32,   // NTSTATUS written on wake
+    pub wait_deadline: u64, // deadline in CNTVCT ticks (0 = no timeout)
+    pub wait_kind: u8,      // WAIT_KIND_*
+    pub wait_count: u8,     // number of handles in wait_handles
+    pub wait_signaled: u64, // bitmask for WAIT_KIND_MULTI_ALL
 
     // 侵入式链表节点（就绪队列 / 等待队列）
-    pub sched_next:    u32,      // TID of next in ready queue (0 = end)
-    pub wait_next:     u32,      // TID of next in wait queue (0 = end)
+    pub sched_next: u32, // TID of next in ready queue (0 = end)
+    pub wait_next: u32,  // TID of next in wait queue (0 = end)
+    pub wait_handles: [u64; MAX_WAIT_HANDLES],
 }
 
 impl KThread {
     const fn zeroed() -> Self {
         Self {
-            state:         ThreadState::Free,
-            priority:      8,
+            state: ThreadState::Free,
+            priority: 8,
             base_priority: 8,
-            tid:           0,
-            teb_va:        0,
-            ctx:           ThreadContext {
-                x: [0u64; 31], sp: 0, pc: 0, pstate: 0, tpidr: 0,
+            tid: 0,
+            teb_va: 0,
+            ctx: ThreadContext {
+                x: [0u64; 31],
+                sp: 0,
+                pc: 0,
+                pstate: 0,
+                tpidr: 0,
             },
-            wait_result:   0,
+            wait_result: 0,
             wait_deadline: 0,
-            sched_next:    0,
-            wait_next:     0,
+            wait_kind: WAIT_KIND_NONE,
+            wait_count: 0,
+            wait_signaled: 0,
+            sched_next: 0,
+            wait_next: 0,
+            wait_handles: [0u64; MAX_WAIT_HANDLES],
         }
     }
 }
@@ -90,7 +108,11 @@ pub struct ReadyQueue {
 
 impl ReadyQueue {
     const fn new() -> Self {
-        Self { heads: [0u32; 32], tails: [0u32; 32], present: 0 }
+        Self {
+            heads: [0u32; 32],
+            tails: [0u32; 32],
+            present: 0,
+        }
     }
 
     pub fn push(&mut self, t: &mut KThread) {
@@ -108,10 +130,14 @@ impl ReadyQueue {
     }
 
     pub fn pop_highest(&mut self) -> u32 {
-        if self.present == 0 { return 0; }
+        if self.present == 0 {
+            return 0;
+        }
         let p = 31 - self.present.leading_zeros() as usize;
         let tid = self.heads[p];
-        if tid == 0 { return 0; }
+        if tid == 0 {
+            return 0;
+        }
         let next = with_thread(tid, |t| t.sched_next);
         self.heads[p] = next;
         if next == 0 {
@@ -125,7 +151,7 @@ impl ReadyQueue {
         // Linear scan per priority level — only called on wait path, not hot
         for p in 0..32usize {
             let mut prev = 0u32;
-            let mut cur  = self.heads[p];
+            let mut cur = self.heads[p];
             while cur != 0 {
                 let next = with_thread(cur, |t| t.sched_next);
                 if cur == tid {
@@ -134,12 +160,16 @@ impl ReadyQueue {
                     } else {
                         with_thread_mut(prev, |t| t.sched_next = next);
                     }
-                    if next == 0 { self.tails[p] = prev; }
-                    if self.heads[p] == 0 { self.present &= !(1u32 << p); }
+                    if next == 0 {
+                        self.tails[p] = prev;
+                    }
+                    if self.heads[p] == 0 {
+                        self.present &= !(1u32 << p);
+                    }
                     return;
                 }
                 prev = cur;
-                cur  = next;
+                cur = next;
             }
         }
     }
@@ -149,46 +179,51 @@ impl ReadyQueue {
 
 // 每 vCPU 调度器：记录当前运行线程
 pub struct KScheduler {
-    pub current_tid:      u32,
+    pub current_tid: u32,
     pub needs_scheduling: bool,
 }
 
 impl KScheduler {
     const fn new() -> Self {
-        Self { current_tid: 0, needs_scheduling: false }
+        Self {
+            current_tid: 0,
+            needs_scheduling: false,
+        }
     }
 }
 
 pub struct Scheduler {
-    threads:    UnsafeCell<[KThread; MAX_THREADS]>,
-    ready:      UnsafeCell<ReadyQueue>,
-    vcpus:      UnsafeCell<[KScheduler; MAX_VCPUS]>,
-    next_tid:   UnsafeCell<u32>,
+    threads: UnsafeCell<[KThread; MAX_THREADS]>,
+    ready: UnsafeCell<ReadyQueue>,
+    vcpus: UnsafeCell<[KScheduler; MAX_VCPUS]>,
+    next_tid: UnsafeCell<u32>,
     // 全局调度锁（可重入，保护 ready queue 和线程状态）
     // 多 vCPU：底层用原子自旋锁
     lock_count: UnsafeCell<u32>,
-    lock_owner: UnsafeCell<u32>,  // vcpu_id + 1（0 = 未持有）
-    spinlock:   UnsafeCell<u32>,  // 0 = free, 1 = locked
+    lock_owner: UnsafeCell<u32>, // vcpu_id + 1（0 = 未持有）
+    spinlock: UnsafeCell<u32>,   // 0 = free, 1 = locked
 }
 
 unsafe impl Sync for Scheduler {}
 
 pub static SCHED: Scheduler = Scheduler {
-    threads:    UnsafeCell::new(unsafe {
+    threads: UnsafeCell::new(unsafe {
         core::mem::transmute([0u8; core::mem::size_of::<[KThread; MAX_THREADS]>()])
     }),
-    ready:      UnsafeCell::new(ReadyQueue::new()),
-    vcpus:      UnsafeCell::new([const { KScheduler::new() }; MAX_VCPUS]),
-    next_tid:   UnsafeCell::new(1),
+    ready: UnsafeCell::new(ReadyQueue::new()),
+    vcpus: UnsafeCell::new([const { KScheduler::new() }; MAX_VCPUS]),
+    next_tid: UnsafeCell::new(1),
     lock_count: UnsafeCell::new(0),
     lock_owner: UnsafeCell::new(0),
-    spinlock:   UnsafeCell::new(0),
+    spinlock: UnsafeCell::new(0),
 };
 
 // ── 线程访问辅助 ──────────────────────────────────────────────
 
 fn thread_ptr(tid: u32) -> *mut KThread {
-    if tid == 0 || tid as usize >= MAX_THREADS { return core::ptr::null_mut(); }
+    if tid == 0 || tid as usize >= MAX_THREADS {
+        return core::ptr::null_mut();
+    }
     unsafe { &mut (*SCHED.threads.get())[tid as usize] }
 }
 
@@ -203,20 +238,26 @@ pub fn with_thread_mut<R>(tid: u32, f: impl FnOnce(&mut KThread) -> R) -> R {
 pub fn current_tid() -> u32 {
     // Read TPIDR_EL1 low 32 bits — set by svc_dispatch on entry
     let val: u64;
-    unsafe { core::arch::asm!("mrs {}, tpidr_el1", out(reg) val, options(nostack, nomem)); }
+    unsafe {
+        core::arch::asm!("mrs {}, tpidr_el1", out(reg) val, options(nostack, nomem));
+    }
     val as u32
 }
 
 pub fn vcpu_id() -> usize {
     // High 32 bits of TPIDR_EL1 hold vcpu_id
     let val: u64;
-    unsafe { core::arch::asm!("mrs {}, tpidr_el1", out(reg) val, options(nostack, nomem)); }
+    unsafe {
+        core::arch::asm!("mrs {}, tpidr_el1", out(reg) val, options(nostack, nomem));
+    }
     (val >> 32) as usize
 }
 
 pub fn set_tpidr_el1(vcpu_id: usize, tid: u32) {
     let val = ((vcpu_id as u64) << 32) | (tid as u64);
-    unsafe { core::arch::asm!("msr tpidr_el1, {}", in(reg) val, options(nostack, nomem)); }
+    unsafe {
+        core::arch::asm!("msr tpidr_el1, {}", in(reg) val, options(nostack, nomem));
+    }
 }
 
 pub fn current_thread_mut<R>(f: impl FnOnce(&mut KThread) -> R) -> R {
@@ -276,7 +317,9 @@ pub fn sched_lock_acquire() {
 pub fn sched_lock_release() {
     unsafe {
         let count = SCHED.lock_count.get();
-        if *count == 0 { return; }
+        if *count == 0 {
+            return;
+        }
         *count -= 1;
         if *count == 0 {
             *SCHED.lock_owner.get() = 0;
@@ -291,23 +334,31 @@ pub fn sched_lock_release() {
 pub fn spawn(pc: u64, sp: u64, arg: u64, teb_va: u64, priority: u8) -> u32 {
     unsafe {
         let tid = *SCHED.next_tid.get();
-        if tid as usize >= MAX_THREADS { return 0; }
+        if tid as usize >= MAX_THREADS {
+            return 0;
+        }
         *SCHED.next_tid.get() = tid + 1;
 
         let t = &mut (*SCHED.threads.get())[tid as usize];
-        t.state         = ThreadState::Ready;
-        t.priority      = priority;
+        t.state = ThreadState::Ready;
+        t.priority = priority;
         t.base_priority = priority;
-        t.tid           = tid;
-        t.teb_va        = teb_va;
-        t.ctx.pc        = pc;
-        t.ctx.sp        = sp;
-        t.ctx.x[0]      = arg;
-        t.ctx.x[18]     = teb_va;
-        t.ctx.pstate    = 0x0; // EL0t
-        t.ctx.tpidr     = teb_va;
-        t.sched_next    = 0;
-        t.wait_next     = 0;
+        t.tid = tid;
+        t.teb_va = teb_va;
+        t.ctx.pc = pc;
+        t.ctx.sp = sp;
+        t.ctx.x[0] = arg;
+        t.ctx.x[18] = teb_va;
+        t.ctx.pstate = 0x0; // EL0t
+        t.ctx.tpidr = teb_va;
+        t.wait_result = 0;
+        t.wait_deadline = 0;
+        t.wait_kind = WAIT_KIND_NONE;
+        t.wait_count = 0;
+        t.wait_signaled = 0;
+        t.sched_next = 0;
+        t.wait_next = 0;
+        t.wait_handles.fill(0);
 
         (*SCHED.ready.get()).push(t);
         tid
@@ -365,13 +416,13 @@ pub fn block_current(vcpu_id: usize, deadline: u64) -> (u32, u32) {
         let vcpu = &mut (*SCHED.vcpus.get())[vcpu_id];
         let cur_tid = vcpu.current_tid;
         with_thread_mut(cur_tid, |t| {
-            t.state         = ThreadState::Waiting;
+            t.state = ThreadState::Waiting;
             t.wait_deadline = deadline;
         });
 
         let next_tid = (*SCHED.ready.get()).pop_highest();
         if next_tid == 0 {
-            return (cur_tid, 0);  // WFI
+            return (cur_tid, 0); // WFI
         }
 
         with_thread_mut(next_tid, |t| t.state = ThreadState::Running);
@@ -385,10 +436,16 @@ pub fn block_current(vcpu_id: usize, deadline: u64) -> (u32, u32) {
 pub fn wake(tid: u32, result: u32) {
     unsafe {
         with_thread_mut(tid, |t| {
-            if t.state != ThreadState::Waiting { return; }
-            t.state         = ThreadState::Ready;
-            t.wait_result   = result;
+            if t.state != ThreadState::Waiting {
+                return;
+            }
+            t.state = ThreadState::Ready;
+            t.wait_result = result;
             t.wait_deadline = 0;
+            t.wait_kind = WAIT_KIND_NONE;
+            t.wait_count = 0;
+            t.wait_signaled = 0;
+            t.wait_handles.fill(0);
             // Resume point for blocked NtWait* should return wake result in x0.
             t.ctx.x[0] = result as u64;
             (*SCHED.ready.get()).push(t);
@@ -402,7 +459,9 @@ pub fn yield_current_thread() {
     with_thread_mut(cur, |t| {
         if t.state == ThreadState::Running {
             t.state = ThreadState::Ready;
-            unsafe { (*SCHED.ready.get()).push(t); }
+            unsafe {
+                (*SCHED.ready.get()).push(t);
+            }
         }
     });
 }
@@ -423,19 +482,27 @@ pub fn set_initial_thread(vcpu_id: usize, tid: u32) {
 pub fn register_thread0(teb_va: u64) {
     unsafe {
         let tid = *SCHED.next_tid.get();
-        if tid as usize >= MAX_THREADS { return; }
+        if tid as usize >= MAX_THREADS {
+            return;
+        }
         *SCHED.next_tid.get() = tid + 1;
 
         let t = &mut (*SCHED.threads.get())[tid as usize];
-        t.state         = ThreadState::Running;
-        t.priority      = 8;
+        t.state = ThreadState::Running;
+        t.priority = 8;
         t.base_priority = 8;
-        t.tid           = tid;
-        t.teb_va        = teb_va;
-        t.ctx           = ThreadContext::default();
-        t.ctx.tpidr     = teb_va;
-        t.sched_next    = 0;
-        t.wait_next     = 0;
+        t.tid = tid;
+        t.teb_va = teb_va;
+        t.ctx = ThreadContext::default();
+        t.ctx.tpidr = teb_va;
+        t.wait_result = 0;
+        t.wait_deadline = 0;
+        t.wait_kind = WAIT_KIND_NONE;
+        t.wait_count = 0;
+        t.wait_signaled = 0;
+        t.sched_next = 0;
+        t.wait_next = 0;
+        t.wait_handles.fill(0);
 
         // Register on vCPU 0
         let vcpu = &mut (*SCHED.vcpus.get())[0];
@@ -457,19 +524,43 @@ pub fn all_threads_done() -> bool {
     }
 }
 
-pub fn check_timeouts(now_filetime: u64) {
-    for tid in 1..unsafe { *SCHED.next_tid.get() } {
+pub fn check_timeouts(now_ticks: u64) {
+    let max_tid = unsafe { *SCHED.next_tid.get() };
+    for tid in 1..max_tid {
+        let timed_out = with_thread(tid, |t| {
+            t.state == ThreadState::Waiting && t.wait_deadline != 0 && now_ticks >= t.wait_deadline
+        });
+        if !timed_out {
+            continue;
+        }
+
+        // Remove stale waiter links from all objects before re-queueing.
+        crate::sched::sync::cleanup_wait_registration(tid);
         with_thread_mut(tid, |t| {
-            if t.state == ThreadState::Waiting
-                && t.wait_deadline != 0
-                && now_filetime >= t.wait_deadline
-            {
-                t.state         = ThreadState::Ready;
-                t.wait_result   = 0x0000_0102; // STATUS_TIMEOUT
-                t.wait_deadline = 0;
-                t.ctx.x[0]      = 0x0000_0102; // x0 = STATUS_TIMEOUT
-                unsafe { (*SCHED.ready.get()).push(t); }
+            if t.state != ThreadState::Waiting {
+                return;
+            }
+            t.state = ThreadState::Ready;
+            t.wait_result = 0x0000_0102; // STATUS_TIMEOUT
+            t.wait_deadline = 0;
+            t.wait_kind = WAIT_KIND_NONE;
+            t.wait_count = 0;
+            t.wait_signaled = 0;
+            t.wait_handles.fill(0);
+            t.ctx.x[0] = 0x0000_0102; // x0 = STATUS_TIMEOUT
+            unsafe {
+                (*SCHED.ready.get()).push(t);
             }
         });
     }
+}
+
+#[inline(always)]
+pub fn now_ticks() -> u64 {
+    crate::hypercall::query_mono_time_100ns()
+}
+
+/// Convert a relative timeout (100ns units) to an absolute counter deadline.
+pub fn deadline_after_100ns(timeout_100ns: u64) -> u64 {
+    now_ticks().saturating_add(timeout_100ns)
 }

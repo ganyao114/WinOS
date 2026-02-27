@@ -1,5 +1,7 @@
+use crate::sched::sync::{
+    make_handle, thread_notify_terminated, HANDLE_TYPE_THREAD, STATUS_SUCCESS,
+};
 use crate::sched::{current_tid, spawn, with_thread, with_thread_mut, ThreadState};
-use crate::sched::sync::{make_handle, HANDLE_TYPE_THREAD, STATUS_SUCCESS};
 use winemu_shared::status;
 
 use super::SvcFrame;
@@ -96,5 +98,6 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
 pub(crate) fn handle_terminate_thread(frame: &mut SvcFrame) {
     let cur = current_tid();
     with_thread_mut(cur, |t| t.state = ThreadState::Terminated);
+    thread_notify_terminated(cur);
     frame.x[0] = STATUS_SUCCESS as u64;
 }

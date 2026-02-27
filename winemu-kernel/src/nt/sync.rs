@@ -1,7 +1,7 @@
 use crate::sched::sync::{
     self, event_alloc, event_reset, event_set, make_handle, mutex_alloc, mutex_release,
-    semaphore_alloc, semaphore_release, wait_handle, EventType, STATUS_SUCCESS,
-    HANDLE_TYPE_EVENT, HANDLE_TYPE_MUTEX, HANDLE_TYPE_SEMAPHORE,
+    semaphore_alloc, semaphore_release, wait_handle, wait_multiple, EventType, WaitDeadline,
+    HANDLE_TYPE_EVENT, HANDLE_TYPE_MUTEX, HANDLE_TYPE_SEMAPHORE, STATUS_SUCCESS,
 };
 use winemu_shared::status;
 
@@ -50,26 +50,34 @@ pub(crate) fn handle_reset_event(frame: &mut SvcFrame) {
 // x0 = Handle, x1 = Alertable, x2 = Timeout* (LARGE_INTEGER*)
 pub(crate) fn handle_wait_single(frame: &mut SvcFrame) {
     let h = frame.x[0];
-    let timeout_ptr = frame.x[2] as *const i64;
-    let deadline = if timeout_ptr.is_null() {
-        0u64
-    } else {
-        let rel = unsafe { timeout_ptr.read_volatile() };
-        if rel < 0 { (-rel) as u64 } else { rel as u64 }
-    };
-
-    frame.x[0] = wait_handle(h, deadline) as u64;
+    let timeout = parse_timeout(frame.x[2] as *const i64);
+    frame.x[0] = wait_handle(h, timeout) as u64;
 }
 
 pub(crate) fn handle_wait_multiple(frame: &mut SvcFrame) {
     let count = frame.x[0] as usize;
     let arr = frame.x[1] as *const u64;
-    if arr.is_null() || count == 0 || count > 64 {
+    let wait_type = frame.x[2] as u32;
+    let wait_all = match wait_type {
+        0 => true,  // WaitAll
+        1 => false, // WaitAny
+        _ => {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        }
+    };
+    if arr.is_null() || count == 0 || count > crate::sched::MAX_WAIT_HANDLES {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
-    let first = unsafe { arr.read_volatile() };
-    frame.x[0] = wait_handle(first, 0) as u64;
+    let timeout = parse_timeout(frame.x[4] as *const i64);
+    let mut handles = [0u64; crate::sched::MAX_WAIT_HANDLES];
+    let mut i = 0usize;
+    while i < count {
+        handles[i] = unsafe { arr.add(i).read_volatile() };
+        i += 1;
+    }
+    frame.x[0] = wait_multiple(&handles[..count], wait_all, timeout) as u64;
 }
 
 // x0 = MutantHandle* (out), x1 = DesiredAccess, x2 = ObjAttr*
@@ -134,4 +142,21 @@ pub(crate) fn handle_release_semaphore(frame: &mut SvcFrame) {
     } else {
         STATUS_SUCCESS as u64
     };
+}
+
+fn parse_timeout(timeout_ptr: *const i64) -> WaitDeadline {
+    if timeout_ptr.is_null() {
+        return WaitDeadline::Infinite;
+    }
+    let raw = unsafe { timeout_ptr.read_volatile() };
+    if raw == 0 {
+        return WaitDeadline::Immediate;
+    }
+    if raw < 0 {
+        let rel_100ns = raw.unsigned_abs();
+        return WaitDeadline::DeadlineTicks(crate::sched::deadline_after_100ns(rel_100ns));
+    }
+    // NT 语义里正值是绝对时间（FILETIME）。当前 guest 内还没有 FILETIME 时钟源，
+    // 先按相对 100ns 处理，保证不会把调用误判成“立即超时”。
+    WaitDeadline::DeadlineTicks(crate::sched::deadline_after_100ns(raw as u64))
 }

@@ -1,4 +1,5 @@
 use std::sync::{Arc, RwLock, Mutex};
+use std::time::Instant;
 use winemu_core::hypercall::nr;
 use crate::memory::GuestMemory;
 use crate::vaspace::VaSpace;
@@ -27,6 +28,7 @@ pub struct HypercallManager {
     syscall_disp: SyscallDispatcher,
     dll_loader: DllLoader,
     host_files: HostFileTable,
+    mono_start: Instant,
 }
 
 impl HypercallManager {
@@ -55,6 +57,7 @@ impl HypercallManager {
             syscall_disp,
             dll_loader: DllLoader::new(dll_search_paths),
             host_files,
+            mono_start: Instant::now(),
         }
     }
 
@@ -603,6 +606,10 @@ impl HypercallManager {
                 let size = self.host_files.stat(fd);
                 log::info!("QUERY_EXE_INFO: fd={} size={:#x}", fd, size);
                 HypercallResult::Sync(fd | (size << 32))
+            }
+            nr::QUERY_MONO_TIME => {
+                let elapsed = self.mono_start.elapsed();
+                HypercallResult::Sync((elapsed.as_nanos() / 100) as u64)
             }
             _ => {
                 log::warn!("unhandled hypercall nr={:#x}", hypercall_nr);

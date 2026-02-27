@@ -150,6 +150,9 @@ pub mod nr {
     /// 查询 EXE 文件信息（VMM 打开 exe 并返回 host_fd + size）
     /// args: [0, 0, 0, 0, 0, 0] → packed (size<<32 | fd)
     pub const QUERY_EXE_INFO: u64 = 0x0817;
+    /// 查询单调时钟（100ns 单位）
+    /// args: [0, 0, 0, 0, 0, 0] → elapsed_100ns
+    pub const QUERY_MONO_TIME: u64 = 0x0818;
 }
 
 /// NT 超时常量（100ns 单位）

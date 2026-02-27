@@ -140,6 +140,12 @@ pub fn query_exe_info() -> (u64, u64) {
     }
 }
 
+/// Query monotonic elapsed time from host, in 100ns units.
+#[inline(always)]
+pub fn query_mono_time_100ns() -> u64 {
+    hypercall(nr::QUERY_MONO_TIME, 0, 0, 0)
+}
+
 pub fn debug_u64(val: u64) {
     let hex = b"0123456789abcdef";
     let mut buf = [0u8; 18]; // "0x" + 16 hex digits
