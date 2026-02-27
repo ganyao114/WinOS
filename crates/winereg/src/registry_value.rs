@@ -1,4 +1,6 @@
-use std::fmt;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt;
 
 #[allow(dead_code)]
 pub const REG_NONE: u32 = 0;
@@ -81,4 +83,3 @@ impl fmt::Display for RegistryValue {
         }
     }
 }
-

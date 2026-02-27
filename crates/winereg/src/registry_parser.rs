@@ -1,21 +1,36 @@
 use std::fs;
 use std::path::Path;
+use core::fmt;
 
 use crate::architecture::Architecture;
 use crate::registry_key::{KeyNode, RegistryKey};
 use crate::registry_utils::{timestamp_to_filetime};
 use crate::registry_value::{RegistryValue, RegistryValueData, REG_BINARY, REG_QWORD};
-use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum ParseError {
-    #[error("invalid header")]
     InvalidHeader,
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("parse error at line {line}: {msg}")]
+    Io(std::io::Error),
     Line { line: usize, msg: String },
 }
+
+impl From<std::io::Error> for ParseError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidHeader => write!(f, "invalid header"),
+            Self::Io(err) => write!(f, "io error: {err}"),
+            Self::Line { line, msg } => write!(f, "parse error at line {line}: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 #[derive(Debug)]
 pub struct LoadResult {
@@ -295,4 +310,3 @@ fn unescape_string(s: &str) -> String {
 fn unescape_key_path(s: &str) -> String {
     s.replace("\\\\", "\\")
 }
-

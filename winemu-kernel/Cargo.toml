@@ -17,5 +17,6 @@ panic = "abort"
 
 [dependencies]
 winemu-shared = { path = "../crates/winemu-shared" }
+winereg = { path = "../crates/winereg", default-features = false }
 
 [workspace]

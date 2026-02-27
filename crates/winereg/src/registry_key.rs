@@ -1,8 +1,12 @@
-use std::collections::BTreeMap;
-use std::rc::{Rc, Weak};
-use std::cell::RefCell;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::rc::{Rc, Weak};
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::cell::RefCell;
 
 use crate::registry_value::RegistryValue;
+#[cfg(feature = "std")]
 use crate::{
     registry_comparator::{DiffResult, RegistryComparator},
     registry_patcher::{PatchOptions, PatchResult, RegistryPatcher},
@@ -231,6 +235,7 @@ fn normalize(name: &str) -> String {
 }
 
 /// Convenience extensions to mirror KRegEdit's extension functions.
+#[cfg(feature = "std")]
 pub trait RegistryKeyExt {
     fn apply_patch_with(&self, diff: &DiffResult, options: PatchOptions) -> PatchResult;
     fn apply_patch(&self, diff: &DiffResult) -> PatchResult;
@@ -244,6 +249,7 @@ pub trait RegistryKeyExt {
     ) -> String;
 }
 
+#[cfg(feature = "std")]
 impl RegistryKeyExt for KeyNode {
     fn apply_patch_with(&self, diff: &DiffResult, options: PatchOptions) -> PatchResult {
         let patcher = RegistryPatcher;
@@ -278,4 +284,3 @@ impl RegistryKeyExt for KeyNode {
         exporter.export(&diff, from_file, to_file)
     }
 }
-

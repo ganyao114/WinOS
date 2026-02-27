@@ -2,6 +2,8 @@
 #![no_main]
 #![allow(dead_code)]
 
+extern crate alloc as rust_alloc;
+
 mod alloc;
 mod hypercall;
 mod ldr;

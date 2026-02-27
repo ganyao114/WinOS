@@ -1,82 +1,37 @@
+use crate::rust_alloc::{string::{String, ToString}, vec::Vec};
 use crate::sched::sync::{self, make_handle, HANDLE_TYPE_KEY};
 use winemu_shared::status;
+use winereg::{
+    KeyNode, RegistryKey, RegistryValue, RegistryValueData, REG_BINARY, REG_DWORD, REG_EXPAND_SZ,
+    REG_MULTI_SZ, REG_QWORD, REG_SZ,
+};
 
-use super::common::read_unicode_direct;
-use super::common::read_oa_path;
+use super::common::{read_oa_path, read_unicode_direct};
 use super::SvcFrame;
 
-const MAX_KEYS: usize = 256;
 const MAX_KEY_HANDLES: usize = 1024;
-const MAX_VALUES: usize = 1024;
-const MAX_NAME: usize = 96;
-const MAX_VALUE_DATA: usize = 512;
 const MAX_PATH: usize = 256;
-const ROOT_KEY_IDX: u16 = 1;
+const MAX_NAME_BYTES: usize = 256;
+const MAX_VALUE_NAME_UTF16: usize = 256;
 
-#[derive(Clone, Copy)]
-struct RegKey {
-    in_use: bool,
-    parent: u16,
-    name_len: u8,
-    name: [u8; MAX_NAME],
+struct RegistryState {
+    root: KeyNode,
+    handles: [Option<KeyNode>; MAX_KEY_HANDLES],
 }
 
-impl RegKey {
-    const fn empty() -> Self {
-        Self {
-            in_use: false,
-            parent: 0,
-            name_len: 0,
-            name: [0; MAX_NAME],
+static mut REG_STATE: Option<RegistryState> = None;
+
+fn ensure_state() -> &'static mut RegistryState {
+    unsafe {
+        if REG_STATE.is_none() {
+            REG_STATE = Some(RegistryState {
+                root: RegistryKey::create_root(),
+                handles: [const { None }; MAX_KEY_HANDLES],
+            });
         }
+        REG_STATE.as_mut().unwrap()
     }
 }
-
-#[derive(Clone, Copy)]
-struct RegValue {
-    in_use: bool,
-    key_idx: u16,
-    ty: u32,
-    name_len: u8,
-    name: [u8; MAX_NAME],
-    data_len: u16,
-    data: [u8; MAX_VALUE_DATA],
-}
-
-impl RegValue {
-    const fn empty() -> Self {
-        Self {
-            in_use: false,
-            key_idx: 0,
-            ty: 0,
-            name_len: 0,
-            name: [0; MAX_NAME],
-            data_len: 0,
-            data: [0; MAX_VALUE_DATA],
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct KeyHandle {
-    in_use: bool,
-    key_idx: u16,
-}
-
-impl KeyHandle {
-    const fn empty() -> Self {
-        Self {
-            in_use: false,
-            key_idx: 0,
-        }
-    }
-}
-
-static mut REG_INIT: bool = false;
-static mut KEYS: [RegKey; MAX_KEYS] = [const { RegKey::empty() }; MAX_KEYS];
-static mut KEY_HANDLES: [KeyHandle; MAX_KEY_HANDLES] =
-    [const { KeyHandle::empty() }; MAX_KEY_HANDLES];
-static mut VALUES: [RegValue; MAX_VALUES] = [const { RegValue::empty() }; MAX_VALUES];
 
 fn lower_ascii(b: u8) -> u8 {
     if b >= b'A' && b <= b'Z' {
@@ -92,6 +47,7 @@ fn normalize_registry_path(path: &mut [u8], mut len: usize) -> (usize, bool) {
             *b = b'/';
         }
     }
+
     let mut start = 0usize;
     while start < len && path[start] == b'/' {
         start += 1;
@@ -111,268 +67,198 @@ fn normalize_registry_path(path: &mut [u8], mut len: usize) -> (usize, bool) {
         b"registry/",
     ];
 
-    for p in prefixes {
-        if len >= p.len() {
-            let mut ok = true;
-            for i in 0..p.len() {
-                if lower_ascii(path[i]) != p[i] {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
-                for i in p.len()..len {
-                    path[i - p.len()] = path[i];
-                }
-                len -= p.len();
-                while len > 0 && path[0] == b'/' {
-                    for i in 1..len {
-                        path[i - 1] = path[i];
-                    }
-                    len -= 1;
-                }
-                return (len, true);
+    for prefix in prefixes {
+        if len < prefix.len() {
+            continue;
+        }
+        let mut matches = true;
+        for i in 0..prefix.len() {
+            if lower_ascii(path[i]) != prefix[i] {
+                matches = false;
+                break;
             }
         }
+        if !matches {
+            continue;
+        }
+
+        for i in prefix.len()..len {
+            path[i - prefix.len()] = path[i];
+        }
+        len -= prefix.len();
+        while len > 0 && path[0] == b'/' {
+            for i in 1..len {
+                path[i - 1] = path[i];
+            }
+            len -= 1;
+        }
+        return (len, true);
     }
 
     (len, false)
 }
 
-fn eq_name(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    for i in 0..a.len() {
-        if lower_ascii(a[i]) != lower_ascii(b[i]) {
-            return false;
-        }
-    }
-    true
-}
-
-fn ensure_init() {
-    unsafe {
-        if REG_INIT {
-            return;
-        }
-        KEYS[ROOT_KEY_IDX as usize].in_use = true;
-        KEYS[ROOT_KEY_IDX as usize].parent = 0;
-        KEYS[ROOT_KEY_IDX as usize].name_len = 0;
-        REG_INIT = true;
-    }
-}
-
-fn find_child(parent: u16, seg: &[u8]) -> Option<u16> {
-    unsafe {
-        for i in 1..MAX_KEYS {
-            let k = KEYS[i];
-            if !k.in_use || k.parent != parent {
+fn bytes_path_to_registry(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut prev_sep = false;
+    for b in bytes {
+        let ch = if *b == b'/' || *b == b'\\' { '\\' } else { *b as char };
+        if ch == '\\' {
+            if prev_sep {
                 continue;
             }
-            let nlen = k.name_len as usize;
-            if eq_name(&k.name[..nlen], seg) {
-                return Some(i as u16);
-            }
-        }
-    }
-    None
-}
-
-fn alloc_key(parent: u16, seg: &[u8]) -> Option<u16> {
-    unsafe {
-        for i in 1..MAX_KEYS {
-            if !KEYS[i].in_use {
-                KEYS[i].in_use = true;
-                KEYS[i].parent = parent;
-                let nlen = core::cmp::min(seg.len(), MAX_NAME);
-                KEYS[i].name_len = nlen as u8;
-                for j in 0..nlen {
-                    KEYS[i].name[j] = lower_ascii(seg[j]);
-                }
-                return Some(i as u16);
-            }
-        }
-    }
-    None
-}
-
-fn path_walk(path: &[u8], create_missing: bool) -> Option<u16> {
-    ensure_init();
-    let mut cur = ROOT_KEY_IDX;
-    let mut i = 0usize;
-    while i < path.len() {
-        while i < path.len() && path[i] == b'/' {
-            i += 1;
-        }
-        if i >= path.len() {
-            break;
-        }
-        let start = i;
-        while i < path.len() && path[i] != b'/' {
-            i += 1;
-        }
-        let seg = &path[start..i];
-        if seg.is_empty() {
-            continue;
-        }
-        if let Some(next) = find_child(cur, seg) {
-            cur = next;
-        } else if create_missing {
-            cur = alloc_key(cur, seg)?;
+            prev_sep = true;
+            out.push('\\');
         } else {
-            return None;
+            prev_sep = false;
+            out.push(ch);
         }
     }
-    Some(cur)
+    while out.ends_with('\\') {
+        out.pop();
+    }
+    out
 }
 
-fn build_key_path(idx: u16, out: &mut [u8]) -> usize {
-    let mut chain = [0u16; 32];
-    let mut n = 0usize;
-    let mut cur = idx;
-    unsafe {
-        while cur != ROOT_KEY_IDX && cur != 0 && n < chain.len() {
-            chain[n] = cur;
-            n += 1;
-            cur = KEYS[cur as usize].parent;
-        }
+fn read_value_name(us_ptr: u64) -> String {
+    let mut raw = [0u8; MAX_NAME_BYTES];
+    let len = read_unicode_direct(us_ptr, &mut raw);
+    let mut out = String::new();
+    for &b in raw.iter().take(len) {
+        out.push(b as char);
     }
-    let mut w = 0usize;
-    unsafe {
-        for ci in (0..n).rev() {
-            let k = KEYS[chain[ci] as usize];
-            let name_len = k.name_len as usize;
-            if name_len == 0 {
-                continue;
-            }
-            if w != 0 && w < out.len() {
-                out[w] = b'/';
-                w += 1;
-            }
-            let copy = core::cmp::min(name_len, out.len().saturating_sub(w));
-            for j in 0..copy {
-                out[w + j] = k.name[j];
-            }
-            w += copy;
-            if w >= out.len() {
-                break;
-            }
-        }
-    }
-    core::cmp::min(w, out.len())
+    out
 }
 
-fn key_idx_from_handle(handle: u64) -> Option<u16> {
+fn alloc_key_handle(state: &mut RegistryState, node: KeyNode) -> Option<u16> {
+    for i in 1..MAX_KEY_HANDLES {
+        if state.handles[i].is_none() {
+            state.handles[i] = Some(node);
+            return Some(i as u16);
+        }
+    }
+    None
+}
+
+fn key_node_from_handle(state: &RegistryState, handle: u64) -> Option<KeyNode> {
     if sync::handle_type(handle) != HANDLE_TYPE_KEY {
         return None;
     }
-    let hidx = sync::handle_idx(handle) as usize;
-    unsafe {
-        if hidx >= MAX_KEY_HANDLES || !KEY_HANDLES[hidx].in_use {
-            None
-        } else {
-            let idx = KEY_HANDLES[hidx].key_idx as usize;
-            if idx == 0 || idx >= MAX_KEYS || !KEYS[idx].in_use {
-                None
-            } else {
-                Some(idx as u16)
-            }
-        }
+    let idx = sync::handle_idx(handle) as usize;
+    if idx == 0 || idx >= MAX_KEY_HANDLES {
+        return None;
     }
+    state.handles[idx].clone()
 }
 
-fn alloc_key_handle(key_idx: u16) -> Option<u16> {
-    unsafe {
-        for i in 1..MAX_KEY_HANDLES {
-            if !KEY_HANDLES[i].in_use {
-                KEY_HANDLES[i].in_use = true;
-                KEY_HANDLES[i].key_idx = key_idx;
-                return Some(i as u16);
-            }
-        }
+fn join_registry_path(base: &str, rel: &str) -> String {
+    if base.is_empty() {
+        return rel.to_string();
     }
-    None
+    if rel.is_empty() {
+        return base.to_string();
+    }
+    let mut s = String::with_capacity(base.len() + 1 + rel.len());
+    s.push_str(base);
+    s.push('\\');
+    s.push_str(rel);
+    s
 }
 
-fn gc_key_handles() {
-    unsafe {
-        for i in 1..MAX_KEY_HANDLES {
-            if !KEY_HANDLES[i].in_use {
-                continue;
-            }
-            let idx = KEY_HANDLES[i].key_idx as usize;
-            if idx == 0 || idx >= MAX_KEYS || !KEYS[idx].in_use {
-                KEY_HANDLES[i].in_use = false;
-                KEY_HANDLES[i].key_idx = 0;
-            }
-        }
+fn oa_full_path(oa_ptr: u64, state: &RegistryState) -> Option<String> {
+    if oa_ptr == 0 {
+        return Some(String::new());
     }
+
+    let root_handle = unsafe { ((oa_ptr + 0x8) as *const u64).read_volatile() };
+    let mut rel = [0u8; MAX_PATH];
+    let rel_len_raw = read_oa_path(oa_ptr, &mut rel);
+    let (rel_len, abs) = normalize_registry_path(&mut rel, rel_len_raw);
+    let rel_path = bytes_path_to_registry(&rel[..rel_len]);
+
+    if abs {
+        return Some(rel_path);
+    }
+
+    let Some(root) = key_node_from_handle(state, root_handle) else {
+        return Some(rel_path);
+    };
+
+    let base = RegistryKey::get_full_path(&root);
+    Some(join_registry_path(&base, &rel_path))
 }
 
-fn delete_key_tree(idx: u16) {
-    unsafe {
-        for i in 1..MAX_KEYS {
-            if KEYS[i].in_use && KEYS[i].parent == idx {
-                delete_key_tree(i as u16);
-            }
+fn parse_utf16le_string(data: &[u8]) -> String {
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i + 1 < data.len() {
+        let ch = u16::from_le_bytes([data[i], data[i + 1]]);
+        i += 2;
+        if ch == 0 {
+            break;
         }
-        for i in 1..MAX_VALUES {
-            if VALUES[i].in_use && VALUES[i].key_idx == idx {
-                VALUES[i].in_use = false;
-            }
-        }
-        if idx != ROOT_KEY_IDX {
-            KEYS[idx as usize].in_use = false;
-            KEYS[idx as usize].name_len = 0;
-        }
+        out.push(core::char::from_u32(ch as u32).unwrap_or('?'));
     }
+    out
 }
 
-fn find_value(key_idx: u16, name: &[u8]) -> Option<usize> {
-    unsafe {
-        for i in 1..MAX_VALUES {
-            let v = VALUES[i];
-            if !v.in_use || v.key_idx != key_idx {
-                continue;
+fn parse_utf16le_multisz(data: &[u8]) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = Vec::<u16>::new();
+    let mut i = 0usize;
+
+    while i + 1 < data.len() {
+        let ch = u16::from_le_bytes([data[i], data[i + 1]]);
+        i += 2;
+
+        if ch == 0 {
+            if cur.is_empty() {
+                break;
             }
-            let nlen = v.name_len as usize;
-            if eq_name(&v.name[..nlen], name) {
-                return Some(i);
-            }
+            let s: String = cur
+                .iter()
+                .map(|u| core::char::from_u32(*u as u32).unwrap_or('?'))
+                .collect();
+            parts.push(s);
+            cur.clear();
+            continue;
         }
+
+        cur.push(ch);
     }
-    None
+
+    parts
 }
 
-fn alloc_value_slot(key_idx: u16, name: &[u8]) -> Option<usize> {
-    unsafe {
-        for i in 1..MAX_VALUES {
-            if !VALUES[i].in_use {
-                VALUES[i].in_use = true;
-                VALUES[i].key_idx = key_idx;
-                let nlen = core::cmp::min(name.len(), MAX_NAME);
-                VALUES[i].name_len = nlen as u8;
-                for j in 0..nlen {
-                    VALUES[i].name[j] = lower_ascii(name[j]);
-                }
-                VALUES[i].data_len = 0;
-                VALUES[i].ty = 0;
-                return Some(i);
-            }
+fn decode_registry_value(name: &str, ty: u32, data: &[u8]) -> RegistryValue {
+    let parsed = match ty {
+        REG_SZ => RegistryValueData::String(parse_utf16le_string(data)),
+        REG_EXPAND_SZ => RegistryValueData::ExpandString(parse_utf16le_string(data)),
+        REG_MULTI_SZ => RegistryValueData::MultiString(parse_utf16le_multisz(data)),
+        REG_DWORD if data.len() >= 4 => {
+            let mut arr = [0u8; 4];
+            arr.copy_from_slice(&data[..4]);
+            RegistryValueData::Dword(u32::from_le_bytes(arr))
         }
-    }
-    None
+        REG_QWORD if data.len() >= 8 => {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&data[..8]);
+            RegistryValueData::Qword(u64::from_le_bytes(arr))
+        }
+        _ => RegistryValueData::Binary(data.to_vec(), if ty == 0 { REG_BINARY } else { ty }),
+    };
+    RegistryValue::new(name.to_string(), parsed)
 }
 
-fn copy_utf16_ascii(name: &[u8], out: &mut [u8]) -> usize {
+fn encode_utf16_bytes(s: &str, out: &mut [u8]) -> usize {
     let mut w = 0usize;
-    for ch in name {
+    for ch in s.encode_utf16() {
         if w + 2 > out.len() {
             break;
         }
-        out[w] = *ch;
-        out[w + 1] = 0;
+        let b = ch.to_le_bytes();
+        out[w] = b[0];
+        out[w + 1] = b[1];
         w += 2;
     }
     w
@@ -384,83 +270,55 @@ fn write_ret_len(ptr: u64, len: usize) {
     }
 }
 
-fn oa_full_path(oa_ptr: u64, out: &mut [u8]) -> Option<usize> {
-    if oa_ptr == 0 {
-        return Some(0);
-    }
-    let root_handle = unsafe { ((oa_ptr + 0x8) as *const u64).read_volatile() };
-    let mut rel = [0u8; MAX_PATH];
-    let rel_len_raw = read_oa_path(oa_ptr, &mut rel);
-    let (rel_len, abs) = normalize_registry_path(&mut rel, rel_len_raw);
-
-    let root_idx = key_idx_from_handle(root_handle);
-    if abs || root_idx.is_none() {
-        let copy = core::cmp::min(rel_len, out.len());
-        for i in 0..copy {
-            out[i] = rel[i];
+fn gc_key_handles(state: &mut RegistryState) {
+    for slot in state.handles.iter_mut().skip(1) {
+        let Some(node) = slot.as_ref() else {
+            continue;
+        };
+        let path = RegistryKey::get_full_path(node);
+        if path.is_empty() {
+            continue;
         }
-        return Some(copy);
-    }
-
-    let base_idx = root_idx?;
-    let mut w = build_key_path(base_idx, out);
-    if rel_len != 0 {
-        if w < out.len() {
-            out[w] = b'/';
-            w += 1;
+        if RegistryKey::find_key(&state.root, &path).is_none() {
+            *slot = None;
         }
-        let copy = core::cmp::min(rel_len, out.len().saturating_sub(w));
-        for i in 0..copy {
-            out[w + i] = rel[i];
-        }
-        w += copy;
     }
-    Some(core::cmp::min(w, out.len()))
 }
 
 pub(crate) fn close_key_handle(handle: u64) -> bool {
+    let state = ensure_state();
     if sync::handle_type(handle) != HANDLE_TYPE_KEY {
         return false;
     }
-    let hidx = sync::handle_idx(handle) as usize;
-    unsafe {
-        if hidx == 0 || hidx >= MAX_KEY_HANDLES || !KEY_HANDLES[hidx].in_use {
-            return false;
-        }
-        KEY_HANDLES[hidx].in_use = false;
-        KEY_HANDLES[hidx].key_idx = 0;
+    let idx = sync::handle_idx(handle) as usize;
+    if idx == 0 || idx >= MAX_KEY_HANDLES {
+        return false;
     }
+    if state.handles[idx].is_none() {
+        return false;
+    }
+    state.handles[idx] = None;
     true
 }
 
 pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
-    ensure_init();
+    let state = ensure_state();
     let out_ptr = frame.x[0] as *mut u64;
     let oa_ptr = frame.x[2];
 
-    let mut path = [0u8; MAX_PATH];
-    let len = match oa_full_path(oa_ptr, &mut path) {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::INVALID_PARAMETER as u64;
-            return;
-        }
+    let Some(path) = oa_full_path(oa_ptr, state) else {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     };
 
-    let idx = match path_walk(&path[..len], false) {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
-            return;
-        }
+    let Some(node) = RegistryKey::find_key(&state.root, &path) else {
+        frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
+        return;
     };
 
-    let handle_idx = match alloc_key_handle(idx) {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::NO_MEMORY as u64;
-            return;
-        }
+    let Some(handle_idx) = alloc_key_handle(state, node) else {
+        frame.x[0] = status::NO_MEMORY as u64;
+        return;
     };
 
     if !out_ptr.is_null() {
@@ -470,39 +328,26 @@ pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
 }
 
 pub(crate) fn handle_create_key(frame: &mut SvcFrame) {
-    ensure_init();
+    let state = ensure_state();
     let out_ptr = frame.x[0] as *mut u64;
     let oa_ptr = frame.x[2];
     let disp_ptr = frame.x[6] as *mut u32;
 
-    let mut path = [0u8; MAX_PATH];
-    let len = match oa_full_path(oa_ptr, &mut path) {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::INVALID_PARAMETER as u64;
-            return;
-        }
+    let Some(path) = oa_full_path(oa_ptr, state) else {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     };
 
-    let existing = path_walk(&path[..len], false);
-    let (idx, disp) = if let Some(v) = existing {
-        (v, 2u32)
+    let existing = RegistryKey::find_key(&state.root, &path);
+    let (node, disp) = if let Some(node) = existing {
+        (node, 2u32)
     } else {
-        match path_walk(&path[..len], true) {
-            Some(v) => (v, 1u32),
-            None => {
-                frame.x[0] = status::NO_MEMORY as u64;
-                return;
-            }
-        }
+        (RegistryKey::create_key_recursive(&state.root, &path), 1u32)
     };
 
-    let handle_idx = match alloc_key_handle(idx) {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::NO_MEMORY as u64;
-            return;
-        }
+    let Some(handle_idx) = alloc_key_handle(state, node) else {
+        frame.x[0] = status::NO_MEMORY as u64;
+        return;
     };
 
     if !disp_ptr.is_null() {
@@ -515,152 +360,151 @@ pub(crate) fn handle_create_key(frame: &mut SvcFrame) {
 }
 
 pub(crate) fn handle_delete_key(frame: &mut SvcFrame) {
-    ensure_init();
+    let state = ensure_state();
     let handle = frame.x[0];
-    let idx = match key_idx_from_handle(handle) {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::INVALID_HANDLE as u64;
-            return;
-        }
+
+    let Some(node) = key_node_from_handle(state, handle) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
     };
-    delete_key_tree(idx);
-    gc_key_handles();
+
+    let path = RegistryKey::get_full_path(&node);
+    if path.is_empty() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+
+    let (parent_path, name) = match path.rsplit_once('\\') {
+        Some((p, n)) => (p, n),
+        None => ("", path.as_str()),
+    };
+
+    let parent = if parent_path.is_empty() {
+        Some(state.root.clone())
+    } else {
+        RegistryKey::find_key(&state.root, parent_path)
+    };
+
+    let Some(parent) = parent else {
+        frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
+        return;
+    };
+
+    if !RegistryKey::delete_subkey(&parent, name, true) {
+        frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
+        return;
+    }
+
+    gc_key_handles(state);
     frame.x[0] = status::SUCCESS as u64;
 }
 
 pub(crate) fn handle_set_value_key(frame: &mut SvcFrame) {
-    ensure_init();
+    let state = ensure_state();
     let handle = frame.x[0];
-    let val_name_us = frame.x[1];
-    let val_type = frame.x[3] as u32;
+    let value_name_us = frame.x[1];
+    let value_type = frame.x[3] as u32;
     let data_ptr = frame.x[4] as *const u8;
     let data_len = frame.x[5] as usize;
 
-    let key_idx = match key_idx_from_handle(handle) {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::INVALID_HANDLE as u64;
-            return;
-        }
+    let Some(node) = key_node_from_handle(state, handle) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
     };
 
-    if data_len > MAX_VALUE_DATA {
-        frame.x[0] = status::BUFFER_TOO_SMALL as u64;
-        return;
-    }
     if data_len != 0 && data_ptr.is_null() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
 
-    let mut name = [0u8; MAX_NAME];
-    let name_len = read_unicode_direct(val_name_us, &mut name);
-    for b in name.iter_mut().take(name_len) {
-        *b = lower_ascii(*b);
-    }
-
-    let slot = find_value(key_idx, &name[..name_len]).or_else(|| alloc_value_slot(key_idx, &name[..name_len]));
-    let i = match slot {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::NO_MEMORY as u64;
-            return;
-        }
+    let value_name = read_value_name(value_name_us);
+    let raw_data = if data_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { core::slice::from_raw_parts(data_ptr, data_len) }.to_vec()
     };
 
-    unsafe {
-        VALUES[i].ty = val_type;
-        VALUES[i].data_len = data_len as u16;
-        if data_len != 0 {
-            core::ptr::copy_nonoverlapping(data_ptr, VALUES[i].data.as_mut_ptr(), data_len);
-        }
-    }
-
+    let value = decode_registry_value(&value_name, value_type, &raw_data);
+    node.borrow_mut().set_value(value_name, value);
     frame.x[0] = status::SUCCESS as u64;
 }
 
 pub(crate) fn handle_query_value_key(frame: &mut SvcFrame) {
-    ensure_init();
+    let state = ensure_state();
     let handle = frame.x[0];
-    let val_name_us = frame.x[1];
+    let value_name_us = frame.x[1];
     let info_class = frame.x[2] as u32;
     let out_ptr = frame.x[3] as *mut u8;
     let out_len = frame.x[4] as usize;
     let ret_len_ptr = frame.x[5];
 
-    let key_idx = match key_idx_from_handle(handle) {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::INVALID_HANDLE as u64;
-            return;
-        }
+    let Some(node) = key_node_from_handle(state, handle) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
     };
 
-    let mut name = [0u8; MAX_NAME];
-    let name_len = read_unicode_direct(val_name_us, &mut name);
-    for b in name.iter_mut().take(name_len) {
-        *b = lower_ascii(*b);
-    }
-
-    let vi = match find_value(key_idx, &name[..name_len]) {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
-            return;
-        }
+    let value_name = read_value_name(value_name_us);
+    let guard = node.borrow();
+    let Some(value) = guard.get_value(&value_name).cloned() else {
+        frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
+        return;
     };
+
+    let mut value_name_w = [0u8; MAX_VALUE_NAME_UTF16 * 2];
+    let value_name_wlen = encode_utf16_bytes(&value.name, &mut value_name_w);
+    let value_data = value.raw_bytes();
+    let value_ty = value.reg_type();
+    let value_data_len = value_data.len();
 
     unsafe {
-        let v = VALUES[vi];
-        let mut name_w = [0u8; MAX_NAME * 2];
-        let name_wlen = copy_utf16_ascii(&v.name[..v.name_len as usize], &mut name_w);
-        let data_len = v.data_len as usize;
-
         match info_class {
             0 => {
-                let need = 12 + name_wlen;
+                let need = 12 + value_name_wlen;
                 write_ret_len(ret_len_ptr, need);
                 if out_ptr.is_null() || out_len < need {
                     frame.x[0] = status::BUFFER_TOO_SMALL as u64;
                     return;
                 }
                 (out_ptr as *mut u32).write_volatile(0);
-                (out_ptr.add(4) as *mut u32).write_volatile(v.ty);
-                (out_ptr.add(8) as *mut u32).write_volatile(name_wlen as u32);
-                core::ptr::copy_nonoverlapping(name_w.as_ptr(), out_ptr.add(12), name_wlen);
+                (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
+                (out_ptr.add(8) as *mut u32).write_volatile(value_name_wlen as u32);
+                core::ptr::copy_nonoverlapping(value_name_w.as_ptr(), out_ptr.add(12), value_name_wlen);
                 frame.x[0] = status::SUCCESS as u64;
             }
             1 => {
-                let need = 20 + name_wlen + data_len;
+                let need = 20 + value_name_wlen + value_data_len;
                 write_ret_len(ret_len_ptr, need);
                 if out_ptr.is_null() || out_len < need {
                     frame.x[0] = status::BUFFER_TOO_SMALL as u64;
                     return;
                 }
                 (out_ptr as *mut u32).write_volatile(0);
-                (out_ptr.add(4) as *mut u32).write_volatile(v.ty);
-                (out_ptr.add(8) as *mut u32).write_volatile((20 + name_wlen) as u32);
-                (out_ptr.add(12) as *mut u32).write_volatile(data_len as u32);
-                (out_ptr.add(16) as *mut u32).write_volatile(name_wlen as u32);
-                core::ptr::copy_nonoverlapping(name_w.as_ptr(), out_ptr.add(20), name_wlen);
-                if data_len != 0 {
-                    core::ptr::copy_nonoverlapping(v.data.as_ptr(), out_ptr.add(20 + name_wlen), data_len);
+                (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
+                (out_ptr.add(8) as *mut u32).write_volatile((20 + value_name_wlen) as u32);
+                (out_ptr.add(12) as *mut u32).write_volatile(value_data_len as u32);
+                (out_ptr.add(16) as *mut u32).write_volatile(value_name_wlen as u32);
+                core::ptr::copy_nonoverlapping(value_name_w.as_ptr(), out_ptr.add(20), value_name_wlen);
+                if value_data_len != 0 {
+                    core::ptr::copy_nonoverlapping(
+                        value_data.as_ptr(),
+                        out_ptr.add(20 + value_name_wlen),
+                        value_data_len,
+                    );
                 }
                 frame.x[0] = status::SUCCESS as u64;
             }
             2 => {
-                let need = 12 + data_len;
+                let need = 12 + value_data_len;
                 write_ret_len(ret_len_ptr, need);
                 if out_ptr.is_null() || out_len < need {
                     frame.x[0] = status::BUFFER_TOO_SMALL as u64;
                     return;
                 }
                 (out_ptr as *mut u32).write_volatile(0);
-                (out_ptr.add(4) as *mut u32).write_volatile(v.ty);
-                (out_ptr.add(8) as *mut u32).write_volatile(data_len as u32);
-                if data_len != 0 {
-                    core::ptr::copy_nonoverlapping(v.data.as_ptr(), out_ptr.add(12), data_len);
+                (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
+                (out_ptr.add(8) as *mut u32).write_volatile(value_data_len as u32);
+                if value_data_len != 0 {
+                    core::ptr::copy_nonoverlapping(value_data.as_ptr(), out_ptr.add(12), value_data_len);
                 }
                 frame.x[0] = status::SUCCESS as u64;
             }
@@ -672,7 +516,7 @@ pub(crate) fn handle_query_value_key(frame: &mut SvcFrame) {
 }
 
 pub(crate) fn handle_enumerate_key(frame: &mut SvcFrame) {
-    ensure_init();
+    let state = ensure_state();
     let handle = frame.x[0];
     let index = frame.x[1] as usize;
     let info_class = frame.x[2] as u32;
@@ -685,56 +529,43 @@ pub(crate) fn handle_enumerate_key(frame: &mut SvcFrame) {
         return;
     }
 
-    let key_idx = match key_idx_from_handle(handle) {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::INVALID_HANDLE as u64;
-            return;
-        }
+    let Some(node) = key_node_from_handle(state, handle) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
     };
 
-    let mut found = 0usize;
-    let mut child_idx = None;
-    unsafe {
-        for i in 1..MAX_KEYS {
-            if KEYS[i].in_use && KEYS[i].parent == key_idx {
-                if found == index {
-                    child_idx = Some(i as u16);
-                    break;
-                }
-                found += 1;
-            }
-        }
+    let child = {
+        let guard = node.borrow();
+        guard.subkeys().values().nth(index).cloned()
+    };
+    let Some(child) = child else {
+        frame.x[0] = status::NO_MORE_ENTRIES as u64;
+        return;
+    };
+
+    let child_name = child.borrow().name.clone();
+    let mut child_name_w = [0u8; MAX_VALUE_NAME_UTF16 * 2];
+    let child_name_wlen = encode_utf16_bytes(&child_name, &mut child_name_w);
+
+    let need = 16 + child_name_wlen;
+    write_ret_len(ret_len_ptr, need);
+    if out_ptr.is_null() || out_len < need {
+        frame.x[0] = status::BUFFER_TOO_SMALL as u64;
+        return;
     }
-    let ci = match child_idx {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::NO_MORE_ENTRIES as u64;
-            return;
-        }
-    };
 
     unsafe {
-        let k = KEYS[ci as usize];
-        let mut name_w = [0u8; MAX_NAME * 2];
-        let name_wlen = copy_utf16_ascii(&k.name[..k.name_len as usize], &mut name_w);
-        let need = 16 + name_wlen;
-        write_ret_len(ret_len_ptr, need);
-        if out_ptr.is_null() || out_len < need {
-            frame.x[0] = status::BUFFER_TOO_SMALL as u64;
-            return;
-        }
         (out_ptr as *mut u64).write_volatile(0);
         (out_ptr.add(8) as *mut u32).write_volatile(0);
-        (out_ptr.add(12) as *mut u32).write_volatile(name_wlen as u32);
-        core::ptr::copy_nonoverlapping(name_w.as_ptr(), out_ptr.add(16), name_wlen);
+        (out_ptr.add(12) as *mut u32).write_volatile(child_name_wlen as u32);
+        core::ptr::copy_nonoverlapping(child_name_w.as_ptr(), out_ptr.add(16), child_name_wlen);
     }
 
     frame.x[0] = status::SUCCESS as u64;
 }
 
 pub(crate) fn handle_enumerate_value_key(frame: &mut SvcFrame) {
-    ensure_init();
+    let state = ensure_state();
     let handle = frame.x[0];
     let index = frame.x[1] as usize;
     let info_class = frame.x[2] as u32;
@@ -742,85 +573,75 @@ pub(crate) fn handle_enumerate_value_key(frame: &mut SvcFrame) {
     let out_len = frame.x[4] as usize;
     let ret_len_ptr = frame.x[5];
 
-    let key_idx = match key_idx_from_handle(handle) {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::INVALID_HANDLE as u64;
-            return;
-        }
+    let Some(node) = key_node_from_handle(state, handle) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
     };
 
-    let mut found = 0usize;
-    let mut vi = None;
-    unsafe {
-        for i in 1..MAX_VALUES {
-            if VALUES[i].in_use && VALUES[i].key_idx == key_idx {
-                if found == index {
-                    vi = Some(i);
-                    break;
-                }
-                found += 1;
-            }
-        }
-    }
-    let i = match vi {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::NO_MORE_ENTRIES as u64;
-            return;
-        }
+    let value = {
+        let guard = node.borrow();
+        guard.values().values().nth(index).cloned()
+    };
+    let Some(value) = value else {
+        frame.x[0] = status::NO_MORE_ENTRIES as u64;
+        return;
     };
 
-    unsafe {
-        let v = VALUES[i];
-        let mut name_w = [0u8; MAX_NAME * 2];
-        let name_wlen = copy_utf16_ascii(&v.name[..v.name_len as usize], &mut name_w);
-        let data_len = v.data_len as usize;
+    let mut value_name_w = [0u8; MAX_VALUE_NAME_UTF16 * 2];
+    let value_name_wlen = encode_utf16_bytes(&value.name, &mut value_name_w);
+    let value_data = value.raw_bytes();
+    let value_ty = value.reg_type();
+    let value_data_len = value_data.len();
 
+    unsafe {
         match info_class {
             0 => {
-                let need = 12 + name_wlen;
+                let need = 12 + value_name_wlen;
                 write_ret_len(ret_len_ptr, need);
                 if out_ptr.is_null() || out_len < need {
                     frame.x[0] = status::BUFFER_TOO_SMALL as u64;
                     return;
                 }
                 (out_ptr as *mut u32).write_volatile(0);
-                (out_ptr.add(4) as *mut u32).write_volatile(v.ty);
-                (out_ptr.add(8) as *mut u32).write_volatile(name_wlen as u32);
-                core::ptr::copy_nonoverlapping(name_w.as_ptr(), out_ptr.add(12), name_wlen);
+                (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
+                (out_ptr.add(8) as *mut u32).write_volatile(value_name_wlen as u32);
+                core::ptr::copy_nonoverlapping(value_name_w.as_ptr(), out_ptr.add(12), value_name_wlen);
                 frame.x[0] = status::SUCCESS as u64;
             }
             1 => {
-                let need = 20 + name_wlen + data_len;
+                let need = 20 + value_name_wlen + value_data_len;
                 write_ret_len(ret_len_ptr, need);
                 if out_ptr.is_null() || out_len < need {
                     frame.x[0] = status::BUFFER_TOO_SMALL as u64;
                     return;
                 }
                 (out_ptr as *mut u32).write_volatile(0);
-                (out_ptr.add(4) as *mut u32).write_volatile(v.ty);
-                (out_ptr.add(8) as *mut u32).write_volatile((20 + name_wlen) as u32);
-                (out_ptr.add(12) as *mut u32).write_volatile(data_len as u32);
-                (out_ptr.add(16) as *mut u32).write_volatile(name_wlen as u32);
-                core::ptr::copy_nonoverlapping(name_w.as_ptr(), out_ptr.add(20), name_wlen);
-                if data_len != 0 {
-                    core::ptr::copy_nonoverlapping(v.data.as_ptr(), out_ptr.add(20 + name_wlen), data_len);
+                (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
+                (out_ptr.add(8) as *mut u32).write_volatile((20 + value_name_wlen) as u32);
+                (out_ptr.add(12) as *mut u32).write_volatile(value_data_len as u32);
+                (out_ptr.add(16) as *mut u32).write_volatile(value_name_wlen as u32);
+                core::ptr::copy_nonoverlapping(value_name_w.as_ptr(), out_ptr.add(20), value_name_wlen);
+                if value_data_len != 0 {
+                    core::ptr::copy_nonoverlapping(
+                        value_data.as_ptr(),
+                        out_ptr.add(20 + value_name_wlen),
+                        value_data_len,
+                    );
                 }
                 frame.x[0] = status::SUCCESS as u64;
             }
             2 => {
-                let need = 12 + data_len;
+                let need = 12 + value_data_len;
                 write_ret_len(ret_len_ptr, need);
                 if out_ptr.is_null() || out_len < need {
                     frame.x[0] = status::BUFFER_TOO_SMALL as u64;
                     return;
                 }
                 (out_ptr as *mut u32).write_volatile(0);
-                (out_ptr.add(4) as *mut u32).write_volatile(v.ty);
-                (out_ptr.add(8) as *mut u32).write_volatile(data_len as u32);
-                if data_len != 0 {
-                    core::ptr::copy_nonoverlapping(v.data.as_ptr(), out_ptr.add(12), data_len);
+                (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
+                (out_ptr.add(8) as *mut u32).write_volatile(value_data_len as u32);
+                if value_data_len != 0 {
+                    core::ptr::copy_nonoverlapping(value_data.as_ptr(), out_ptr.add(12), value_data_len);
                 }
                 frame.x[0] = status::SUCCESS as u64;
             }
@@ -832,27 +653,16 @@ pub(crate) fn handle_enumerate_value_key(frame: &mut SvcFrame) {
 }
 
 pub(crate) fn handle_delete_value_key(frame: &mut SvcFrame) {
-    ensure_init();
+    let state = ensure_state();
     let handle = frame.x[0];
-    let val_name_us = frame.x[1];
+    let value_name_us = frame.x[1];
 
-    let key_idx = match key_idx_from_handle(handle) {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::INVALID_HANDLE as u64;
-            return;
-        }
+    let Some(node) = key_node_from_handle(state, handle) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
     };
 
-    let mut name = [0u8; MAX_NAME];
-    let name_len = read_unicode_direct(val_name_us, &mut name);
-    for b in name.iter_mut().take(name_len) {
-        *b = lower_ascii(*b);
-    }
-
-    if let Some(i) = find_value(key_idx, &name[..name_len]) {
-        unsafe { VALUES[i].in_use = false; }
-    }
-
+    let value_name = read_value_name(value_name_us);
+    node.borrow_mut().delete_value(&value_name);
     frame.x[0] = status::SUCCESS as u64;
 }

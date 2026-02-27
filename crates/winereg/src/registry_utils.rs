@@ -1,3 +1,6 @@
+#[cfg(feature = "std")]
+use alloc::vec::Vec;
+
 const TICKS_PER_SEC: u64 = 10_000_000;
 const TICKS_1601_TO_1970: u64 = 86_400 * (369 * 365 + 89) * TICKS_PER_SEC;
 
@@ -33,6 +36,7 @@ pub fn hex_digit_value(c: char) -> Option<u8> {
     }
 }
 
+#[cfg(feature = "std")]
 pub fn set_current_time_recursive(node: &crate::registry_key::KeyNode) {
     let now = timestamp_to_filetime(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -41,6 +45,7 @@ pub fn set_current_time_recursive(node: &crate::registry_key::KeyNode) {
     set_time(node, now);
 }
 
+#[cfg(feature = "std")]
 fn set_time(node: &crate::registry_key::KeyNode, time: u64) {
     {
         let mut guard = node.borrow_mut();
@@ -51,4 +56,3 @@ fn set_time(node: &crate::registry_key::KeyNode, time: u64) {
         set_time(&child, time);
     }
 }
-

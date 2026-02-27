@@ -7,8 +7,13 @@ name = "winemu-kernel"
 version = "0.1.0"
 dependencies = [
  "winemu-shared",
+ "winereg",
 ]
 
 [[package]]
 name = "winemu-shared"
+version = "0.1.0"
+
+[[package]]
+name = "winereg"
 version = "0.1.0"
