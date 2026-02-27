@@ -1,10 +1,18 @@
+use super::{
+    ffi::{self, hv_vcpu_exit_t, hv_vcpuid_t},
+    timer::HvfVTimer,
+};
+use crate::{
+    types::{Regs, SpecialRegs, VmExit},
+    Vcpu,
+};
 use winemu_core::{Result, WinemuError};
-use crate::{Vcpu, types::{Regs, SpecialRegs, VmExit}};
-use super::ffi::{self, hv_vcpuid_t, hv_vcpu_exit_t};
 
 pub struct HvfVcpu {
     id: hv_vcpuid_t,
     exit: *const hv_vcpu_exit_t,
+    vtimer: HvfVTimer,
+    use_vtimer_exit: bool,
 }
 
 // Safety: HvfVcpu is only used from one thread at a time (vCPU thread)
@@ -14,15 +22,22 @@ impl HvfVcpu {
     pub fn new() -> Result<Self> {
         let mut id: hv_vcpuid_t = 0;
         let mut exit: *const hv_vcpu_exit_t = std::ptr::null();
-        let ret = unsafe {
-            ffi::hv_vcpu_create(&mut id, &mut exit, std::ptr::null_mut())
-        };
+        let ret = unsafe { ffi::hv_vcpu_create(&mut id, &mut exit, std::ptr::null_mut()) };
         if ret != ffi::HV_SUCCESS {
-            return Err(WinemuError::Hypervisor(
-                format!("hv_vcpu_create failed: {:#x}", ret),
-            ));
+            return Err(WinemuError::Hypervisor(format!(
+                "hv_vcpu_create failed: {:#x}",
+                ret
+            )));
         }
-        let mut vcpu = Self { id, exit };
+        let mut vcpu = Self {
+            id,
+            exit,
+            vtimer: HvfVTimer::new(),
+            use_vtimer_exit: std::env::var("WINEMU_HVF_VTIMER_EXIT")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true),
+        };
         vcpu.init_el1()?;
         Ok(vcpu)
     }
@@ -48,7 +63,11 @@ impl HvfVcpu {
 
         // CPACR_EL1: FPEN=0b11 — allow FP/SIMD at EL0 and EL1 (no trapping)
         self.set_sys_reg(ffi::HV_SYS_REG_CPACR_EL1, 0x0030_0000)?;
-        log::debug!("init_el1: CPACR_EL1 set to {:#x}", self.get_sys_reg(ffi::HV_SYS_REG_CPACR_EL1).unwrap_or(0xdead));
+        log::debug!(
+            "init_el1: CPACR_EL1 set to {:#x}",
+            self.get_sys_reg(ffi::HV_SYS_REG_CPACR_EL1)
+                .unwrap_or(0xdead)
+        );
 
         // VBAR_EL1: 暂设为 0，Guest Kernel 启动后会设置
         self.set_sys_reg(ffi::HV_SYS_REG_VBAR_EL1, 0)?;
@@ -60,7 +79,10 @@ impl HvfVcpu {
         let mut val = 0u64;
         let ret = unsafe { ffi::hv_vcpu_get_reg(self.id, reg, &mut val) };
         if ret != ffi::HV_SUCCESS {
-            return Err(WinemuError::Hypervisor(format!("hv_vcpu_get_reg({}) failed: {:#x}", reg, ret)));
+            return Err(WinemuError::Hypervisor(format!(
+                "hv_vcpu_get_reg({}) failed: {:#x}",
+                reg, ret
+            )));
         }
         Ok(val)
     }
@@ -68,7 +90,10 @@ impl HvfVcpu {
     fn set_reg(&mut self, reg: ffi::hv_reg_t, val: u64) -> Result<()> {
         let ret = unsafe { ffi::hv_vcpu_set_reg(self.id, reg, val) };
         if ret != ffi::HV_SUCCESS {
-            return Err(WinemuError::Hypervisor(format!("hv_vcpu_set_reg({}) failed: {:#x}", reg, ret)));
+            return Err(WinemuError::Hypervisor(format!(
+                "hv_vcpu_set_reg({}) failed: {:#x}",
+                reg, ret
+            )));
         }
         Ok(())
     }
@@ -77,7 +102,10 @@ impl HvfVcpu {
         let mut val = 0u64;
         let ret = unsafe { ffi::hv_vcpu_get_sys_reg(self.id, reg, &mut val) };
         if ret != ffi::HV_SUCCESS {
-            return Err(WinemuError::Hypervisor(format!("hv_vcpu_get_sys_reg({:#x}) failed: {:#x}", reg, ret)));
+            return Err(WinemuError::Hypervisor(format!(
+                "hv_vcpu_get_sys_reg({:#x}) failed: {:#x}",
+                reg, ret
+            )));
         }
         Ok(val)
     }
@@ -85,17 +113,31 @@ impl HvfVcpu {
     fn set_sys_reg(&mut self, reg: ffi::hv_sys_reg_t, val: u64) -> Result<()> {
         let ret = unsafe { ffi::hv_vcpu_set_sys_reg(self.id, reg, val) };
         if ret != ffi::HV_SUCCESS {
-            return Err(WinemuError::Hypervisor(format!("hv_vcpu_set_sys_reg({:#x}) failed: {:#x}", reg, ret)));
+            return Err(WinemuError::Hypervisor(format!(
+                "hv_vcpu_set_sys_reg({:#x}) failed: {:#x}",
+                reg, ret
+            )));
         }
         Ok(())
     }
 
-    fn parse_exit(&self) -> Result<VmExit> {
+    fn parse_exit(&mut self) -> Result<VmExit> {
         let exit = unsafe { &*self.exit };
         // Log raw exit struct for debugging
-        log::debug!("parse_exit: reason={} syndrome={:#x} va={:#x} pa={:#x}",
-            exit.reason, exit.exception.syndrome,
-            exit.exception.virtual_address, exit.exception.physical_address);
+        log::debug!(
+            "parse_exit: reason={} syndrome={:#x} va={:#x} pa={:#x}",
+            exit.reason,
+            exit.exception.syndrome,
+            exit.exception.virtual_address,
+            exit.exception.physical_address
+        );
+        if exit.reason == ffi::HV_EXIT_REASON_VTIMER_ACTIVATED {
+            if !self.use_vtimer_exit {
+                return Ok(VmExit::Wfi);
+            }
+            self.vtimer.on_vtimer_activated(self.id)?;
+            return Ok(VmExit::Timer);
+        }
         if exit.reason == ffi::HV_EXIT_REASON_CANCELED {
             let pc = self.get_reg(ffi::HV_REG_PC).unwrap_or(0);
             let pstate = self.get_reg(ffi::HV_REG_CPSR).unwrap_or(0);
@@ -115,20 +157,27 @@ impl HvfVcpu {
         let ec = (esr >> 26) & 0x3F;
         // Log CPACR_EL1 when we see an abort to diagnose FP trap issues
         if ec == 0x07 || ec == 0x20 || ec == 0x21 {
-            let cpacr = self.get_sys_reg(ffi::HV_SYS_REG_CPACR_EL1).unwrap_or(0xdead);
+            let cpacr = self
+                .get_sys_reg(ffi::HV_SYS_REG_CPACR_EL1)
+                .unwrap_or(0xdead);
             log::debug!("parse_exit: ec={:#x} cpacr_el1={:#x}", ec, cpacr);
         }
         // When guest jumps to exception vector at 0x200 (VBAR=0), log the saved
         // ELR_EL1/ESR_EL1 to reveal the *original* fault that triggered the vector.
         if exit.exception.virtual_address == 0x200 {
-            let elr  = self.get_sys_reg(ffi::HV_SYS_REG_ELR_EL1).unwrap_or(0xdead);
+            let elr = self.get_sys_reg(ffi::HV_SYS_REG_ELR_EL1).unwrap_or(0xdead);
             let esr1 = self.get_sys_reg(ffi::HV_SYS_REG_ESR_EL1).unwrap_or(0xdead);
             let spsr = self.get_sys_reg(ffi::HV_SYS_REG_SPSR_EL1).unwrap_or(0xdead);
-            let far  = self.get_sys_reg(ffi::HV_SYS_REG_FAR_EL1).unwrap_or(0xdead);
+            let far = self.get_sys_reg(ffi::HV_SYS_REG_FAR_EL1).unwrap_or(0xdead);
             log::error!("GUEST EXCEPTION VECTOR HIT: elr_el1={:#x} esr_el1={:#x} spsr_el1={:#x} far_el1={:#x}",
                 elr, esr1, spsr, far);
         }
         match ec {
+            0x01 => {
+                // Trapped WFI/WFE (EC=0x01). HVF traps this synchronously;
+                // VMM advances PC and re-enters guest.
+                Ok(VmExit::Wfi)
+            }
             0x15 => {
                 // SVC from EL0 — should not reach host in WinEmu design,
                 // but handle defensively
@@ -155,7 +204,11 @@ impl HvfVcpu {
                 if is_write {
                     let rt = (iss & 0x1F) as u32;
                     let data = self.get_reg(rt)?;
-                    Ok(VmExit::MmioWrite { addr: far, data, size })
+                    Ok(VmExit::MmioWrite {
+                        addr: far,
+                        data,
+                        size,
+                    })
                 } else {
                     Ok(VmExit::MmioRead { addr: far, size })
                 }
@@ -167,12 +220,21 @@ impl HvfVcpu {
 
 impl Drop for HvfVcpu {
     fn drop(&mut self) {
-        unsafe { ffi::hv_vcpu_destroy(self.id); }
+        unsafe {
+            ffi::hv_vcpu_destroy(self.id);
+        }
     }
 }
 
-impl Vcpu for HvfVcpu {
-    fn run(&mut self) -> Result<VmExit> {
+impl HvfVcpu {
+    fn run_vcpu(&mut self) -> Result<VmExit> {
+        self.vtimer.prepare_run(self.id, self.use_vtimer_exit)?;
+        self.run_inner()
+    }
+}
+
+impl HvfVcpu {
+    fn run_inner(&mut self) -> Result<VmExit> {
         let timeout_ms = std::env::var("WINEMU_HVF_RUN_TIMEOUT_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -199,9 +261,19 @@ impl Vcpu for HvfVcpu {
             unsafe { ffi::hv_vcpu_run(self.id) }
         };
         if ret != ffi::HV_SUCCESS {
-            return Err(WinemuError::Hypervisor(format!("hv_vcpu_run failed: {:#x}", ret)));
+            return Err(WinemuError::Hypervisor(format!(
+                "hv_vcpu_run failed: {:#x}",
+                ret
+            )));
         }
         self.parse_exit()
+    }
+
+}
+
+impl Vcpu for HvfVcpu {
+    fn run(&mut self) -> Result<VmExit> {
+        self.run_vcpu()
     }
 
     fn regs(&self) -> Result<Regs> {
@@ -209,7 +281,7 @@ impl Vcpu for HvfVcpu {
         for i in 0u32..31 {
             r.x[i as usize] = self.get_reg(i)?;
         }
-        r.pc     = self.get_reg(ffi::HV_REG_PC)?;
+        r.pc = self.get_reg(ffi::HV_REG_PC)?;
         r.pstate = self.get_reg(ffi::HV_REG_CPSR)?;
         // EL bits [3:2]: 0b00 = EL0, 0b01 = EL1
         // SPSel bit [0]: 0 = SP_EL0, 1 = SP_ELx
@@ -257,11 +329,11 @@ impl Vcpu for HvfVcpu {
 
     fn set_special_regs(&mut self, sr: &SpecialRegs) -> Result<()> {
         self.set_sys_reg(ffi::HV_SYS_REG_SCTLR_EL1, sr.data[0])?;
-        self.set_sys_reg(ffi::HV_SYS_REG_TCR_EL1,   sr.data[1])?;
+        self.set_sys_reg(ffi::HV_SYS_REG_TCR_EL1, sr.data[1])?;
         self.set_sys_reg(ffi::HV_SYS_REG_TTBR0_EL1, sr.data[2])?;
         self.set_sys_reg(ffi::HV_SYS_REG_TTBR1_EL1, sr.data[3])?;
-        self.set_sys_reg(ffi::HV_SYS_REG_MAIR_EL1,  sr.data[4])?;
-        self.set_sys_reg(ffi::HV_SYS_REG_VBAR_EL1,  sr.data[5])?;
+        self.set_sys_reg(ffi::HV_SYS_REG_MAIR_EL1, sr.data[4])?;
+        self.set_sys_reg(ffi::HV_SYS_REG_VBAR_EL1, sr.data[5])?;
         Ok(())
     }
 

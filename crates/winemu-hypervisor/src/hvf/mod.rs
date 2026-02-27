@@ -1,4 +1,5 @@
 pub mod ffi;
+mod timer;
 pub mod vcpu;
 pub mod vm;
 

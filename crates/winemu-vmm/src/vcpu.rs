@@ -1,24 +1,35 @@
+use super::hypercall::{HypercallManager, HypercallResult};
+use super::sched::{SchedResult, Scheduler, ThreadContext, ThreadId};
 use std::sync::Arc;
 use std::time::Duration;
-use winemu_hypervisor::{Vcpu, types::VmExit};
-use super::hypercall::{HypercallManager, HypercallResult};
-use super::sched::{Scheduler, ThreadId, ThreadContext, SchedResult};
+use winemu_hypervisor::{types::VmExit, Vcpu};
 
 pub fn vcpu_thread(
     vcpu_id: u32,
     mut vcpu: Box<dyn Vcpu>,
     hc_mgr: Arc<HypercallManager>,
-    sched:  Arc<Scheduler>,
+    sched: Arc<Scheduler>,
 ) {
     // ── Phase 1: 直接运行 Guest Kernel，直到 KERNEL_READY ────────
     // 内核不是调度线程，用 ThreadId(0) 作为占位符
     let kernel_tid = ThreadId(0);
     'kernel: loop {
         let exit = match vcpu.run() {
-            Ok(e)  => e,
-            Err(e) => { log::error!("vcpu{} kernel run error: {:?}", vcpu_id, e); return; }
+            Ok(e) => e,
+            Err(e) => {
+                log::error!("vcpu{} kernel run error: {:?}", vcpu_id, e);
+                return;
+            }
         };
         match exit {
+            VmExit::Wfi => {
+                let _ = vcpu.advance_pc(4);
+                continue 'kernel;
+            }
+            VmExit::Timer => {
+                // Phase 1 should not arm timers; ignore defensively.
+                continue 'kernel;
+            }
             VmExit::Hypercall { nr, args } => {
                 let is_ready = nr == winemu_shared::nr::KERNEL_READY;
                 let result = hc_mgr.dispatch(nr, args, kernel_tid);
@@ -35,7 +46,9 @@ pub fn vcpu_thread(
                         // HVF auto-advances PC
                     }
                 }
-                if is_ready { break 'kernel; }
+                if is_ready {
+                    break 'kernel;
+                }
             }
             VmExit::Halt | VmExit::Shutdown => {
                 log::info!("vcpu{} kernel halted in phase 1", vcpu_id);
@@ -43,8 +56,14 @@ pub fn vcpu_thread(
             }
             exit => {
                 if let Ok(r) = vcpu.regs() {
-                    log::warn!("vcpu{} phase1 unhandled vmexit: {:?} pc={:#x} pstate={:#x} sp={:#x}",
-                        vcpu_id, exit, r.pc, r.pstate, r.sp);
+                    log::warn!(
+                        "vcpu{} phase1 unhandled vmexit: {:?} pc={:#x} pstate={:#x} sp={:#x}",
+                        vcpu_id,
+                        exit,
+                        r.pc,
+                        r.pstate,
+                        r.sp
+                    );
                 } else {
                     log::warn!("vcpu{} phase1 unhandled vmexit: {:?}", vcpu_id, exit);
                 }
@@ -76,23 +95,41 @@ pub fn vcpu_thread(
 
         let ctx = match sched.take_ctx(tid) {
             Some(c) => c,
-            None => { current = None; continue; }
+            None => {
+                current = None;
+                continue;
+            }
         };
         restore_ctx(&mut *vcpu, &ctx);
 
         let exit = match vcpu.run() {
-            Ok(e)  => e,
-            Err(e) => { log::error!("vcpu{} run error: {:?}", vcpu_id, e); break; }
+            Ok(e) => e,
+            Err(e) => {
+                log::error!("vcpu{} run error: {:?}", vcpu_id, e);
+                break;
+            }
         };
 
         match exit {
+            VmExit::Wfi => {
+                // HVF traps WFI/WFE as a synchronous exit. Emulate completion.
+                let _ = vcpu.advance_pc(4);
+                let ctx = save_ctx(&mut *vcpu);
+                sched.save_ctx(tid, ctx);
+                continue 'run;
+            }
+            VmExit::Timer => {
+                // Timer IRQ is already marked pending in HVF backend.
+                // Resume guest so EL1 IRQ vector can run and wake the scheduler.
+                continue 'run;
+            }
             VmExit::Hypercall { nr, args } => {
                 if nr == winemu_shared::nr::NT_SYSCALL {
                     let regs = vcpu.regs().unwrap();
                     log::debug!("NT_SYSCALL hvc: x0={:#x} x8={:#x} x9={:#x} x10={:#x} x11={:#x} x12={:#x} x30={:#x} pc={:#x} sp={:#x}",
                         regs.x[0], regs.x[8], regs.x[9], regs.x[10], regs.x[11], regs.x[12], regs.x[30], regs.pc, regs.sp);
                     let syscall_nr = regs.x[9];
-                    let table_nr   = regs.x[10];
+                    let table_nr = regs.x[10];
                     // x11 = orig_x0: SVC handler does `mov x11, x0` before hvc
                     let x0 = regs.x[11];
                     let x1 = regs.x[1];
@@ -106,7 +143,8 @@ pub fn vcpu_thread(
                     let full_args = [syscall_nr, table_nr, x0, x1, x2, x3, x4, x5, x6, x7];
                     let result = hc_mgr.dispatch_nt_syscall(full_args, sp_el0, tid);
                     match result {
-                        HypercallResult::Sync(ret) | HypercallResult::Sched(SchedResult::Sync(ret)) => {
+                        HypercallResult::Sync(ret)
+                        | HypercallResult::Sched(SchedResult::Sync(ret)) => {
                             set_x0(&mut *vcpu, ret);
                             let ctx = save_ctx(&mut *vcpu);
                             sched.save_ctx(tid, ctx);
@@ -165,8 +203,14 @@ pub fn vcpu_thread(
             }
             exit => {
                 if let Ok(r) = vcpu.regs() {
-                    log::warn!("vcpu{} unhandled vmexit: {:?} pc={:#x} pstate={:#x} sp={:#x}",
-                        vcpu_id, exit, r.pc, r.pstate, r.sp);
+                    log::warn!(
+                        "vcpu{} unhandled vmexit: {:?} pc={:#x} pstate={:#x} sp={:#x}",
+                        vcpu_id,
+                        exit,
+                        r.pc,
+                        r.pstate,
+                        r.sp
+                    );
                 } else {
                     log::warn!("vcpu{} unhandled vmexit: {:?}", vcpu_id, exit);
                 }
@@ -183,14 +227,19 @@ fn restore_ctx(vcpu: &mut dyn Vcpu, ctx: &ThreadContext) {
     {
         let mut regs = vcpu.regs().unwrap();
         regs.x[..31].copy_from_slice(&ctx.gpr[..31]);
-        regs.sp    = ctx.gpr[31];
-        regs.pc    = ctx.gpr[32];
+        regs.sp = ctx.gpr[31];
+        regs.pc = ctx.gpr[32];
         regs.pstate = ctx.pstate;
         vcpu.set_regs(&regs).unwrap();
         // Verify SP was set correctly
         let check = vcpu.regs().unwrap();
-        log::debug!("restore_ctx: pc={:#x} sp={:#x} pstate={:#x} (wanted sp={:#x})",
-            check.pc, check.sp, check.pstate, ctx.gpr[31]);
+        log::debug!(
+            "restore_ctx: pc={:#x} sp={:#x} pstate={:#x} (wanted sp={:#x})",
+            check.pc,
+            check.sp,
+            check.pstate,
+            ctx.gpr[31]
+        );
         if ctx.fp_dirty {
             // TODO: vcpu FP register API (Phase 3)
         }
@@ -205,7 +254,7 @@ fn save_ctx(vcpu: &mut dyn Vcpu) -> ThreadContext {
         ctx.gpr[..31].copy_from_slice(&regs.x[..31]);
         ctx.gpr[31] = regs.sp;
         ctx.gpr[32] = regs.pc;
-        ctx.pstate  = regs.pstate as u64;
+        ctx.pstate = regs.pstate as u64;
         // FP 延迟保存：暂不保存（Phase 3 加 fp_dirty 检测）
         ctx.fp_dirty = false;
     }

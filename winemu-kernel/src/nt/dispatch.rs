@@ -4,9 +4,10 @@
 
 use crate::hypercall;
 use crate::sched::{
-    check_timeouts, current_tid, now_ticks, register_thread0, sched_lock_acquire,
-    sched_lock_release, schedule, vcpu_id, with_thread_mut,
+    check_timeouts, current_tid, next_wait_deadline, now_ticks, register_thread0,
+    sched_lock_acquire, sched_lock_release, schedule, vcpu_id, with_thread_mut,
 };
+use crate::timer;
 
 use super::{file, memory, object, process, registry, section, sync, thread, SvcFrame};
 
@@ -150,23 +151,38 @@ fn restore_ctx_to_frame(tid: u32, frame: &mut SvcFrame) {
 
 fn maybe_preempt(frame: &mut SvcFrame) {
     let vid = vcpu_id();
-    let from = current_tid();
-    sched_lock_acquire();
-    check_timeouts(now_ticks());
-    let (_, to) = schedule(vid);
-    if to == 0 {
+    let mut from = current_tid();
+    loop {
+        sched_lock_acquire();
+        let now = now_ticks();
+        check_timeouts(now);
+        let (_, to) = schedule(vid);
+        if to != 0 {
+            if from != 0 && from != to {
+                save_ctx_for(from, frame);
+                restore_ctx_to_frame(to, frame);
+            } else if from == 0 {
+                // We were idling; current frame no longer belongs to a runnable thread.
+                restore_ctx_to_frame(to, frame);
+            }
+            sched_lock_release();
+            return;
+        }
+
+        // No runnable thread. Persist current frame once before sleeping.
+        if from != 0 {
+            save_ctx_for(from, frame);
+            from = 0;
+        }
+
+        let next_deadline = next_wait_deadline();
         sched_lock_release();
+
         if crate::sched::all_threads_done() {
             hypercall::process_exit(0);
         }
-        unsafe { core::arch::asm!("wfi", options(nostack, nomem)) };
-        return;
+        timer::idle_wait_until_deadline_100ns(now, next_deadline);
     }
-    if from != 0 && from != to {
-        save_ctx_for(from, frame);
-        restore_ctx_to_frame(to, frame);
-    }
-    sched_lock_release();
 }
 
 #[no_mangle]

@@ -11,6 +11,7 @@ mod mm;
 mod nt;
 mod sched;
 mod teb;
+mod timer;
 mod vectors;
 
 /// EL0 Data Abort / Instruction Abort handler.

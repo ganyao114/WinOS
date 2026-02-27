@@ -6,10 +6,12 @@ pub struct VmConfig {
 #[derive(Debug)]
 pub enum VmExit {
     Hypercall { nr: u64, args: [u64; 6] },
-    MmioRead  { addr: u64, size: u8 },
+    MmioRead { addr: u64, size: u8 },
     MmioWrite { addr: u64, data: u64, size: u8 },
-    IoRead    { port: u16, size: u8 },
-    IoWrite   { port: u16, data: u32, size: u8 },
+    IoRead { port: u16, size: u8 },
+    IoWrite { port: u16, data: u32, size: u8 },
+    Timer,
+    Wfi,
     Halt,
     Shutdown,
     Unknown(u32),
@@ -31,11 +33,24 @@ pub struct Regs {
 #[repr(C)]
 #[derive(Debug, Default, Clone)]
 pub struct Regs {
-    pub rax: u64, pub rbx: u64, pub rcx: u64, pub rdx: u64,
-    pub rsi: u64, pub rdi: u64, pub rsp: u64, pub rbp: u64,
-    pub r8:  u64, pub r9:  u64, pub r10: u64, pub r11: u64,
-    pub r12: u64, pub r13: u64, pub r14: u64, pub r15: u64,
-    pub rip: u64, pub rflags: u64,
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    pub rflags: u64,
 }
 
 #[derive(Debug, Default, Clone)]

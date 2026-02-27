@@ -555,6 +555,28 @@ pub fn check_timeouts(now_ticks: u64) {
     }
 }
 
+/// Return the earliest waiting deadline (100ns), 0 if none.
+pub fn next_wait_deadline() -> u64 {
+    let max_tid = unsafe { *SCHED.next_tid.get() };
+    let mut min_deadline = 0u64;
+    for tid in 1..max_tid {
+        let d = with_thread(tid, |t| {
+            if t.state == ThreadState::Waiting {
+                t.wait_deadline
+            } else {
+                0
+            }
+        });
+        if d == 0 {
+            continue;
+        }
+        if min_deadline == 0 || d < min_deadline {
+            min_deadline = d;
+        }
+    }
+    min_deadline
+}
+
 #[inline(always)]
 pub fn now_ticks() -> u64 {
     crate::hypercall::query_mono_time_100ns()

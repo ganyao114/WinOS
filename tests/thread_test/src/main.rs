@@ -19,6 +19,7 @@ const NR_YIELD_EXECUTION: u64   = 0x0046;
 const NR_CREATE_THREAD_EX: u64  = 0x00C1;
 
 const STATUS_SUCCESS: u64 = 0;
+const STATUS_TIMEOUT: u64 = 0x0000_0102;
 
 // ── Shared state ────────────────────────────────────────────
 static COUNTER_A: AtomicU32 = AtomicU32::new(0);
@@ -184,6 +185,21 @@ unsafe fn wait_single(handle: u64) -> u64 {
     svc(NR_WAIT_SINGLE, handle, 0, 0, 0, 0, 0, 0, 0)
 }
 
+unsafe fn wait_single_timeout_rel(handle: u64, rel_timeout_100ns: i64) -> u64 {
+    let mut timeout = rel_timeout_100ns;
+    svc(
+        NR_WAIT_SINGLE,
+        handle,
+        0,
+        &mut timeout as *mut i64 as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+    )
+}
+
 unsafe fn close(handle: u64) -> u64 {
     svc(NR_CLOSE, handle, 0, 0, 0, 0, 0, 0, 0)
 }
@@ -310,6 +326,20 @@ unsafe fn test_event_wake() {
     close(ev);
 }
 
+unsafe fn test_wait_timeout_interrupt_wake() {
+    print(b"== Wait Timeout (Timer IRQ) ==\r\n");
+
+    // Create auto-reset event, initially non-signaled.
+    let (st_ev, ev) = create_event(false, false);
+    check(b"Create event for timeout wait", st_ev == STATUS_SUCCESS);
+
+    // Relative timeout: -50_000 * 100ns = 5ms.
+    let st = wait_single_timeout_rel(ev, -50_000);
+    check(b"NtWaitForSingleObject times out", st == STATUS_TIMEOUT);
+
+    close(ev);
+}
+
 // ── Entry point ─────────────────────────────────────────────
 
 #[no_mangle]
@@ -326,6 +356,9 @@ pub extern "C" fn mainCRTStartup() -> ! {
         print(b"\r\n");
 
         test_event_wake();
+        print(b"\r\n");
+
+        test_wait_timeout_interrupt_wake();
         print(b"\r\n");
 
         // Summary
