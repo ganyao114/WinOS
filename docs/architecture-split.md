@@ -41,12 +41,11 @@
 | 功能 | 说明 |
 |------|------|
 | **物理内存映射** | 响应 guest 的 MAP_PAGES / UNMAP_PAGES hypercall，建立 GPA→HPA 映射 |
-| **文件 I/O** | NtCreateFile / NtReadFile / NtWriteFile / NtClose 等，访问 host 文件系统 |
-| **DLL 文件内容提供** | 响应 LOAD_DLL_IMAGE hypercall，把 DLL 文件内容写入 guest 内存；解析/重定位由 guest 完成 |
-| **真正的阻塞等待** | 当 guest 需要等待一个 host 事件（如文件 I/O 完成、定时器）时，VMM 负责阻塞 vCPU 线程 |
-| **进程/线程生命周期** | NtCreateProcess / NtTerminateProcess 等需要 host 资源的操作 |
+| **原始文件 I/O 原语** | HOST_OPEN / HOST_READ / HOST_WRITE / HOST_CLOSE / HOST_MMAP — 提供对 host 文件系统的原始访问；NT 文件语义（NtCreateFile 等）由 Guest Kernel 实现 |
+| **DLL/EXE 文件内容提供** | 响应 HOST_OPEN/READ hypercall，把文件内容暴露给 guest；解析/重定位/IAT 填充全部由 Guest Kernel 完成 |
+| **真正的阻塞等待** | 当 guest 需要等待 host 事件（如文件 I/O 完成、定时器）时，VMM 负责阻塞 vCPU 线程 |
+| **进程/线程生命周期** | KERNEL_READY / PROCESS_EXIT / THREAD_CREATE（初始线程）等需要 host 资源的操作 |
 | **时钟 / 定时器** | NtQuerySystemTime、NtDelayExecution 等需要 host 时钟的操作 |
-| **注册表** | 维护 in-process 注册表数据库（现有设计保留） |
 | **调试输出** | DEBUG_PRINT hypercall（现有设计保留） |
 
 ### 不需要 Hypercall 的操作（全部在 guest 完成）
