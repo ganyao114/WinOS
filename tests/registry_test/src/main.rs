@@ -7,6 +7,7 @@ const STDOUT: u64 = 0xFFFF_FFFF_FFFF_FFF5;
 
 const NR_WRITE_FILE: u64            = 0x0008;
 const NR_DELETE_KEY: u64            = 0x000C;
+const NR_DELETE_VALUE_KEY: u64      = 0x006A;
 const NR_ENUMERATE_VALUE_KEY: u64   = 0x0010;
 const NR_CLOSE: u64                 = 0x000F;
 const NR_OPEN_KEY: u64              = 0x0012;
@@ -429,6 +430,52 @@ unsafe fn test_registry_syscalls() {
         false
     };
     check(b"Enumerated value name/type are correct", enum_value_ok);
+
+    let st = svc(
+        NR_DELETE_VALUE_KEY,
+        sub_handle,
+        &mut value_us as *mut _ as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    check(b"NtDeleteValueKey returns SUCCESS", st == STATUS_SUCCESS);
+
+    let mut deleted_value_ret_len: u32 = 0;
+    let st = svc(
+        NR_QUERY_VALUE_KEY,
+        sub_handle,
+        &mut value_us as *mut _ as u64,
+        2,
+        VALUE_INFO_BUF.as_mut_ptr() as u64,
+        VALUE_INFO_BUF.len() as u64,
+        &mut deleted_value_ret_len as *mut u32 as u64,
+        0,
+        0,
+    );
+    check(
+        b"NtQueryValueKey after delete returns OBJECT_NAME_NOT_FOUND",
+        st == STATUS_OBJECT_NAME_NOT_FOUND,
+    );
+
+    let st = svc(
+        NR_DELETE_VALUE_KEY,
+        sub_handle,
+        &mut value_us as *mut _ as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    check(
+        b"NtDeleteValueKey(nonexistent) returns OBJECT_NAME_NOT_FOUND",
+        st == STATUS_OBJECT_NAME_NOT_FOUND,
+    );
 
     let st = nt_close(sub_handle);
     check(b"NtClose(subkey handle) returns SUCCESS", st == STATUS_SUCCESS);

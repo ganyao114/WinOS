@@ -663,6 +663,9 @@ pub(crate) fn handle_delete_value_key(frame: &mut SvcFrame) {
     };
 
     let value_name = read_value_name(value_name_us);
-    node.borrow_mut().delete_value(&value_name);
-    frame.x[0] = status::SUCCESS as u64;
+    if node.borrow_mut().delete_value(&value_name) {
+        frame.x[0] = status::SUCCESS as u64;
+    } else {
+        frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
+    }
 }

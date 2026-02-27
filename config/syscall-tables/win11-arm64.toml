@@ -40,6 +40,7 @@ NtCreateKey               = 0x001D
 NtQueryValueKey           = 0x0016
 NtSetValueKey             = 0x003D
 NtDeleteKey               = 0x000C
+NtDeleteValueKey          = 0x006A
 NtEnumerateKey            = 0x0032
 NtEnumerateValueKey       = 0x0010
 NtDuplicateObject         = 0x003C

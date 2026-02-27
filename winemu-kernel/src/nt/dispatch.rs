@@ -11,6 +11,7 @@ use super::{file, memory, object, process, registry, section, sync, thread, SvcF
 const NR_CREATE_EVENT: u16 = 0x0048;
 const NR_SET_INFORMATION_THREAD: u16 = 0x000D;
 const NR_DELETE_KEY: u16 = 0x000C;
+const NR_DELETE_VALUE_KEY: u16 = 0x006A;
 const NR_ENUMERATE_VALUE_KEY: u16 = 0x0010;
 const NR_OPEN_KEY: u16 = 0x0012;
 const NR_QUERY_VALUE_KEY: u16 = 0x0016;
@@ -88,6 +89,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         NR_QUERY_VALUE_KEY => registry::handle_query_value_key(frame),
         NR_SET_VALUE_KEY => registry::handle_set_value_key(frame),
         NR_DELETE_KEY => registry::handle_delete_key(frame),
+        NR_DELETE_VALUE_KEY => registry::handle_delete_value_key(frame),
         NR_ENUMERATE_KEY => registry::handle_enumerate_key(frame),
         NR_ENUMERATE_VALUE_KEY => registry::handle_enumerate_value_key(frame),
 
