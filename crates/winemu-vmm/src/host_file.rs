@@ -31,7 +31,8 @@ impl HostFileTable {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             files: Mutex::new(HashMap::new()),
-            next_fd: Mutex::new(1),
+            // Reserve 0/1/2 for stdin/stdout/stderr.
+            next_fd: Mutex::new(3),
             root: root.into(),
         }
     }
@@ -111,6 +112,13 @@ impl HostFileTable {
 
     /// Read from file into a buffer. Returns bytes read.
     pub fn read(&self, fd: u64, buf: &mut [u8], offset: u64) -> usize {
+        if fd == 0 {
+            use std::io::Read;
+            return std::io::stdin().read(buf).unwrap_or(0);
+        }
+        if fd == 1 || fd == 2 {
+            return 0;
+        }
         let mut files = self.files.lock().unwrap();
         let hf = match files.get_mut(&fd) {
             Some(f) => f,
@@ -126,6 +134,27 @@ impl HostFileTable {
 
     /// Write buffer to file. Returns bytes written.
     pub fn write(&self, fd: u64, buf: &[u8], offset: u64) -> usize {
+        if fd == 1 {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            if out.write_all(buf).is_ok() {
+                let _ = out.flush();
+                return buf.len();
+            }
+            return 0;
+        }
+        if fd == 2 {
+            use std::io::Write;
+            let mut err = std::io::stderr();
+            if err.write_all(buf).is_ok() {
+                let _ = err.flush();
+                return buf.len();
+            }
+            return 0;
+        }
+        if fd == 0 {
+            return 0;
+        }
         let mut files = self.files.lock().unwrap();
         let hf = match files.get_mut(&fd) {
             Some(f) => f,
@@ -141,11 +170,17 @@ impl HostFileTable {
 
     /// Close a file.
     pub fn close(&self, fd: u64) {
+        if fd <= 2 {
+            return;
+        }
         self.files.lock().unwrap().remove(&fd);
     }
 
     /// Query file size. Returns size (0 on error).
     pub fn stat(&self, fd: u64) -> u64 {
+        if fd <= 2 {
+            return 0;
+        }
         let files = self.files.lock().unwrap();
         match files.get(&fd) {
             Some(hf) => hf.file.metadata().map(|m| m.len()).unwrap_or(0),

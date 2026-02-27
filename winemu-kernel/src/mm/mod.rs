@@ -130,8 +130,11 @@ unsafe fn enable_mmu() {
     // Enable MMU + caches.
     // Clear SA/SA0 for bring-up and clear control bits that can restrict
     // execution on writable/user-accessible mappings during early boot.
+    // Keep SPAN=1 so EL0->EL1 exceptions don't force PAN=1; syscall handlers
+    // need to dereference user pointers (handle out params, stack args).
     sctlr |= 1 | (1 << 2) | (1 << 12); // M=1, C=1, I=1
-    sctlr &= !((1 << 3) | (1 << 4) | (1 << 19) | (1 << 20) | (1 << 22) | (1 << 23));
+    sctlr &= !((1 << 3) | (1 << 4) | (1 << 19) | (1 << 20) | (1 << 22));
+    sctlr |= 1 << 23; // SPAN=1
     crate::hypercall::debug_print("mmu: sctlr target ");
     crate::hypercall::debug_u64(sctlr);
     crate::hypercall::debug_print("\n");
