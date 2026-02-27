@@ -3,8 +3,9 @@
 // 所有状态机在 guest 内完成，不走 HVC。
 
 use super::{
-    boost_thread_priority_locked, current_tid, sched_lock_acquire, sched_lock_release,
-    set_thread_priority_locked, set_thread_state_locked, wake, with_thread, with_thread_mut,
+    boost_thread_priority_locked, clear_wait_deadline_locked, current_tid, sched_lock_acquire,
+    sched_lock_release, set_thread_priority_locked, set_thread_state_locked,
+    set_wait_deadline_locked, wake, with_thread, with_thread_mut,
     ThreadState, MAX_THREADS, MAX_WAIT_HANDLES, WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY,
     WAIT_KIND_NONE, WAIT_KIND_SINGLE,
 };
@@ -285,7 +286,6 @@ fn set_wait_metadata(tid: u32, kind: u8, handles: &[u64], timeout: WaitDeadline)
     set_thread_state_locked(tid, ThreadState::Waiting);
     with_thread_mut(tid, |t| {
         t.wait_result = STATUS_PENDING;
-        t.wait_deadline = deadline;
         t.wait_kind = kind;
         t.wait_count = count as u8;
         t.wait_signaled = 0;
@@ -296,14 +296,15 @@ fn set_wait_metadata(tid: u32, kind: u8, handles: &[u64], timeout: WaitDeadline)
             i += 1;
         }
     });
+    set_wait_deadline_locked(tid, deadline);
 }
 
 fn clear_wait_metadata(tid: u32) {
+    clear_wait_deadline_locked(tid);
     with_thread_mut(tid, |t| {
         t.wait_kind = WAIT_KIND_NONE;
         t.wait_count = 0;
         t.wait_signaled = 0;
-        t.wait_deadline = 0;
         t.wait_handles.fill(0);
     });
 }

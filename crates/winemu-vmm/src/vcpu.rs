@@ -75,7 +75,7 @@ pub fn vcpu_thread(
     log::info!("vcpu{} kernel ready — entering scheduler loop", vcpu_id);
 
     // ── Phase 2: 调度循环，运行 Guest 用户线程 ───────────────────
-    sched.register_vcpu_thread();
+    sched.register_vcpu_thread(vcpu_id);
     let mut current: Option<ThreadId> = None;
 
     'run: loop {
@@ -86,11 +86,14 @@ pub fn vcpu_thread(
         if current.is_none() {
             current = sched.pop_ready();
             if current.is_none() {
+                sched.set_vcpu_idle(vcpu_id, true);
                 std::thread::park_timeout(Duration::from_millis(1));
+                sched.set_vcpu_idle(vcpu_id, false);
                 sched.check_timeouts();
                 continue;
             }
         }
+        sched.set_vcpu_idle(vcpu_id, false);
         let tid = current.unwrap();
 
         let ctx = match sched.take_ctx(tid) {

@@ -407,25 +407,23 @@ fn wait_multiple(handles: &[Handle], wait_all: bool, timeout: u64) -> NtStatus {
 
 ## 7. 超时处理
 
-超时不依赖 host 定时器中断（EL1 无中断），而是在调度循环中检查：
+超时由 guest 内核定时器负责，核心原则是：
 
 ```
-fn schedule() {
-    // 检查所有 Waiting 线程的 deadline
-    let now = hvc_query_system_time();   // 一次 HVC，读 host 时钟
-    for t in waiting_threads() {
-        if t.wait_deadline != 0 && now >= t.wait_deadline {
-            t.wait_result = STATUS_TIMEOUT;
-            dequeue_from_wait_queue(t);
-            t.state = Ready;
-            READY_QUEUE.push(t);
-        }
-    }
-    // 然后正常选取下一个线程
+fn timer_irq() {
+    // 1) guest 侧完成 EOI（清 CNTV_CTL_EL0.ENABLE）
+    // 2) 处理到期 timeout，唤醒等待线程
+    // 3) 更新时间片，必要时触发抢占调度
+    // 4) 重新编程下一次 one-shot deadline
 }
 ```
 
-**优化**：维护一个按 deadline 排序的最小堆，避免每次遍历所有等待线程。
+实现要点：
+
+1. timeout 结构维护为最小堆（按 deadline 升序），避免每次扫描全部线程。
+2. idle 场景下，调度器编程下一次 one-shot 定时器后执行 WFI。
+3. HVF 下 vtimer unmask 与 guest EOI 对齐，确保中断风暴不会重复注入。
+4. syscall 返回路径和 timer IRQ 路径都可触发调度，但抢占决策逻辑统一走同一调度入口。
 
 ---
 
@@ -523,7 +521,37 @@ static HANDLES:    HandleTable            // TID/对象 映射表
 
 ---
 
-## 12. 性能预期
+## 12. 架构修订（2026-02）
+
+参考 Atmosphere `kern_k_scheduler.cpp` 后，调度器实现补充如下架构约束：
+
+1. 线程状态变迁单入口：
+`Ready/Running/Waiting/Terminated` 的切换必须通过统一 API 执行，禁止在业务代码直接写 `thread.state = ...`。
+统一入口负责维护 ready queue 一致性，避免“状态与队列不同步”。
+2. 调度锁职责收敛：
+`SchedLock` 仅负责并发互斥与可重入计数；解锁边界是后续“延迟调度提交”的唯一触发点。
+3. 调度触发源统一：
+syscall 尾部调度与 timer IRQ 抢占都走同一个 `schedule()` 决策路径，避免两套状态机。
+4. 职责分层目标文件：
+`sched/lock.rs`（调度锁）
+`sched/mod.rs`（调度核心/线程表）
+`timer.rs`（定时器编程与 IRQ 快路径）
+`nt/*`（只做 syscall 语义封装，不维护调度内部不变量）
+5. 多 vCPU 扩展策略：
+先完成单 vCPU 正确性（状态机/抢占/超时），再加入跨 vCPU 的 reschedule mask 与 idle vCPU 唤醒。
+
+### 12.1 当前实现进度
+
+1. 已完成：`sched/lock.rs` 独立化，调度锁与核心逻辑解耦。
+2. 已完成：引入统一线程状态迁移入口（调度核心内部），`spawn/wake/yield/timeout/terminate` 开始切换到该入口。
+3. 已完成：补齐“解锁边界延迟提交”机制，状态变更在 `SchedLock` 最外层释放时统一提交为 pending reschedule。
+4. 已完成：超时路径由 O(N) 扫描切换为最小堆（含 stale entry 惰性清理）。
+5. 已完成：加入多 vCPU `reschedule mask + idle mask` 基础设施，并在 VMM 侧补上 idle vCPU unpark 路径。
+6. 进行中：timer IRQ 驱动的无 yield 抢占回归仍有边界场景待收敛（见 `thread_test` 的 preemption 用例）。
+
+---
+
+## 13. 性能预期
 
 | 操作 | 当前（走 HVC） | 目标（guest 内） |
 |------|--------------|----------------|

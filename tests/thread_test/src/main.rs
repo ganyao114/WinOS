@@ -11,21 +11,44 @@ const NR_WRITE_FILE: u64        = 0x0008;
 const NR_WAIT_SINGLE: u64       = 0x0004;
 const NR_SET_EVENT: u64         = 0x000E;
 const NR_CLOSE: u64             = 0x000F;
+const NR_SET_INFORMATION_THREAD: u64 = 0x000D;
 const NR_TERMINATE_PROCESS: u64 = 0x002C;
 const NR_TERMINATE_THREAD: u64  = 0x0053;
 const NR_RESET_EVENT: u64       = 0x0034;
 const NR_CREATE_EVENT: u64      = 0x0048;
+const NR_CREATE_MUTEX: u64      = 0x00A9;
+const NR_RELEASE_MUTANT: u64    = 0x001C;
 const NR_YIELD_EXECUTION: u64   = 0x0046;
 const NR_CREATE_THREAD_EX: u64  = 0x00C1;
 
 const STATUS_SUCCESS: u64 = 0;
 const STATUS_TIMEOUT: u64 = 0x0000_0102;
 
+const PREEMPT_A_WORK: u32 = 12_000_000;
+const PREEMPT_B_WORK: u32 = 500_000;
+const PI_LOW_WORK: u32 = 500_000;
+const PI_MED_WORK: u32 = 1_000_000;
+
 // ── Shared state ────────────────────────────────────────────
 static COUNTER_A: AtomicU32 = AtomicU32::new(0);
 static COUNTER_B: AtomicU32 = AtomicU32::new(0);
 static DONE_A:    AtomicU32 = AtomicU32::new(0);
 static DONE_B:    AtomicU32 = AtomicU32::new(0);
+static PREEMPT_SEEN: AtomicU32 = AtomicU32::new(0);
+static PREEMPT_FLAG: AtomicU32 = AtomicU32::new(0);
+static TIMEOUT_EVENT: AtomicU32 = AtomicU32::new(0);
+static TIMEOUT_DONE: AtomicU32 = AtomicU32::new(0);
+static TIMEOUT_STATUS: AtomicU32 = AtomicU32::new(0);
+
+static LOW_GO_EVENT: AtomicU32 = AtomicU32::new(0);
+static HIGH_GO_EVENT: AtomicU32 = AtomicU32::new(0);
+static MED_GO_EVENT: AtomicU32 = AtomicU32::new(0);
+static TEST_MUTEX: AtomicU32 = AtomicU32::new(0);
+static LOW_HAS_MUTEX: AtomicU32 = AtomicU32::new(0);
+static LOW_DONE: AtomicU32 = AtomicU32::new(0);
+static HIGH_DONE: AtomicU32 = AtomicU32::new(0);
+static MED_DONE: AtomicU32 = AtomicU32::new(0);
+static HIGH_BEFORE_MED_DONE: AtomicU32 = AtomicU32::new(0);
 
 static mut PASS_COUNT: u32 = 0;
 static mut FAIL_COUNT: u32 = 0;
@@ -42,6 +65,10 @@ unsafe fn svc(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64,
         in("x1") a1, in("x2") a2, in("x3") a3,
         in("x4") a4, in("x5") a5, in("x6") a6, in("x7") a7,
         in("x8") nr,
+        lateout("x20") _, lateout("x21") _, lateout("x22") _,
+        lateout("x23") _, lateout("x24") _, lateout("x25") _, lateout("x26") _,
+        lateout("x27") _, lateout("x28") _,
+        clobber_abi("C"),
         options(nostack),
     );
     ret
@@ -61,6 +88,10 @@ unsafe fn svc10(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64,
         in("x1") a1, in("x2") a2, in("x3") a3,
         in("x4") a4, in("x5") a5, in("x6") a6, in("x7") a7,
         in("x8") nr,
+        lateout("x20") _, lateout("x21") _, lateout("x22") _,
+        lateout("x23") _, lateout("x24") _, lateout("x25") _, lateout("x26") _,
+        lateout("x27") _, lateout("x28") _,
+        clobber_abi("C"),
         options(nostack),
     );
     ret
@@ -82,6 +113,10 @@ unsafe fn svc11(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64,
         in("x1") a1, in("x2") a2, in("x3") a3,
         in("x4") a4, in("x5") a5, in("x6") a6, in("x7") a7,
         in("x8") nr,
+        lateout("x20") _, lateout("x21") _, lateout("x22") _,
+        lateout("x23") _, lateout("x24") _, lateout("x25") _, lateout("x26") _,
+        lateout("x27") _, lateout("x28") _,
+        clobber_abi("C"),
         options(nostack),
     );
     ret
@@ -177,6 +212,39 @@ unsafe fn create_event(manual: bool, initial: bool) -> (u64, u64) {
     (st, handle)
 }
 
+unsafe fn create_mutex(initial_owner: bool) -> (u64, u64) {
+    let mut handle: u64 = 0;
+    let st = svc(
+        NR_CREATE_MUTEX,
+        &mut handle as *mut u64 as u64,
+        0x001F0001,
+        0,
+        if initial_owner { 1 } else { 0 },
+        0, 0, 0, 0,
+    );
+    (st, handle)
+}
+
+unsafe fn release_mutant(handle: u64) -> u64 {
+    svc(NR_RELEASE_MUTANT, handle, 0, 0, 0, 0, 0, 0, 0)
+}
+
+unsafe fn set_thread_priority(thread_handle: u64, prio: i32) -> u64 {
+    let mut p = prio;
+    // ThreadPriority = 2
+    svc(
+        NR_SET_INFORMATION_THREAD,
+        thread_handle,
+        2,
+        &mut p as *mut i32 as u64,
+        core::mem::size_of::<i32>() as u64,
+        0,
+        0,
+        0,
+        0,
+    )
+}
+
 unsafe fn set_event(handle: u64) -> u64 {
     svc(NR_SET_EVENT, handle, 0, 0, 0, 0, 0, 0, 0)
 }
@@ -243,7 +311,87 @@ extern "C" fn thread_d(arg: u64) -> ! {
     unsafe { exit_thread() }
 }
 
+extern "C" fn thread_preempt_a(_arg: u64) -> ! {
+    let mut seen = 0u32;
+    for _ in 0..PREEMPT_A_WORK {
+        COUNTER_A.fetch_add(1, Ordering::Relaxed);
+        if PREEMPT_FLAG.load(Ordering::Acquire) != 0 {
+            seen = 1;
+            break;
+        }
+    }
+    PREEMPT_SEEN.store(seen, Ordering::Release);
+    DONE_A.store(1, Ordering::Release);
+    unsafe { exit_thread() }
+}
+
+extern "C" fn thread_preempt_b(_arg: u64) -> ! {
+    PREEMPT_FLAG.store(1, Ordering::Release);
+    for _ in 0..PREEMPT_B_WORK {
+        COUNTER_B.fetch_add(1, Ordering::Relaxed);
+    }
+    DONE_B.store(1, Ordering::Release);
+    unsafe { exit_thread() }
+}
+
+extern "C" fn thread_pi_low(_arg: u64) -> ! {
+    let go = LOW_GO_EVENT.load(Ordering::Acquire) as u64;
+    unsafe { wait_single(go); }
+    let mutex = TEST_MUTEX.load(Ordering::Acquire) as u64;
+    if unsafe { wait_single(mutex) } == STATUS_SUCCESS {
+        LOW_HAS_MUTEX.store(1, Ordering::Release);
+        for _ in 0..PI_LOW_WORK {
+            COUNTER_A.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe { release_mutant(mutex); }
+    }
+    LOW_DONE.store(1, Ordering::Release);
+    unsafe { exit_thread() }
+}
+
+extern "C" fn thread_pi_high(_arg: u64) -> ! {
+    let go = HIGH_GO_EVENT.load(Ordering::Acquire) as u64;
+    unsafe { wait_single(go); }
+    let mutex = TEST_MUTEX.load(Ordering::Acquire) as u64;
+    if unsafe { wait_single(mutex) } == STATUS_SUCCESS {
+        if MED_DONE.load(Ordering::Acquire) == 0 {
+            HIGH_BEFORE_MED_DONE.store(1, Ordering::Release);
+        }
+        unsafe { release_mutant(mutex); }
+    }
+    HIGH_DONE.store(1, Ordering::Release);
+    unsafe { exit_thread() }
+}
+
+extern "C" fn thread_pi_medium(_arg: u64) -> ! {
+    let go = MED_GO_EVENT.load(Ordering::Acquire) as u64;
+    unsafe { wait_single(go); }
+    for _ in 0..PI_MED_WORK {
+        COUNTER_B.fetch_add(1, Ordering::Relaxed);
+    }
+    MED_DONE.store(1, Ordering::Release);
+    unsafe { exit_thread() }
+}
+
+extern "C" fn thread_timeout_wait(_arg: u64) -> ! {
+    let ev = TIMEOUT_EVENT.load(Ordering::Acquire) as u64;
+    let st = unsafe { wait_single_timeout_rel(ev, -50_000) };
+    TIMEOUT_STATUS.store(st as u32, Ordering::Release);
+    TIMEOUT_DONE.store(1, Ordering::Release);
+    unsafe { exit_thread() }
+}
+
 // ── Tests ───────────────────────────────────────────────────
+
+unsafe fn wait_flag_with_yield(flag: &AtomicU32, max_iters: u32) -> bool {
+    for _ in 0..max_iters {
+        if flag.load(Ordering::Acquire) != 0 {
+            return true;
+        }
+        yield_exec();
+    }
+    false
+}
 
 unsafe fn test_basic_thread_create() {
     print(b"== Thread Create ==\r\n");
@@ -329,15 +477,126 @@ unsafe fn test_event_wake() {
 unsafe fn test_wait_timeout_interrupt_wake() {
     print(b"== Wait Timeout (Timer IRQ) ==\r\n");
 
+    TIMEOUT_DONE.store(0, Ordering::Relaxed);
+    TIMEOUT_STATUS.store(0, Ordering::Relaxed);
+
     // Create auto-reset event, initially non-signaled.
     let (st_ev, ev) = create_event(false, false);
     check(b"Create event for timeout wait", st_ev == STATUS_SUCCESS);
+    TIMEOUT_EVENT.store(ev as u32, Ordering::Release);
 
-    // Relative timeout: -50_000 * 100ns = 5ms.
-    let st = wait_single_timeout_rel(ev, -50_000);
-    check(b"NtWaitForSingleObject times out", st == STATUS_TIMEOUT);
+    let (st_t, h_t) = create_thread(thread_timeout_wait as *const () as u64, 0, 0x10000);
+    check(b"Create timeout waiter thread", st_t == STATUS_SUCCESS);
 
+    let done = wait_flag_with_yield(&TIMEOUT_DONE, 10_000);
+    check(b"Timeout waiter thread completed", done);
+    if done {
+        let st = TIMEOUT_STATUS.load(Ordering::Acquire) as u64;
+        check(b"NtWaitForSingleObject times out", st == STATUS_TIMEOUT);
+    } else {
+        check(b"NtWaitForSingleObject times out", false);
+    }
+
+    close(h_t);
     close(ev);
+}
+
+unsafe fn test_timer_preemption_without_yield() {
+    print(b"== Timer Preemption (No Yield) ==\r\n");
+
+    COUNTER_A.store(0, Ordering::Relaxed);
+    COUNTER_B.store(0, Ordering::Relaxed);
+    DONE_A.store(0, Ordering::Relaxed);
+    DONE_B.store(0, Ordering::Relaxed);
+    PREEMPT_SEEN.store(0, Ordering::Relaxed);
+    PREEMPT_FLAG.store(0, Ordering::Relaxed);
+
+    let (st_a, h_a) = create_thread(thread_preempt_a as *const () as u64, 0, 0x10000);
+    let (st_b, h_b) = create_thread(thread_preempt_b as *const () as u64, 0, 0x10000);
+    check(b"Create preempt thread A", st_a == STATUS_SUCCESS);
+    check(b"Create preempt thread B", st_b == STATUS_SUCCESS);
+
+    let a_done = wait_flag_with_yield(&DONE_A, 20_000);
+    let b_done = wait_flag_with_yield(&DONE_B, 20_000);
+    check(b"preempt thread A completed", a_done);
+    check(b"preempt thread B completed", b_done);
+    check(
+        b"thread A observed thread B before exit (requires timer preemption)",
+        PREEMPT_SEEN.load(Ordering::Acquire) != 0,
+    );
+
+    close(h_a);
+    close(h_b);
+}
+
+unsafe fn test_mutex_priority_inheritance() {
+    print(b"== Mutex Priority Inheritance ==\r\n");
+
+    COUNTER_A.store(0, Ordering::Relaxed);
+    COUNTER_B.store(0, Ordering::Relaxed);
+    LOW_HAS_MUTEX.store(0, Ordering::Relaxed);
+    LOW_DONE.store(0, Ordering::Relaxed);
+    HIGH_DONE.store(0, Ordering::Relaxed);
+    MED_DONE.store(0, Ordering::Relaxed);
+    HIGH_BEFORE_MED_DONE.store(0, Ordering::Relaxed);
+
+    let (st_low_go, low_go) = create_event(false, false);
+    let (st_high_go, high_go) = create_event(false, false);
+    let (st_med_go, med_go) = create_event(false, false);
+    check(b"Create low-go event", st_low_go == STATUS_SUCCESS);
+    check(b"Create high-go event", st_high_go == STATUS_SUCCESS);
+    check(b"Create med-go event", st_med_go == STATUS_SUCCESS);
+
+    let (st_mutex, mutex) = create_mutex(false);
+    check(b"Create mutex", st_mutex == STATUS_SUCCESS);
+    TEST_MUTEX.store(mutex as u32, Ordering::Release);
+    LOW_GO_EVENT.store(low_go as u32, Ordering::Release);
+    HIGH_GO_EVENT.store(high_go as u32, Ordering::Release);
+    MED_GO_EVENT.store(med_go as u32, Ordering::Release);
+
+    let (st_low, h_low) = create_thread(thread_pi_low as *const () as u64, 0, 0x10000);
+    let (st_med, h_med) = create_thread(thread_pi_medium as *const () as u64, 0, 0x10000);
+    let (st_high, h_high) = create_thread(thread_pi_high as *const () as u64, 0, 0x10000);
+    check(b"Create low thread", st_low == STATUS_SUCCESS);
+    check(b"Create medium thread", st_med == STATUS_SUCCESS);
+    check(b"Create high thread", st_high == STATUS_SUCCESS);
+
+    let st_prio_low = set_thread_priority(h_low, 8);
+    let st_prio_med = set_thread_priority(h_med, 12);
+    let st_prio_high = set_thread_priority(h_high, 20);
+    check(b"Set low thread priority", st_prio_low == STATUS_SUCCESS);
+    check(b"Set medium thread priority", st_prio_med == STATUS_SUCCESS);
+    check(b"Set high thread priority", st_prio_high == STATUS_SUCCESS);
+
+    set_event(low_go);
+    let low_has_mutex = wait_flag_with_yield(&LOW_HAS_MUTEX, 20_000);
+    check(b"Low thread acquired mutex first", low_has_mutex);
+
+    set_event(high_go);
+    for _ in 0..20u32 {
+        yield_exec();
+    }
+
+    set_event(med_go);
+
+    let high_done = wait_flag_with_yield(&HIGH_DONE, 20_000);
+    let med_done = wait_flag_with_yield(&MED_DONE, 20_000);
+    let low_done = wait_flag_with_yield(&LOW_DONE, 20_000);
+    check(b"High thread completed", high_done);
+    check(b"Medium thread completed", med_done);
+    check(b"Low thread completed", low_done);
+    check(
+        b"High acquired mutex before medium completed (priority inheritance)",
+        HIGH_BEFORE_MED_DONE.load(Ordering::Acquire) != 0,
+    );
+
+    close(h_low);
+    close(h_med);
+    close(h_high);
+    close(mutex);
+    close(low_go);
+    close(high_go);
+    close(med_go);
 }
 
 // ── Entry point ─────────────────────────────────────────────
@@ -359,6 +618,12 @@ pub extern "C" fn mainCRTStartup() -> ! {
         print(b"\r\n");
 
         test_wait_timeout_interrupt_wake();
+        print(b"\r\n");
+
+        test_timer_preemption_without_yield();
+        print(b"\r\n");
+
+        test_mutex_priority_inheritance();
         print(b"\r\n");
 
         // Summary

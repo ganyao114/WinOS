@@ -42,7 +42,7 @@ global_asm!(
     ".balign 128",
 
     // ── Slot 1: Current EL SP_EL0 IRQ ───────────────────────
-    "b __timer_irq",
+    "b __timer_irq_el1",
     ".balign 128",
 
     // ── Slot 2: Current EL SP_EL0 FIQ ───────────────────────
@@ -58,7 +58,7 @@ global_asm!(
     ".balign 128",
 
     // ── Slot 5: Current EL SP_EL1 IRQ ───────────────────────
-    "b __timer_irq",
+    "b __timer_irq_el1",
     ".balign 128",
 
     // ── Slot 6: Current EL SP_EL1 FIQ ───────────────────────
@@ -91,7 +91,7 @@ global_asm!(
     ".balign 128",
 
     // ── Slot 9: Lower EL AArch64 IRQ ────────────────────────
-    "b __timer_irq",
+    "b __timer_irq_el0",
     ".balign 128",
 
     // ── Slot 10: Lower EL AArch64 FIQ ───────────────────────

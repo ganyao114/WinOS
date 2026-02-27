@@ -92,7 +92,9 @@ pub struct Scheduler {
     next_tid:    AtomicU32,
     next_handle: AtomicU32,
     pub vcpu_count: u32,
-    vcpu_threads: Mutex<Vec<std::thread::Thread>>,
+    vcpu_threads: Mutex<Vec<(u32, std::thread::Thread)>>,
+    idle_vcpu_mask: AtomicU32,
+    wake_cursor: AtomicU32,
     pub shutdown: AtomicBool,
 }
 
@@ -106,20 +108,58 @@ impl Scheduler {
             next_handle:  AtomicU32::new(1),
             vcpu_count,
             vcpu_threads: Mutex::new(Vec::new()),
+            idle_vcpu_mask: AtomicU32::new(0),
+            wake_cursor: AtomicU32::new(0),
             shutdown:     AtomicBool::new(false),
         })
     }
 
     // ── vCPU 注册 ────────────────────────────────────────────
-    pub fn register_vcpu_thread(&self) {
-        self.vcpu_threads.lock().unwrap()
-            .push(std::thread::current());
+    pub fn register_vcpu_thread(&self, vcpu_id: u32) {
+        self.vcpu_threads
+            .lock()
+            .unwrap()
+            .push((vcpu_id, std::thread::current()));
+    }
+
+    pub fn set_vcpu_idle(&self, vcpu_id: u32, idle: bool) {
+        let bit = if vcpu_id < 32 { 1u32 << vcpu_id } else { 0 };
+        if bit == 0 {
+            return;
+        }
+        if idle {
+            self.idle_vcpu_mask.fetch_or(bit, Ordering::Release);
+        } else {
+            self.idle_vcpu_mask.fetch_and(!bit, Ordering::Release);
+        }
+    }
+
+    pub fn unpark_vcpu_mask(&self, mask: u32) {
+        if mask == 0 {
+            return;
+        }
+        for (id, t) in self.vcpu_threads.lock().unwrap().iter() {
+            let bit = if *id < 32 { 1u32 << *id } else { 0 };
+            if (mask & bit) != 0 {
+                t.unpark();
+            }
+        }
     }
 
     pub fn unpark_one_vcpu(&self) {
-        if let Some(t) = self.vcpu_threads.lock().unwrap().first() {
-            t.unpark();
+        let idle_mask = self.idle_vcpu_mask.load(Ordering::Acquire);
+        if idle_mask != 0 {
+            self.unpark_vcpu_mask(idle_mask);
+            return;
         }
+
+        let threads = self.vcpu_threads.lock().unwrap();
+        let len = threads.len();
+        if len == 0 {
+            return;
+        }
+        let idx = (self.wake_cursor.fetch_add(1, Ordering::Relaxed) as usize) % len;
+        threads[idx].1.unpark();
     }
 
     // ── ThreadId 分片 ────────────────────────────────────────
@@ -217,6 +257,7 @@ impl Scheduler {
     /// 检查超时，将到期的 Waiting 线程移回 Ready 队列
     pub fn check_timeouts(&self) {
         let now = Instant::now();
+        let mut woke_any = false;
         for shard in &self.threads {
             let mut map = shard.lock().unwrap();
             let expired: Vec<ThreadId> = map.values()
@@ -235,8 +276,12 @@ impl Scheduler {
                     t.ctx.gpr[0] = 0x0000_0102;
                     t.state = ThreadState::Ready;
                     self.ready.lock().unwrap().push_back(tid);
+                    woke_any = true;
                 }
             }
+        }
+        if woke_any {
+            self.unpark_one_vcpu();
         }
     }
 
@@ -255,7 +300,7 @@ impl Scheduler {
         });
         if all_done {
             self.shutdown.store(true, Ordering::Release);
-            for t in self.vcpu_threads.lock().unwrap().iter() {
+            for (_, t) in self.vcpu_threads.lock().unwrap().iter() {
                 t.unpark();
             }
         }

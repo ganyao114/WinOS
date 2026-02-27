@@ -10,7 +10,7 @@ pub mod vaspace;
 pub mod vcpu;
 
 use std::sync::{Arc, RwLock};
-use winemu_core::{addr::Gpa, mem::MemProt, Result};
+use winemu_core::{addr::Gpa, mem::MemProt, Result, WinemuError};
 use winemu_hypervisor::{Hypervisor, Vm, VmConfig};
 use memory::GuestMemory;
 use hypercall::HypercallManager;
@@ -36,7 +36,12 @@ impl Vmm {
         dll_search_paths: Vec<std::path::PathBuf>,
         exe_path: impl Into<std::path::PathBuf>,
     ) -> Result<Self> {
-        let vcpu_count = num_cpus::get() as u32;
+        let host_cpus = num_cpus::get().max(1) as u32;
+        let vcpu_count = std::env::var("WINEMU_VCPU_COUNT")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|n| n.clamp(1, host_cpus))
+            .unwrap_or(1);
         let config = VmConfig { memory_size: 512 * 1024 * 1024, vcpu_count };
         let vm: Arc<dyn Vm> = Arc::from(hypervisor.create_vm(config)?);
         let mut memory = GuestMemory::new(512 * 1024 * 1024)?;
@@ -58,10 +63,37 @@ impl Vmm {
     }
 
     pub fn run(&mut self) -> Result<()> {
-        // HVF requires hv_vcpu_create on the same thread as hv_vm_create.
-        // Run the single vCPU on the current (main) thread.
-        let vcpu = self.vm.create_vcpu(0)?;
-        vcpu::vcpu_thread(0, vcpu, Arc::clone(&self.hypercall_mgr), Arc::clone(&self.sched));
+        let mut vcpus = Vec::with_capacity(self.vcpu_count as usize);
+        for id in 0..self.vcpu_count {
+            let vcpu = self.vm.create_vcpu(id)?;
+            vcpus.push((id, vcpu));
+        }
+
+        if vcpus.len() == 1 {
+            let (id, vcpu) = vcpus.pop().unwrap();
+            vcpu::vcpu_thread(id, vcpu, Arc::clone(&self.hypercall_mgr), Arc::clone(&self.sched));
+            return Ok(());
+        }
+
+        let mut joins = Vec::with_capacity(vcpus.len());
+        for (id, vcpu) in vcpus {
+            let hc_mgr = Arc::clone(&self.hypercall_mgr);
+            let sched = Arc::clone(&self.sched);
+            let name = format!("winemu-vcpu-{id}");
+            let handle = std::thread::Builder::new()
+                .name(name)
+                .spawn(move || {
+                    vcpu::vcpu_thread(id, vcpu, hc_mgr, sched);
+                })
+                .map_err(|e| WinemuError::Hypervisor(format!("spawn vcpu thread failed: {e}")))?;
+            joins.push(handle);
+        }
+
+        for handle in joins {
+            handle
+                .join()
+                .map_err(|_| WinemuError::Hypervisor("vcpu thread panicked".to_string()))?;
+        }
         Ok(())
     }
 }
