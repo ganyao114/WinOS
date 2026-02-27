@@ -29,7 +29,7 @@ use core::arch::global_asm;
 // 超过4个参数的部分由 VMM 从 guest 栈读取（args[4]=sp）
 
 global_asm!(
-    ".section .text",
+    ".section .text,\"ax\"",
     ".global __winemu_syscall_dispatcher",
     ".balign 16",
     "__winemu_syscall_dispatcher:",

@@ -1,5 +1,6 @@
 pub mod dll;
 pub mod file_io;
+pub mod host_file;
 pub mod hypercall;
 pub mod memory;
 pub mod sched;

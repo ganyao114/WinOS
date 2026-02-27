@@ -114,6 +114,43 @@ pub mod nr {
     pub const WAVE_OUT_OPEN:  u64 = 0x0200;
     pub const WAVE_OUT_WRITE: u64 = 0x0201;
     pub const WAVE_OUT_CLOSE: u64 = 0x0202;
+
+    // ── 物理内存管理: 0x0800 - 0x080F ──────────────────────
+    /// 分配连续物理页框
+    /// args: [num_pages, 0, 0, 0, 0, 0] → 首页 GPA（失败返回 0）
+    pub const ALLOC_PHYS_PAGES: u64 = 0x0800;
+    /// 释放连续物理页框
+    /// args: [gpa, num_pages, 0, 0, 0, 0]
+    pub const FREE_PHYS_PAGES:  u64 = 0x0801;
+
+    // ── Host 文件操作: 0x0810 - 0x081F ─────────────────────
+    /// 打开宿主文件
+    /// args: [path_gpa, path_len, flags(0=RD,1=WR,2=RW,3=CREATE), 0, 0, 0]
+    /// 返回: host_fd (失败返回 u64::MAX)
+    pub const HOST_OPEN:   u64 = 0x0810;
+    /// 读取文件内容到 guest 内存
+    /// args: [host_fd, dst_gpa, len, offset(u64::MAX=current), 0, 0]
+    /// 返回: 实际读取字节数
+    pub const HOST_READ:   u64 = 0x0811;
+    /// 写入 guest 内存到文件
+    /// args: [host_fd, src_gpa, len, offset(u64::MAX=current), 0, 0]
+    /// 返回: 实际写入字节数
+    pub const HOST_WRITE:  u64 = 0x0812;
+    /// 关闭文件
+    /// args: [host_fd, 0, 0, 0, 0, 0]
+    pub const HOST_CLOSE:  u64 = 0x0813;
+    /// 查询文件大小
+    /// args: [host_fd, 0, 0, 0, 0, 0] → 文件大小（字节）
+    pub const HOST_STAT:   u64 = 0x0814;
+    /// mmap 宿主文件到 guest 物理地址空间（零拷贝）
+    /// args: [host_fd, offset, size, prot, 0, 0] → gpa (失败返回 0)
+    pub const HOST_MMAP:   u64 = 0x0815;
+    /// 解除文件映射
+    /// args: [gpa, size, 0, 0, 0, 0]
+    pub const HOST_MUNMAP: u64 = 0x0816;
+    /// 查询 EXE 文件信息（VMM 打开 exe 并返回 host_fd + size）
+    /// args: [0, 0, 0, 0, 0, 0] → packed (size<<32 | fd)
+    pub const QUERY_EXE_INFO: u64 = 0x0817;
 }
 
 /// NT 超时常量（100ns 单位）

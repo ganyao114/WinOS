@@ -43,6 +43,7 @@ NtDeleteKey               = 0x000C
 NtEnumerateKey            = 0x0032
 NtEnumerateValueKey       = 0x0010
 NtDuplicateObject         = 0x003C
+NtYieldExecution          = 0x0046
 
 [win32k]
 NtGdiCreateCompatibleDC   = 0x1012

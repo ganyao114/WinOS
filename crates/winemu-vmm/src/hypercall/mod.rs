@@ -4,6 +4,7 @@ use crate::memory::GuestMemory;
 use crate::vaspace::VaSpace;
 use crate::file_io::FileTable;
 use crate::dll::DllLoader;
+use crate::host_file::HostFileTable;
 use crate::sched::{Scheduler, ThreadId, SchedResult};
 use crate::sched::sync::{SyncHandle, SyncObject, EventObj, MutexObj, SemaphoreObj};
 use crate::syscall::{SyscallDispatcher, DispatchResult};
@@ -17,6 +18,7 @@ pub enum HypercallResult {
 pub struct HypercallManager {
     syscall_table_toml: String,
     exe_image: Vec<u8>,
+    exe_path: std::path::PathBuf,
     memory: Arc<RwLock<GuestMemory>>,
     vaspace: Arc<Mutex<VaSpace>>,
     files: FileTable,
@@ -24,6 +26,7 @@ pub struct HypercallManager {
     pub sched: Arc<Scheduler>,
     syscall_disp: SyscallDispatcher,
     dll_loader: DllLoader,
+    host_files: HostFileTable,
 }
 
 impl HypercallManager {
@@ -35,18 +38,23 @@ impl HypercallManager {
         dll_search_paths: Vec<std::path::PathBuf>,
         exe_path: impl Into<std::path::PathBuf>,
     ) -> Self {
-        let exe_image = std::fs::read(exe_path.into()).unwrap_or_default();
+        let exe_path: std::path::PathBuf = exe_path.into();
+        let exe_image = std::fs::read(&exe_path).unwrap_or_default();
+        let root_path: std::path::PathBuf = root.into();
         let syscall_disp = SyscallDispatcher::new(&syscall_table_toml);
+        let host_files = HostFileTable::new(root_path.clone());
         Self {
             syscall_table_toml,
             exe_image,
+            exe_path,
             memory,
             vaspace: Arc::new(Mutex::new(VaSpace::new())),
-            files: FileTable::new(root),
+            files: FileTable::new(root_path),
             sections: SectionTable::new(),
             sched,
             syscall_disp,
             dll_loader: DllLoader::new(dll_search_paths),
+            host_files,
         }
     }
 
@@ -491,6 +499,110 @@ impl HypercallManager {
             }
             nr::NT_YIELD_EXECUTION => {
                 HypercallResult::Sched(SchedResult::Yield)
+            }
+            // ── Host 文件操作 ──────────────────────────────────
+            nr::HOST_OPEN => {
+                let path_gpa = winemu_core::addr::Gpa(args[0]);
+                let path_len = args[1] as usize;
+                let flags = args[2];
+                if path_len == 0 || path_len > 1024 {
+                    return HypercallResult::Sync(u64::MAX);
+                }
+                let path = {
+                    let mem = self.memory.read().unwrap();
+                    let bytes = mem.read_bytes(path_gpa, path_len);
+                    match std::str::from_utf8(bytes) {
+                        Ok(s) => s.to_owned(),
+                        Err(_) => return HypercallResult::Sync(u64::MAX),
+                    }
+                };
+                let fd = self.host_files.open(&path, flags);
+                log::debug!("HOST_OPEN: path={} flags={} fd={}", path, flags, fd);
+                HypercallResult::Sync(fd)
+            }
+            nr::HOST_READ => {
+                let fd = args[0];
+                let dst_gpa = args[1];
+                let len = args[2] as usize;
+                let offset = args[3];
+                if len == 0 || len > 64 * 1024 * 1024 {
+                    return HypercallResult::Sync(0);
+                }
+                let mut buf = vec![0u8; len];
+                let got = self.host_files.read(fd, &mut buf, offset);
+                if got > 0 {
+                    let mut mem = self.memory.write().unwrap();
+                    mem.write_bytes(winemu_core::addr::Gpa(dst_gpa), &buf[..got]);
+                }
+                HypercallResult::Sync(got as u64)
+            }
+            nr::HOST_WRITE => {
+                let fd = args[0];
+                let src_gpa = args[1];
+                let len = args[2] as usize;
+                let offset = args[3];
+                if len == 0 || len > 64 * 1024 * 1024 {
+                    return HypercallResult::Sync(0);
+                }
+                let buf = {
+                    let mem = self.memory.read().unwrap();
+                    mem.read_bytes(winemu_core::addr::Gpa(src_gpa), len).to_vec()
+                };
+                let written = self.host_files.write(fd, &buf, offset);
+                HypercallResult::Sync(written as u64)
+            }
+            nr::HOST_CLOSE => {
+                self.host_files.close(args[0]);
+                HypercallResult::Sync(0)
+            }
+            nr::HOST_STAT => {
+                let size = self.host_files.stat(args[0]);
+                HypercallResult::Sync(size)
+            }
+            nr::HOST_MMAP => {
+                // args: [host_fd, offset, size, prot, 0, 0] → gpa (0 on failure)
+                // Simple implementation: read file contents into guest memory
+                let fd = args[0];
+                let offset = args[1];
+                let size = args[2] as usize;
+                if size == 0 || size > 64 * 1024 * 1024 {
+                    return HypercallResult::Sync(0);
+                }
+                // Allocate VA space for the mapping
+                let va = self.vaspace.lock().unwrap().alloc(0, size as u64, args[3] as u32);
+                match va {
+                    Some(gpa) => {
+                        let mut buf = vec![0u8; size];
+                        let got = self.host_files.read(fd, &mut buf, offset);
+                        if got > 0 {
+                            let mut mem = self.memory.write().unwrap();
+                            mem.write_bytes(winemu_core::addr::Gpa(gpa), &buf[..got]);
+                        }
+                        log::debug!("HOST_MMAP: fd={} off={:#x} size={:#x} → gpa={:#x}", fd, offset, size, gpa);
+                        HypercallResult::Sync(gpa)
+                    }
+                    None => {
+                        log::warn!("HOST_MMAP: VA alloc failed size={:#x}", size);
+                        HypercallResult::Sync(0)
+                    }
+                }
+            }
+            nr::HOST_MUNMAP => {
+                // args: [gpa, size, 0, 0, 0, 0]
+                let base = args[0];
+                let ok = self.vaspace.lock().unwrap().free(base);
+                log::debug!("HOST_MUNMAP: gpa={:#x} ok={}", base, ok);
+                HypercallResult::Sync(if ok { 0 } else { u64::MAX })
+            }
+            nr::QUERY_EXE_INFO => {
+                let fd = self.host_files.open_absolute(&self.exe_path, 0);
+                if fd == u64::MAX {
+                    log::error!("QUERY_EXE_INFO: failed to open {:?}", self.exe_path);
+                    return HypercallResult::Sync(u64::MAX);
+                }
+                let size = self.host_files.stat(fd);
+                log::info!("QUERY_EXE_INFO: fd={} size={:#x}", fd, size);
+                HypercallResult::Sync(fd | (size << 32))
             }
             _ => {
                 log::warn!("unhandled hypercall nr={:#x}", hypercall_nr);

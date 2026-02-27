@@ -99,3 +99,56 @@ pub fn get_proc_address(dll_base: u64, name: &str) -> u64 {
         0, 0, 0,
     )
 }
+
+// ── Host 文件操作 ──────────────────────────────────────────
+
+/// HOST_OPEN — 打开宿主文件，返回 fd（失败返回 u64::MAX）
+pub fn host_open(path: &str, flags: u64) -> u64 {
+    hypercall(nr::HOST_OPEN, path.as_ptr() as u64, path.len() as u64, flags)
+}
+
+/// HOST_READ — 读取文件到 dst 指针，返回实际读取字节数
+pub fn host_read(fd: u64, dst: *mut u8, len: usize, offset: u64) -> usize {
+    hypercall6(nr::HOST_READ, fd, dst as u64, len as u64, offset, 0, 0) as usize
+}
+
+/// HOST_WRITE — 写入 src 指针到文件，返回实际写入字节数
+pub fn host_write(fd: u64, src: *const u8, len: usize, offset: u64) -> usize {
+    hypercall6(nr::HOST_WRITE, fd, src as u64, len as u64, offset, 0, 0) as usize
+}
+
+/// HOST_CLOSE — 关闭文件
+pub fn host_close(fd: u64) {
+    hypercall(nr::HOST_CLOSE, fd, 0, 0);
+}
+
+/// HOST_STAT — 查询文件大小
+pub fn host_stat(fd: u64) -> u64 {
+    hypercall(nr::HOST_STAT, fd, 0, 0)
+}
+
+/// QUERY_EXE_INFO — VMM 打开 exe 并返回 packed (size<<32 | fd)
+/// 返回 (fd, file_size)，fd == u64::MAX 表示失败
+pub fn query_exe_info() -> (u64, u64) {
+    let ret = hypercall(nr::QUERY_EXE_INFO, 0, 0, 0);
+    if ret == u64::MAX {
+        (u64::MAX, 0)
+    } else {
+        let fd = ret & 0xFFFF_FFFF;
+        let size = ret >> 32;
+        (fd, size)
+    }
+}
+
+pub fn debug_u64(val: u64) {
+    let hex = b"0123456789abcdef";
+    let mut buf = [0u8; 18]; // "0x" + 16 hex digits
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16usize {
+        let shift = (15 - i) * 4;
+        buf[2 + i] = hex[((val >> shift) & 0xF) as usize];
+    }
+    let s = unsafe { core::str::from_utf8_unchecked(&buf) };
+    debug_print(s);
+}

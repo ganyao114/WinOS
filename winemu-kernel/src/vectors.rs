@@ -21,7 +21,7 @@ use core::arch::global_asm;
 // Dedicated SVC stack in .bss — lives well below __heap_start,
 // so it never overlaps with exe/dll images allocated from the heap.
 global_asm!(
-    ".section .bss",
+    ".bss",
     ".balign 16",
     ".global __svc_stack_bottom",
     "__svc_stack_bottom:",
@@ -32,7 +32,7 @@ global_asm!(
 
 global_asm!(
     // 2KB 对齐，放在 .text.vectors section
-    ".section .text.vectors",
+    ".section .text.vectors,\"ax\"",
     ".balign 2048",
     ".global __exception_vectors",
     "__exception_vectors:",
@@ -70,59 +70,18 @@ global_asm!(
     "b .",
     ".balign 128",
 
-    // ── Slot 8: Lower EL AArch64 Sync (SVC from EL0) ────────
-    // 约定：x8 = (table<<12)|syscall_nr, x0-x7 = args
-    // HVC 约定（VMM 从 vCPU regs 读取）：
-    //   x0  = NT_SYSCALL (0x0700)
-    //   x9  = syscall_nr (x8 & 0xFFF)
-    //   x10 = table_nr   (x8 >> 12 & 0x3)
-    //   x11 = orig_x0    (FileHandle / arg0)
-    //   x1-x7 = original syscall args 1-7 (untouched)
-    // Reset SP_EL1 to fixed SVC stack top each entry (avoids SP_EL1 leak)
-    // Use TPIDR_EL1 as per-CPU scratch to save x9 before overwriting it.
-    // SVC stack layout (SP_EL1 after all pushes, low addr first):
-    //   [sp+ 0] = elr_el1_orig  (SVC return PC, hvc would clobber it)
-    //   [sp+ 8] = spsr_el1_orig (EL0 pstate)
-    //   [sp+16] = x11_orig
-    //   [sp+24] = x12_orig
-    //   [sp+32] = x9_orig
-    //   [sp+40] = x10_orig
-    //   [sp+48] = x29_orig
-    //   [sp+56] = x30_orig
-    "msr tpidr_el1, x9",               // save user's x9 to EL1 system register
-    "adr x9, __svc_stack_top",         // x9 = SVC stack top (BSS, below heap)
-    "mov sp, x9",
-    // Save scratch regs (push order: x29/x30, x9/x10, x11/x12, then elr/spsr)
-    // Final SP_EL1 layout (low addr = top of stack):
-    //   [sp+ 0]=elr_orig, [sp+ 8]=spsr_orig (pushed last → lowest addr)
-    //   [sp+16]=x11_orig, [sp+24]=x12_orig
-    //   [sp+32]=x9_orig,  [sp+40]=x10_orig
-    //   [sp+48]=x29_orig, [sp+56]=x30_orig
-    "stp x29, x30, [sp, #-16]!",
-    "mrs x9, tpidr_el1",               // restore user's x9 from system register
-    "stp x9,  x10, [sp, #-16]!",
-    "stp x11, x12, [sp, #-16]!",
-    // Save ELR_EL1 and SPSR_EL1 — hvc will overwrite them
-    "mrs x9,  elr_el1",
-    "mrs x10, spsr_el1",
-    "stp x9,  x10, [sp, #-16]!",
-    // Extract syscall_nr (x9) and table_nr (x10) from x8
-    "and x9,  x8, #0xFFF",
-    "lsr x10, x8, #12",
-    "and x10, x10, #0x3",
-    // x11 = orig_x0 (VMM reads from regs.x[11]); x1-x7 untouched
-    "mov x11, x0",
-    "mov x0, #0x0700",          // HVC x0 = NT_SYSCALL
-    "hvc #0",
-    // Restore ELR_EL1 and SPSR_EL1 (hvc clobbered them)
-    "ldp x9,  x10, [sp], #16",
-    "msr elr_el1,  x9",
-    "msr spsr_el1, x10",
-    // Restore scratch regs
-    "ldp x11, x12, [sp], #16",
-    "ldp x9,  x10, [sp], #16",
-    "ldp x29, x30, [sp], #16",
-    "eret",
+    // ── Slot 8: Lower EL AArch64 Sync ────────────────────────
+    // Save x9 first, then use it for dispatch. x10 is NOT touched here.
+    "msr tpidr_el1, x9",          // save user x9 before clobbering
+    "mrs x9, esr_el1",
+    "lsr x9, x9, #26",            // EC = bits[31:26]
+    "cmp x9, #0x15",              // EC=0x15 → SVC from AArch64
+    "b.eq __el0_svc",
+    "cmp x9, #0x24",              // EC=0x24 → Data Abort from lower EL
+    "b.eq __el0_da",
+    "cmp x9, #0x20",              // EC=0x20 → Instruction Abort from lower EL
+    "b.eq __el0_da",
+    "b .",                          // unknown exception — hang
     ".balign 128",
 
     // ── Slot 9: Lower EL AArch64 IRQ ────────────────────────
@@ -146,6 +105,64 @@ global_asm!(
     ".balign 128",
     "b .",
     ".balign 128",
+
+    // ════════════════════════════════════════════════════════════
+    // Out-of-line handlers (no 128-byte limit)
+    // ════════════════════════════════════════════════════════════
+
+    // ── SVC from EL0 ───────────────────────────────────────────
+    // x9 was already saved to tpidr_el1 by the Slot 8 dispatch above.
+    "__el0_svc:",
+    "ldr x9, =__svc_stack_top",
+    "mov sp, x9",
+    "stp x29, x30, [sp, #-16]!",
+    "mrs x9, tpidr_el1",
+    "stp x9,  x10, [sp, #-16]!",
+    "stp x11, x12, [sp, #-16]!",
+    "mrs x9,  elr_el1",
+    "mrs x10, spsr_el1",
+    "stp x9,  x10, [sp, #-16]!",
+    "and x9,  x8, #0xFFF",
+    "lsr x10, x8, #12",
+    "and x10, x10, #0x3",
+    "mov x11, x0",
+    "mov x0, #0x0700",
+    "hvc #0",
+    "ldp x9,  x10, [sp], #16",
+    "msr elr_el1,  x9",
+    "msr spsr_el1, x10",
+    "ldp x11, x12, [sp], #16",
+    "ldp x9,  x10, [sp], #16",
+    "ldp x29, x30, [sp], #16",
+    "eret",
+
+    // ── Data Abort / Instruction Abort from EL0 ────────────────
+    // x9 was already saved to tpidr_el1 by the Slot 8 dispatch above.
+    "__el0_da:",
+    "ldr x9, =__svc_stack_top",
+    "mov sp, x9",
+    "stp x29, x30, [sp, #-16]!",
+    "mrs x9, tpidr_el1",
+    "stp x9,  x10, [sp, #-16]!",
+    // Save ELR/SPSR
+    "mrs x9,  elr_el1",
+    "mrs x10, spsr_el1",
+    "stp x9,  x10, [sp, #-16]!",
+    // Args for Rust handler
+    "mrs x0, far_el1",
+    "mrs x1, esr_el1",
+    "mrs x2, elr_el1",
+    "bl el0_page_fault",
+    // Restore ELR/SPSR
+    "ldp x9,  x10, [sp], #16",
+    "msr elr_el1,  x9",
+    "msr spsr_el1, x10",
+    "ldp x9,  x10, [sp], #16",
+    "ldp x29, x30, [sp], #16",
+    // Check return value: x0 = 1 means resolved
+    "cbnz x0, 1f",
+    "b .",                          // unresolved fault — hang
+    "1: eret",
 );
 
 extern "C" {

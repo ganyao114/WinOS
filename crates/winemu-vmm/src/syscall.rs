@@ -266,8 +266,10 @@ impl SyscallDispatcher {
             }
             "NtClose" => {
                 let handle = extra(0);
-                // Try file handle first, then sync handle
+                // Try file handle first, then section handle, then sync handle
                 let st = if files.close(handle) == status::SUCCESS as u64 {
+                    status::SUCCESS as u64
+                } else if sections.close(handle) {
                     status::SUCCESS as u64
                 } else if sched.close_handle(SyncHandle(handle as u32)) {
                     status::SUCCESS as u64
@@ -278,12 +280,19 @@ impl SyscallDispatcher {
             }
             // ── 同步 ─────────────────────────────────────────
             "NtCreateEvent" => {
-                let event_type = extra(2) as u32; // 0=NotificationEvent(manual), 1=SynchronizationEvent(auto)
-                let initial    = extra(3) != 0;
-                let manual     = event_type == 0;
+                // NtCreateEvent(OUT PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, EVENT_TYPE, BOOLEAN)
+                // x0=EventHandle ptr, x1=DesiredAccess, x2=ObjectAttributes, x3=EventType, x4=InitialState
+                let handle_gpa = extra(0);
+                let event_type = extra(3) as u32; // 0=NotificationEvent(manual), 1=SynchronizationEvent(auto)
+                let initial    = extra(4) != 0;
+                let manual_reset = event_type == 0;
                 let h = sched.alloc_handle();
-                sched.insert_object(h, SyncObject::Event(EventObj::new(manual, initial)));
-                DispatchResult::Sync(h.0 as u64)
+                sched.insert_object(h, SyncObject::Event(EventObj::new(manual_reset, initial)));
+                if handle_gpa != 0 {
+                    memory.write().unwrap()
+                        .write_bytes(Gpa(handle_gpa), &(h.0 as u64).to_le_bytes());
+                }
+                DispatchResult::Sync(status::SUCCESS as u64)
             }
             "NtWaitForSingleObject" => {
                 let handle  = SyncHandle(extra(0) as u32);
@@ -291,6 +300,47 @@ impl SyscallDispatcher {
                 let timeout = extra(2) as i64;
                 let _ = alertable; // Phase 3: APC
                 DispatchResult::Sched(sched.wait_single(tid, handle, timeout))
+            }
+            "NtSetEvent" => {
+                // NtSetEvent(EventHandle, OUT PLONG PreviousState)
+                let handle = SyncHandle(extra(0) as u32);
+                let prev_gpa = extra(1);
+                let shard = Scheduler::object_shard_pub(handle);
+                let mut map = sched.objects[shard].lock().unwrap();
+                if let Some(SyncObject::Event(ref mut evt)) = map.get_mut(&handle) {
+                    let prev = if evt.signaled { 1u64 } else { 0u64 };
+                    let wakeups = evt.set();
+                    drop(map);
+                    for wake_tid in wakeups {
+                        sched.push_ready(wake_tid);
+                    }
+                    if prev_gpa != 0 {
+                        memory.write().unwrap()
+                            .write_bytes(Gpa(prev_gpa), &(prev as u32).to_le_bytes());
+                    }
+                    DispatchResult::Sync(status::SUCCESS as u64)
+                } else {
+                    drop(map);
+                    DispatchResult::Sync(status::INVALID_HANDLE as u64)
+                }
+            }
+            "NtResetEvent" => {
+                // NtResetEvent(EventHandle, OUT PLONG PreviousState)
+                let handle = SyncHandle(extra(0) as u32);
+                let prev_gpa = extra(1);
+                let shard = Scheduler::object_shard_pub(handle);
+                let mut map = sched.objects[shard].lock().unwrap();
+                if let Some(SyncObject::Event(ref mut evt)) = map.get_mut(&handle) {
+                    let prev = if evt.signaled { 1u64 } else { 0u64 };
+                    evt.reset();
+                    if prev_gpa != 0 {
+                        memory.write().unwrap()
+                            .write_bytes(Gpa(prev_gpa), &(prev as u32).to_le_bytes());
+                    }
+                    DispatchResult::Sync(status::SUCCESS as u64)
+                } else {
+                    DispatchResult::Sync(status::INVALID_HANDLE as u64)
+                }
             }
             "NtWaitForMultipleObjects" => {
                 let count    = extra(0) as usize;
@@ -807,14 +857,28 @@ impl SyscallDispatcher {
             "NtDuplicateObject" => {
                 // a[0]=SrcProcess, a[1]=SrcHandle, a[2]=DstProcess
                 // a[3]=*DstHandle, a[4]=DesiredAccess, a[5]=HandleAttributes, a[6]=Options
-                // Simple: copy the handle value as-is
-                let src_handle = extra(1);
-                let dst_gpa    = extra(3);
-                if dst_gpa != 0 {
-                    memory.write().unwrap()
-                        .write_bytes(Gpa(dst_gpa), &src_handle.to_le_bytes());
+                let src_h = SyncHandle(extra(1) as u32);
+                let dst_gpa = extra(3);
+                let shard = Scheduler::object_shard_pub(src_h);
+                let map = sched.objects[shard].lock().unwrap();
+                let cloned = match map.get(&src_h) {
+                    Some(SyncObject::Event(e)) => {
+                        Some(SyncObject::Event(EventObj::new(e.manual_reset, e.signaled)))
+                    }
+                    _ => None,
+                };
+                drop(map);
+                if let Some(obj) = cloned {
+                    let new_h = sched.alloc_handle();
+                    sched.insert_object(new_h, obj);
+                    if dst_gpa != 0 {
+                        memory.write().unwrap()
+                            .write_bytes(Gpa(dst_gpa), &(new_h.0 as u64).to_le_bytes());
+                    }
+                    DispatchResult::Sync(status::SUCCESS as u64)
+                } else {
+                    DispatchResult::Sync(status::INVALID_HANDLE as u64)
                 }
-                DispatchResult::Sync(status::SUCCESS as u64)
             }
             // ── 对象查询 ──────────────────────────────────────
             "NtQueryObject" => {
