@@ -3,7 +3,8 @@
 // 所有状态机在 guest 内完成，不走 HVC。
 
 use super::{
-    current_tid, sched_lock_acquire, sched_lock_release, wake, with_thread, with_thread_mut,
+    boost_thread_priority_locked, current_tid, sched_lock_acquire, sched_lock_release,
+    set_thread_priority_locked, set_thread_state_locked, wake, with_thread, with_thread_mut,
     ThreadState, MAX_THREADS, MAX_WAIT_HANDLES, WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY,
     WAIT_KIND_NONE, WAIT_KIND_SINGLE,
 };
@@ -116,6 +117,30 @@ impl WaitQueue {
             i += 1;
         }
     }
+
+    pub fn highest_waiting_priority(&self) -> Option<u8> {
+        let mut best: Option<u8> = None;
+        for i in 0..self.len {
+            let tid = self.tids[i];
+            if tid == 0 {
+                continue;
+            }
+            let prio = with_thread(tid, |t| {
+                if t.state == ThreadState::Waiting {
+                    Some(t.priority)
+                } else {
+                    None
+                }
+            });
+            if let Some(p) = prio {
+                best = match best {
+                    Some(cur) if cur >= p => Some(cur),
+                    _ => Some(p),
+                };
+            }
+        }
+        best
+    }
 }
 
 // ── KEvent ────────────────────────────────────────────────────
@@ -221,6 +246,26 @@ pub fn handle_idx(h: u64) -> u16 {
     (h & 0xFFF) as u16
 }
 
+fn recompute_owned_mutex_priority_locked(owner_tid: u32) {
+    if owner_tid == 0 || owner_tid as usize >= MAX_THREADS {
+        return;
+    }
+    let mut target = with_thread(owner_tid, |t| t.base_priority);
+    unsafe {
+        for i in 1..MAX_MUTEXES {
+            if !MUTEXES[i].in_use || MUTEXES[i].owner_tid != owner_tid {
+                continue;
+            }
+            if let Some(waiter_prio) = MUTEXES[i].waiters.highest_waiting_priority() {
+                if waiter_prio > target {
+                    target = waiter_prio;
+                }
+            }
+        }
+    }
+    set_thread_priority_locked(owner_tid, target);
+}
+
 // ── 内部辅助 ──────────────────────────────────────────────────
 
 fn deadline_ticks(timeout: WaitDeadline) -> u64 {
@@ -237,8 +282,8 @@ fn set_wait_metadata(tid: u32, kind: u8, handles: &[u64], timeout: WaitDeadline)
         handles.len()
     };
     let deadline = deadline_ticks(timeout);
+    set_thread_state_locked(tid, ThreadState::Waiting);
     with_thread_mut(tid, |t| {
-        t.state = ThreadState::Waiting;
         t.wait_result = STATUS_PENDING;
         t.wait_deadline = deadline;
         t.wait_kind = kind;
@@ -361,10 +406,12 @@ fn consume_handle_signal_locked(waiter_tid: u32, h: u64) -> bool {
             if m.owner_tid == 0 {
                 m.owner_tid = waiter_tid;
                 m.recursion = 1;
+                recompute_owned_mutex_priority_locked(waiter_tid);
                 return true;
             }
             if m.owner_tid == waiter_tid {
                 m.recursion = m.recursion.saturating_add(1);
+                recompute_owned_mutex_priority_locked(waiter_tid);
                 return true;
             }
             false
@@ -435,6 +482,11 @@ fn register_waiter_on_handle_locked(h: u64, tid: u32) {
         HANDLE_TYPE_MUTEX => unsafe {
             if idx > 0 && idx < MAX_MUTEXES && MUTEXES[idx].in_use {
                 MUTEXES[idx].waiters.enqueue(tid);
+                let owner_tid = MUTEXES[idx].owner_tid;
+                if owner_tid != 0 && owner_tid != tid {
+                    let waiter_prio = with_thread(tid, |t| t.priority);
+                    boost_thread_priority_locked(owner_tid, waiter_prio);
+                }
             }
         },
         HANDLE_TYPE_SEMAPHORE => unsafe {
@@ -826,11 +878,16 @@ pub fn mutex_release(idx: u16) -> u32 {
             return STATUS_SUCCESS;
         }
 
-        with_thread_mut(cur, |t| t.priority = t.base_priority);
         (*m_ptr).owner_tid = 0;
 
         let h = make_handle(HANDLE_TYPE_MUTEX, idx);
         let _ = wake_queue_one_for_handle_locked(&mut (*m_ptr).waiters, h);
+
+        recompute_owned_mutex_priority_locked(cur);
+        let new_owner = (*m_ptr).owner_tid;
+        if new_owner != 0 {
+            recompute_owned_mutex_priority_locked(new_owner);
+        }
 
         sched_lock_release();
     }

@@ -3,9 +3,12 @@
 // 借鉴 yuzu KAbstractSchedulerLock 的"延迟更新"模式。
 // vCPU 空闲时执行 WFI → VM exit → VMM park 宿主线程。
 
+mod lock;
 pub mod sync;
 
 use core::cell::UnsafeCell;
+
+pub use lock::{sched_lock_acquire, sched_lock_release};
 
 // ── 常量 ─────────────────────────────────────────────────────
 
@@ -62,6 +65,10 @@ pub struct KThread {
     pub wait_count: u8,     // number of handles in wait_handles
     pub wait_signaled: u64, // bitmask for WAIT_KIND_MULTI_ALL
 
+    // 时间片记账（100ns）
+    pub slice_remaining_100ns: u64,
+    pub last_start_100ns: u64,
+
     // 侵入式链表节点（就绪队列 / 等待队列）
     pub sched_next: u32, // TID of next in ready queue (0 = end)
     pub wait_next: u32,  // TID of next in wait queue (0 = end)
@@ -88,6 +95,8 @@ impl KThread {
             wait_kind: WAIT_KIND_NONE,
             wait_count: 0,
             wait_signaled: 0,
+            slice_remaining_100ns: 0,
+            last_start_100ns: 0,
             sched_next: 0,
             wait_next: 0,
             wait_handles: [0u64; MAX_WAIT_HANDLES],
@@ -145,6 +154,14 @@ impl ReadyQueue {
             self.present &= !(1u32 << p);
         }
         tid
+    }
+
+    pub fn highest_priority(&self) -> Option<u8> {
+        if self.present == 0 {
+            None
+        } else {
+            Some((31 - self.present.leading_zeros() as usize) as u8)
+        }
     }
 
     pub fn remove(&mut self, tid: u32) {
@@ -207,9 +224,7 @@ pub struct Scheduler {
 unsafe impl Sync for Scheduler {}
 
 pub static SCHED: Scheduler = Scheduler {
-    threads: UnsafeCell::new(unsafe {
-        core::mem::transmute([0u8; core::mem::size_of::<[KThread; MAX_THREADS]>()])
-    }),
+    threads: UnsafeCell::new([const { KThread::zeroed() }; MAX_THREADS]),
     ready: UnsafeCell::new(ReadyQueue::new()),
     vcpus: UnsafeCell::new([const { KScheduler::new() }; MAX_VCPUS]),
     next_tid: UnsafeCell::new(1),
@@ -264,66 +279,30 @@ pub fn current_thread_mut<R>(f: impl FnOnce(&mut KThread) -> R) -> R {
     with_thread_mut(current_tid(), f)
 }
 
-// ── 调度锁 ────────────────────────────────────────────────────
-// 可重入；底层用原子自旋锁保护多 vCPU 并发。
-// lock_owner 存 vcpu_id+1（0 = 未持有）。
-
-fn spinlock_acquire() {
-    unsafe {
-        let p = SCHED.spinlock.get();
-        loop {
-            // STXR/LDXR 自旋
-            core::arch::asm!(
-                "1: ldaxr {old:w}, [{p}]",
-                "   cbnz  {old:w}, 1b",
-                "   stxr  {old:w}, {one:w}, [{p}]",
-                "   cbnz  {old:w}, 1b",
-                p   = in(reg) p,
-                old = out(reg) _,
-                one = in(reg) 1u32,
-                options(nostack)
-            );
-            break;
-        }
+// 调度状态变迁的唯一入口（调用者必须持有 sched lock）。
+pub(crate) fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
+    if tid == 0 || tid as usize >= MAX_THREADS {
+        return;
     }
-}
-
-fn spinlock_release() {
-    unsafe {
-        core::arch::asm!(
-            "stlr wzr, [{}]",
-            in(reg) SCHED.spinlock.get(),
-            options(nostack)
-        );
+    let old_state = with_thread(tid, |t| t.state);
+    if old_state == new_state {
+        return;
     }
-}
 
-pub fn sched_lock_acquire() {
-    let vid = vcpu_id();
-    let owner_key = (vid as u32) + 1;
     unsafe {
-        let owner = SCHED.lock_owner.get();
-        let count = SCHED.lock_count.get();
-        if *owner == owner_key && *count > 0 {
-            *count += 1;
-            return;
+        if old_state == ThreadState::Ready {
+            (*SCHED.ready.get()).remove(tid);
         }
-        spinlock_acquire();
-        *owner = owner_key;
-        *count = 1;
-    }
-}
 
-pub fn sched_lock_release() {
-    unsafe {
-        let count = SCHED.lock_count.get();
-        if *count == 0 {
-            return;
-        }
-        *count -= 1;
-        if *count == 0 {
-            *SCHED.lock_owner.get() = 0;
-            spinlock_release();
+        with_thread_mut(tid, |t| {
+            t.state = new_state;
+            if new_state != ThreadState::Running {
+                t.last_start_100ns = 0;
+            }
+        });
+
+        if new_state == ThreadState::Ready {
+            with_thread_mut(tid, |t| (*SCHED.ready.get()).push(t));
         }
     }
 }
@@ -332,15 +311,17 @@ pub fn sched_lock_release() {
 
 /// 分配新 TID，初始化 KThread，加入就绪队列
 pub fn spawn(pc: u64, sp: u64, arg: u64, teb_va: u64, priority: u8) -> u32 {
+    sched_lock_acquire();
     unsafe {
         let tid = *SCHED.next_tid.get();
         if tid as usize >= MAX_THREADS {
+            sched_lock_release();
             return 0;
         }
         *SCHED.next_tid.get() = tid + 1;
 
         let t = &mut (*SCHED.threads.get())[tid as usize];
-        t.state = ThreadState::Ready;
+        t.state = ThreadState::Free;
         t.priority = priority;
         t.base_priority = priority;
         t.tid = tid;
@@ -356,53 +337,74 @@ pub fn spawn(pc: u64, sp: u64, arg: u64, teb_va: u64, priority: u8) -> u32 {
         t.wait_kind = WAIT_KIND_NONE;
         t.wait_count = 0;
         t.wait_signaled = 0;
+        t.slice_remaining_100ns = 0;
+        t.last_start_100ns = 0;
         t.sched_next = 0;
         t.wait_next = 0;
         t.wait_handles.fill(0);
 
-        (*SCHED.ready.get()).push(t);
+        set_thread_state_locked(tid, ThreadState::Ready);
+        sched_lock_release();
         tid
     }
 }
 
 // ── 调度核心 ──────────────────────────────────────────────────
 
-/// 选取下一个线程并切换（在 sched_lock_release 末尾调用）
+/// 选取下一个线程并切换（在 trap 路径持锁调用）
 /// 返回 (from_tid, to_tid)；若无需切换则 from == to；to == 0 表示 WFI idle
-pub fn schedule(vcpu_id: usize) -> (u32, u32) {
+pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32) {
     unsafe {
         let vcpu = &mut (*SCHED.vcpus.get())[vcpu_id];
         let cur_tid = vcpu.current_tid;
+        let cur_running = cur_tid != 0 && with_thread(cur_tid, |t| t.state == ThreadState::Running);
+
+        // Strict priority preemption:
+        // keep current running thread unless there exists a higher-priority ready thread.
+        if cur_running {
+            let cur_prio = with_thread(cur_tid, |t| t.priority);
+            match (*SCHED.ready.get()).highest_priority() {
+                None => return (cur_tid, cur_tid),
+                Some(ready_prio) if ready_prio <= cur_prio => return (cur_tid, cur_tid),
+                _ => {}
+            }
+        }
+
         let next_tid = (*SCHED.ready.get()).pop_highest();
 
         if next_tid == 0 {
             // No ready threads — if current thread is still Running, keep it
-            if cur_tid != 0 {
-                let still_running = with_thread(cur_tid, |t| t.state == ThreadState::Running);
-                if still_running {
-                    return (cur_tid, cur_tid);
-                }
+            if cur_running {
+                return (cur_tid, cur_tid);
             }
             // No runnable threads at all → WFI
             return (cur_tid, 0);
         }
 
-        if next_tid == cur_tid {
-            // Same thread — keep it Running, no switch needed
-            with_thread_mut(cur_tid, |t| t.state = ThreadState::Running);
-            return (cur_tid, cur_tid);
+        if cur_running {
+            if next_tid == cur_tid {
+                set_thread_state_locked(cur_tid, ThreadState::Running);
+                with_thread_mut(cur_tid, |t| {
+                    if t.slice_remaining_100ns == 0 {
+                        t.slice_remaining_100ns = quantum_100ns.max(1);
+                    }
+                    t.last_start_100ns = now_100ns;
+                });
+                return (cur_tid, cur_tid);
+            }
+            let cur_state = with_thread(cur_tid, |t| t.state);
+            if cur_state == ThreadState::Running {
+                set_thread_state_locked(cur_tid, ThreadState::Ready);
+            }
         }
 
-        if cur_tid != 0 {
-            with_thread_mut(cur_tid, |t| {
-                if t.state == ThreadState::Running {
-                    t.state = ThreadState::Ready;
-                    (*SCHED.ready.get()).push(t);
-                }
-            });
-        }
-
-        with_thread_mut(next_tid, |t| t.state = ThreadState::Running);
+        set_thread_state_locked(next_tid, ThreadState::Running);
+        with_thread_mut(next_tid, |t| {
+            if t.slice_remaining_100ns == 0 {
+                t.slice_remaining_100ns = quantum_100ns.max(1);
+            }
+            t.last_start_100ns = now_100ns;
+        });
         vcpu.current_tid = next_tid;
         set_tpidr_el1(vcpu_id, next_tid);
 
@@ -415,17 +417,15 @@ pub fn block_current(vcpu_id: usize, deadline: u64) -> (u32, u32) {
     unsafe {
         let vcpu = &mut (*SCHED.vcpus.get())[vcpu_id];
         let cur_tid = vcpu.current_tid;
-        with_thread_mut(cur_tid, |t| {
-            t.state = ThreadState::Waiting;
-            t.wait_deadline = deadline;
-        });
+        set_thread_state_locked(cur_tid, ThreadState::Waiting);
+        with_thread_mut(cur_tid, |t| t.wait_deadline = deadline);
 
         let next_tid = (*SCHED.ready.get()).pop_highest();
         if next_tid == 0 {
             return (cur_tid, 0); // WFI
         }
 
-        with_thread_mut(next_tid, |t| t.state = ThreadState::Running);
+        set_thread_state_locked(next_tid, ThreadState::Running);
         vcpu.current_tid = next_tid;
         set_tpidr_el1(vcpu_id, next_tid);
         (cur_tid, next_tid)
@@ -434,47 +434,56 @@ pub fn block_current(vcpu_id: usize, deadline: u64) -> (u32, u32) {
 
 /// 唤醒指定线程
 pub fn wake(tid: u32, result: u32) {
-    unsafe {
-        with_thread_mut(tid, |t| {
-            if t.state != ThreadState::Waiting {
-                return;
-            }
-            t.state = ThreadState::Ready;
-            t.wait_result = result;
-            t.wait_deadline = 0;
-            t.wait_kind = WAIT_KIND_NONE;
-            t.wait_count = 0;
-            t.wait_signaled = 0;
-            t.wait_handles.fill(0);
-            // Resume point for blocked NtWait* should return wake result in x0.
-            t.ctx.x[0] = result as u64;
-            (*SCHED.ready.get()).push(t);
-        });
+    sched_lock_acquire();
+    let state = with_thread(tid, |t| t.state);
+    if state != ThreadState::Waiting {
+        sched_lock_release();
+        return;
     }
+    with_thread_mut(tid, |t| {
+        t.wait_result = result;
+        t.wait_deadline = 0;
+        t.wait_kind = WAIT_KIND_NONE;
+        t.wait_count = 0;
+        t.wait_signaled = 0;
+        t.wait_handles.fill(0);
+        // Resume point for blocked NtWait* should return wake result in x0.
+        t.ctx.x[0] = result as u64;
+    });
+    set_thread_state_locked(tid, ThreadState::Ready);
+    sched_lock_release();
 }
 
 /// Put the current running thread back to ready queue.
 pub fn yield_current_thread() {
+    sched_lock_acquire();
     let cur = current_tid();
-    with_thread_mut(cur, |t| {
-        if t.state == ThreadState::Running {
-            t.state = ThreadState::Ready;
-            unsafe {
-                (*SCHED.ready.get()).push(t);
-            }
-        }
-    });
+    let cur_state = with_thread(cur, |t| t.state);
+    if cur_state == ThreadState::Running {
+        set_thread_state_locked(cur, ThreadState::Ready);
+    }
+    sched_lock_release();
+}
+
+pub fn terminate_current_thread() {
+    sched_lock_acquire();
+    let cur = current_tid();
+    if cur != 0 {
+        set_thread_state_locked(cur, ThreadState::Terminated);
+    }
+    sched_lock_release();
 }
 
 /// Initialize the first thread on a vCPU (called from kernel_main).
 pub fn set_initial_thread(vcpu_id: usize, tid: u32) {
+    sched_lock_acquire();
     unsafe {
         let vcpu = &mut (*SCHED.vcpus.get())[vcpu_id];
         vcpu.current_tid = tid;
-        with_thread_mut(tid, |t| t.state = ThreadState::Running);
-        (*SCHED.ready.get()).remove(tid);
+        set_thread_state_locked(tid, ThreadState::Running);
         set_tpidr_el1(vcpu_id, tid);
     }
+    sched_lock_release();
 }
 
 /// Lazily register Thread 0 on first SVC entry.
@@ -500,6 +509,8 @@ pub fn register_thread0(teb_va: u64) {
         t.wait_kind = WAIT_KIND_NONE;
         t.wait_count = 0;
         t.wait_signaled = 0;
+        t.slice_remaining_100ns = 0;
+        t.last_start_100ns = 0;
         t.sched_next = 0;
         t.wait_next = 0;
         t.wait_handles.fill(0);
@@ -540,7 +551,6 @@ pub fn check_timeouts(now_ticks: u64) {
             if t.state != ThreadState::Waiting {
                 return;
             }
-            t.state = ThreadState::Ready;
             t.wait_result = 0x0000_0102; // STATUS_TIMEOUT
             t.wait_deadline = 0;
             t.wait_kind = WAIT_KIND_NONE;
@@ -548,10 +558,8 @@ pub fn check_timeouts(now_ticks: u64) {
             t.wait_signaled = 0;
             t.wait_handles.fill(0);
             t.ctx.x[0] = 0x0000_0102; // x0 = STATUS_TIMEOUT
-            unsafe {
-                (*SCHED.ready.get()).push(t);
-            }
         });
+        set_thread_state_locked(tid, ThreadState::Ready);
     }
 }
 
@@ -585,4 +593,98 @@ pub fn now_ticks() -> u64 {
 /// Convert a relative timeout (100ns units) to an absolute counter deadline.
 pub fn deadline_after_100ns(timeout_100ns: u64) -> u64 {
     now_ticks().saturating_add(timeout_100ns)
+}
+
+// ── 优先级辅助（调用者必须持有 sched lock）──────────────────────
+
+pub(crate) fn set_thread_priority_locked(tid: u32, new_priority: u8) {
+    if tid == 0 || tid as usize >= MAX_THREADS {
+        return;
+    }
+    let clamped = if new_priority > 31 { 31 } else { new_priority };
+    let state = with_thread(tid, |t| t.state);
+    if state == ThreadState::Ready {
+        unsafe { (*SCHED.ready.get()).remove(tid) };
+    }
+    with_thread_mut(tid, |t| t.priority = clamped);
+    if state == ThreadState::Ready {
+        with_thread_mut(tid, |t| unsafe { (*SCHED.ready.get()).push(t) });
+    }
+}
+
+pub(crate) fn boost_thread_priority_locked(tid: u32, min_priority: u8) {
+    if tid == 0 || tid as usize >= MAX_THREADS {
+        return;
+    }
+    let cur = with_thread(tid, |t| t.priority);
+    if min_priority > cur {
+        set_thread_priority_locked(tid, min_priority);
+    }
+}
+
+// ── 时间片记账（调用者必须持有 sched lock）──────────────────────
+
+pub fn charge_current_runtime_locked(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> bool {
+    unsafe {
+        let cur_tid = (*SCHED.vcpus.get())[vcpu_id].current_tid;
+        if cur_tid == 0 {
+            return false;
+        }
+        let mut expired = false;
+        with_thread_mut(cur_tid, |t| {
+            if t.state != ThreadState::Running {
+                return;
+            }
+            if t.slice_remaining_100ns == 0 {
+                t.slice_remaining_100ns = quantum_100ns.max(1);
+            }
+            if t.last_start_100ns == 0 {
+                t.last_start_100ns = now_100ns;
+                return;
+            }
+            let elapsed = now_100ns.saturating_sub(t.last_start_100ns);
+            t.last_start_100ns = now_100ns;
+            if elapsed >= t.slice_remaining_100ns {
+                t.slice_remaining_100ns = 0;
+                expired = true;
+            } else {
+                t.slice_remaining_100ns -= elapsed;
+            }
+        });
+        expired
+    }
+}
+
+pub fn rotate_current_on_quantum_expire_locked(vcpu_id: usize, quantum_100ns: u64) {
+    unsafe {
+        let cur_tid = (*SCHED.vcpus.get())[vcpu_id].current_tid;
+        if cur_tid == 0 {
+            return;
+        }
+        let is_running = with_thread(cur_tid, |t| t.state == ThreadState::Running);
+        if !is_running {
+            return;
+        }
+        with_thread_mut(cur_tid, |t| {
+            t.slice_remaining_100ns = quantum_100ns.max(1);
+            t.last_start_100ns = 0;
+        });
+        set_thread_state_locked(cur_tid, ThreadState::Ready);
+    }
+}
+
+pub fn current_slice_remaining_100ns(vcpu_id: usize, default_100ns: u64) -> u64 {
+    unsafe {
+        let cur_tid = (*SCHED.vcpus.get())[vcpu_id].current_tid;
+        if cur_tid == 0 {
+            return default_100ns.max(1);
+        }
+        with_thread(cur_tid, |t| {
+            if t.state != ThreadState::Running || t.slice_remaining_100ns == 0 {
+                default_100ns.max(1)
+            } else {
+                t.slice_remaining_100ns
+            }
+        })
+    }
 }

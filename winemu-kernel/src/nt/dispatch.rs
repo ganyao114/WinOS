@@ -4,7 +4,8 @@
 
 use crate::hypercall;
 use crate::sched::{
-    check_timeouts, current_tid, next_wait_deadline, now_ticks, register_thread0,
+    charge_current_runtime_locked, check_timeouts, current_slice_remaining_100ns, current_tid,
+    next_wait_deadline, now_ticks, register_thread0, rotate_current_on_quantum_expire_locked,
     sched_lock_acquire, sched_lock_release, schedule, vcpu_id, with_thread_mut,
 };
 use crate::timer;
@@ -126,7 +127,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         _ => forward_to_vmm(frame, nr, table),
     }
 
-    maybe_preempt(frame);
+    schedule_from_trap(frame, true);
 }
 
 fn save_ctx_for(tid: u32, frame: &SvcFrame) {
@@ -149,14 +150,19 @@ fn restore_ctx_to_frame(tid: u32, frame: &mut SvcFrame) {
     });
 }
 
-fn maybe_preempt(frame: &mut SvcFrame) {
+fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
     let vid = vcpu_id();
+    let quantum_100ns = timer::DEFAULT_TIMESLICE_100NS;
     let mut from = current_tid();
     loop {
         sched_lock_acquire();
         let now = now_ticks();
+        let quantum_expired = charge_current_runtime_locked(vid, now, quantum_100ns);
+        if quantum_expired {
+            rotate_current_on_quantum_expire_locked(vid, quantum_100ns);
+        }
         check_timeouts(now);
-        let (_, to) = schedule(vid);
+        let (_, to) = schedule(vid, now, quantum_100ns);
         if to != 0 {
             if from != 0 && from != to {
                 save_ctx_for(from, frame);
@@ -166,7 +172,16 @@ fn maybe_preempt(frame: &mut SvcFrame) {
                 restore_ctx_to_frame(to, frame);
             }
             sched_lock_release();
-            return;
+            let now = now_ticks();
+            let next_deadline = next_wait_deadline();
+            let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
+            timer::arm_running_slice_100ns(now, next_deadline, slice_remaining);
+            return true;
+        }
+
+        if !allow_idle_wait {
+            sched_lock_release();
+            return false;
         }
 
         // No runnable thread. Persist current frame once before sleeping.
@@ -183,6 +198,11 @@ fn maybe_preempt(frame: &mut SvcFrame) {
         }
         timer::idle_wait_until_deadline_100ns(now, next_deadline);
     }
+}
+
+#[no_mangle]
+pub extern "C" fn timer_irq_dispatch(frame: &mut SvcFrame) {
+    let _ = schedule_from_trap(frame, false);
 }
 
 #[no_mangle]
