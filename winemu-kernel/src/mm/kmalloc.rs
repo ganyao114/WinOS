@@ -47,6 +47,25 @@ impl KmallocStats {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct KmallocSnapshot {
+    pub stats: KmallocStats,
+    pub alloc_fail_precheck: u64,
+    pub alloc_fail_small_oom: u64,
+    pub alloc_fail_large_oom: u64,
+    pub alloc_fail_corruption: u64,
+    pub invalid_free_bad_ptr: u64,
+    pub invalid_free_double: u64,
+    pub small_alloc_by_cache: [u64; NUM_CACHES],
+    pub small_free_by_cache: [u64; NUM_CACHES],
+    pub large_alloc_by_order: [u64; NUM_ORDERS],
+    pub free_blocks_by_order: [u16; NUM_ORDERS],
+    pub partial_slabs_by_cache: [u16; NUM_CACHES],
+    pub full_slabs_by_cache: [u16; NUM_CACHES],
+    pub largest_free_order: u8,
+    pub free_pages_total: usize,
+}
+
 struct SpinLock {
     locked: AtomicBool,
 }
@@ -136,6 +155,15 @@ struct AllocState {
     pages: [PageMeta; MAX_PAGES],
     caches: [CacheMeta; NUM_CACHES],
     stats: KmallocStats,
+    alloc_fail_precheck: u64,
+    alloc_fail_small_oom: u64,
+    alloc_fail_large_oom: u64,
+    alloc_fail_corruption: u64,
+    invalid_free_bad_ptr: u64,
+    invalid_free_double: u64,
+    small_alloc_by_cache: [u64; NUM_CACHES],
+    small_free_by_cache: [u64; NUM_CACHES],
+    large_alloc_by_order: [u64; NUM_ORDERS],
 }
 
 impl AllocState {
@@ -148,6 +176,15 @@ impl AllocState {
             pages: [const { PageMeta::empty() }; MAX_PAGES],
             caches: [const { CacheMeta::empty() }; NUM_CACHES],
             stats: KmallocStats::new(),
+            alloc_fail_precheck: 0,
+            alloc_fail_small_oom: 0,
+            alloc_fail_large_oom: 0,
+            alloc_fail_corruption: 0,
+            invalid_free_bad_ptr: 0,
+            invalid_free_double: 0,
+            small_alloc_by_cache: [0; NUM_CACHES],
+            small_free_by_cache: [0; NUM_CACHES],
+            large_alloc_by_order: [0; NUM_ORDERS],
         }
     }
 
@@ -170,6 +207,15 @@ impl AllocState {
             c += 1;
         }
         self.stats = KmallocStats::new();
+        self.alloc_fail_precheck = 0;
+        self.alloc_fail_small_oom = 0;
+        self.alloc_fail_large_oom = 0;
+        self.alloc_fail_corruption = 0;
+        self.invalid_free_bad_ptr = 0;
+        self.invalid_free_double = 0;
+        self.small_alloc_by_cache = [0; NUM_CACHES];
+        self.small_free_by_cache = [0; NUM_CACHES];
+        self.large_alloc_by_order = [0; NUM_ORDERS];
 
         // Build buddy free lists from available pages.
         let mut idx = 0usize;
@@ -201,6 +247,18 @@ impl AllocState {
             return None;
         }
         Some(idx)
+    }
+
+    #[inline]
+    fn mark_invalid_free_bad_ptr(&mut self) {
+        self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
+        self.invalid_free_bad_ptr = self.invalid_free_bad_ptr.saturating_add(1);
+    }
+
+    #[inline]
+    fn mark_invalid_free_double(&mut self) {
+        self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
+        self.invalid_free_double = self.invalid_free_double.saturating_add(1);
     }
 
     fn mark_block_unused(&mut self, idx: usize, order: usize) {
@@ -421,7 +479,10 @@ impl AllocState {
         if page_idx == NONE_I16 {
             page_idx = match self.create_slab_page(cache_idx) {
                 Some(idx) => idx as i16,
-                None => return null_mut(),
+                None => {
+                    self.alloc_fail_small_oom = self.alloc_fail_small_oom.saturating_add(1);
+                    return null_mut();
+                }
             };
         }
 
@@ -433,7 +494,7 @@ impl AllocState {
             // Corrupted freelist head; quarantine this slab page from further allocs.
             self.cache_remove_partial(cache_idx, pidx);
             self.pages[pidx].free_obj = NONE_U16;
-            self.stats.alloc_failures = self.stats.alloc_failures.saturating_add(1);
+            self.alloc_fail_corruption = self.alloc_fail_corruption.saturating_add(1);
             return null_mut();
         }
 
@@ -443,7 +504,7 @@ impl AllocState {
             // Corrupted next pointer; stop using this slab page for allocation.
             self.cache_remove_partial(cache_idx, pidx);
             self.pages[pidx].free_obj = NONE_U16;
-            self.stats.alloc_failures = self.stats.alloc_failures.saturating_add(1);
+            self.alloc_fail_corruption = self.alloc_fail_corruption.saturating_add(1);
             return null_mut();
         }
         self.pages[pidx].free_obj = next;
@@ -452,39 +513,44 @@ impl AllocState {
             self.cache_remove_partial(cache_idx, pidx);
         }
         self.stats.small_allocs = self.stats.small_allocs.saturating_add(1);
+        self.small_alloc_by_cache[cache_idx] = self.small_alloc_by_cache[cache_idx].saturating_add(1);
         obj_ptr
     }
 
     fn free_small(&mut self, page_idx: usize, ptr: usize) {
         let cache_idx = self.pages[page_idx].cache as usize;
         if cache_idx >= NUM_CACHES {
-            self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
+            self.mark_invalid_free_bad_ptr();
             return;
         }
         let obj_size = self.caches[cache_idx].obj_size as usize;
         let page_base = self.page_addr(page_idx);
         if ptr < page_base || ptr >= page_base + PAGE_SIZE {
-            self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
+            self.mark_invalid_free_bad_ptr();
             return;
         }
 
         let off = ptr - page_base;
         if off % obj_size != 0 {
-            self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
+            self.mark_invalid_free_bad_ptr();
             return;
         }
         let obj_idx = (off / obj_size) as u16;
         if obj_idx >= self.pages[page_idx].total {
-            self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
+            self.mark_invalid_free_bad_ptr();
             return;
         }
         if self.pages[page_idx].inuse == 0 {
-            self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
+            self.mark_invalid_free_bad_ptr();
             return;
         }
         match self.slab_freelist_contains(page_idx, obj_idx, obj_size) {
-            Ok(true) | Err(()) => {
-                self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
+            Ok(true) => {
+                self.mark_invalid_free_double();
+                return;
+            }
+            Err(()) => {
+                self.mark_invalid_free_bad_ptr();
                 return;
             }
             Ok(false) => {}
@@ -496,6 +562,7 @@ impl AllocState {
         }
         self.pages[page_idx].free_obj = obj_idx;
         self.pages[page_idx].inuse -= 1;
+        self.small_free_by_cache[cache_idx] = self.small_free_by_cache[cache_idx].saturating_add(1);
 
         if was_full {
             self.cache_add_partial(cache_idx, page_idx);
@@ -581,21 +648,26 @@ impl AllocState {
 
         let idx = match self.buddy_alloc(order) {
             Some(v) => v,
-            None => return null_mut(),
+            None => {
+                self.alloc_fail_large_oom = self.alloc_fail_large_oom.saturating_add(1);
+                return null_mut();
+            }
         };
         self.mark_large_block(idx, order);
         self.stats.large_allocs = self.stats.large_allocs.saturating_add(1);
+        self.large_alloc_by_order[order] = self.large_alloc_by_order[order].saturating_add(1);
         self.page_addr(idx) as *mut u8
     }
 
-    fn free_large(&mut self, page_idx: usize, ptr: usize) {
+    fn free_large(&mut self, page_idx: usize, ptr: usize) -> bool {
         let page_base = self.page_addr(page_idx);
         if ptr != page_base {
-            return;
+            return false;
         }
         let order = self.pages[page_idx].order as usize;
         self.mark_block_unused(page_idx, order);
         self.buddy_free(page_idx, order);
+        true
     }
 
     fn cache_index_for(bytes: usize, align: usize) -> Option<usize> {
@@ -614,6 +686,7 @@ impl AllocState {
         self.stats.alloc_calls = self.stats.alloc_calls.saturating_add(1);
         if !self.initialized || size == 0 {
             self.stats.alloc_failures = self.stats.alloc_failures.saturating_add(1);
+            self.alloc_fail_precheck = self.alloc_fail_precheck.saturating_add(1);
             return null_mut();
         }
         let align = align.max(1);
@@ -634,19 +707,23 @@ impl AllocState {
     fn free(&mut self, ptr: *mut u8) {
         self.stats.free_calls = self.stats.free_calls.saturating_add(1);
         if !self.initialized || ptr.is_null() {
-            self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
+            self.mark_invalid_free_bad_ptr();
             return;
         }
         let p = ptr as usize;
         let Some(page_idx) = self.ptr_to_page(p) else {
-            self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
+            self.mark_invalid_free_bad_ptr();
             return;
         };
         match self.pages[page_idx].kind {
             PAGE_KIND_SLAB => self.free_small(page_idx, p),
-            PAGE_KIND_LARGE_HEAD => self.free_large(page_idx, p),
+            PAGE_KIND_LARGE_HEAD => {
+                if !self.free_large(page_idx, p) {
+                    self.mark_invalid_free_bad_ptr();
+                }
+            }
             _ => {
-                self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
+                self.mark_invalid_free_bad_ptr();
             }
         }
     }
@@ -656,6 +733,79 @@ impl AllocState {
             return false;
         }
         self.ptr_to_page(ptr as usize).is_some()
+    }
+
+    fn count_free_blocks_for_order(&self, order: usize) -> u16 {
+        let mut count = 0usize;
+        let mut steps = 0usize;
+        let mut cur = self.free_heads[order];
+        while cur != NONE_I16 {
+            count += 1;
+            let idx = cur as usize;
+            if idx >= self.heap_pages {
+                return u16::MAX;
+            }
+            cur = self.pages[idx].next;
+            steps += 1;
+            if steps > self.heap_pages {
+                return u16::MAX;
+            }
+        }
+        core::cmp::min(count, u16::MAX as usize) as u16
+    }
+
+    fn snapshot(&self) -> KmallocSnapshot {
+        let mut free_blocks_by_order = [0u16; NUM_ORDERS];
+        let mut largest_free_order = 0u8;
+        let mut free_pages_total = 0usize;
+        let mut order = 0usize;
+        while order < NUM_ORDERS {
+            let blocks = self.count_free_blocks_for_order(order);
+            free_blocks_by_order[order] = blocks;
+            if blocks != 0 {
+                largest_free_order = order as u8;
+            }
+            free_pages_total = free_pages_total.saturating_add((blocks as usize) << order);
+            order += 1;
+        }
+
+        let mut partial_slabs_by_cache = [0u16; NUM_CACHES];
+        let mut full_slabs_by_cache = [0u16; NUM_CACHES];
+        let mut page = 0usize;
+        while page < self.heap_pages {
+            let meta = self.pages[page];
+            if meta.kind == PAGE_KIND_SLAB {
+                let cache_idx = meta.cache as usize;
+                if cache_idx < NUM_CACHES {
+                    if meta.free_obj == NONE_U16 {
+                        full_slabs_by_cache[cache_idx] =
+                            full_slabs_by_cache[cache_idx].saturating_add(1);
+                    } else {
+                        partial_slabs_by_cache[cache_idx] =
+                            partial_slabs_by_cache[cache_idx].saturating_add(1);
+                    }
+                }
+            }
+            page += 1;
+        }
+
+        KmallocSnapshot {
+            stats: self.stats,
+            alloc_fail_precheck: self.alloc_fail_precheck,
+            alloc_fail_small_oom: self.alloc_fail_small_oom,
+            alloc_fail_large_oom: self.alloc_fail_large_oom,
+            alloc_fail_corruption: self.alloc_fail_corruption,
+            invalid_free_bad_ptr: self.invalid_free_bad_ptr,
+            invalid_free_double: self.invalid_free_double,
+            small_alloc_by_cache: self.small_alloc_by_cache,
+            small_free_by_cache: self.small_free_by_cache,
+            large_alloc_by_order: self.large_alloc_by_order,
+            free_blocks_by_order,
+            partial_slabs_by_cache,
+            full_slabs_by_cache,
+            largest_free_order,
+            free_pages_total,
+        }
     }
 }
 
@@ -708,4 +858,8 @@ pub fn contains(ptr: *mut u8) -> bool {
 
 pub fn stats() -> KmallocStats {
     with_state_mut(|s| s.stats)
+}
+
+pub fn snapshot() -> KmallocSnapshot {
+    with_state_mut(|s| s.snapshot())
 }
