@@ -12,6 +12,7 @@
 #define NR_WAIT_SINGLE          0x0004
 #define NR_CLOSE                0x000F
 #define NR_QUERY_INFORMATION_PROCESS 0x0019
+#define NR_OPEN_PROCESS         0x0026
 #define NR_DUPLICATE_OBJECT     0x003C
 #define NR_YIELD_EXECUTION      0x0046
 #define NR_QUERY_PERFORMANCE_COUNTER 0x0031
@@ -132,6 +133,18 @@ EXPORT NTSTATUS NtQueryInformationProcess(
         (uint64_t)len,
         (uint64_t)ret_len,
         0
+    );
+}
+
+EXPORT NTSTATUS NtOpenProcess(
+    HANDLE* process_handle, ULONG desired_access, void* object_attributes, void* client_id)
+{
+    return syscall4(
+        NR_OPEN_PROCESS,
+        (uint64_t)process_handle,
+        (uint64_t)desired_access,
+        (uint64_t)object_attributes,
+        (uint64_t)client_id
     );
 }
 

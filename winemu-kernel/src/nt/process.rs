@@ -2,6 +2,12 @@ use winemu_shared::status;
 
 use super::SvcFrame;
 
+#[repr(C)]
+struct ClientId {
+    unique_process: u64,
+    unique_thread: u64,
+}
+
 // x0=ProcessHandle, x1=ProcessInformationClass, x2=Buffer, x3=BufferLength, x4=*ReturnLength
 pub(crate) fn handle_query_information_process(frame: &mut SvcFrame) {
     let process_handle = frame.x[0];
@@ -13,6 +19,37 @@ pub(crate) fn handle_query_information_process(frame: &mut SvcFrame) {
     frame.x[0] =
         crate::process::query_information_process(process_handle, info_class, buf, buf_len, ret_len)
             as u64;
+}
+
+// NtOpenProcess:
+// x0=*ProcessHandle, x1=DesiredAccess, x2=ObjectAttributes, x3=ClientId
+pub(crate) fn handle_open_process(frame: &mut SvcFrame) {
+    let out_ptr = frame.x[0] as *mut u64;
+    let desired_access = frame.x[1] as u32;
+    let _obj_attr = frame.x[2];
+    let client_id_ptr = frame.x[3] as *const ClientId;
+
+    if out_ptr.is_null() || client_id_ptr.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+
+    let cid = unsafe { &*client_id_ptr };
+    let target_pid = cid.unique_process as u32;
+    if target_pid == 0 {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+
+    match crate::process::open_process(target_pid, desired_access) {
+        Ok(handle) => {
+            unsafe { out_ptr.write_volatile(handle) };
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        Err(st) => {
+            frame.x[0] = st as u64;
+        }
+    }
 }
 
 // NtCreateProcessEx:

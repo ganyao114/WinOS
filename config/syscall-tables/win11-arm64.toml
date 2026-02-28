@@ -29,6 +29,7 @@ NtCreateThreadEx          = 0x00C1
 NtTerminateProcess        = 0x002C
 NtTerminateThread         = 0x0053
 NtQueryInformationProcess = 0x0019
+NtOpenProcess             = 0x0026
 NtQueryInformationThread  = 0x0025
 NtSetInformationThread    = 0x000D
 NtWaitForSingleObject     = 0x0004

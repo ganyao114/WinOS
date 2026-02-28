@@ -23,7 +23,7 @@
 - 同步：`NtCreateEvent/NtSetEvent/NtResetEvent/NtWaitForSingleObject/NtWaitForMultipleObjects/NtCreateMutant/NtReleaseMutant/NtCreateSemaphore/NtReleaseSemaphore`
 - 注册表：`NtOpenKey/NtCreateKey/NtDeleteKey/NtSetValueKey/NtQueryValueKey/NtEnumerateKey/NtEnumerateValueKey/NtDeleteValueKey`
 - 内存/Section：`NtAllocateVirtualMemory/NtFreeVirtualMemory/NtProtectVirtualMemory/NtQueryVirtualMemory/NtCreateSection/NtMapViewOfSection/NtUnmapViewOfSection`
-- 进程/线程：`NtCreateProcessEx/NtTerminateProcess/NtQueryInformationProcess/NtCreateThreadEx/NtTerminateThread/NtQueryInformationThread/NtSetInformationThread/NtYieldExecution`
+- 进程/线程：`NtCreateProcessEx/NtOpenProcess/NtTerminateProcess/NtQueryInformationProcess/NtCreateThreadEx/NtTerminateThread/NtQueryInformationThread/NtSetInformationThread/NtYieldExecution`
 - 对象：`NtDuplicateObject/NtClose`
 
 ## 4. 程序常用但尚未在 guest 落地（按 Wine 频次）
@@ -130,11 +130,10 @@
 - `tests/hello_win`
 - `guest/process_test`
 
-## 8. 本轮执行项
+## 8. 最近进展
 
-本轮按 Phase 1 落地：
-
-1. 在 guest kernel 实现  
+1. 已完成 Phase 1：  
    `NtQuerySystemInformation/NtQuerySystemTime/NtQueryPerformanceCounter/NtDelayExecution`
-2. 新增 `guest/syscall_sysinfo_test`（C + mingw）
-3. 编译、签名并运行新测试与回归测试
+2. 已新增并通过：`guest/syscall_sysinfo_test`
+3. 已开始 Phase 2：实现 `NtOpenProcess`，并新增 `guest/open_process_test`
+4. 回归通过：`tests/full_test`、`tests/thread_test`、`tests/registry_test`、`tests/hello_win`

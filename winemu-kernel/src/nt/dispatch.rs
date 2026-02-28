@@ -77,6 +77,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         sysno::UNMAP_VIEW_OF_SECTION => section::handle_unmap_view_of_section(frame),
 
         sysno::QUERY_INFORMATION_PROCESS => process::handle_query_information_process(frame),
+        sysno::OPEN_PROCESS => process::handle_open_process(frame),
         sysno::CREATE_PROCESS_EX => process::handle_create_process(frame),
         sysno::TERMINATE_PROCESS => process::handle_terminate_process(frame),
 

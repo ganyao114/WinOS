@@ -9,7 +9,7 @@ use core::cell::UnsafeCell;
 pub use handle::{current_pid, resolve_process_handle};
 pub use lifecycle::{
     create_process, init_boot_process, last_handle_closed, on_thread_created, on_thread_terminated,
-    process_accepts_new_threads, process_exists, process_signaled, switch_to_thread_process,
+    open_process, process_accepts_new_threads, process_exists, process_signaled, switch_to_thread_process,
     terminate_process,
 };
 pub use query::query_information_process;

@@ -96,6 +96,14 @@ pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> R
     Ok(handle)
 }
 
+pub fn open_process(pid: u32, _desired_access: u32) -> Result<u64, u32> {
+    if pid == 0 || !process_exists(pid) {
+        return Err(status::INVALID_PARAMETER);
+    }
+    crate::sched::sync::make_new_handle(crate::sched::sync::HANDLE_TYPE_PROCESS, pid)
+        .ok_or(status::NO_MEMORY)
+}
+
 pub fn on_thread_created(pid: u32, tid: u32) {
     let _ = with_process_mut(pid, |p| {
         p.thread_count = p.thread_count.saturating_add(1);
