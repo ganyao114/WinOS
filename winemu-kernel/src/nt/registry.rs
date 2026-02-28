@@ -130,11 +130,11 @@ fn read_value_name(us_ptr: u64) -> String {
     out
 }
 
-fn alloc_key_handle(state: &mut RegistryState, node: KeyNode) -> Option<u16> {
+fn alloc_key_handle(state: &mut RegistryState, node: KeyNode) -> Option<u32> {
     for i in 1..MAX_KEY_HANDLES {
         if state.handles[i].is_none() {
             state.handles[i] = Some(node);
-            return Some(i as u16);
+            return Some(i as u32);
         }
     }
     None

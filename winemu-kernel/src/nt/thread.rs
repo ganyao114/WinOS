@@ -74,7 +74,7 @@ pub(crate) fn handle_set_information_thread(frame: &mut SvcFrame) {
     {
         current_tid()
     } else if handle_type(thread_handle) == HANDLE_TYPE_THREAD {
-        handle_idx(thread_handle) as u32
+        handle_idx(thread_handle)
     } else {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
@@ -133,7 +133,7 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
         frame.x[0] = 0xC000_0017u64;
         return;
     }
-    let handle = make_handle(HANDLE_TYPE_THREAD, tid as u16);
+    let handle = make_handle(HANDLE_TYPE_THREAD, tid);
     if !out_ptr.is_null() {
         unsafe { out_ptr.write_volatile(handle) };
     }

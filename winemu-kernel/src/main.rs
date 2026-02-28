@@ -6,6 +6,7 @@ extern crate alloc as rust_alloc;
 
 mod alloc;
 mod hypercall;
+mod kobj;
 mod ldr;
 mod mm;
 mod nt;

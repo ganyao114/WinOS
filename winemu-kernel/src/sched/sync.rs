@@ -2,12 +2,16 @@
 // KEvent, KMutex, KSemaphore, Thread waiters, HandleTable
 // 所有状态机在 guest 内完成，不走 HVC。
 
+use crate::kobj::ObjectStore;
+use crate::rust_alloc::vec::Vec;
+use core::cell::UnsafeCell;
+use core::ptr::null_mut;
+
 use super::{
     boost_thread_priority_locked, clear_wait_deadline_locked, current_tid, sched_lock_acquire,
     sched_lock_release, set_thread_priority_locked, set_thread_state_locked,
-    set_wait_deadline_locked, wake, with_thread, with_thread_mut,
-    ThreadState, MAX_THREADS, MAX_WAIT_HANDLES, WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY,
-    WAIT_KIND_NONE, WAIT_KIND_SINGLE,
+    set_wait_deadline_locked, thread_exists, wake, with_thread, with_thread_mut, ThreadState,
+    MAX_WAIT_HANDLES, WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY, WAIT_KIND_NONE, WAIT_KIND_SINGLE,
 };
 
 // ── NTSTATUS 常量 ─────────────────────────────────────────────
@@ -28,42 +32,34 @@ pub enum WaitDeadline {
     DeadlineTicks(u64),
 }
 
-// ── 等待队列（零分配，按优先级排序）──────────────────────────
-//
-// 说明：
-// - 不能使用 KThread.wait_next 侵入式链表，因为 WaitMultiple 需要把同一线程注册到多个队列。
-// - 这里用定长数组保存 TID，支持同一线程出现在不同对象队列里。
+// ── 等待队列（动态，按优先级排序）─────────────────────────────
 
 pub struct WaitQueue {
-    tids: [u32; MAX_THREADS],
-    len: usize,
+    tids: Vec<u32>,
 }
 
 impl WaitQueue {
-    pub const fn new() -> Self {
-        Self {
-            tids: [0; MAX_THREADS],
-            len: 0,
-        }
+    pub fn new() -> Self {
+        Self { tids: Vec::new() }
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.tids.len()
     }
 
     pub fn enqueue(&mut self, tid: u32) {
-        if tid == 0 || self.len >= MAX_THREADS {
+        if tid == 0 {
             return;
         }
-        for i in 0..self.len {
+        for i in 0..self.tids.len() {
             if self.tids[i] == tid {
                 return;
             }
         }
 
         let prio = with_thread(tid, |t| t.priority);
-        let mut pos = self.len;
-        for i in 0..self.len {
+        let mut pos = self.tids.len();
+        for i in 0..self.tids.len() {
             let cur_tid = self.tids[i];
             let cur_prio = with_thread(cur_tid, |t| t.priority);
             if prio > cur_prio {
@@ -72,27 +68,19 @@ impl WaitQueue {
             }
         }
 
-        let mut j = self.len;
-        while j > pos {
-            self.tids[j] = self.tids[j - 1];
-            j -= 1;
+        if self.tids.try_reserve(1).is_err() {
+            return;
         }
-        self.tids[pos] = tid;
-        self.len += 1;
+        self.tids.insert(pos, tid);
     }
 
     pub fn dequeue_waiting(&mut self) -> u32 {
-        while self.len > 0 {
-            let tid = self.tids[0];
-            let mut i = 1usize;
-            while i < self.len {
-                self.tids[i - 1] = self.tids[i];
-                i += 1;
-            }
-            self.len -= 1;
-            self.tids[self.len] = 0;
-
-            if tid != 0 && with_thread(tid, |t| t.state == ThreadState::Waiting) {
+        while !self.tids.is_empty() {
+            let tid = self.tids.remove(0);
+            if tid != 0
+                && thread_exists(tid)
+                && with_thread(tid, |t| t.state == ThreadState::Waiting)
+            {
                 return tid;
             }
         }
@@ -100,30 +88,22 @@ impl WaitQueue {
     }
 
     pub fn remove(&mut self, tid: u32) {
-        if tid == 0 || self.len == 0 {
+        if tid == 0 || self.tids.is_empty() {
             return;
         }
-        let mut i = 0usize;
-        while i < self.len {
+        for i in 0..self.tids.len() {
             if self.tids[i] == tid {
-                let mut j = i + 1;
-                while j < self.len {
-                    self.tids[j - 1] = self.tids[j];
-                    j += 1;
-                }
-                self.len -= 1;
-                self.tids[self.len] = 0;
+                self.tids.remove(i);
                 return;
             }
-            i += 1;
         }
     }
 
     pub fn highest_waiting_priority(&self) -> Option<u8> {
         let mut best: Option<u8> = None;
-        for i in 0..self.len {
+        for i in 0..self.tids.len() {
             let tid = self.tids[i];
-            if tid == 0 {
+            if tid == 0 || !thread_exists(tid) {
                 continue;
             }
             let prio = with_thread(tid, |t| {
@@ -154,79 +134,162 @@ pub enum EventType {
 }
 
 pub struct KEvent {
-    pub in_use: bool,
     pub signaled: bool,
     pub ev_type: EventType,
     pub waiters: WaitQueue,
 }
 
 impl KEvent {
-    const fn new() -> Self {
+    fn new(ev_type: EventType, signaled: bool) -> Self {
         Self {
-            in_use: false,
-            signaled: false,
-            ev_type: EventType::NotificationEvent,
+            signaled,
+            ev_type,
             waiters: WaitQueue::new(),
         }
     }
 }
 
-pub const MAX_EVENTS: usize = 256;
-static mut EVENTS: [KEvent; MAX_EVENTS] = [const { KEvent::new() }; MAX_EVENTS];
-
 // ── KMutex ────────────────────────────────────────────────────
 
 pub struct KMutex {
-    pub in_use: bool,
     pub owner_tid: u32, // 0 = unowned
     pub recursion: u32,
     pub waiters: WaitQueue,
 }
 
 impl KMutex {
-    const fn new() -> Self {
+    fn new(initial_owner: bool) -> Self {
+        let owner_tid = if initial_owner { current_tid() } else { 0 };
+        let recursion = if initial_owner { 1 } else { 0 };
         Self {
-            in_use: false,
-            owner_tid: 0,
-            recursion: 0,
+            owner_tid,
+            recursion,
             waiters: WaitQueue::new(),
         }
     }
 }
 
-pub const MAX_MUTEXES: usize = 256;
-static mut MUTEXES: [KMutex; MAX_MUTEXES] = [const { KMutex::new() }; MAX_MUTEXES];
-
 // ── KSemaphore ────────────────────────────────────────────────
 
 pub struct KSemaphore {
-    pub in_use: bool,
     pub count: i32,
     pub maximum: i32,
     pub waiters: WaitQueue,
 }
 
 impl KSemaphore {
-    const fn new() -> Self {
+    fn new(initial: i32, maximum: i32) -> Self {
         Self {
-            in_use: false,
-            count: 0,
-            maximum: 0,
+            count: initial,
+            maximum,
             waiters: WaitQueue::new(),
         }
     }
 }
 
-pub const MAX_SEMAPHORES: usize = 128;
-static mut SEMAPHORES: [KSemaphore; MAX_SEMAPHORES] = [const { KSemaphore::new() }; MAX_SEMAPHORES];
+struct SyncState {
+    events: UnsafeCell<Option<ObjectStore<KEvent>>>,
+    mutexes: UnsafeCell<Option<ObjectStore<KMutex>>>,
+    semaphores: UnsafeCell<Option<ObjectStore<KSemaphore>>>,
+    thread_waiters: UnsafeCell<Option<Vec<WaitQueue>>>,
+}
 
-// 每个目标线程一个等待队列，用于 Wait(ThreadHandle)
-static mut THREAD_WAITERS: [WaitQueue; MAX_THREADS] = [const { WaitQueue::new() }; MAX_THREADS];
+unsafe impl Sync for SyncState {}
+
+static SYNC_STATE: SyncState = SyncState {
+    events: UnsafeCell::new(None),
+    mutexes: UnsafeCell::new(None),
+    semaphores: UnsafeCell::new(None),
+    thread_waiters: UnsafeCell::new(None),
+};
+
+fn events_store_mut() -> &'static mut ObjectStore<KEvent> {
+    unsafe {
+        let slot = &mut *SYNC_STATE.events.get();
+        if slot.is_none() {
+            *slot = Some(ObjectStore::new());
+        }
+        slot.as_mut().unwrap()
+    }
+}
+
+fn mutexes_store_mut() -> &'static mut ObjectStore<KMutex> {
+    unsafe {
+        let slot = &mut *SYNC_STATE.mutexes.get();
+        if slot.is_none() {
+            *slot = Some(ObjectStore::new());
+        }
+        slot.as_mut().unwrap()
+    }
+}
+
+fn semaphores_store_mut() -> &'static mut ObjectStore<KSemaphore> {
+    unsafe {
+        let slot = &mut *SYNC_STATE.semaphores.get();
+        if slot.is_none() {
+            *slot = Some(ObjectStore::new());
+        }
+        slot.as_mut().unwrap()
+    }
+}
+
+fn thread_waiters_mut() -> &'static mut Vec<WaitQueue> {
+    unsafe {
+        let slot = &mut *SYNC_STATE.thread_waiters.get();
+        if slot.is_none() {
+            let mut v = Vec::new();
+            let _ = v.try_reserve(1);
+            v.push(WaitQueue::new()); // index 0 unused
+            *slot = Some(v);
+        }
+        slot.as_mut().unwrap()
+    }
+}
+
+fn ensure_thread_waiters_slot(tid: u32) -> bool {
+    let idx = tid as usize;
+    let waiters = thread_waiters_mut();
+    if idx < waiters.len() {
+        return true;
+    }
+    let need = idx + 1 - waiters.len();
+    if waiters.try_reserve(need).is_err() {
+        return false;
+    }
+    while waiters.len() <= idx {
+        waiters.push(WaitQueue::new());
+    }
+    true
+}
+
+fn thread_waiters_ptr(tid: u32) -> *mut WaitQueue {
+    let idx = tid as usize;
+    unsafe {
+        let Some(waiters) = (&mut *SYNC_STATE.thread_waiters.get()).as_mut() else {
+            return null_mut();
+        };
+        if idx >= waiters.len() {
+            return null_mut();
+        }
+        &mut waiters[idx] as *mut WaitQueue
+    }
+}
+
+fn event_ptr(idx: u32) -> *mut KEvent {
+    events_store_mut().get_ptr(idx)
+}
+
+fn mutex_ptr(idx: u32) -> *mut KMutex {
+    mutexes_store_mut().get_ptr(idx)
+}
+
+fn semaphore_ptr(idx: u32) -> *mut KSemaphore {
+    semaphores_store_mut().get_ptr(idx)
+}
 
 // ── HandleTable ───────────────────────────────────────────────
-// Handle encoding: bits[15:12] = type, bits[11:0] = index
-// Type 0 = invalid, 1 = event, 2 = mutex, 3 = semaphore, 4 = thread
-// Handles are u64 (Windows HANDLE), we use low 16 bits.
+// Handle encoding: bits[31:28] = type, bits[27:0] = object id
+// 保持在低 32 bit，兼容用户态把 HANDLE 临时存到 u32 的场景。
 
 pub const HANDLE_TYPE_EVENT: u64 = 1;
 pub const HANDLE_TYPE_MUTEX: u64 = 2;
@@ -236,34 +299,33 @@ pub const HANDLE_TYPE_FILE: u64 = 5;
 pub const HANDLE_TYPE_SECTION: u64 = 6;
 pub const HANDLE_TYPE_KEY: u64 = 7;
 
-pub fn make_handle(htype: u64, idx: u16) -> u64 {
-    ((htype & 0xF) << 12) | (idx as u64 & 0xFFF)
+pub fn make_handle(htype: u64, idx: u32) -> u64 {
+    ((htype & 0xF) << 28) | ((idx as u64) & 0x0FFF_FFFF)
 }
 
 pub fn handle_type(h: u64) -> u64 {
-    (h >> 12) & 0xF
+    (h >> 28) & 0xF
 }
-pub fn handle_idx(h: u64) -> u16 {
-    (h & 0xFFF) as u16
+
+pub fn handle_idx(h: u64) -> u32 {
+    (h & 0x0FFF_FFFF) as u32
 }
 
 fn recompute_owned_mutex_priority_locked(owner_tid: u32) {
-    if owner_tid == 0 || owner_tid as usize >= MAX_THREADS {
+    if owner_tid == 0 || !thread_exists(owner_tid) {
         return;
     }
     let mut target = with_thread(owner_tid, |t| t.base_priority);
-    unsafe {
-        for i in 1..MAX_MUTEXES {
-            if !MUTEXES[i].in_use || MUTEXES[i].owner_tid != owner_tid {
-                continue;
-            }
-            if let Some(waiter_prio) = MUTEXES[i].waiters.highest_waiting_priority() {
-                if waiter_prio > target {
-                    target = waiter_prio;
-                }
+    mutexes_store_mut().for_each_live_ptr(|_id, ptr| unsafe {
+        if (*ptr).owner_tid != owner_tid {
+            return;
+        }
+        if let Some(waiter_prio) = (*ptr).waiters.highest_waiting_priority() {
+            if waiter_prio > target {
+                target = waiter_prio;
             }
         }
-    }
+    });
     set_thread_priority_locked(owner_tid, target);
 }
 
@@ -310,7 +372,7 @@ fn clear_wait_metadata(tid: u32) {
 }
 
 fn validate_thread_target_tid(target_tid: u32) -> bool {
-    if target_tid == 0 || target_tid as usize >= MAX_THREADS {
+    if target_tid == 0 || !thread_exists(target_tid) {
         return false;
     }
     let state = with_thread(target_tid, |t| t.state);
@@ -318,31 +380,31 @@ fn validate_thread_target_tid(target_tid: u32) -> bool {
 }
 
 fn validate_waitable_handle_locked(h: u64) -> u32 {
-    let idx = handle_idx(h) as usize;
+    let idx = handle_idx(h);
     match handle_type(h) {
-        HANDLE_TYPE_EVENT => unsafe {
-            if idx == 0 || idx >= MAX_EVENTS || !EVENTS[idx].in_use {
+        HANDLE_TYPE_EVENT => {
+            if idx == 0 || event_ptr(idx).is_null() {
                 STATUS_INVALID_HANDLE
             } else {
                 STATUS_SUCCESS
             }
-        },
-        HANDLE_TYPE_MUTEX => unsafe {
-            if idx == 0 || idx >= MAX_MUTEXES || !MUTEXES[idx].in_use {
+        }
+        HANDLE_TYPE_MUTEX => {
+            if idx == 0 || mutex_ptr(idx).is_null() {
                 STATUS_INVALID_HANDLE
             } else {
                 STATUS_SUCCESS
             }
-        },
-        HANDLE_TYPE_SEMAPHORE => unsafe {
-            if idx == 0 || idx >= MAX_SEMAPHORES || !SEMAPHORES[idx].in_use {
+        }
+        HANDLE_TYPE_SEMAPHORE => {
+            if idx == 0 || semaphore_ptr(idx).is_null() {
                 STATUS_INVALID_HANDLE
             } else {
                 STATUS_SUCCESS
             }
-        },
+        }
         HANDLE_TYPE_THREAD => {
-            if validate_thread_target_tid(idx as u32) {
+            if validate_thread_target_tid(idx) {
                 STATUS_SUCCESS
             } else {
                 STATUS_INVALID_HANDLE
@@ -353,23 +415,32 @@ fn validate_waitable_handle_locked(h: u64) -> u32 {
 }
 
 fn is_handle_signaled_locked(waiter_tid: u32, h: u64) -> bool {
-    let idx = handle_idx(h) as usize;
+    let idx = handle_idx(h);
     match handle_type(h) {
-        HANDLE_TYPE_EVENT => unsafe {
-            idx != 0 && idx < MAX_EVENTS && EVENTS[idx].in_use && EVENTS[idx].signaled
-        },
-        HANDLE_TYPE_MUTEX => unsafe {
-            idx != 0
-                && idx < MAX_MUTEXES
-                && MUTEXES[idx].in_use
-                && (MUTEXES[idx].owner_tid == 0 || MUTEXES[idx].owner_tid == waiter_tid)
-        },
-        HANDLE_TYPE_SEMAPHORE => unsafe {
-            idx != 0 && idx < MAX_SEMAPHORES && SEMAPHORES[idx].in_use && SEMAPHORES[idx].count > 0
-        },
+        HANDLE_TYPE_EVENT => {
+            let ev = event_ptr(idx);
+            if ev.is_null() {
+                return false;
+            }
+            unsafe { (*ev).signaled }
+        }
+        HANDLE_TYPE_MUTEX => {
+            let m = mutex_ptr(idx);
+            if m.is_null() {
+                return false;
+            }
+            unsafe { (*m).owner_tid == 0 || (*m).owner_tid == waiter_tid }
+        }
+        HANDLE_TYPE_SEMAPHORE => {
+            let s = semaphore_ptr(idx);
+            if s.is_null() {
+                return false;
+            }
+            unsafe { (*s).count > 0 }
+        }
         HANDLE_TYPE_THREAD => {
-            let tid = idx as u32;
-            if tid == 0 || idx >= MAX_THREADS {
+            let tid = idx;
+            if tid == 0 || !thread_exists(tid) {
                 false
             } else {
                 let state = with_thread(tid, |t| t.state);
@@ -381,53 +452,56 @@ fn is_handle_signaled_locked(waiter_tid: u32, h: u64) -> bool {
 }
 
 fn consume_handle_signal_locked(waiter_tid: u32, h: u64) -> bool {
-    let idx = handle_idx(h) as usize;
+    let idx = handle_idx(h);
     match handle_type(h) {
-        HANDLE_TYPE_EVENT => unsafe {
-            if idx == 0 || idx >= MAX_EVENTS {
+        HANDLE_TYPE_EVENT => {
+            let ev = event_ptr(idx);
+            if ev.is_null() {
                 return false;
             }
-            let ev = &mut EVENTS[idx];
-            if !ev.in_use || !ev.signaled {
-                return false;
-            }
-            if ev.ev_type == EventType::SynchronizationEvent {
-                ev.signaled = false;
+            unsafe {
+                if !(*ev).signaled {
+                    return false;
+                }
+                if (*ev).ev_type == EventType::SynchronizationEvent {
+                    (*ev).signaled = false;
+                }
             }
             true
-        },
-        HANDLE_TYPE_MUTEX => unsafe {
-            if idx == 0 || idx >= MAX_MUTEXES {
+        }
+        HANDLE_TYPE_MUTEX => {
+            let m = mutex_ptr(idx);
+            if m.is_null() {
                 return false;
             }
-            let m = &mut MUTEXES[idx];
-            if !m.in_use {
-                return false;
-            }
-            if m.owner_tid == 0 {
-                m.owner_tid = waiter_tid;
-                m.recursion = 1;
-                recompute_owned_mutex_priority_locked(waiter_tid);
-                return true;
-            }
-            if m.owner_tid == waiter_tid {
-                m.recursion = m.recursion.saturating_add(1);
-                recompute_owned_mutex_priority_locked(waiter_tid);
-                return true;
+            unsafe {
+                if (*m).owner_tid == 0 {
+                    (*m).owner_tid = waiter_tid;
+                    (*m).recursion = 1;
+                    recompute_owned_mutex_priority_locked(waiter_tid);
+                    return true;
+                }
+                if (*m).owner_tid == waiter_tid {
+                    (*m).recursion = (*m).recursion.saturating_add(1);
+                    recompute_owned_mutex_priority_locked(waiter_tid);
+                    return true;
+                }
             }
             false
-        },
-        HANDLE_TYPE_SEMAPHORE => unsafe {
-            if idx == 0 || idx >= MAX_SEMAPHORES {
+        }
+        HANDLE_TYPE_SEMAPHORE => {
+            let s = semaphore_ptr(idx);
+            if s.is_null() {
                 return false;
             }
-            let s = &mut SEMAPHORES[idx];
-            if !s.in_use || s.count <= 0 {
-                return false;
+            unsafe {
+                if (*s).count <= 0 {
+                    return false;
+                }
+                (*s).count -= 1;
             }
-            s.count -= 1;
             true
-        },
+        }
         HANDLE_TYPE_THREAD => is_handle_signaled_locked(waiter_tid, h),
         _ => false,
     }
@@ -473,60 +547,72 @@ fn consume_wait_all_locked(tid: u32, handles: &[u64]) -> bool {
 }
 
 fn register_waiter_on_handle_locked(h: u64, tid: u32) {
-    let idx = handle_idx(h) as usize;
+    let idx = handle_idx(h);
     match handle_type(h) {
-        HANDLE_TYPE_EVENT => unsafe {
-            if idx > 0 && idx < MAX_EVENTS && EVENTS[idx].in_use {
-                EVENTS[idx].waiters.enqueue(tid);
+        HANDLE_TYPE_EVENT => {
+            let ev = event_ptr(idx);
+            if !ev.is_null() {
+                unsafe { (*ev).waiters.enqueue(tid) };
             }
-        },
-        HANDLE_TYPE_MUTEX => unsafe {
-            if idx > 0 && idx < MAX_MUTEXES && MUTEXES[idx].in_use {
-                MUTEXES[idx].waiters.enqueue(tid);
-                let owner_tid = MUTEXES[idx].owner_tid;
-                if owner_tid != 0 && owner_tid != tid {
-                    let waiter_prio = with_thread(tid, |t| t.priority);
-                    boost_thread_priority_locked(owner_tid, waiter_prio);
+        }
+        HANDLE_TYPE_MUTEX => {
+            let m = mutex_ptr(idx);
+            if !m.is_null() {
+                unsafe {
+                    (*m).waiters.enqueue(tid);
+                    let owner_tid = (*m).owner_tid;
+                    if owner_tid != 0 && owner_tid != tid {
+                        let waiter_prio = with_thread(tid, |t| t.priority);
+                        boost_thread_priority_locked(owner_tid, waiter_prio);
+                    }
                 }
             }
-        },
-        HANDLE_TYPE_SEMAPHORE => unsafe {
-            if idx > 0 && idx < MAX_SEMAPHORES && SEMAPHORES[idx].in_use {
-                SEMAPHORES[idx].waiters.enqueue(tid);
+        }
+        HANDLE_TYPE_SEMAPHORE => {
+            let s = semaphore_ptr(idx);
+            if !s.is_null() {
+                unsafe { (*s).waiters.enqueue(tid) };
             }
-        },
-        HANDLE_TYPE_THREAD => unsafe {
-            if idx > 0 && idx < MAX_THREADS && validate_thread_target_tid(idx as u32) {
-                THREAD_WAITERS[idx].enqueue(tid);
+        }
+        HANDLE_TYPE_THREAD => {
+            if validate_thread_target_tid(idx) && ensure_thread_waiters_slot(idx) {
+                let q = thread_waiters_ptr(idx);
+                if !q.is_null() {
+                    unsafe { (*q).enqueue(tid) };
+                }
             }
-        },
+        }
         _ => {}
     }
 }
 
 fn remove_waiter_from_handle_locked(h: u64, tid: u32) {
-    let idx = handle_idx(h) as usize;
+    let idx = handle_idx(h);
     match handle_type(h) {
-        HANDLE_TYPE_EVENT => unsafe {
-            if idx > 0 && idx < MAX_EVENTS && EVENTS[idx].in_use {
-                EVENTS[idx].waiters.remove(tid);
+        HANDLE_TYPE_EVENT => {
+            let ev = event_ptr(idx);
+            if !ev.is_null() {
+                unsafe { (*ev).waiters.remove(tid) };
             }
-        },
-        HANDLE_TYPE_MUTEX => unsafe {
-            if idx > 0 && idx < MAX_MUTEXES && MUTEXES[idx].in_use {
-                MUTEXES[idx].waiters.remove(tid);
+        }
+        HANDLE_TYPE_MUTEX => {
+            let m = mutex_ptr(idx);
+            if !m.is_null() {
+                unsafe { (*m).waiters.remove(tid) };
             }
-        },
-        HANDLE_TYPE_SEMAPHORE => unsafe {
-            if idx > 0 && idx < MAX_SEMAPHORES && SEMAPHORES[idx].in_use {
-                SEMAPHORES[idx].waiters.remove(tid);
+        }
+        HANDLE_TYPE_SEMAPHORE => {
+            let s = semaphore_ptr(idx);
+            if !s.is_null() {
+                unsafe { (*s).waiters.remove(tid) };
             }
-        },
-        HANDLE_TYPE_THREAD => unsafe {
-            if idx > 0 && idx < MAX_THREADS {
-                THREAD_WAITERS[idx].remove(tid);
+        }
+        HANDLE_TYPE_THREAD => {
+            let q = thread_waiters_ptr(idx);
+            if !q.is_null() {
+                unsafe { (*q).remove(tid) };
             }
-        },
+        }
         _ => {}
     }
 }
@@ -618,8 +704,7 @@ fn wake_queue_one_for_handle_locked(queue: &mut WaitQueue, signaled_handle: u64)
         if try_complete_waiter_for_handle_locked(tid, signaled_handle) {
             return true;
         }
-        // 条件尚未满足（常见于 WaitAll），保留在队列中等待其它对象信号。
-        if with_thread(tid, |t| t.state == ThreadState::Waiting) {
+        if thread_exists(tid) && with_thread(tid, |t| t.state == ThreadState::Waiting) {
             queue.enqueue(tid);
         }
         i += 1;
@@ -638,7 +723,7 @@ fn wake_queue_all_for_handle_locked(queue: &mut WaitQueue, signaled_handle: u64)
         }
         if try_complete_waiter_for_handle_locked(tid, signaled_handle) {
             woke += 1;
-        } else if with_thread(tid, |t| t.state == ThreadState::Waiting) {
+        } else if thread_exists(tid) && with_thread(tid, |t| t.state == ThreadState::Waiting) {
             queue.enqueue(tid);
         }
         i += 1;
@@ -745,51 +830,39 @@ pub fn cleanup_wait_registration(tid: u32) {
 /// Notify synchronization subsystem that a thread became terminated.
 /// Wakes waiters blocked on this thread handle.
 pub fn thread_notify_terminated(target_tid: u32) {
-    if target_tid == 0 || target_tid as usize >= MAX_THREADS {
+    if target_tid == 0 {
         return;
     }
     sched_lock_acquire();
-    let h = make_handle(HANDLE_TYPE_THREAD, target_tid as u16);
-    unsafe {
-        wake_queue_all_for_handle_locked(&mut THREAD_WAITERS[target_tid as usize], h);
+    let h = make_handle(HANDLE_TYPE_THREAD, target_tid);
+    let q = thread_waiters_ptr(target_tid);
+    if !q.is_null() {
+        unsafe {
+            wake_queue_all_for_handle_locked(&mut *q, h);
+        }
     }
     sched_lock_release();
 }
 
 // ── Event API ────────────────────────────────────────────────
 
-pub fn event_alloc(ev_type: EventType, initial_state: bool) -> Option<u16> {
-    unsafe {
-        for i in 1..MAX_EVENTS {
-            if !EVENTS[i].in_use {
-                EVENTS[i].in_use = true;
-                EVENTS[i].signaled = initial_state;
-                EVENTS[i].ev_type = ev_type;
-                EVENTS[i].waiters = WaitQueue::new();
-                return Some(i as u16);
-            }
-        }
-        None
-    }
+pub fn event_alloc(ev_type: EventType, initial_state: bool) -> Option<u32> {
+    events_store_mut().alloc_with(|_| KEvent::new(ev_type, initial_state))
 }
 
-pub fn event_set(idx: u16) -> u32 {
-    let i = idx as usize;
-    if i == 0 || i >= MAX_EVENTS {
+pub fn event_set(idx: u32) -> u32 {
+    if idx == 0 {
         return STATUS_INVALID_HANDLE;
     }
+    let ev_ptr = event_ptr(idx);
+    if ev_ptr.is_null() {
+        return STATUS_INVALID_HANDLE;
+    }
+
+    sched_lock_acquire();
+    let h = make_handle(HANDLE_TYPE_EVENT, idx);
     unsafe {
-        if !EVENTS[i].in_use {
-            return STATUS_INVALID_HANDLE;
-        }
-
-        sched_lock_acquire();
-        let ev_ptr = &mut EVENTS[i] as *mut KEvent;
-        let h = make_handle(HANDLE_TYPE_EVENT, idx);
-
         if (*ev_ptr).ev_type == EventType::SynchronizationEvent {
-            // SyncEvent: expose signaled state before probing waiters so
-            // WAIT_KIND_SINGLE/MULTI_ANY can consume it in common path.
             (*ev_ptr).signaled = true;
             if wake_queue_one_for_handle_locked(&mut (*ev_ptr).waiters, h) {
                 (*ev_ptr).signaled = false;
@@ -798,74 +871,52 @@ pub fn event_set(idx: u16) -> u32 {
             (*ev_ptr).signaled = true;
             let _ = wake_queue_all_for_handle_locked(&mut (*ev_ptr).waiters, h);
         }
-
-        sched_lock_release();
     }
+    sched_lock_release();
+
     STATUS_SUCCESS
 }
 
-pub fn event_reset(idx: u16) -> u32 {
-    let i = idx as usize;
-    if i == 0 || i >= MAX_EVENTS {
+pub fn event_reset(idx: u32) -> u32 {
+    if idx == 0 {
+        return STATUS_INVALID_HANDLE;
+    }
+    let ev = event_ptr(idx);
+    if ev.is_null() {
         return STATUS_INVALID_HANDLE;
     }
     unsafe {
-        if !EVENTS[i].in_use {
-            return STATUS_INVALID_HANDLE;
-        }
-        EVENTS[i].signaled = false;
+        (*ev).signaled = false;
     }
     STATUS_SUCCESS
 }
 
-pub fn event_free(idx: u16) {
-    let i = idx as usize;
-    if i == 0 || i >= MAX_EVENTS {
+pub fn event_free(idx: u32) {
+    if idx == 0 {
         return;
     }
-    unsafe {
-        if EVENTS[i].in_use {
-            EVENTS[i].in_use = false;
-            EVENTS[i].signaled = false;
-            EVENTS[i].waiters = WaitQueue::new();
-        }
-    }
+    let _ = events_store_mut().free(idx);
 }
 
 // ── Mutex API ────────────────────────────────────────────────
 
-pub fn mutex_alloc(initial_owner: bool) -> Option<u16> {
-    unsafe {
-        for i in 1..MAX_MUTEXES {
-            if !MUTEXES[i].in_use {
-                MUTEXES[i].in_use = true;
-                MUTEXES[i].waiters = WaitQueue::new();
-                MUTEXES[i].recursion = 0;
-                MUTEXES[i].owner_tid = if initial_owner { current_tid() } else { 0 };
-                if initial_owner {
-                    MUTEXES[i].recursion = 1;
-                }
-                return Some(i as u16);
-            }
-        }
-    }
-    None
+pub fn mutex_alloc(initial_owner: bool) -> Option<u32> {
+    mutexes_store_mut().alloc_with(|_| KMutex::new(initial_owner))
 }
 
-pub fn mutex_release(idx: u16) -> u32 {
-    let i = idx as usize;
-    if i == 0 || i >= MAX_MUTEXES {
+pub fn mutex_release(idx: u32) -> u32 {
+    if idx == 0 {
         return STATUS_INVALID_HANDLE;
     }
+    let m_ptr = mutex_ptr(idx);
+    if m_ptr.is_null() {
+        return STATUS_INVALID_HANDLE;
+    }
+
+    sched_lock_acquire();
+
+    let cur = current_tid();
     unsafe {
-        if !MUTEXES[i].in_use {
-            return STATUS_INVALID_HANDLE;
-        }
-
-        sched_lock_acquire();
-
-        let m_ptr = &mut MUTEXES[i] as *mut KMutex;
-        let cur = current_tid();
         if (*m_ptr).owner_tid != cur {
             sched_lock_release();
             return STATUS_MUTANT_NOT_OWNED;
@@ -889,64 +940,46 @@ pub fn mutex_release(idx: u16) -> u32 {
         if new_owner != 0 {
             recompute_owned_mutex_priority_locked(new_owner);
         }
-
-        sched_lock_release();
     }
+
+    sched_lock_release();
     STATUS_SUCCESS
 }
 
-pub fn mutex_free(idx: u16) {
-    let i = idx as usize;
-    if i == 0 || i >= MAX_MUTEXES {
+pub fn mutex_free(idx: u32) {
+    if idx == 0 {
         return;
     }
-    unsafe {
-        if MUTEXES[i].in_use {
-            MUTEXES[i].in_use = false;
-            MUTEXES[i].owner_tid = 0;
-            MUTEXES[i].recursion = 0;
-            MUTEXES[i].waiters = WaitQueue::new();
-        }
-    }
+    let _ = mutexes_store_mut().free(idx);
 }
 
 // ── Semaphore API ────────────────────────────────────────────
 
-pub fn semaphore_alloc(initial: i32, maximum: i32) -> Option<u16> {
+pub fn semaphore_alloc(initial: i32, maximum: i32) -> Option<u32> {
     if maximum <= 0 || initial < 0 || initial > maximum {
         return None;
     }
-    unsafe {
-        for i in 1..MAX_SEMAPHORES {
-            if !SEMAPHORES[i].in_use {
-                SEMAPHORES[i].in_use = true;
-                SEMAPHORES[i].count = initial;
-                SEMAPHORES[i].maximum = maximum;
-                SEMAPHORES[i].waiters = WaitQueue::new();
-                return Some(i as u16);
-            }
-        }
-    }
-    None
+    semaphores_store_mut().alloc_with(|_| KSemaphore::new(initial, maximum))
 }
 
 /// Returns previous count, or STATUS_SEMAPHORE_LIMIT_EXCEEDED.
-pub fn semaphore_release(idx: u16, count: i32) -> u32 {
-    let i = idx as usize;
-    if i == 0 || i >= MAX_SEMAPHORES {
+pub fn semaphore_release(idx: u32, count: i32) -> u32 {
+    if idx == 0 {
         return STATUS_INVALID_HANDLE;
     }
     if count <= 0 {
         return STATUS_INVALID_PARAMETER;
     }
-    unsafe {
-        if !SEMAPHORES[i].in_use {
-            return STATUS_INVALID_HANDLE;
-        }
 
-        sched_lock_acquire();
-        let s_ptr = &mut SEMAPHORES[i] as *mut KSemaphore;
-        let prev = (*s_ptr).count;
+    let s_ptr = semaphore_ptr(idx);
+    if s_ptr.is_null() {
+        return STATUS_INVALID_HANDLE;
+    }
+
+    sched_lock_acquire();
+    let prev;
+    unsafe {
+        prev = (*s_ptr).count;
         let new_count = (*s_ptr).count.saturating_add(count);
         if new_count > (*s_ptr).maximum {
             sched_lock_release();
@@ -962,25 +995,16 @@ pub fn semaphore_release(idx: u16, count: i32) -> u32 {
             }
             rounds -= 1;
         }
-
-        sched_lock_release();
-        prev as u32
     }
+    sched_lock_release();
+    prev as u32
 }
 
-pub fn semaphore_free(idx: u16) {
-    let i = idx as usize;
-    if i == 0 || i >= MAX_SEMAPHORES {
+pub fn semaphore_free(idx: u32) {
+    if idx == 0 {
         return;
     }
-    unsafe {
-        if SEMAPHORES[i].in_use {
-            SEMAPHORES[i].in_use = false;
-            SEMAPHORES[i].count = 0;
-            SEMAPHORES[i].maximum = 0;
-            SEMAPHORES[i].waiters = WaitQueue::new();
-        }
-    }
+    let _ = semaphores_store_mut().free(idx);
 }
 
 // ── Handle wait / close ─────────────────────────────────────

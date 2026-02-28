@@ -171,20 +171,20 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
         // only run schedule() when a committed reschedule request exists, or
         // timer logic produced runnable-state change.
         if pending_resched || quantum_expired || timeout_woke || from == 0 {
-            let (_, to) = schedule(vid, now, quantum_100ns);
+            let (from_sched, to) = schedule(vid, now, quantum_100ns);
             if to != 0 {
                 set_vcpu_idle_locked(vid, false);
-                if from != 0 && from != to {
-                    save_ctx_for(from, frame);
+                if from_sched != 0 && from_sched != to {
+                    save_ctx_for(from_sched, frame);
                     restore_ctx_to_frame(to, frame);
-                } else if from == 0 {
+                } else if from_sched == 0 {
                     // We were idling; current frame no longer belongs to a runnable thread.
                     restore_ctx_to_frame(to, frame);
                 }
                 let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
                 sched_lock_release();
                 timer::arm_running_slice_100ns(now, next_deadline, slice_remaining);
-                return from != to;
+                return from_sched != to;
             }
 
             if !allow_idle_wait {
@@ -194,8 +194,8 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
             }
 
             // No runnable thread. Persist current frame once before sleeping.
-            if from != 0 {
-                save_ctx_for(from, frame);
+            if from_sched != 0 {
+                save_ctx_for(from_sched, frame);
                 from = 0;
             }
             set_vcpu_idle_locked(vid, true);

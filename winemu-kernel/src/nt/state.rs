@@ -77,12 +77,13 @@ impl VmRegion {
     }
 }
 
-static mut GUEST_FILES: [GuestFile; MAX_GUEST_FILES] = [const { GuestFile::empty() }; MAX_GUEST_FILES];
+static mut GUEST_FILES: [GuestFile; MAX_GUEST_FILES] =
+    [const { GuestFile::empty() }; MAX_GUEST_FILES];
 static mut GUEST_SECTIONS: [GuestSection; MAX_GUEST_SECTIONS] =
     [const { GuestSection::empty() }; MAX_GUEST_SECTIONS];
-static mut GUEST_VIEWS: [GuestView; MAX_GUEST_VIEWS] = [const { GuestView::empty() }; MAX_GUEST_VIEWS];
+static mut GUEST_VIEWS: [GuestView; MAX_GUEST_VIEWS] =
+    [const { GuestView::empty() }; MAX_GUEST_VIEWS];
 static mut VM_REGIONS: [VmRegion; MAX_VM_REGIONS] = [const { VmRegion::empty() }; MAX_VM_REGIONS];
-static mut DUP_TAG: u64 = 1;
 
 pub(crate) fn vm_alloc_region(size: u64, prot: u32) -> Option<u64> {
     let size = align_up_4k(size.max(0x1000));
@@ -133,20 +134,20 @@ pub(crate) fn vm_free_region(base: u64) -> bool {
     false
 }
 
-pub(crate) fn file_alloc(host_fd: u64) -> Option<u16> {
+pub(crate) fn file_alloc(host_fd: u64) -> Option<u32> {
     unsafe {
         for i in 1..MAX_GUEST_FILES {
             if !GUEST_FILES[i].in_use {
                 GUEST_FILES[i].in_use = true;
                 GUEST_FILES[i].host_fd = host_fd;
-                return Some(i as u16);
+                return Some(i as u32);
             }
         }
     }
     None
 }
 
-pub(crate) fn file_host_fd(idx: u16) -> Option<u64> {
+pub(crate) fn file_host_fd(idx: u32) -> Option<u64> {
     unsafe {
         let i = idx as usize;
         if i < MAX_GUEST_FILES && GUEST_FILES[i].in_use {
@@ -156,7 +157,7 @@ pub(crate) fn file_host_fd(idx: u16) -> Option<u64> {
     None
 }
 
-pub(crate) fn file_free(idx: u16) {
+pub(crate) fn file_free(idx: u32) {
     unsafe {
         let i = idx as usize;
         if i < MAX_GUEST_FILES && GUEST_FILES[i].in_use {
@@ -167,7 +168,7 @@ pub(crate) fn file_free(idx: u16) {
     }
 }
 
-pub(crate) fn section_alloc(size: u64, prot: u32, file_handle: u64) -> Option<u16> {
+pub(crate) fn section_alloc(size: u64, prot: u32, file_handle: u64) -> Option<u32> {
     unsafe {
         for i in 1..MAX_GUEST_SECTIONS {
             if !GUEST_SECTIONS[i].in_use {
@@ -175,14 +176,14 @@ pub(crate) fn section_alloc(size: u64, prot: u32, file_handle: u64) -> Option<u1
                 GUEST_SECTIONS[i].size = size;
                 GUEST_SECTIONS[i].prot = prot;
                 GUEST_SECTIONS[i].file_handle = file_handle;
-                return Some(i as u16);
+                return Some(i as u32);
             }
         }
     }
     None
 }
 
-pub(crate) fn section_get(idx: u16) -> Option<GuestSection> {
+pub(crate) fn section_get(idx: u32) -> Option<GuestSection> {
     unsafe {
         let i = idx as usize;
         if i < MAX_GUEST_SECTIONS && GUEST_SECTIONS[i].in_use {
@@ -192,7 +193,7 @@ pub(crate) fn section_get(idx: u16) -> Option<GuestSection> {
     None
 }
 
-pub(crate) fn section_free(idx: u16) {
+pub(crate) fn section_free(idx: u32) {
     unsafe {
         let i = idx as usize;
         if i < MAX_GUEST_SECTIONS {
@@ -230,9 +231,5 @@ pub(crate) fn view_free(base: u64) -> bool {
 }
 
 pub(crate) fn duplicate_handle(src: u64) -> u64 {
-    unsafe {
-        let dup = src | ((DUP_TAG & 0xFFFF_FFFF) << 16);
-        DUP_TAG = DUP_TAG.wrapping_add(1);
-        dup
-    }
+    src
 }
