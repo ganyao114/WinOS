@@ -7,6 +7,7 @@
 //   x9  = 调用者 LR（由 syscall stub 保存）
 //   返回值在 x0
 
+#[cfg(target_arch = "aarch64")]
 use core::arch::global_asm;
 
 // ── syscall dispatcher 汇编 ──────────────────────────────────
@@ -28,6 +29,7 @@ use core::arch::global_asm;
 //   args[5] = arg3 (x3)
 // 超过4个参数的部分由 VMM 从 guest 栈读取（args[4]=sp）
 
+#[cfg(target_arch = "aarch64")]
 global_asm!(
     ".section .text,\"ax\"",
     ".global __winemu_syscall_dispatcher",
@@ -37,11 +39,11 @@ global_asm!(
     "stp x9, x30, [sp, #-16]!",
     // 构造 hypercall 参数
     // x0 = NT_SYSCALL hypercall 号
-    "mov x16, #0x0700",        // NT_SYSCALL nr
+    "mov x16, #0x0700", // NT_SYSCALL nr
     // 把 syscall 号和表号打包到 x17
-    "and x17, x8, #0xFFF",     // x17 = syscall_nr
+    "and x17, x8, #0xFFF", // x17 = syscall_nr
     "lsr x18, x8, #12",
-    "and x18, x18, #0x3",      // x18 = table_nr
+    "and x18, x18, #0x3", // x18 = table_nr
     // 参数 x0-x7 已就位，直接 HVC
     // HVC 约定：x0=nr, x1-x6=args
     // 需要把 syscall_nr/table_nr 插入，先移位参数
@@ -54,13 +56,13 @@ global_asm!(
     //   x5 = original x2 (arg2)
     //   x6 = original x3 (arg3)
     // 超过4个参数：VMM 从 guest sp+16 读取
-    "mov x6, x3",              // arg3
-    "mov x5, x2",              // arg2
-    "mov x4, x1",              // arg1
-    "mov x3, x0",              // arg0
-    "mov x2, x18",             // table_nr
-    "mov x1, x17",             // syscall_nr
-    "mov x0, x16",             // NT_SYSCALL
+    "mov x6, x3",  // arg3
+    "mov x5, x2",  // arg2
+    "mov x4, x1",  // arg1
+    "mov x3, x0",  // arg0
+    "mov x2, x18", // table_nr
+    "mov x1, x17", // syscall_nr
+    "mov x0, x16", // NT_SYSCALL
     "hvc #0",
     // 恢复 LR 并返回
     "ldp x9, x30, [sp], #16",
@@ -72,9 +74,14 @@ global_asm!(
 // 这样 Wine 的 syscall stub（ldr x16, [x18, #0x2f8]; blr x16）
 // 就会跳到我们的 dispatcher
 
+#[cfg(target_arch = "aarch64")]
 extern "C" {
     fn __winemu_syscall_dispatcher();
 }
+
+#[cfg(not(target_arch = "aarch64"))]
+#[no_mangle]
+extern "C" fn __winemu_syscall_dispatcher() {}
 
 /// 初始化 syscall 分发器
 /// teb_va: 当前线程的 TEB 虚拟地址

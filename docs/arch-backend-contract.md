@@ -9,6 +9,21 @@
   - `x86_64 -> src/arch/x86_64/`
 - 业务层只调用 `crate::arch::{cpu,mmu,timer,spin,hypercall,vectors}`。
 
+## 编译期契约（Trait）
+
+`winemu-kernel/src/arch/contract.rs` 定义了显式 trait：
+
+- `CpuBackend`
+- `MmuBackend`
+- `HypercallBackend`
+- `SpinBackend`
+- `TimerBackend`
+- `VectorsBackend`
+- 组合 trait：`KernelArchBackend`
+
+每个 backend 需要在 `mod.rs` 提供 `ArchBackend`，并实现上述 trait。  
+这样新增或修改能力时，编译器会强制检查所有后端是否同步实现。
+
 ## 必须实现的 backend 模块
 
 每个 backend 目录都需要下列模块：
@@ -57,3 +72,8 @@
 - `aarch64`：完整实现。
 - `x86_64`：已建立骨架（stub），接口齐全但未实现真实行为。
 
+## 持续校验
+
+- 本地脚本：`scripts/check-kernel-backends.sh`
+- CI Job：`.github/workflows/ci.yml` 中 `kernel-backend-check`
+- 目标：确保 `winemu-kernel` 在 `aarch64` 与 `x86_64` 路径持续可编译。
