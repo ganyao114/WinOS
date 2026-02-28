@@ -2,8 +2,9 @@
 // 参考: Wine dlls/ntdll/unix/signal_arm64.c call_init_thunk
 //       Wine dlls/ntdll/unix/virtual.c init_teb / init_peb
 
-use winemu_shared::{teb, peb};
-use crate::alloc;
+use crate::mm::vaspace::VmaType;
+use crate::nt::state::{vm_alloc_region_typed, vm_free_region};
+use winemu_shared::{peb, teb};
 
 /// 已初始化的 TEB/PEB 描述符
 pub struct TebPeb {
@@ -152,21 +153,63 @@ pub fn init(
     cmdline: &str,
 ) -> Option<TebPeb> {
     let stack_size = align_up(stack_reserve.max(0x10_0000), 0x10000) as usize;
+    let mut allocated = [0u64; 6];
+    let mut allocated_count = 0usize;
+    let stack_limit = match alloc_user_region(
+        pid,
+        stack_size,
+        VmaType::ThreadStack,
+        &mut allocated,
+        &mut allocated_count,
+    ) {
+        Some(v) => v,
+        None => return None,
+    };
+    let stack_base = stack_limit + stack_size as u64;
 
-    let stack_mem  = alloc::alloc_zeroed(stack_size, 0x10000)?;
-    let stack_limit = stack_mem as u64;
-    let stack_base  = stack_limit + stack_size as u64;
+    let peb_va = match alloc_user_region(
+        pid,
+        peb::SIZE,
+        VmaType::Private,
+        &mut allocated,
+        &mut allocated_count,
+    ) {
+        Some(v) => v,
+        None => {
+            free_user_regions(pid, &allocated, allocated_count);
+            return None;
+        }
+    };
 
-    let peb_mem = alloc::alloc_zeroed(peb::SIZE, 0x1000)?;
-    let peb_va  = peb_mem as u64;
-
-    let teb_mem = alloc::alloc_zeroed(teb::SIZE, 0x1000)?;
-    let teb_va  = teb_mem as u64;
+    let teb_va = match alloc_user_region(
+        pid,
+        teb::SIZE,
+        VmaType::Private,
+        &mut allocated,
+        &mut allocated_count,
+    ) {
+        Some(v) => v,
+        None => {
+            free_user_regions(pid, &allocated, allocated_count);
+            return None;
+        }
+    };
 
     // ── ProcessParameters ────────────────────────────────────
-    let upp_mem = alloc::alloc_zeroed(upp::SIZE, 0x1000)?;
-    let upp_va  = upp_mem as u64;
-    let upp_buf = unsafe { core::slice::from_raw_parts_mut(upp_mem, upp::SIZE) };
+    let upp_va = match alloc_user_region(
+        pid,
+        upp::SIZE,
+        VmaType::Private,
+        &mut allocated,
+        &mut allocated_count,
+    ) {
+        Some(v) => v,
+        None => {
+            free_user_regions(pid, &allocated, allocated_count);
+            return None;
+        }
+    };
+    let upp_buf = unsafe { core::slice::from_raw_parts_mut(upp_va as *mut u8, upp::SIZE) };
 
     // 把 image_path 和 cmdline 编码为 UTF-16LE，写入字符串数据区
     let mut str_off = upp::STR_DATA_OFF;
@@ -193,7 +236,7 @@ pub fn init(
     wu64(upp_buf, upp::COMMAND_LINE + 8, cmd_va);
 
     // ── PEB ──────────────────────────────────────────────────
-    let peb_buf = unsafe { core::slice::from_raw_parts_mut(peb_mem, peb::SIZE) };
+    let peb_buf = unsafe { core::slice::from_raw_parts_mut(peb_va as *mut u8, peb::SIZE) };
     wu64(peb_buf, peb::IMAGE_BASE_ADDRESS,  image_base);
     wu64(peb_buf, peb::PROCESS_PARAMETERS,  upp_va);
     wu32(peb_buf, peb::OS_MAJOR_VERSION,    10);
@@ -202,9 +245,20 @@ pub fn init(
     wu32(peb_buf, peb::OS_PLATFORM_ID,      2);
 
     // ── PEB_LDR_DATA ─────────────────────────────────────────
-    let ldr_mem = alloc::alloc_zeroed(ldr_data::SIZE, 0x1000)?;
-    let ldr_va  = ldr_mem as u64;
-    let ldr_buf = unsafe { core::slice::from_raw_parts_mut(ldr_mem, ldr_data::SIZE) };
+    let ldr_va = match alloc_user_region(
+        pid,
+        ldr_data::SIZE,
+        VmaType::Private,
+        &mut allocated,
+        &mut allocated_count,
+    ) {
+        Some(v) => v,
+        None => {
+            free_user_regions(pid, &allocated, allocated_count);
+            return None;
+        }
+    };
+    let ldr_buf = unsafe { core::slice::from_raw_parts_mut(ldr_va as *mut u8, ldr_data::SIZE) };
 
     wu32(ldr_buf, ldr_data::LENGTH,      ldr_data::SIZE as u32);
     wu32(ldr_buf, ldr_data::INITIALIZED, 1);
@@ -214,9 +268,20 @@ pub fn init(
     write_list_head(ldr_buf, ldr_data::IN_INIT_ORDER,    ldr_va);
 
     // ── LDR_DATA_TABLE_ENTRY for main module ─────────────────
-    let entry_mem = alloc::alloc_zeroed(ldr_entry::SIZE, 0x1000)?;
-    let entry_va  = entry_mem as u64;
-    let entry_buf = unsafe { core::slice::from_raw_parts_mut(entry_mem, ldr_entry::SIZE) };
+    let entry_va = match alloc_user_region(
+        pid,
+        ldr_entry::SIZE,
+        VmaType::Private,
+        &mut allocated,
+        &mut allocated_count,
+    ) {
+        Some(v) => v,
+        None => {
+            free_user_regions(pid, &allocated, allocated_count);
+            return None;
+        }
+    };
+    let entry_buf = unsafe { core::slice::from_raw_parts_mut(entry_va as *mut u8, ldr_entry::SIZE) };
 
     wu64(entry_buf, ldr_entry::DLL_BASE,      image_base);
     wu64(entry_buf, ldr_entry::ENTRY_POINT,   0); // filled later if needed
@@ -263,7 +328,7 @@ pub fn init(
     wu64(upp_buf, upp_handles::STANDARD_ERROR,  0xFFFF_FFFF_FFFF_FFF4u64); // -12
 
     // ── TEB ──────────────────────────────────────────────────
-    let teb_buf = unsafe { core::slice::from_raw_parts_mut(teb_mem, teb::SIZE) };
+    let teb_buf = unsafe { core::slice::from_raw_parts_mut(teb_va as *mut u8, teb::SIZE) };
     wu64(teb_buf, teb::EXCEPTION_LIST, u64::MAX);
     wu64(teb_buf, teb::STACK_BASE,     stack_base);
     wu64(teb_buf, teb::STACK_LIMIT,    stack_limit);
@@ -273,6 +338,33 @@ pub fn init(
     wu64(teb_buf, teb::CLIENT_ID + 8,  tid as u64);
 
     Some(TebPeb { teb_va, peb_va, stack_base, stack_limit })
+}
+
+fn free_user_regions(pid: u32, regions: &[u64; 6], count: usize) {
+    for i in 0..count.min(regions.len()) {
+        let base = regions[i];
+        if base != 0 {
+            let _ = vm_free_region(pid, base);
+        }
+    }
+}
+
+fn alloc_user_region(
+    pid: u32,
+    size: usize,
+    vma_type: VmaType,
+    regions: &mut [u64; 6],
+    count: &mut usize,
+) -> Option<u64> {
+    let base = vm_alloc_region_typed(pid, 0, size as u64, 0x04, vma_type)?;
+    if *count < regions.len() {
+        regions[*count] = base;
+        *count += 1;
+        Some(base)
+    } else {
+        let _ = vm_free_region(pid, base);
+        None
+    }
 }
 
 /// 将 UTF-8 字符串编码为 UTF-16LE 写入 buf[*off..]，返回该字符串在 guest 内存中的 VA。

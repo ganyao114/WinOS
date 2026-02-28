@@ -154,6 +154,12 @@ impl ProcessAddressSpace {
 
     fn clone_l2_child_tables(&mut self) -> bool {
         for idx in 0..PAGE_TABLE_ENTRIES {
+            if l2_entry_in_user_window(idx) {
+                unsafe {
+                    *self.l2.add(idx) = DESC_INVALID;
+                }
+                continue;
+            }
             let l2e = unsafe { *self.l2.add(idx) };
             if (l2e & DESC_TYPE_MASK) == DESC_TABLE_OR_PAGE {
                 let src_l3 = (l2e & TABLE_ADDR_MASK) as *const u64;
@@ -229,19 +235,23 @@ impl ProcessAddressSpace {
         }
 
         let l2e = unsafe { *self.l2.add(l2_idx) };
-        if (l2e & DESC_TYPE_MASK) != DESC_TABLE_OR_PAGE {
-            return false;
+        let l2_kind = l2e & DESC_TYPE_MASK;
+        if l2_kind == DESC_INVALID || l2_kind == DESC_BLOCK {
+            return true;
+        }
+        if l2_kind != DESC_TABLE_OR_PAGE {
+            return true;
         }
 
         let l3 = (l2e & TABLE_ADDR_MASK) as *mut u64;
         if l3.is_null() {
-            return false;
+            return true;
         }
 
         let idx = l3_index(va);
         let old = unsafe { *l3.add(idx) };
         if (old & DESC_TYPE_MASK) != DESC_TABLE_OR_PAGE {
-            return false;
+            return true;
         }
 
         let pa = old & TABLE_ADDR_MASK;

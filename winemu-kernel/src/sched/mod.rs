@@ -7,10 +7,12 @@ mod lock;
 pub mod sync;
 
 use crate::kobj::ObjectStore;
+use crate::mm::vaspace::VmaType;
 use crate::nt::constants::{
     DEFAULT_THREAD_STACK_RESERVE, PAGE_SIZE_4K, PSEUDO_CURRENT_THREAD, PSEUDO_CURRENT_THREAD_ALT,
     THREAD_BASIC_INFORMATION_SIZE, THREAD_STACK_ALIGN,
 };
+use crate::nt::state::{vm_alloc_region_typed, vm_free_region};
 use crate::rust_alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use winemu_shared::status;
@@ -670,10 +672,14 @@ pub fn create_user_thread(
     }
 
     let stack_size = normalize_stack_size(max_stack_size_arg);
-    let stack_base = crate::alloc::alloc_zeroed(stack_size as usize, THREAD_STACK_ALIGN as usize)
-        .ok_or(CreateThreadError::NoMemory)? as u64;
-    let teb_va = crate::alloc::alloc_zeroed(PAGE_SIZE_4K as usize, PAGE_SIZE_4K as usize)
-        .map_or(0, |p| p as u64);
+    let stack_base = vm_alloc_region_typed(pid, 0, stack_size, 0x04, VmaType::ThreadStack)
+        .ok_or(CreateThreadError::NoMemory)?;
+    let teb_va =
+        vm_alloc_region_typed(pid, 0, PAGE_SIZE_4K, 0x04, VmaType::Private).map_or(0, |v| v);
+    if teb_va == 0 {
+        let _ = vm_free_region(pid, stack_base);
+        return Err(CreateThreadError::NoMemory);
+    }
     let stack_top = stack_base + stack_size;
 
     let tid = spawn(
@@ -687,10 +693,8 @@ pub fn create_user_thread(
         priority,
     );
     if tid == 0 {
-        crate::alloc::dealloc(stack_base as *mut u8);
-        if teb_va != 0 {
-            crate::alloc::dealloc(teb_va as *mut u8);
-        }
+        let _ = vm_free_region(pid, stack_base);
+        let _ = vm_free_region(pid, teb_va);
         return Err(CreateThreadError::NoMemory);
     }
     crate::process::on_thread_created(pid, tid);
@@ -717,12 +721,8 @@ pub fn terminate_thread_by_tid(tid: u32) -> bool {
     set_thread_state_locked(tid, ThreadState::Terminated);
     sched_lock_release();
 
-    if stack_base != 0 {
-        crate::alloc::dealloc(stack_base as *mut u8);
-    }
-    if teb_va != 0 {
-        crate::alloc::dealloc(teb_va as *mut u8);
-    }
+    let _ = vm_free_region(pid, stack_base);
+    let _ = vm_free_region(pid, teb_va);
     crate::process::on_thread_terminated(pid, tid);
     true
 }

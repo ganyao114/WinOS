@@ -22,23 +22,35 @@ mod vectors;
 /// Returns 1 if fault resolved (demand paging), 0 if unresolvable.
 #[no_mangle]
 pub extern "C" fn el0_page_fault(far: u64, esr: u64, elr: u64) -> u64 {
-    // ESR_EL1 fields
     let ec = (esr >> 26) & 0x3F;
     let iss = esr & 0x01FF_FFFF;
-    let wnr = (iss >> 6) & 1; // 1=write, 0=read
+    let fsc = iss & 0x3F;
+    let wnr = (iss >> 6) & 1;
 
-    hypercall::debug_print("PAGE_FAULT: ");
+    let is_el0_abort = ec == 0x20 || ec == 0x24;
+    let is_translation_fault = (0x04..=0x07).contains(&fsc);
+    let is_access_flag_fault = fsc == 0x09 || fsc == 0x0B;
+    if is_el0_abort && (is_translation_fault || is_access_flag_fault) {
+        let access = if ec == 0x20 {
+            crate::nt::state::VM_ACCESS_EXEC
+        } else if wnr != 0 {
+            crate::nt::state::VM_ACCESS_WRITE
+        } else {
+            crate::nt::state::VM_ACCESS_READ
+        };
+        let owner_pid = crate::process::current_pid();
+        if owner_pid != 0 && crate::nt::state::vm_handle_page_fault(owner_pid, far, access) {
+            return 1;
+        }
+    }
+
+    hypercall::debug_print("PAGE_FAULT_UNRESOLVED: ");
     hypercall::debug_u64(far);
-    hypercall::debug_print(" EC=");
-    hypercall::debug_u64(ec);
-    hypercall::debug_print(" WnR=");
-    hypercall::debug_u64(wnr);
+    hypercall::debug_print(" ESR=");
+    hypercall::debug_u64(esr);
     hypercall::debug_print(" ELR=");
     hypercall::debug_u64(elr);
     hypercall::debug_print("\n");
-
-    // TODO: When MMU is enabled, look up VMA and demand-page here.
-    // For now, report and return unresolved.
     0
 }
 
@@ -125,8 +137,18 @@ pub extern "C" fn kernel_main() -> ! {
         }
     };
 
-    // ── 3. 初始化 TEB / PEB / 栈 ────────────────────────────
-    let teb_peb = match teb::init(loaded.base, 1, 1, stack_reserve, "C:\\app.exe", "app.exe") {
+    // ── 3. 先建立 boot process，再在其地址空间初始化 TEB / PEB / 栈 ──
+    if !process::init_boot_process(loaded.base, 0) {
+        hypercall::debug_print("kernel: boot process init failed\n");
+        hypercall::process_exit(1);
+    }
+    let boot_pid = process::boot_pid();
+    if boot_pid == 0 {
+        hypercall::debug_print("kernel: boot pid invalid\n");
+        hypercall::process_exit(1);
+    }
+
+    let teb_peb = match teb::init(loaded.base, boot_pid, 1, stack_reserve, "C:\\app.exe", "app.exe") {
         Some(t) => t,
         None => {
             hypercall::debug_print("kernel: teb init failed\n");
@@ -135,7 +157,7 @@ pub extern "C" fn kernel_main() -> ! {
     };
 
     if !process::init_boot_process(loaded.base, teb_peb.peb_va) {
-        hypercall::debug_print("kernel: boot process init failed\n");
+        hypercall::debug_print("kernel: boot process update failed\n");
         hypercall::process_exit(1);
     }
 

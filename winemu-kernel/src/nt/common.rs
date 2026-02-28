@@ -14,6 +14,9 @@ pub(crate) const HOST_OPEN_RW: u64 = 2;
 pub(crate) const HOST_OPEN_CREATE: u64 = 3;
 
 pub(crate) const MEM_COMMIT: u32 = 0x1000;
+pub(crate) const MEM_RESERVE: u32 = 0x2000;
+pub(crate) const MEM_DECOMMIT: u32 = 0x4000;
+pub(crate) const MEM_RELEASE: u32 = 0x8000;
 
 #[repr(C)]
 pub(crate) struct IoStatusBlock {

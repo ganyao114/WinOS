@@ -1,10 +1,12 @@
 use winemu_shared::status;
 
-use super::common::{align_up_4k, MEM_COMMIT};
+use super::common::{align_up_4k, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE};
 use super::constants::{PAGE_MASK_4K, PAGE_SIZE_4K};
-use super::state::{vm_alloc_region_typed, vm_find_region, vm_free_region, vm_set_region_prot};
+use super::state::{
+    vm_commit_private, vm_decommit_private, vm_protect_range, vm_query_region, vm_release_private,
+    vm_reserve_private,
+};
 use super::SvcFrame;
-use crate::mm::vaspace::VmaType;
 
 // x1=*BaseAddress, x3=*RegionSize, x5=Protect
 pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
@@ -20,61 +22,139 @@ pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
+    let alloc_type = frame.x[4] as u32;
     let prot = frame.x[5] as u32;
     let size = align_up_4k(req_size);
     let owner_pid = crate::process::current_pid();
-    let hint = if !base_ptr.is_null() {
-        unsafe { base_ptr.read_volatile() }
+    let req_base = if !base_ptr.is_null() {
+        (unsafe { base_ptr.read_volatile() }) & PAGE_MASK_4K
     } else {
         0
     };
 
-    let base = match vm_alloc_region_typed(owner_pid, hint, size, prot, VmaType::Private) {
-        Some(v) => v,
-        None => {
-            frame.x[0] = status::NO_MEMORY as u64;
-            return;
+    let reserve = (alloc_type & MEM_RESERVE) != 0;
+    let commit = (alloc_type & MEM_COMMIT) != 0;
+    if !reserve && !commit {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+
+    if reserve {
+        let base = match vm_reserve_private(owner_pid, req_base, size, prot) {
+            Ok(v) => v,
+            Err(st) => {
+                frame.x[0] = st as u64;
+                return;
+            }
+        };
+        if commit {
+            let st = vm_commit_private(owner_pid, base, size, prot);
+            if st != status::SUCCESS {
+                let _ = vm_release_private(owner_pid, base);
+                frame.x[0] = st as u64;
+                return;
+            }
         }
-    };
+        if !base_ptr.is_null() {
+            unsafe { base_ptr.write_volatile(base) };
+        }
+        unsafe { size_ptr.write_volatile(size) };
+        frame.x[0] = status::SUCCESS as u64;
+        return;
+    }
+
+    if req_base == 0 {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+
+    let st = vm_commit_private(owner_pid, req_base, size, prot);
+    if st != status::SUCCESS {
+        frame.x[0] = st as u64;
+        return;
+    }
     if !base_ptr.is_null() {
-        unsafe { base_ptr.write_volatile(base) };
+        unsafe { base_ptr.write_volatile(req_base) };
     }
     unsafe { size_ptr.write_volatile(size) };
     frame.x[0] = status::SUCCESS as u64;
 }
 
-// x1=*BaseAddress
+// x1=*BaseAddress, x2=*RegionSize, x3=FreeType
 pub(crate) fn handle_free_virtual_memory(frame: &mut SvcFrame) {
-    let base_ptr = frame.x[1] as *const u64;
+    let base_ptr = frame.x[1] as *mut u64;
+    let size_ptr = frame.x[2] as *mut u64;
+    let free_type = frame.x[3] as u32;
     if base_ptr.is_null() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
     let base = unsafe { base_ptr.read_volatile() };
     let owner_pid = crate::process::current_pid();
-    let _ = vm_free_region(owner_pid, base);
-    frame.x[0] = status::SUCCESS as u64;
+    match free_type {
+        MEM_RELEASE => {
+            if !size_ptr.is_null() {
+                let size = unsafe { size_ptr.read_volatile() };
+                if size != 0 {
+                    frame.x[0] = status::INVALID_PARAMETER as u64;
+                    return;
+                }
+            }
+            frame.x[0] = vm_release_private(owner_pid, base) as u64;
+        }
+        MEM_DECOMMIT => {
+            if size_ptr.is_null() {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            }
+            let size = unsafe { size_ptr.read_volatile() };
+            if size == 0 {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            }
+            frame.x[0] = vm_decommit_private(owner_pid, base, size) as u64;
+        }
+        _ => {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+        }
+    }
 }
 
-// x1=*BaseAddress, x3=NewProtect, x4=*OldProtect
+// x1=*BaseAddress, x2=*RegionSize, x3=NewProtect, x4=*OldProtect
 pub(crate) fn handle_protect_virtual_memory(frame: &mut SvcFrame) {
-    let base_ptr = frame.x[1] as *const u64;
+    let base_ptr = frame.x[1] as *mut u64;
+    let size_ptr = frame.x[2] as *mut u64;
     let old_ptr = frame.x[4] as *mut u32;
-    if base_ptr.is_null() {
+    if base_ptr.is_null() || size_ptr.is_null() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
-    let base = unsafe { base_ptr.read_volatile() };
-    let owner_pid = crate::process::current_pid();
-    if let Some((idx, region)) = vm_find_region(owner_pid, base) {
-        if !old_ptr.is_null() {
-            unsafe { old_ptr.write_volatile(region.prot) };
-        }
-        let _ = vm_set_region_prot(idx, frame.x[3] as u32);
-    } else if !old_ptr.is_null() {
-        unsafe { old_ptr.write_volatile(0) };
+    let base = unsafe { base_ptr.read_volatile() } & PAGE_MASK_4K;
+    let size = align_up_4k(unsafe { size_ptr.read_volatile() });
+    if size == 0 {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     }
-    frame.x[0] = status::SUCCESS as u64;
+
+    let owner_pid = crate::process::current_pid();
+    match vm_protect_range(owner_pid, base, size, frame.x[3] as u32) {
+        Ok(old) => {
+            if !old_ptr.is_null() {
+                unsafe { old_ptr.write_volatile(old) };
+            }
+            unsafe {
+                base_ptr.write_volatile(base);
+                size_ptr.write_volatile(size);
+            }
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        Err(st) => {
+            if !old_ptr.is_null() {
+                unsafe { old_ptr.write_volatile(0) };
+            }
+            frame.x[0] = st as u64;
+        }
+    }
 }
 
 // x1=BaseAddress, x3=Buffer, x4=BufferSize, x5=*ReturnLength
@@ -89,8 +169,8 @@ pub(crate) fn handle_query_virtual_memory(frame: &mut SvcFrame) {
     }
     let owner_pid = crate::process::current_pid();
 
-    let (base, size, prot, state) = if let Some((_, r)) = vm_find_region(owner_pid, addr) {
-        (r.base, r.size, r.prot, MEM_COMMIT)
+    let (base, size, prot, state) = if let Some(q) = vm_query_region(owner_pid, addr) {
+        (q.base, q.size, q.prot, q.state)
     } else {
         (addr & PAGE_MASK_4K, PAGE_SIZE_4K, 0u32, 0u32)
     };

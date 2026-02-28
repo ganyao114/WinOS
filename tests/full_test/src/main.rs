@@ -8,28 +8,31 @@ use core::arch::asm;
 const STDOUT: u64 = 0xFFFF_FFFF_FFFF_FFF5;
 
 // ── NT syscall numbers (Windows 11 ARM64, table 0) ──────────────
-const NR_WRITE_FILE: u64              = 0x0008;
-const NR_CLOSE: u64                   = 0x000F;
-const NR_TERMINATE_PROCESS: u64       = 0x002C;
+const NR_WRITE_FILE: u64 = 0x0008;
+const NR_CLOSE: u64 = 0x000F;
+const NR_TERMINATE_PROCESS: u64 = 0x002C;
 const NR_ALLOCATE_VIRTUAL_MEMORY: u64 = 0x0015;
-const NR_FREE_VIRTUAL_MEMORY: u64     = 0x001E;
-const NR_PROTECT_VIRTUAL_MEMORY: u64  = 0x004D;
-const NR_QUERY_VIRTUAL_MEMORY: u64    = 0x0023;
-const NR_CREATE_SECTION: u64          = 0x004A;
-const NR_MAP_VIEW_OF_SECTION: u64     = 0x0028;
-const NR_UNMAP_VIEW_OF_SECTION: u64   = 0x002A;
-const NR_CREATE_EVENT: u64            = 0x0048;
-const NR_SET_EVENT: u64               = 0x000E;
-const NR_RESET_EVENT: u64             = 0x0034;
-const NR_YIELD_EXECUTION: u64         = 0x0046;
+const NR_FREE_VIRTUAL_MEMORY: u64 = 0x001E;
+const NR_PROTECT_VIRTUAL_MEMORY: u64 = 0x004D;
+const NR_QUERY_VIRTUAL_MEMORY: u64 = 0x0023;
+const NR_CREATE_SECTION: u64 = 0x004A;
+const NR_MAP_VIEW_OF_SECTION: u64 = 0x0028;
+const NR_UNMAP_VIEW_OF_SECTION: u64 = 0x002A;
+const NR_CREATE_EVENT: u64 = 0x0048;
+const NR_SET_EVENT: u64 = 0x000E;
+const NR_RESET_EVENT: u64 = 0x0034;
+const NR_YIELD_EXECUTION: u64 = 0x0046;
 const NR_QUERY_INFORMATION_PROCESS: u64 = 0x0019;
-const NR_DUPLICATE_OBJECT: u64        = 0x003C;
+const NR_DUPLICATE_OBJECT: u64 = 0x003C;
 
 const STATUS_SUCCESS: u64 = 0;
+const STATUS_INVALID_PARAMETER: u64 = 0xC000000D;
 const PAGE_READWRITE: u64 = 0x04;
-const MEM_COMMIT: u64     = 0x1000;
-const MEM_RESERVE: u64    = 0x2000;
-const MEM_RELEASE: u64    = 0x8000;
+const PAGE_READONLY: u64 = 0x02;
+const MEM_COMMIT: u64 = 0x1000;
+const MEM_RESERVE: u64 = 0x2000;
+const MEM_DECOMMIT: u64 = 0x4000;
+const MEM_RELEASE: u64 = 0x8000;
 
 static mut PASS_COUNT: u32 = 0;
 static mut FAIL_COUNT: u32 = 0;
@@ -37,8 +40,17 @@ static mut FAIL_COUNT: u32 = 0;
 // ── Low-level SVC wrappers ──────────────────────────────────────
 
 #[inline(always)]
-unsafe fn svc(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64,
-              a4: u64, a5: u64, a6: u64, a7: u64) -> u64 {
+unsafe fn svc(
+    nr: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+) -> u64 {
     let ret: u64;
     asm!(
         "svc #0",
@@ -52,9 +64,19 @@ unsafe fn svc(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64,
 }
 
 #[inline(always)]
-unsafe fn svc10(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64,
-                a4: u64, a5: u64, a6: u64, a7: u64,
-                s0: u64, s1: u64) -> u64 {
+unsafe fn svc10(
+    nr: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    s0: u64,
+    s1: u64,
+) -> u64 {
     let ret: u64;
     asm!(
         "stp {sa}, {sb}, [sp, #-16]!",
@@ -73,27 +95,39 @@ unsafe fn svc10(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64,
 // ── Output helpers ──────────────────────────────────────────────
 
 #[repr(C)]
-struct IoStatusBlock { status: u64, info: u64 }
+struct IoStatusBlock {
+    status: u64,
+    info: u64,
+}
 
 unsafe fn nt_write_stdout(buf: *const u8, len: u32) -> u64 {
     let mut iosb = IoStatusBlock { status: 0, info: 0 };
     svc10(
         NR_WRITE_FILE,
-        STDOUT, 0, 0, 0,
+        STDOUT,
+        0,
+        0,
+        0,
         &mut iosb as *mut _ as u64,
-        buf as u64, len as u64, 0,
-        0, 0,
+        buf as u64,
+        len as u64,
+        0,
+        0,
+        0,
     )
 }
 
 fn print(s: &[u8]) {
-    unsafe { nt_write_stdout(s.as_ptr(), s.len() as u32); }
+    unsafe {
+        nt_write_stdout(s.as_ptr(), s.len() as u32);
+    }
 }
 
 fn print_hex(val: u64) {
     let hex = b"0123456789abcdef";
     let mut buf = [0u8; 18];
-    buf[0] = b'0'; buf[1] = b'x';
+    buf[0] = b'0';
+    buf[1] = b'x';
     for i in 0..16usize {
         buf[2 + i] = hex[((val >> ((15 - i) * 4)) & 0xF) as usize];
     }
@@ -104,24 +138,69 @@ fn print_u32(val: u32) {
     let mut buf = [0u8; 10];
     let mut n = val;
     let mut len = 0usize;
-    if n == 0 { buf[0] = b'0'; len = 1; }
-    else {
-        while n > 0 { buf[len] = b'0' + (n % 10) as u8; n /= 10; len += 1; }
+    if n == 0 {
+        buf[0] = b'0';
+        len = 1;
+    } else {
+        while n > 0 {
+            buf[len] = b'0' + (n % 10) as u8;
+            n /= 10;
+            len += 1;
+        }
         buf[..len].reverse();
     }
     print(&buf[..len]);
 }
 
 unsafe fn check(name: &[u8], ok: bool) {
-    if ok { print(b"  [PASS] "); PASS_COUNT += 1; }
-    else  { print(b"  [FAIL] "); FAIL_COUNT += 1; }
+    if ok {
+        print(b"  [PASS] ");
+        PASS_COUNT += 1;
+    } else {
+        print(b"  [FAIL] ");
+        FAIL_COUNT += 1;
+    }
     print(name);
     print(b"\r\n");
 }
 
 unsafe fn exit(code: u32) -> ! {
-    svc(NR_TERMINATE_PROCESS, 0xFFFFFFFFFFFFFFFF, code as u64, 0, 0, 0, 0, 0, 0);
-    loop { asm!("wfi", options(nostack)); }
+    svc(
+        NR_TERMINATE_PROCESS,
+        0xFFFFFFFFFFFFFFFF,
+        code as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    loop {
+        asm!("wfi", options(nostack));
+    }
+}
+
+#[inline(always)]
+unsafe fn nt_query_virtual(addr: u64, out: &mut [u8; 48]) -> u64 {
+    let mut ret_len: u64 = 0;
+    svc(
+        NR_QUERY_VIRTUAL_MEMORY,
+        0xFFFF_FFFF_FFFF_FFFF,
+        addr,
+        0,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+        &mut ret_len as *mut u64 as u64,
+        0,
+        0,
+    )
+}
+
+fn rd_u32(buf: &[u8], off: usize) -> u32 {
+    let mut tmp = [0u8; 4];
+    tmp.copy_from_slice(&buf[off..off + 4]);
+    u32::from_le_bytes(tmp)
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -131,47 +210,205 @@ unsafe fn exit(code: u32) -> ! {
 unsafe fn test_virtual_memory() {
     print(b"== Virtual Memory ==\r\n");
 
-    // Allocate 64KB
+    // Reserve 64KB only
     let mut base: u64 = 0;
     let mut size: u64 = 0x10000;
     let st = svc(
         NR_ALLOCATE_VIRTUAL_MEMORY,
-        0xFFFFFFFFFFFFFFFF,              // ProcessHandle (-1 = self)
-        &mut base as *mut u64 as u64,    // BaseAddress ptr
-        0,                               // ZeroBits
-        &mut size as *mut u64 as u64,    // RegionSize ptr
-        MEM_COMMIT | MEM_RESERVE,        // AllocationType
-        PAGE_READWRITE,                  // Protect
-        0, 0,
+        0xFFFFFFFFFFFFFFFF,           // ProcessHandle (-1 = self)
+        &mut base as *mut u64 as u64, // BaseAddress ptr
+        0,                            // ZeroBits
+        &mut size as *mut u64 as u64, // RegionSize ptr
+        MEM_RESERVE,                  // AllocationType
+        PAGE_READWRITE,               // Protect
+        0,
+        0,
     );
-    check(b"NtAllocateVirtualMemory returns SUCCESS", st == STATUS_SUCCESS);
+    check(
+        b"NtAllocateVirtualMemory reserve returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
     check(b"Allocated base is non-zero", base != 0);
     check(b"Allocated size >= 64KB", size >= 0x10000);
 
-    // Write pattern and read back
-    let ptr = base as *mut u8;
-    for i in 0..256u32 {
-        *ptr.add(i as usize) = (i & 0xFF) as u8;
-    }
-    let mut ok = true;
-    for i in 0..256u32 {
-        if *ptr.add(i as usize) != (i & 0xFF) as u8 { ok = false; break; }
-    }
-    check(b"Write/read pattern in allocated memory", ok);
+    let mut mbi = [0u8; 48];
+    let st = nt_query_virtual(base, &mut mbi);
+    check(
+        b"NtQueryVirtualMemory on reserved page returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+    check(
+        b"Reserved page reports MEM_RESERVE",
+        rd_u32(&mbi, 32) as u64 == MEM_RESERVE,
+    );
 
-    // Free
+    // Commit 8KB from reserved region
+    let mut commit_base = base;
+    let mut commit_size: u64 = 0x2000;
+    let st = svc(
+        NR_ALLOCATE_VIRTUAL_MEMORY,
+        0xFFFFFFFFFFFFFFFF,
+        &mut commit_base as *mut u64 as u64,
+        0,
+        &mut commit_size as *mut u64 as u64,
+        MEM_COMMIT,
+        PAGE_READWRITE,
+        0,
+        0,
+    );
+    check(
+        b"NtAllocateVirtualMemory commit-in-reserve returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+
+    // First touch should fault-in pages, then read back
+    let p0 = base as *mut u64;
+    let p1 = (base + 0x1000) as *mut u64;
+    *p0 = 0x1122_3344_5566_7788;
+    *p1 = 0x8877_6655_4433_2211;
+    check(
+        b"Write/read pattern in committed pages",
+        *p0 == 0x1122_3344_5566_7788 && *p1 == 0x8877_6655_4433_2211,
+    );
+
+    // Query committed state
+    let mut mbi = [0u8; 48];
+    let st = nt_query_virtual(base, &mut mbi);
+    check(
+        b"NtQueryVirtualMemory on committed page returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+    check(
+        b"Committed page reports MEM_COMMIT",
+        rd_u32(&mbi, 32) as u64 == MEM_COMMIT,
+    );
+
+    // Protect first page to READONLY
+    let mut prot_base = base;
+    let mut prot_size: u64 = 0x1000;
+    let mut old_prot: u32 = 0;
+    let st = svc(
+        NR_PROTECT_VIRTUAL_MEMORY,
+        0xFFFFFFFFFFFFFFFF,
+        &mut prot_base as *mut u64 as u64,
+        &mut prot_size as *mut u64 as u64,
+        PAGE_READONLY,
+        &mut old_prot as *mut u32 as u64,
+        0,
+        0,
+        0,
+    );
+    check(
+        b"NtProtectVirtualMemory returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+    check(
+        b"NtProtectVirtualMemory old protection is PAGE_READWRITE",
+        old_prot as u64 == PAGE_READWRITE,
+    );
+
+    // Decommit second page
+    let mut decommit_base = base + 0x1000;
+    let mut decommit_size: u64 = 0x1000;
+    let st = svc(
+        NR_FREE_VIRTUAL_MEMORY,
+        0xFFFFFFFFFFFFFFFF,
+        &mut decommit_base as *mut u64 as u64,
+        &mut decommit_size as *mut u64 as u64,
+        MEM_DECOMMIT,
+        0,
+        0,
+        0,
+        0,
+    );
+    check(
+        b"NtFreeVirtualMemory MEM_DECOMMIT returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+
+    let mut mbi = [0u8; 48];
+    let st = nt_query_virtual(base + 0x1000, &mut mbi);
+    check(
+        b"Query decommitted page returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+    check(
+        b"Decommitted page reports MEM_RESERVE",
+        rd_u32(&mbi, 32) as u64 == MEM_RESERVE,
+    );
+
+    // Re-commit decommitted page and touch again
+    let mut recommit_base = base + 0x1000;
+    let mut recommit_size: u64 = 0x1000;
+    let st = svc(
+        NR_ALLOCATE_VIRTUAL_MEMORY,
+        0xFFFFFFFFFFFFFFFF,
+        &mut recommit_base as *mut u64 as u64,
+        0,
+        &mut recommit_size as *mut u64 as u64,
+        MEM_COMMIT,
+        PAGE_READWRITE,
+        0,
+        0,
+    );
+    check(
+        b"Re-commit after decommit returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+    let p1 = (base + 0x1000) as *mut u64;
+    *p1 = 0xAABB_CCDD_EEFF_0011;
+    check(b"Re-committed page writable", *p1 == 0xAABB_CCDD_EEFF_0011);
+
+    // Overlapping reserve at fixed base should fail
+    let mut overlap_base = base;
+    let mut overlap_size: u64 = 0x1000;
+    let st = svc(
+        NR_ALLOCATE_VIRTUAL_MEMORY,
+        0xFFFFFFFFFFFFFFFF,
+        &mut overlap_base as *mut u64 as u64,
+        0,
+        &mut overlap_size as *mut u64 as u64,
+        MEM_RESERVE,
+        PAGE_READWRITE,
+        0,
+        0,
+    );
+    check(b"Overlapping MEM_RESERVE fails", st != STATUS_SUCCESS);
+
+    // Release region
     let mut free_base = base;
     let mut free_size: u64 = 0;
     let st = svc(
         NR_FREE_VIRTUAL_MEMORY,
         0xFFFFFFFFFFFFFFFF,
         &mut free_base as *mut u64 as u64,
-        0,
         &mut free_size as *mut u64 as u64,
         MEM_RELEASE,
-        0, 0, 0,
+        0,
+        0,
+        0,
+        0,
     );
     check(b"NtFreeVirtualMemory returns SUCCESS", st == STATUS_SUCCESS);
+
+    // Commit without reserve should fail
+    let mut bad_commit_base = base;
+    let mut bad_commit_size: u64 = 0x1000;
+    let st = svc(
+        NR_ALLOCATE_VIRTUAL_MEMORY,
+        0xFFFFFFFFFFFFFFFF,
+        &mut bad_commit_base as *mut u64 as u64,
+        0,
+        &mut bad_commit_size as *mut u64 as u64,
+        MEM_COMMIT,
+        PAGE_READWRITE,
+        0,
+        0,
+    );
+    check(
+        b"MEM_COMMIT without reserve fails",
+        st == STATUS_INVALID_PARAMETER || st != STATUS_SUCCESS,
+    );
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -186,13 +423,13 @@ unsafe fn test_section() {
     let mut sec_size: u64 = 0x10000;
     let st = svc(
         NR_CREATE_SECTION,
-        &mut sec_handle as *mut u64 as u64,  // SectionHandle out
-        0x000F001F,                          // DesiredAccess (SECTION_ALL_ACCESS)
-        0,                                   // ObjectAttributes
-        &mut sec_size as *mut u64 as u64,    // MaximumSize
-        PAGE_READWRITE,                      // SectionPageProtection
-        0x08000000,                          // AllocationAttributes (SEC_COMMIT)
-        0,                                   // FileHandle (0 = pagefile)
+        &mut sec_handle as *mut u64 as u64, // SectionHandle out
+        0x000F001F,                         // DesiredAccess (SECTION_ALL_ACCESS)
+        0,                                  // ObjectAttributes
+        &mut sec_size as *mut u64 as u64,   // MaximumSize
+        PAGE_READWRITE,                     // SectionPageProtection
+        0x08000000,                         // AllocationAttributes (SEC_COMMIT)
+        0,                                  // FileHandle (0 = pagefile)
         0,
     );
     check(b"NtCreateSection returns SUCCESS", st == STATUS_SUCCESS);
@@ -204,15 +441,16 @@ unsafe fn test_section() {
     let mut view_off: u64 = 0;
     let st = svc10(
         NR_MAP_VIEW_OF_SECTION,
-        sec_handle,                          // SectionHandle
-        0xFFFFFFFFFFFFFFFF,                  // ProcessHandle
-        &mut view_base as *mut u64 as u64,   // BaseAddress ptr
-        0,                                   // ZeroBits
-        0,                                   // CommitSize
-        &mut view_off as *mut u64 as u64,    // SectionOffset
-        &mut view_size as *mut u64 as u64,   // ViewSize
-        1,                                   // InheritDisposition
-        0, PAGE_READWRITE,                   // AllocationType, Win32Protect
+        sec_handle,                        // SectionHandle
+        0xFFFFFFFFFFFFFFFF,                // ProcessHandle
+        &mut view_base as *mut u64 as u64, // BaseAddress ptr
+        0,                                 // ZeroBits
+        0,                                 // CommitSize
+        &mut view_off as *mut u64 as u64,  // SectionOffset
+        &mut view_size as *mut u64 as u64, // ViewSize
+        1,                                 // InheritDisposition
+        0,
+        PAGE_READWRITE, // AllocationType, Win32Protect
     );
     check(b"NtMapViewOfSection returns SUCCESS", st == STATUS_SUCCESS);
     check(b"Mapped base is non-zero", view_base != 0);
@@ -229,9 +467,17 @@ unsafe fn test_section() {
         NR_UNMAP_VIEW_OF_SECTION,
         0xFFFFFFFFFFFFFFFF,
         view_base,
-        0, 0, 0, 0, 0, 0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     );
-    check(b"NtUnmapViewOfSection returns SUCCESS", st == STATUS_SUCCESS);
+    check(
+        b"NtUnmapViewOfSection returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
 
     // Close section handle
     let st = svc(NR_CLOSE, sec_handle, 0, 0, 0, 0, 0, 0, 0);
@@ -249,12 +495,14 @@ unsafe fn test_event() {
     let mut evt_handle: u64 = 0;
     let st = svc(
         NR_CREATE_EVENT,
-        &mut evt_handle as *mut u64 as u64,  // EventHandle out
-        0x001F0003,                          // EVENT_ALL_ACCESS
-        0,                                   // ObjectAttributes
-        1,                                   // EventType: NotificationEvent (manual)
-        0,                                   // InitialState: non-signaled
-        0, 0, 0,
+        &mut evt_handle as *mut u64 as u64, // EventHandle out
+        0x001F0003,                         // EVENT_ALL_ACCESS
+        0,                                  // ObjectAttributes
+        1,                                  // EventType: NotificationEvent (manual)
+        0,                                  // InitialState: non-signaled
+        0,
+        0,
+        0,
     );
     check(b"NtCreateEvent returns SUCCESS", st == STATUS_SUCCESS);
     check(b"Event handle is valid", evt_handle != 0);
@@ -265,7 +513,12 @@ unsafe fn test_event() {
         NR_SET_EVENT,
         evt_handle,
         &mut prev_state as *mut u64 as u64,
-        0, 0, 0, 0, 0, 0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     );
     check(b"NtSetEvent returns SUCCESS", st == STATUS_SUCCESS);
 
@@ -275,7 +528,12 @@ unsafe fn test_event() {
         NR_RESET_EVENT,
         evt_handle,
         &mut prev_state2 as *mut u64 as u64,
-        0, 0, 0, 0, 0, 0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     );
     check(b"NtResetEvent returns SUCCESS", st == STATUS_SUCCESS);
 
@@ -308,19 +566,25 @@ unsafe fn test_duplicate_object() {
     svc(
         NR_CREATE_EVENT,
         &mut evt as *mut u64 as u64,
-        0x001F0003, 0, 1, 0, 0, 0, 0,
+        0x001F0003,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
     );
 
     let mut dup: u64 = 0;
     let st = svc(
         NR_DUPLICATE_OBJECT,
-        0xFFFFFFFFFFFFFFFF,                  // SourceProcessHandle
-        evt,                                 // SourceHandle
-        0xFFFFFFFFFFFFFFFF,                  // TargetProcessHandle
-        &mut dup as *mut u64 as u64,         // TargetHandle out
-        0,                                   // DesiredAccess
-        0,                                   // HandleAttributes
-        0x00000002,                          // Options: DUPLICATE_SAME_ACCESS
+        0xFFFFFFFFFFFFFFFF,          // SourceProcessHandle
+        evt,                         // SourceHandle
+        0xFFFFFFFFFFFFFFFF,          // TargetProcessHandle
+        &mut dup as *mut u64 as u64, // TargetHandle out
+        0,                           // DesiredAccess
+        0,                           // HandleAttributes
+        0x00000002,                  // Options: DUPLICATE_SAME_ACCESS
         0,
     );
     check(b"NtDuplicateObject returns SUCCESS", st == STATUS_SUCCESS);
@@ -352,9 +616,12 @@ unsafe fn test_multi_alloc() {
             &mut size as *mut u64 as u64,
             MEM_COMMIT | MEM_RESERVE,
             PAGE_READWRITE,
-            0, 0,
+            0,
+            0,
         );
-        if st != STATUS_SUCCESS || base == 0 { all_ok = false; }
+        if st != STATUS_SUCCESS || base == 0 {
+            all_ok = false;
+        }
         bases[i] = base;
         // Write unique tag
         *(base as *mut u64) = 0xA5A5_0000 + i as u64;
@@ -366,7 +633,9 @@ unsafe fn test_multi_alloc() {
     for i in 0..8 {
         if bases[i] != 0 {
             let tag = *(bases[i] as *const u64);
-            if tag != 0xA5A5_0000 + i as u64 { tags_ok = false; }
+            if tag != 0xA5A5_0000 + i as u64 {
+                tags_ok = false;
+            }
         }
     }
     check(b"All 8 regions have correct tags", tags_ok);
@@ -381,11 +650,16 @@ unsafe fn test_multi_alloc() {
                 NR_FREE_VIRTUAL_MEMORY,
                 0xFFFFFFFFFFFFFFFF,
                 &mut fb as *mut u64 as u64,
-                0,
                 &mut fs as *mut u64 as u64,
-                MEM_RELEASE, 0, 0, 0,
+                MEM_RELEASE,
+                0,
+                0,
+                0,
+                0,
             );
-            if st != STATUS_SUCCESS { free_ok = false; }
+            if st != STATUS_SUCCESS {
+                free_ok = false;
+            }
         }
     }
     check(b"Free all 8 regions", free_ok);
@@ -437,5 +711,7 @@ pub extern "C" fn mainCRTStartup() -> ! {
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     print(b"PANIC!\r\n");
-    unsafe { exit(99); }
+    unsafe {
+        exit(99);
+    }
 }
