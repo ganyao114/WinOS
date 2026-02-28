@@ -123,6 +123,10 @@ pub fn vcpu_thread(
             }
             VmExit::Timer => {
                 // Timer IRQ is already marked pending in HVF backend.
+                // Save current guest context first, otherwise next loop would
+                // restore a stale context and lose the pending-IRQ return point.
+                let ctx = save_ctx(&mut *vcpu);
+                sched.save_ctx(tid, ctx);
                 // Resume guest so EL1 IRQ vector can run and wake the scheduler.
                 continue 'run;
             }
