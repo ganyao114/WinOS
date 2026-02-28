@@ -101,8 +101,10 @@ static inline uint64_t svc11(uint64_t nr,
     register uint64_t x6 asm("x6") = a6;
     register uint64_t x7 asm("x7") = a7;
     asm volatile(
-        "stp %[stack1], %[stack2], [sp, #-16]!\n"
-        "str %[stack0], [sp, #-16]!\n"
+        "sub sp, sp, #32\n"
+        "str %[stack0], [sp, #0]\n"
+        "str %[stack1], [sp, #8]\n"
+        "str %[stack2], [sp, #16]\n"
         "svc #0\n"
         "add sp, sp, #32\n"
         : "+r"(x0)

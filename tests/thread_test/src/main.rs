@@ -80,7 +80,9 @@ unsafe fn svc10(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64,
                 s0: u64, s1: u64) -> u64 {
     let ret: u64;
     asm!(
-        "stp {sa}, {sb}, [sp, #-16]!",
+        "sub sp, sp, #16",
+        "str {sa}, [sp, #0]",
+        "str {sb}, [sp, #8]",
         "svc #0",
         "add sp, sp, #16",
         sa = in(reg) s0, sb = in(reg) s1,
@@ -92,7 +94,7 @@ unsafe fn svc10(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64,
         lateout("x23") _, lateout("x24") _, lateout("x25") _, lateout("x26") _,
         lateout("x27") _, lateout("x28") _,
         clobber_abi("C"),
-        options(nostack),
+        options(),
     );
     ret
 }
@@ -104,8 +106,10 @@ unsafe fn svc11(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64,
                 s0: u64, s1: u64, s2: u64) -> u64 {
     let ret: u64;
     asm!(
-        "stp {sb}, {sc}, [sp, #-16]!",
-        "str {sa}, [sp, #-16]!",
+        "sub sp, sp, #32",
+        "str {sa}, [sp, #0]",
+        "str {sb}, [sp, #8]",
+        "str {sc}, [sp, #16]",
         "svc #0",
         "add sp, sp, #32",
         sa = in(reg) s0, sb = in(reg) s1, sc = in(reg) s2,
@@ -117,7 +121,7 @@ unsafe fn svc11(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64,
         lateout("x23") _, lateout("x24") _, lateout("x25") _, lateout("x26") _,
         lateout("x27") _, lateout("x28") _,
         clobber_abi("C"),
-        options(nostack),
+        options(),
     );
     ret
 }
