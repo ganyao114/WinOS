@@ -14,9 +14,13 @@
 #define NR_QUERY_INFORMATION_PROCESS 0x0019
 #define NR_DUPLICATE_OBJECT     0x003C
 #define NR_YIELD_EXECUTION      0x0046
+#define NR_QUERY_PERFORMANCE_COUNTER 0x0031
+#define NR_QUERY_SYSTEM_INFORMATION 0x0036
+#define NR_DELAY_EXECUTION      0x0034
 #define NR_ALLOCATE_VIRTUAL_MEM 0x0018
 #define NR_FREE_VIRTUAL_MEM     0x001E
 #define NR_QUERY_VIRTUAL_MEM    0x0023
+#define NR_QUERY_SYSTEM_TIME    0x005A
 #define NR_CREATE_SECTION       0x004A
 #define NR_CREATE_PROCESS_EX    0x004B
 #define NR_MAP_VIEW_OF_SECTION  0x0028
@@ -287,8 +291,29 @@ EXPORT void RtlInitAnsiString(ANSI_STRING* dest, const UCHAR* src) {
 EXPORT NTSTATUS RtlGetVersion(void* osvi) { (void)osvi; return 0; }
 
 EXPORT NTSTATUS NtQuerySystemInformation(ULONG cls, void* buf, ULONG len, ULONG* ret) {
-    (void)cls; (void)buf; (void)len; (void)ret;
-    return STATUS_NOT_IMPLEMENTED;
+    return syscall4(
+        NR_QUERY_SYSTEM_INFORMATION,
+        (uint64_t)cls,
+        (uint64_t)buf,
+        (uint64_t)len,
+        (uint64_t)ret
+    );
+}
+
+EXPORT NTSTATUS NtQuerySystemTime(int64_t* time) {
+    return syscall2(NR_QUERY_SYSTEM_TIME, (uint64_t)time, 0);
+}
+
+EXPORT NTSTATUS NtQueryPerformanceCounter(int64_t* counter, int64_t* frequency) {
+    return syscall2(
+        NR_QUERY_PERFORMANCE_COUNTER,
+        (uint64_t)counter,
+        (uint64_t)frequency
+    );
+}
+
+EXPORT NTSTATUS NtDelayExecution(UCHAR alertable, const int64_t* timeout) {
+    return syscall2(NR_DELAY_EXECUTION, (uint64_t)alertable, (uint64_t)timeout);
 }
 
 EXPORT ULONG RtlNtStatusToDosError(NTSTATUS status) {

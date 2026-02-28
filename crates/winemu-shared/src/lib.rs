@@ -153,6 +153,9 @@ pub mod nr {
     /// 查询单调时钟（100ns 单位）
     /// args: [0, 0, 0, 0, 0, 0] → elapsed_100ns
     pub const QUERY_MONO_TIME: u64 = 0x0818;
+    /// 查询系统墙钟时间（NT epoch 1601 起的 100ns）
+    /// args: [0, 0, 0, 0, 0, 0] → system_time_100ns
+    pub const QUERY_SYSTEM_TIME: u64 = 0x0819;
 }
 
 /// NT 超时常量（100ns 单位）

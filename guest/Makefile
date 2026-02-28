@@ -1,7 +1,7 @@
 include common.mk
 
 DLLS := ntdll
-EXES := hello_win process_test
+EXES := hello_win process_test syscall_sysinfo_test
 
 .PHONY: all clean $(DLLS) $(EXES)
 

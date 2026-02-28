@@ -6,19 +6,18 @@ use crate::hypercall;
 use crate::sched::{
     charge_current_runtime_locked, check_timeouts, consume_pending_reschedule_locked,
     current_slice_remaining_100ns, current_tid, next_wait_deadline_locked, now_ticks,
-    register_thread0,
-    rotate_current_on_quantum_expire_locked, sched_lock_acquire,
+    register_thread0, rotate_current_on_quantum_expire_locked, sched_lock_acquire,
     sched_lock_release, schedule, set_vcpu_idle_locked, vcpu_id, with_thread_mut,
 };
 use crate::timer;
 
 use super::constants::{
-    EL0_FAULT_ELR_TAG, EL0_FAULT_ESR_TAG, EL0_FAULT_FAR_TAG, EL0_FAULT_SPSR_TAG,
-    EL1_FAULT_ELR_TAG, EL1_FAULT_ESR_TAG, EL1_FAULT_FAR_TAG, EL1_FAULT_SPSR_TAG, SVC_TAG_NR_MASK,
-    SVC_TAG_TABLE_MASK, SVC_TAG_TABLE_SHIFT,
+    EL0_FAULT_ELR_TAG, EL0_FAULT_ESR_TAG, EL0_FAULT_FAR_TAG, EL0_FAULT_SPSR_TAG, EL1_FAULT_ELR_TAG,
+    EL1_FAULT_ESR_TAG, EL1_FAULT_FAR_TAG, EL1_FAULT_SPSR_TAG, SVC_TAG_NR_MASK, SVC_TAG_TABLE_MASK,
+    SVC_TAG_TABLE_SHIFT,
 };
-use super::{file, memory, object, process, registry, section, sync, thread, SvcFrame};
 use super::sysno;
+use super::{file, memory, object, process, registry, section, sync, system, thread, SvcFrame};
 
 #[no_mangle]
 pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
@@ -43,10 +42,13 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         sysno::QUERY_INFORMATION_FILE => file::handle_query_information_file(frame),
         sysno::SET_INFORMATION_FILE => file::handle_set_information_file(frame),
         sysno::QUERY_DIRECTORY_FILE => file::handle_query_directory_file(frame),
+        sysno::QUERY_SYSTEM_INFORMATION => system::handle_query_system_information(frame),
+        sysno::QUERY_SYSTEM_TIME => system::handle_query_system_time(frame),
+        sysno::QUERY_PERFORMANCE_COUNTER => system::handle_query_performance_counter(frame),
 
         sysno::CREATE_EVENT => sync::handle_create_event(frame),
         sysno::SET_EVENT => sync::handle_set_event(frame),
-        sysno::RESET_EVENT => sync::handle_reset_event(frame),
+        sysno::RESET_EVENT => sync::handle_reset_event_or_delay(frame),
         sysno::WAIT_SINGLE => sync::handle_wait_single(frame),
         sysno::WAIT_MULTIPLE => sync::handle_wait_multiple(frame),
         sysno::CREATE_MUTEX => sync::handle_create_mutex(frame),

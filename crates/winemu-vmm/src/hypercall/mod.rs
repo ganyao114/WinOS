@@ -8,7 +8,7 @@ use crate::section::SectionTable;
 use crate::syscall::{DispatchResult, SyscallDispatcher};
 use crate::vaspace::VaSpace;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use winemu_core::hypercall::nr;
 
 pub enum HypercallResult {
@@ -732,6 +732,14 @@ impl HypercallManager {
             nr::QUERY_MONO_TIME => {
                 let elapsed = self.mono_start.elapsed();
                 HypercallResult::Sync((elapsed.as_nanos() / 100) as u64)
+            }
+            nr::QUERY_SYSTEM_TIME => {
+                const NT_EPOCH_OFFSET_100NS: u64 = 116_444_736_000_000_000;
+                let unix_100ns = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| (d.as_nanos() / 100) as u64)
+                    .unwrap_or(0);
+                HypercallResult::Sync(unix_100ns.saturating_add(NT_EPOCH_OFFSET_100NS))
             }
             _ => {
                 log::warn!("unhandled hypercall nr={:#x}", hypercall_nr);

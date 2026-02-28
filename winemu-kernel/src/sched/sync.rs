@@ -15,7 +15,8 @@ use super::{
     boost_thread_priority_locked, clear_wait_deadline_locked, current_tid, sched_lock_acquire,
     sched_lock_release, set_thread_priority_locked, set_thread_state_locked,
     set_wait_deadline_locked, thread_exists, wake, with_thread, with_thread_mut, ThreadState,
-    MAX_WAIT_HANDLES, WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY, WAIT_KIND_NONE, WAIT_KIND_SINGLE,
+    MAX_WAIT_HANDLES, WAIT_KIND_DELAY, WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY, WAIT_KIND_NONE,
+    WAIT_KIND_SINGLE,
 };
 
 // ── NTSTATUS 常量 ─────────────────────────────────────────────
@@ -1272,6 +1273,27 @@ pub fn wait_multiple(handles: &[u64], wait_all: bool, timeout: WaitDeadline) -> 
     let st = wait_common_locked(handles, wait_all, timeout);
     sched_lock_release();
     st
+}
+
+/// Delay current thread for specified timeout semantics.
+/// Return STATUS_PENDING if the thread is blocked; scheduler timeout path
+/// will resume it with STATUS_SUCCESS.
+pub fn delay_current_thread(timeout: WaitDeadline) -> u32 {
+    if timeout == WaitDeadline::Immediate {
+        return STATUS_SUCCESS;
+    }
+
+    sched_lock_acquire();
+    let cur = current_tid();
+    if cur == 0 || !thread_exists(cur) {
+        sched_lock_release();
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    set_wait_metadata(cur, WAIT_KIND_DELAY, &[], timeout);
+    set_thread_state_locked(cur, ThreadState::Waiting);
+    sched_lock_release();
+    STATUS_PENDING
 }
 
 /// Remove a waiting thread from all object wait queues.

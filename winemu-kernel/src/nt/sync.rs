@@ -29,8 +29,12 @@ pub(crate) fn handle_set_event(frame: &mut SvcFrame) {
     frame.x[0] = event_set_by_handle(frame.x[0]) as u64;
 }
 
-pub(crate) fn handle_reset_event(frame: &mut SvcFrame) {
-    frame.x[0] = event_reset_by_handle(frame.x[0]) as u64;
+pub(crate) fn handle_reset_event_or_delay(frame: &mut SvcFrame) {
+    if super::system::should_dispatch_delay_execution(frame) {
+        super::system::handle_delay_execution(frame);
+    } else {
+        frame.x[0] = event_reset_by_handle(frame.x[0]) as u64;
+    }
 }
 
 // x0 = Handle, x1 = Alertable, x2 = Timeout* (LARGE_INTEGER*)

@@ -29,6 +29,7 @@ pub const WAIT_KIND_NONE: u8 = 0;
 pub const WAIT_KIND_SINGLE: u8 = 1;
 pub const WAIT_KIND_MULTI_ANY: u8 = 2;
 pub const WAIT_KIND_MULTI_ALL: u8 = 3;
+pub const WAIT_KIND_DELAY: u8 = 4;
 
 // ── 线程状态 ──────────────────────────────────────────────────
 
@@ -1004,14 +1005,19 @@ pub fn check_timeouts(now_ticks: u64) -> bool {
         }
 
         with_thread_mut(ent.tid, |t| {
-            t.wait_result = status::TIMEOUT;
+            let timeout_result = if t.wait_kind == WAIT_KIND_DELAY {
+                status::SUCCESS
+            } else {
+                status::TIMEOUT
+            };
+            t.wait_result = timeout_result;
             t.wait_deadline = 0;
             t.wait_seq = t.wait_seq.wrapping_add(1);
             t.wait_kind = WAIT_KIND_NONE;
             t.wait_count = 0;
             t.wait_signaled = 0;
             t.wait_handles.fill(0);
-            t.ctx.x[0] = status::TIMEOUT as u64; // x0 = STATUS_TIMEOUT
+            t.ctx.x[0] = timeout_result as u64;
         });
         set_thread_state_locked(ent.tid, ThreadState::Ready);
         woke_any = true;
