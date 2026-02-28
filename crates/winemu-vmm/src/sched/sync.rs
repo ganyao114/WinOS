@@ -1,27 +1,31 @@
-use std::collections::VecDeque;
 use super::ThreadId;
+use std::collections::VecDeque;
 
 // ── SyncHandle ───────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SyncHandle(pub u32);
 
 // ── NT 状态码 ────────────────────────────────────────────────
-pub const STATUS_SUCCESS:  u64 = 0x0000_0000;
-pub const STATUS_TIMEOUT:  u64 = 0x0000_0102;
-pub const STATUS_WAIT_0:   u64 = 0x0000_0000;
+pub const STATUS_SUCCESS: u64 = 0x0000_0000;
+pub const STATUS_TIMEOUT: u64 = 0x0000_0102;
+pub const STATUS_WAIT_0: u64 = 0x0000_0000;
 pub const STATUS_ABANDONED_WAIT_0: u64 = 0x0000_0080;
 pub const STATUS_MUTANT_NOT_OWNED: u64 = 0xC000_0046;
 
 // ── Event ────────────────────────────────────────────────────
 pub struct EventObj {
     pub manual_reset: bool,
-    pub signaled:     bool,
-    pub waiters:      VecDeque<ThreadId>,
+    pub signaled: bool,
+    pub waiters: VecDeque<ThreadId>,
 }
 
 impl EventObj {
     pub fn new(manual_reset: bool, initial: bool) -> Self {
-        Self { manual_reset, signaled: initial, waiters: VecDeque::new() }
+        Self {
+            manual_reset,
+            signaled: initial,
+            waiters: VecDeque::new(),
+        }
     }
 
     /// 尝试立即获取信号。返回 true 表示成功消费。
@@ -69,9 +73,9 @@ impl EventObj {
 
 // ── Mutex ────────────────────────────────────────────────────
 pub struct MutexObj {
-    pub owner:     Option<ThreadId>,
+    pub owner: Option<ThreadId>,
     pub rec_count: u32,
-    pub waiters:   VecDeque<ThreadId>,
+    pub waiters: VecDeque<ThreadId>,
     pub abandoned: bool,
 }
 
@@ -79,9 +83,14 @@ impl MutexObj {
     pub fn new(initial_owner: Option<ThreadId>) -> Self {
         let (owner, rec_count) = match initial_owner {
             Some(tid) => (Some(tid), 1),
-            None      => (None, 0),
+            None => (None, 0),
         };
-        Self { owner, rec_count, waiters: VecDeque::new(), abandoned: false }
+        Self {
+            owner,
+            rec_count,
+            waiters: VecDeque::new(),
+            abandoned: false,
+        }
     }
 
     /// 尝试获取。返回 (acquired, abandoned)
@@ -126,14 +135,18 @@ impl MutexObj {
 
 // ── Semaphore ────────────────────────────────────────────────
 pub struct SemaphoreObj {
-    pub count:   i64,
+    pub count: i64,
     pub maximum: i64,
     pub waiters: VecDeque<ThreadId>,
 }
 
 impl SemaphoreObj {
     pub fn new(initial: i64, maximum: i64) -> Self {
-        Self { count: initial, maximum, waiters: VecDeque::new() }
+        Self {
+            count: initial,
+            maximum,
+            waiters: VecDeque::new(),
+        }
     }
 
     pub fn try_acquire(&mut self) -> bool {

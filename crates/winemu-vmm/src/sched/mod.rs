@@ -2,14 +2,17 @@ pub mod sync;
 pub mod wait;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, atomic::{AtomicU32, AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    Arc, Mutex,
+};
 use std::time::Instant;
 
 pub use sync::{SyncHandle, SyncObject};
 
 // ── 分片常量 ────────────────────────────────────────────────
 const THREAD_SHARDS: usize = 16;
-const SYNC_SHARDS:   usize = 16;
+const SYNC_SHARDS: usize = 16;
 
 // ── ThreadId ────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -19,24 +22,24 @@ pub struct ThreadId(pub u32);
 #[derive(Clone)]
 pub struct ThreadContext {
     /// x0-x30 = [0..30], sp = [31], pc = [32]
-    pub gpr:      [u64; 33],
-    pub pstate:   u64,
+    pub gpr: [u64; 33],
+    pub pstate: u64,
     /// Q0-Q31（延迟保存）
-    pub fp_regs:  [u128; 32],
+    pub fp_regs: [u128; 32],
     pub fp_dirty: bool,
-    pub fpcr:     u64,
-    pub fpsr:     u64,
+    pub fpcr: u64,
+    pub fpsr: u64,
 }
 
 impl Default for ThreadContext {
     fn default() -> Self {
         Self {
-            gpr:      [0u64; 33],
-            pstate:   0,
-            fp_regs:  [0u128; 32],
+            gpr: [0u64; 33],
+            pstate: 0,
+            fp_regs: [0u128; 32],
             fp_dirty: false,
-            fpcr:     0,
-            fpsr:     0,
+            fpcr: 0,
+            fpsr: 0,
         }
     }
 }
@@ -45,13 +48,16 @@ impl Default for ThreadContext {
 #[derive(Clone)]
 pub enum WaitKind {
     Single(SyncHandle),
-    Multiple { handles: Vec<SyncHandle>, wait_all: bool },
+    Multiple {
+        handles: Vec<SyncHandle>,
+        wait_all: bool,
+    },
 }
 
 #[derive(Clone)]
 pub struct WaitRequest {
-    pub kind:       WaitKind,
-    pub deadline:   Option<Instant>,
+    pub kind: WaitKind,
+    pub deadline: Option<Instant>,
     /// 唤醒时填入：哪个 handle 触发（WaitMultiple 用）
     pub wake_index: Option<usize>,
 }
@@ -66,9 +72,9 @@ pub enum ThreadState {
 
 // ── Guest 线程 ───────────────────────────────────────────────
 pub struct GuestThread {
-    pub id:      ThreadId,
-    pub state:   ThreadState,
-    pub ctx:     ThreadContext,
+    pub id: ThreadId,
+    pub state: ThreadState,
+    pub ctx: ThreadContext,
     pub teb_gva: u64,
 }
 
@@ -86,10 +92,10 @@ pub enum SchedResult {
 
 // ── Scheduler ───────────────────────────────────────────────
 pub struct Scheduler {
-    ready:       Mutex<VecDeque<ThreadId>>,
+    ready: Mutex<VecDeque<ThreadId>>,
     pub threads: [Mutex<HashMap<ThreadId, GuestThread>>; THREAD_SHARDS],
     pub objects: [Mutex<HashMap<SyncHandle, SyncObject>>; SYNC_SHARDS],
-    next_tid:    AtomicU32,
+    next_tid: AtomicU32,
     next_handle: AtomicU32,
     pub vcpu_count: u32,
     vcpu_threads: Mutex<Vec<(u32, std::thread::Thread)>>,
@@ -101,16 +107,16 @@ pub struct Scheduler {
 impl Scheduler {
     pub fn new(vcpu_count: u32) -> Arc<Self> {
         Arc::new(Self {
-            ready:        Mutex::new(VecDeque::new()),
-            threads:      std::array::from_fn(|_| Mutex::new(HashMap::new())),
-            objects:      std::array::from_fn(|_| Mutex::new(HashMap::new())),
-            next_tid:     AtomicU32::new(1),
-            next_handle:  AtomicU32::new(1),
+            ready: Mutex::new(VecDeque::new()),
+            threads: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            objects: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            next_tid: AtomicU32::new(1),
+            next_handle: AtomicU32::new(1),
             vcpu_count,
             vcpu_threads: Mutex::new(Vec::new()),
             idle_vcpu_mask: AtomicU32::new(0),
             wake_cursor: AtomicU32::new(0),
-            shutdown:     AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
         })
     }
 
@@ -186,12 +192,15 @@ impl Scheduler {
 
     pub fn spawn(&self, tid: ThreadId, ctx: ThreadContext, teb_gva: u64) {
         let shard = Self::thread_shard(tid);
-        self.threads[shard].lock().unwrap().insert(tid, GuestThread {
-            id: tid,
-            state: ThreadState::Ready,
-            ctx,
-            teb_gva,
-        });
+        self.threads[shard].lock().unwrap().insert(
+            tid,
+            GuestThread {
+                id: tid,
+                state: ThreadState::Ready,
+                ctx,
+                teb_gva,
+            },
+        );
         self.push_ready(tid);
     }
 
@@ -260,7 +269,8 @@ impl Scheduler {
         let mut woke_any = false;
         for shard in &self.threads {
             let mut map = shard.lock().unwrap();
-            let expired: Vec<ThreadId> = map.values()
+            let expired: Vec<ThreadId> = map
+                .values()
                 .filter_map(|t| {
                     if let ThreadState::Waiting(ref req) = t.state {
                         if req.deadline.map(|d| now >= d).unwrap_or(false) {
@@ -288,7 +298,9 @@ impl Scheduler {
     /// Return the TEB GVA for a thread, if known.
     pub fn get_teb(&self, tid: ThreadId) -> Option<u64> {
         let shard = Self::thread_shard(tid);
-        self.threads[shard].lock().unwrap()
+        self.threads[shard]
+            .lock()
+            .unwrap()
             .get(&tid)
             .map(|t| t.teb_gva)
     }
@@ -296,7 +308,11 @@ impl Scheduler {
     fn notify_thread_exit(&self, _tid: ThreadId) {
         // Check if all threads are terminated — if so, signal shutdown
         let all_done = self.threads.iter().all(|shard| {
-            shard.lock().unwrap().values().all(|t| matches!(t.state, ThreadState::Terminated(_)))
+            shard
+                .lock()
+                .unwrap()
+                .values()
+                .all(|t| matches!(t.state, ThreadState::Terminated(_)))
         });
         if all_done {
             self.shutdown.store(true, Ordering::Release);

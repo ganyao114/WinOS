@@ -29,7 +29,10 @@ impl DiffResult {
     }
 
     pub fn added_keys(&self) -> Vec<&RegistryChange> {
-        self.changes.iter().filter(|c| matches!(c, RegistryChange::KeyAdded(_))).collect()
+        self.changes
+            .iter()
+            .filter(|c| matches!(c, RegistryChange::KeyAdded(_)))
+            .collect()
     }
 }
 
@@ -38,12 +41,22 @@ pub struct RegistryComparator;
 impl RegistryComparator {
     pub fn compare_registries(&self, left: &KeyNode, right: &KeyNode) -> DiffResult {
         let mut changes = Vec::new();
-        compare_keys(Some(left.clone()), Some(right.clone()), String::new(), &mut changes);
+        compare_keys(
+            Some(left.clone()),
+            Some(right.clone()),
+            String::new(),
+            &mut changes,
+        );
         DiffResult { changes }
     }
 }
 
-fn compare_keys(left: Option<KeyNode>, right: Option<KeyNode>, path: String, changes: &mut Vec<RegistryChange>) {
+fn compare_keys(
+    left: Option<KeyNode>,
+    right: Option<KeyNode>,
+    path: String,
+    changes: &mut Vec<RegistryChange>,
+) {
     match (left, right) {
         (None, Some(r)) => {
             changes.push(RegistryChange::KeyAdded(path.clone()));
@@ -59,13 +72,22 @@ fn compare_keys(left: Option<KeyNode>, right: Option<KeyNode>, path: String, cha
 
             let mut prop_changes = Vec::new();
             if l_guard.class_name != r_guard.class_name {
-                prop_changes.push(KeyPropertyChange::ClassNameChange(l_guard.class_name.clone(), r_guard.class_name.clone()));
+                prop_changes.push(KeyPropertyChange::ClassNameChange(
+                    l_guard.class_name.clone(),
+                    r_guard.class_name.clone(),
+                ));
             }
             if l_guard.is_symlink != r_guard.is_symlink {
-                prop_changes.push(KeyPropertyChange::SymlinkChange(l_guard.is_symlink, r_guard.is_symlink));
+                prop_changes.push(KeyPropertyChange::SymlinkChange(
+                    l_guard.is_symlink,
+                    r_guard.is_symlink,
+                ));
             }
             if l_guard.is_volatile != r_guard.is_volatile {
-                prop_changes.push(KeyPropertyChange::VolatileChange(l_guard.is_volatile, r_guard.is_volatile));
+                prop_changes.push(KeyPropertyChange::VolatileChange(
+                    l_guard.is_volatile,
+                    r_guard.is_volatile,
+                ));
             }
             drop(l_guard);
             drop(r_guard);
@@ -86,18 +108,31 @@ fn compare_values(left: &KeyNode, right: &KeyNode, path: &str, changes: &mut Vec
 
     for (name, rv) in r_vals.iter() {
         if !l_vals.contains_key(name) {
-            changes.push(RegistryChange::ValueAdded(path.to_string(), rv.name.clone(), rv.clone()));
+            changes.push(RegistryChange::ValueAdded(
+                path.to_string(),
+                rv.name.clone(),
+                rv.clone(),
+            ));
         }
     }
     for (name, lv) in l_vals.iter() {
         if !r_vals.contains_key(name) {
-            changes.push(RegistryChange::ValueDeleted(path.to_string(), lv.name.clone(), lv.clone()));
+            changes.push(RegistryChange::ValueDeleted(
+                path.to_string(),
+                lv.name.clone(),
+                lv.clone(),
+            ));
         }
     }
     for (name, lv) in l_vals.iter() {
         if let Some(rv) = r_vals.get(name) {
             if !values_equal(lv, rv) {
-                changes.push(RegistryChange::ValueModified(path.to_string(), lv.name.clone(), lv.clone(), rv.clone()));
+                changes.push(RegistryChange::ValueModified(
+                    path.to_string(),
+                    lv.name.clone(),
+                    lv.clone(),
+                    rv.clone(),
+                ));
             }
         }
     }
@@ -114,18 +149,35 @@ fn compare_subkeys(left: &KeyNode, right: &KeyNode, path: &str, changes: &mut Ve
     }
     names.sort();
     for name in names {
-        let sub_path = if path.is_empty() { name.clone() } else { format!("{}\\{}", path, name) };
-        compare_keys(l_sub.get(&name).cloned(), r_sub.get(&name).cloned(), sub_path, changes);
+        let sub_path = if path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}\\{}", path, name)
+        };
+        compare_keys(
+            l_sub.get(&name).cloned(),
+            r_sub.get(&name).cloned(),
+            sub_path,
+            changes,
+        );
     }
 }
 
 fn add_subtree_added(node: &KeyNode, path: &str, changes: &mut Vec<RegistryChange>) {
     let guard = node.borrow();
     for v in guard.values().values() {
-        changes.push(RegistryChange::ValueAdded(path.to_string(), v.name.clone(), v.clone()));
+        changes.push(RegistryChange::ValueAdded(
+            path.to_string(),
+            v.name.clone(),
+            v.clone(),
+        ));
     }
     for (name, sub) in guard.subkeys() {
-        let sub_path = if path.is_empty() { name.clone() } else { format!("{}\\{}", path, name) };
+        let sub_path = if path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}\\{}", path, name)
+        };
         changes.push(RegistryChange::KeyAdded(sub_path.clone()));
         add_subtree_added(sub, &sub_path, changes);
     }
@@ -134,10 +186,18 @@ fn add_subtree_added(node: &KeyNode, path: &str, changes: &mut Vec<RegistryChang
 fn add_subtree_deleted(node: &KeyNode, path: &str, changes: &mut Vec<RegistryChange>) {
     let guard = node.borrow();
     for v in guard.values().values() {
-        changes.push(RegistryChange::ValueDeleted(path.to_string(), v.name.clone(), v.clone()));
+        changes.push(RegistryChange::ValueDeleted(
+            path.to_string(),
+            v.name.clone(),
+            v.clone(),
+        ));
     }
     for (name, sub) in guard.subkeys() {
-        let sub_path = if path.is_empty() { name.clone() } else { format!("{}\\{}", path, name) };
+        let sub_path = if path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}\\{}", path, name)
+        };
         changes.push(RegistryChange::KeyDeleted(sub_path.clone()));
         add_subtree_deleted(sub, &sub_path, changes);
     }
@@ -146,4 +206,3 @@ fn add_subtree_deleted(node: &KeyNode, path: &str, changes: &mut Vec<RegistryCha
 fn values_equal(a: &RegistryValue, b: &RegistryValue) -> bool {
     a.reg_type() == b.reg_type() && a.raw_bytes() == b.raw_bytes()
 }
-

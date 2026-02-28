@@ -7,16 +7,24 @@ pub struct Gpa(pub u64);
 pub struct Gva(pub u64);
 
 impl Gpa {
-    pub fn offset(self, n: u64) -> Self { Gpa(self.0 + n) }
-    pub fn align_down(self, align: u64) -> Self { Gpa(self.0 & !(align - 1)) }
+    pub fn offset(self, n: u64) -> Self {
+        Gpa(self.0 + n)
+    }
+    pub fn align_down(self, align: u64) -> Self {
+        Gpa(self.0 & !(align - 1))
+    }
     pub fn align_up(self, align: u64) -> Self {
         Gpa((self.0 + align - 1) & !(align - 1))
     }
 }
 
 impl Gva {
-    pub fn offset(self, n: u64) -> Self { Gva(self.0 + n) }
-    pub fn align_down(self, align: u64) -> Self { Gva(self.0 & !(align - 1)) }
+    pub fn offset(self, n: u64) -> Self {
+        Gva(self.0 + n)
+    }
+    pub fn align_down(self, align: u64) -> Self {
+        Gva(self.0 & !(align - 1))
+    }
     pub fn align_up(self, align: u64) -> Self {
         Gva((self.0 + align - 1) & !(align - 1))
     }

@@ -10,9 +10,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// Host file open flags (matches winemu-shared nr module docs)
-const FLAG_READ:   u64 = 0;
-const FLAG_WRITE:  u64 = 1;
-const FLAG_RW:     u64 = 2;
+const FLAG_READ: u64 = 0;
+const FLAG_WRITE: u64 = 1;
+const FLAG_RW: u64 = 2;
 const FLAG_CREATE: u64 = 3;
 
 struct HostFile {
@@ -48,11 +48,12 @@ impl HostFileTable {
     /// Guest kernel passes UTF-8 paths relative to the filesystem root.
     fn resolve(&self, path: &str) -> PathBuf {
         // Strip leading slashes/backslashes
-        let stripped = path
-            .trim_start_matches('/')
-            .trim_start_matches('\\');
+        let stripped = path.trim_start_matches('/').trim_start_matches('\\');
         // Convert backslashes
-        let rel: String = stripped.chars().map(|c| if c == '\\' { '/' } else { c }).collect();
+        let rel: String = stripped
+            .chars()
+            .map(|c| if c == '\\' { '/' } else { c })
+            .collect();
         self.root.join(rel)
     }
 
@@ -64,16 +65,22 @@ impl HostFileTable {
             FLAG_WRITE => OpenOptions::new().write(true).open(path),
             FLAG_RW => OpenOptions::new().read(true).write(true).open(path),
             FLAG_CREATE => OpenOptions::new()
-                .read(true).write(true).create(true).open(path),
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(path),
             _ => OpenOptions::new().read(true).open(path),
         };
         match result {
             Ok(file) => {
                 let fd = self.alloc_fd();
-                self.files.lock().unwrap().insert(fd, HostFile {
-                    file,
-                    path: path.to_path_buf(),
-                });
+                self.files.lock().unwrap().insert(
+                    fd,
+                    HostFile {
+                        file,
+                        path: path.to_path_buf(),
+                    },
+                );
                 fd
             }
             Err(e) => {
@@ -91,16 +98,22 @@ impl HostFileTable {
             FLAG_WRITE => OpenOptions::new().write(true).open(&host_path),
             FLAG_RW => OpenOptions::new().read(true).write(true).open(&host_path),
             FLAG_CREATE => OpenOptions::new()
-                .read(true).write(true).create(true).open(&host_path),
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&host_path),
             _ => OpenOptions::new().read(true).open(&host_path),
         };
         match result {
             Ok(file) => {
                 let fd = self.alloc_fd();
-                self.files.lock().unwrap().insert(fd, HostFile {
-                    file,
-                    path: host_path,
-                });
+                self.files.lock().unwrap().insert(
+                    fd,
+                    HostFile {
+                        file,
+                        path: host_path,
+                    },
+                );
                 fd
             }
             Err(e) => {

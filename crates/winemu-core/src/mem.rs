@@ -17,11 +17,11 @@ bitflags! {
 impl MemProt {
     pub fn from_win32(protect: u32) -> Self {
         match protect {
-            0x01 => Self::NONE,  // PAGE_NOACCESS
-            0x02 => Self::READ,  // PAGE_READONLY
-            0x04 => Self::RX,    // PAGE_EXECUTE_READ
-            0x40 => Self::RWX,   // PAGE_EXECUTE_READWRITE
-            _ => Self::RW,       // PAGE_READWRITE (default)
+            0x01 => Self::NONE, // PAGE_NOACCESS
+            0x02 => Self::READ, // PAGE_READONLY
+            0x04 => Self::RX,   // PAGE_EXECUTE_READ
+            0x40 => Self::RWX,  // PAGE_EXECUTE_READWRITE
+            _ => Self::RW,      // PAGE_READWRITE (default)
         }
     }
 }

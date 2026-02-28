@@ -1,10 +1,10 @@
+use core::fmt;
 use std::fs;
 use std::path::Path;
-use core::fmt;
 
 use crate::architecture::Architecture;
 use crate::registry_key::{KeyNode, RegistryKey};
-use crate::registry_utils::{timestamp_to_filetime};
+use crate::registry_utils::timestamp_to_filetime;
 use crate::registry_value::{RegistryValue, RegistryValueData, REG_BINARY, REG_QWORD};
 
 #[derive(Debug)]
@@ -86,7 +86,11 @@ impl RegistryParser {
                 continue;
             }
             if trimmed.starts_with('[') {
-                let (path, timestamp) = parse_key_header(trimmed).map_err(|msg| ParseError::Line { line: line_idx, msg })?;
+                let (path, timestamp) =
+                    parse_key_header(trimmed).map_err(|msg| ParseError::Line {
+                        line: line_idx,
+                        msg,
+                    })?;
                 let key_path = unescape_key_path(&path);
                 let key_node = RegistryKey::create_key_recursive(&root, &key_path);
                 {
@@ -121,11 +125,21 @@ impl RegistryParser {
 
             // value line
             if trimmed.starts_with('@') || trimmed.starts_with('"') {
-                let (value, consumed) = parse_value_line(trimmed, &lines[(line_idx)..]).map_err(|msg| ParseError::Line { line: line_idx, msg })?;
+                let (value, consumed) =
+                    parse_value_line(trimmed, &lines[(line_idx)..]).map_err(|msg| {
+                        ParseError::Line {
+                            line: line_idx,
+                            msg,
+                        }
+                    })?;
                 if let Some(ref key) = current_key {
-                    key.borrow_mut().set_value_for_loading(value.name.clone(), value);
+                    key.borrow_mut()
+                        .set_value_for_loading(value.name.clone(), value);
                 } else {
-                    return Err(ParseError::Line { line: line_idx, msg: "value without key".into() });
+                    return Err(ParseError::Line {
+                        line: line_idx,
+                        msg: "value without key".into(),
+                    });
                 }
                 line_idx += consumed;
                 continue;
@@ -215,8 +229,15 @@ fn parse_value_data(data: &str, name: String) -> Result<RegistryValue, String> {
     }
     if data.starts_with("str(7):") {
         let s = parse_quoted_string(&data["str(7):".len()..])?;
-        let parts: Vec<String> = s.split('\u{0}').filter(|v| !v.is_empty()).map(|v| v.to_string()).collect();
-        return Ok(RegistryValue::new(name, RegistryValueData::MultiString(parts)));
+        let parts: Vec<String> = s
+            .split('\u{0}')
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+            .collect();
+        return Ok(RegistryValue::new(
+            name,
+            RegistryValueData::MultiString(parts),
+        ));
     }
     if data.starts_with("dword:") {
         let hex = data["dword:".len()..].trim();
@@ -239,11 +260,17 @@ fn parse_value_data(data: &str, name: String) -> Result<RegistryValue, String> {
             let val = u64::from_le_bytes(arr);
             return Ok(RegistryValue::new(name, RegistryValueData::Qword(val)));
         }
-        return Ok(RegistryValue::new(name, RegistryValueData::Binary(bytes, ty)));
+        return Ok(RegistryValue::new(
+            name,
+            RegistryValueData::Binary(bytes, ty),
+        ));
     }
     if data.starts_with("hex:") {
         let bytes = parse_hex_bytes(&data["hex:".len()..])?;
-        return Ok(RegistryValue::new(name, RegistryValueData::Binary(bytes, REG_BINARY)));
+        return Ok(RegistryValue::new(
+            name,
+            RegistryValueData::Binary(bytes, REG_BINARY),
+        ));
     }
     if data.starts_with("hex(b):") {
         let bytes = parse_hex_bytes(&data["hex(b):".len()..])?;
@@ -253,7 +280,10 @@ fn parse_value_data(data: &str, name: String) -> Result<RegistryValue, String> {
             let val = u64::from_le_bytes(arr);
             return Ok(RegistryValue::new(name, RegistryValueData::Qword(val)));
         }
-        return Ok(RegistryValue::new(name, RegistryValueData::Binary(bytes, REG_QWORD)));
+        return Ok(RegistryValue::new(
+            name,
+            RegistryValueData::Binary(bytes, REG_QWORD),
+        ));
     }
     // default string
     let s = parse_quoted_string(data)?;

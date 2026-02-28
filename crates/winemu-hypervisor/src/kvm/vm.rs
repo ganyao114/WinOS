@@ -1,8 +1,8 @@
+use super::vcpu::KvmVcpu;
+use crate::{Vcpu, Vm, VmConfig};
+use kvm_ioctls::VmFd;
 use std::sync::atomic::{AtomicU32, Ordering};
 use winemu_core::{addr::Gpa, mem::MemProt, Result, WinemuError};
-use crate::{Vm, Vcpu, VmConfig};
-use super::vcpu::KvmVcpu;
-use kvm_ioctls::VmFd;
 
 pub struct KvmVm {
     vm_fd: VmFd,
@@ -12,7 +12,11 @@ pub struct KvmVm {
 
 impl KvmVm {
     pub fn new(vm_fd: VmFd, config: VmConfig) -> Self {
-        Self { vm_fd, config, next_slot: AtomicU32::new(0) }
+        Self {
+            vm_fd,
+            config,
+            next_slot: AtomicU32::new(0),
+        }
     }
 }
 
@@ -26,8 +30,9 @@ impl Vm for KvmVm {
             userspace_addr: hva as u64,
             flags: 0,
         };
-        self.vm_fd.set_user_memory_region(region)
-            .map_err(|e| WinemuError::Hypervisor(format!("kvm set_user_memory_region failed: {}", e)))
+        self.vm_fd.set_user_memory_region(region).map_err(|e| {
+            WinemuError::Hypervisor(format!("kvm set_user_memory_region failed: {}", e))
+        })
     }
 
     fn unmap_memory(&self, _gpa: Gpa, _size: usize) -> Result<()> {
@@ -37,7 +42,9 @@ impl Vm for KvmVm {
     }
 
     fn create_vcpu(&self, id: u32) -> Result<Box<dyn Vcpu>> {
-        let vcpu_fd = self.vm_fd.create_vcpu(id as u64)
+        let vcpu_fd = self
+            .vm_fd
+            .create_vcpu(id as u64)
             .map_err(|e| WinemuError::Hypervisor(format!("kvm create_vcpu failed: {}", e)))?;
         Ok(Box::new(KvmVcpu::new(vcpu_fd)?))
     }

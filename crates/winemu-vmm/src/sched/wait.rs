@@ -1,5 +1,5 @@
-use super::{Scheduler, ThreadId, WaitKind, WaitRequest, SchedResult};
-use super::sync::{SyncHandle, SyncObject, STATUS_SUCCESS, STATUS_WAIT_0, STATUS_ABANDONED_WAIT_0};
+use super::sync::{SyncHandle, SyncObject, STATUS_ABANDONED_WAIT_0, STATUS_SUCCESS, STATUS_WAIT_0};
+use super::{SchedResult, Scheduler, ThreadId, WaitKind, WaitRequest};
 use std::time::{Duration, Instant};
 
 /// NT 超时单位：100ns，负值=相对，正值=绝对，0=立即
@@ -52,8 +52,8 @@ impl Scheduler {
                 drop(objects);
 
                 let req = WaitRequest {
-                    kind:       WaitKind::Single(handle),
-                    deadline:   deadline_from_nt(timeout_100ns),
+                    kind: WaitKind::Single(handle),
+                    deadline: deadline_from_nt(timeout_100ns),
                     wake_index: None,
                 };
                 SchedResult::Block(req)
@@ -124,8 +124,8 @@ impl Scheduler {
         }
 
         let req = WaitRequest {
-            kind:       WaitKind::Multiple { handles, wait_all },
-            deadline:   deadline_from_nt(timeout_100ns),
+            kind: WaitKind::Multiple { handles, wait_all },
+            deadline: deadline_from_nt(timeout_100ns),
             wake_index: None,
         };
         SchedResult::Block(req)
@@ -174,10 +174,10 @@ impl Scheduler {
 
 fn obj_is_signaled(obj: &SyncObject, tid: ThreadId) -> bool {
     match obj {
-        SyncObject::Event(e)     => e.signaled,
-        SyncObject::Mutex(m)     => m.owner.is_none() || m.owner == Some(tid),
+        SyncObject::Event(e) => e.signaled,
+        SyncObject::Mutex(m) => m.owner.is_none() || m.owner == Some(tid),
         SyncObject::Semaphore(s) => s.count > 0,
-        SyncObject::Thread(_)    => false, // Phase 3
+        SyncObject::Thread(_) => false, // Phase 3
     }
 }
 
@@ -185,19 +185,31 @@ fn obj_is_signaled(obj: &SyncObject, tid: ThreadId) -> bool {
 fn try_acquire_obj(obj: &mut SyncObject, tid: ThreadId) -> (bool, u64) {
     match obj {
         SyncObject::Event(e) => {
-            if e.try_acquire() { (true, STATUS_SUCCESS) } else { (false, 0) }
+            if e.try_acquire() {
+                (true, STATUS_SUCCESS)
+            } else {
+                (false, 0)
+            }
         }
         SyncObject::Mutex(m) => {
             let (ok, abandoned) = m.try_acquire(tid);
             if ok {
-                let ret = if abandoned { STATUS_ABANDONED_WAIT_0 } else { STATUS_SUCCESS };
+                let ret = if abandoned {
+                    STATUS_ABANDONED_WAIT_0
+                } else {
+                    STATUS_SUCCESS
+                };
                 (true, ret)
             } else {
                 (false, 0)
             }
         }
         SyncObject::Semaphore(s) => {
-            if s.try_acquire() { (true, STATUS_SUCCESS) } else { (false, 0) }
+            if s.try_acquire() {
+                (true, STATUS_SUCCESS)
+            } else {
+                (false, 0)
+            }
         }
         SyncObject::Thread(_) => (false, 0),
     }
@@ -205,18 +217,18 @@ fn try_acquire_obj(obj: &mut SyncObject, tid: ThreadId) -> (bool, u64) {
 
 fn add_waiter_obj(obj: &mut SyncObject, tid: ThreadId) {
     match obj {
-        SyncObject::Event(e)     => e.add_waiter(tid),
-        SyncObject::Mutex(m)     => m.add_waiter(tid),
+        SyncObject::Event(e) => e.add_waiter(tid),
+        SyncObject::Mutex(m) => m.add_waiter(tid),
         SyncObject::Semaphore(s) => s.add_waiter(tid),
-        SyncObject::Thread(_)    => {}
+        SyncObject::Thread(_) => {}
     }
 }
 
 fn remove_waiter_obj(obj: &mut SyncObject, tid: ThreadId) {
     match obj {
-        SyncObject::Event(e)     => e.remove_waiter(tid),
-        SyncObject::Mutex(m)     => m.remove_waiter(tid),
+        SyncObject::Event(e) => e.remove_waiter(tid),
+        SyncObject::Mutex(m) => m.remove_waiter(tid),
         SyncObject::Semaphore(s) => s.remove_waiter(tid),
-        SyncObject::Thread(_)    => {}
+        SyncObject::Thread(_) => {}
     }
 }

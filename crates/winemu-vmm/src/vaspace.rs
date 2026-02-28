@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 
 /// 用户空间范围 (Windows ARM64 convention)
-const USER_BASE: u64 = 0x0000_0001_0000;       // 64 KB
-const USER_END:  u64 = 0x0000_7FFF_FFFF_0000;
+const USER_BASE: u64 = 0x0000_0001_0000; // 64 KB
+const USER_END: u64 = 0x0000_7FFF_FFFF_0000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RegionState {
@@ -16,10 +16,10 @@ pub enum RegionState {
 
 #[derive(Clone, Debug)]
 pub struct Region {
-    pub base:  u64,
-    pub size:  u64,
+    pub base: u64,
+    pub size: u64,
     pub state: RegionState,
-    pub prot:  u32,  // Windows PAGE_* flags
+    pub prot: u32, // Windows PAGE_* flags
 }
 
 pub struct VaSpace {
@@ -35,21 +35,27 @@ impl VaSpace {
         // GuestMemory is 512MB: [0x40000000, 0x60000000)
         let end = 0x6000_0000u64;
         self.regions.clear();
-        self.regions.insert(base, Region {
+        self.regions.insert(
             base,
-            size: end - base,
-            state: RegionState::Free,
-            prot: 0,
-        });
+            Region {
+                base,
+                size: end - base,
+                state: RegionState::Free,
+                prot: 0,
+            },
+        );
     }
     pub fn new() -> Self {
         let mut regions = BTreeMap::new();
-        regions.insert(USER_BASE, Region {
-            base:  USER_BASE,
-            size:  USER_END - USER_BASE,
-            state: RegionState::Free,
-            prot:  0,
-        });
+        regions.insert(
+            USER_BASE,
+            Region {
+                base: USER_BASE,
+                size: USER_END - USER_BASE,
+                state: RegionState::Free,
+                prot: 0,
+            },
+        );
         Self { regions }
     }
 
@@ -65,7 +71,9 @@ impl VaSpace {
     }
 
     fn alloc_anywhere(&mut self, size: u64, prot: u32) -> Option<u64> {
-        let base = self.regions.values()
+        let base = self
+            .regions
+            .values()
             .find(|r| r.state == RegionState::Free && r.size >= size)
             .map(|r| r.base)?;
         self.alloc_at(base, size, prot)
@@ -74,28 +82,47 @@ impl VaSpace {
     fn alloc_at(&mut self, base: u64, size: u64, prot: u32) -> Option<u64> {
         let base = align_up(base, 0x10000);
         // Find the free region that contains [base, base+size)
-        let (&rbase, _) = self.regions.range(..=base).next_back()
+        let (&rbase, _) = self
+            .regions
+            .range(..=base)
+            .next_back()
             .filter(|(_, r)| r.state == RegionState::Free && r.base + r.size >= base + size)?;
         let old = self.regions.remove(&rbase).unwrap();
 
         // Split: [rbase, base) stays free (if non-empty)
         if base > rbase {
-            self.regions.insert(rbase, Region {
-                base: rbase, size: base - rbase,
-                state: RegionState::Free, prot: 0,
-            });
+            self.regions.insert(
+                rbase,
+                Region {
+                    base: rbase,
+                    size: base - rbase,
+                    state: RegionState::Free,
+                    prot: 0,
+                },
+            );
         }
         // Allocated region
-        self.regions.insert(base, Region {
-            base, size, state: RegionState::Committed, prot,
-        });
+        self.regions.insert(
+            base,
+            Region {
+                base,
+                size,
+                state: RegionState::Committed,
+                prot,
+            },
+        );
         // Tail: [base+size, old_end) stays free (if non-empty)
         let old_end = old.base + old.size;
         if base + size < old_end {
-            self.regions.insert(base + size, Region {
-                base: base + size, size: old_end - (base + size),
-                state: RegionState::Free, prot: 0,
-            });
+            self.regions.insert(
+                base + size,
+                Region {
+                    base: base + size,
+                    size: old_end - (base + size),
+                    state: RegionState::Free,
+                    prot: 0,
+                },
+            );
         }
         Some(base)
     }
@@ -105,7 +132,7 @@ impl VaSpace {
         let base = align_down(base, 0x10000);
         if let Some(r) = self.regions.get_mut(&base) {
             r.state = RegionState::Free;
-            r.prot  = 0;
+            r.prot = 0;
         } else {
             return false;
         }
@@ -115,7 +142,9 @@ impl VaSpace {
 
     /// 查询包含 `addr` 的区域。
     pub fn query(&self, addr: u64) -> Option<&Region> {
-        self.regions.range(..=addr).next_back()
+        self.regions
+            .range(..=addr)
+            .next_back()
             .map(|(_, r)| r)
             .filter(|r| addr < r.base + r.size)
     }
@@ -123,7 +152,9 @@ impl VaSpace {
     fn coalesce(&mut self, base: u64) {
         // Merge with next
         if let Some(next_base) = self.regions.range((base + 1)..).next().map(|(&k, _)| k) {
-            let next_free = self.regions.get(&next_base)
+            let next_free = self
+                .regions
+                .get(&next_base)
                 .map(|r| r.state == RegionState::Free)
                 .unwrap_or(false);
             if next_free {
@@ -133,7 +164,9 @@ impl VaSpace {
         }
         // Merge with prev
         if let Some(prev_base) = self.regions.range(..base).next_back().map(|(&k, _)| k) {
-            let prev_free = self.regions.get(&prev_base)
+            let prev_free = self
+                .regions
+                .get(&prev_base)
                 .map(|r| r.state == RegionState::Free)
                 .unwrap_or(false);
             if prev_free {

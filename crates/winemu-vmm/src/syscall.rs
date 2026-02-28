@@ -209,9 +209,16 @@ impl SyscallDispatcher {
             "NtProtectVirtualMemory" => memory::nt_protect_virtual_memory(&call, &ctx),
 
             // ── 注册表（应由 guest kernel 处理） ───────────────
-            "NtOpenKey" | "NtOpenKeyEx" | "NtCreateKey" | "NtQueryValueKey"
-            | "NtEnumerateKey" | "NtEnumerateValueKey" | "NtSetValueKey"
-            | "NtDeleteKey" | "NtDeleteValueKey" | "NtFlushKey" => {
+            "NtOpenKey"
+            | "NtOpenKeyEx"
+            | "NtCreateKey"
+            | "NtQueryValueKey"
+            | "NtEnumerateKey"
+            | "NtEnumerateValueKey"
+            | "NtSetValueKey"
+            | "NtDeleteKey"
+            | "NtDeleteValueKey"
+            | "NtFlushKey" => {
                 log::warn!("NT_SYSCALL: {} must be handled in guest kernel", name);
                 DispatchResult::Sync(status::INVALID_PARAMETER as u64)
             }

@@ -9,12 +9,12 @@ pub mod syscall;
 pub mod vaspace;
 pub mod vcpu;
 
+use hypercall::HypercallManager;
+use memory::GuestMemory;
+use sched::Scheduler;
 use std::sync::{Arc, RwLock};
 use winemu_core::{addr::Gpa, mem::MemProt, Result, WinemuError};
 use winemu_hypervisor::{Hypervisor, Vm, VmConfig};
-use memory::GuestMemory;
-use hypercall::HypercallManager;
-use sched::Scheduler;
 
 pub struct Vmm {
     #[allow(dead_code)]
@@ -42,7 +42,10 @@ impl Vmm {
             .and_then(|s| s.parse::<u32>().ok())
             .map(|n| n.clamp(1, host_cpus))
             .unwrap_or(1);
-        let config = VmConfig { memory_size: 512 * 1024 * 1024, vcpu_count };
+        let config = VmConfig {
+            memory_size: 512 * 1024 * 1024,
+            vcpu_count,
+        };
         let vm: Arc<dyn Vm> = Arc::from(hypervisor.create_vm(config)?);
         let mut memory = GuestMemory::new(512 * 1024 * 1024)?;
         vm.map_memory(memory.base_gpa(), memory.hva(), memory.size(), MemProt::RWX)?;
@@ -59,7 +62,14 @@ impl Vmm {
             exe_path,
         ));
 
-        Ok(Self { hypervisor, vm, memory, hypercall_mgr, sched, vcpu_count })
+        Ok(Self {
+            hypervisor,
+            vm,
+            memory,
+            hypercall_mgr,
+            sched,
+            vcpu_count,
+        })
     }
 
     pub fn run(&mut self) -> Result<()> {
@@ -71,7 +81,12 @@ impl Vmm {
 
         if vcpus.len() == 1 {
             let (id, vcpu) = vcpus.pop().unwrap();
-            vcpu::vcpu_thread(id, vcpu, Arc::clone(&self.hypercall_mgr), Arc::clone(&self.sched));
+            vcpu::vcpu_thread(
+                id,
+                vcpu,
+                Arc::clone(&self.hypercall_mgr),
+                Arc::clone(&self.sched),
+            );
             return Ok(());
         }
 

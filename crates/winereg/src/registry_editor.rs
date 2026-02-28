@@ -1,6 +1,9 @@
 use crate::{
-    architecture::Architecture, registry_comparator::RegistryComparator, registry_key::KeyNode,
-    registry_parser::{LoadResult, RegistryParser}, registry_writer::RegistryWriter,
+    architecture::Architecture,
+    registry_comparator::RegistryComparator,
+    registry_key::KeyNode,
+    registry_parser::{LoadResult, RegistryParser},
+    registry_writer::RegistryWriter,
 };
 
 /// Options for writing/serializing registry data.
@@ -24,7 +27,9 @@ pub struct RegistryEditor;
 
 impl RegistryEditor {
     /// Load a registry file from disk.
-    pub fn load_from_file(filename: &str) -> Result<LoadResult, crate::registry_parser::ParseError> {
+    pub fn load_from_file(
+        filename: &str,
+    ) -> Result<LoadResult, crate::registry_parser::ParseError> {
         let parser = RegistryParser;
         parser.load_from_file(filename)
     }
@@ -68,9 +73,11 @@ impl RegistryEditor {
     }
 
     /// Compare two registries and return the diff.
-    pub fn compare_registries(key1: &KeyNode, key2: &KeyNode) -> crate::registry_comparator::DiffResult {
+    pub fn compare_registries(
+        key1: &KeyNode,
+        key2: &KeyNode,
+    ) -> crate::registry_comparator::DiffResult {
         let comparator = RegistryComparator;
         comparator.compare_registries(key1, key2)
     }
 }
-

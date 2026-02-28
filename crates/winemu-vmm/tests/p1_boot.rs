@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod p1_boot {
-    use winemu_hypervisor::{create_hypervisor, VmConfig, types::VmExit};
-    use winemu_core::{addr::Gpa, mem::MemProt, hypercall::nr};
     use memmap2::MmapMut;
+    use winemu_core::{addr::Gpa, hypercall::nr, mem::MemProt};
+    use winemu_hypervisor::{create_hypervisor, types::VmExit, VmConfig};
 
     fn load_kernel_bin() -> Option<Vec<u8>> {
         let paths = [
@@ -30,13 +30,19 @@ mod p1_boot {
 
         let hv = match create_hypervisor() {
             Ok(h) => h,
-            Err(e) => { eprintln!("SKIP: hypervisor unavailable: {}", e); return; }
+            Err(e) => {
+                eprintln!("SKIP: hypervisor unavailable: {}", e);
+                return;
+            }
         };
 
         const MEM_SIZE: usize = 64 * 1024 * 1024;
         const KERNEL_GPA: u64 = 0x4000_0000;
 
-        let config = VmConfig { memory_size: MEM_SIZE, vcpu_count: 1 };
+        let config = VmConfig {
+            memory_size: MEM_SIZE,
+            vcpu_count: 1,
+        };
         let vm = hv.create_vm(config).expect("create_vm");
 
         let mut mmap = MmapMut::map_anon(MEM_SIZE).expect("mmap");
@@ -50,11 +56,15 @@ mod p1_boot {
         let exit = vcpu.run().expect("vcpu run");
 
         match exit {
-            VmExit::Hypercall { nr: hypercall_nr, .. } => {
+            VmExit::Hypercall {
+                nr: hypercall_nr, ..
+            } => {
                 assert_eq!(
-                    hypercall_nr, nr::KERNEL_READY,
+                    hypercall_nr,
+                    nr::KERNEL_READY,
                     "expected KERNEL_READY ({:#x}), got {:#x}",
-                    nr::KERNEL_READY, hypercall_nr
+                    nr::KERNEL_READY,
+                    hypercall_nr
                 );
                 println!("✓ Guest kernel ready hypercall received");
             }

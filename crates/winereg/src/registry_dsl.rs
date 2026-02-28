@@ -131,7 +131,10 @@ impl RegistryKeyDsl {
     pub fn value(&mut self, name: &str, value: &str) {
         self.key.borrow_mut().set_value(
             name.to_string(),
-            RegistryValue::new(name.to_string(), RegistryValueData::String(value.to_string())),
+            RegistryValue::new(
+                name.to_string(),
+                RegistryValueData::String(value.to_string()),
+            ),
         );
     }
 
@@ -152,14 +155,20 @@ impl RegistryKeyDsl {
     pub fn binary(&mut self, name: &str, data: &[u8]) {
         self.key.borrow_mut().set_value(
             name.to_string(),
-            RegistryValue::new(name.to_string(), RegistryValueData::Binary(data.to_vec(), crate::registry_value::REG_BINARY)),
+            RegistryValue::new(
+                name.to_string(),
+                RegistryValueData::Binary(data.to_vec(), crate::registry_value::REG_BINARY),
+            ),
         );
     }
 
     pub fn expand_string(&mut self, name: &str, value: &str) {
         self.key.borrow_mut().set_value(
             name.to_string(),
-            RegistryValue::new(name.to_string(), RegistryValueData::ExpandString(value.to_string())),
+            RegistryValue::new(
+                name.to_string(),
+                RegistryValueData::ExpandString(value.to_string()),
+            ),
         );
     }
 
@@ -218,7 +227,9 @@ where
 
 pub fn load_registry(path: &str) -> RegistryResult {
     let parser = RegistryParser;
-    let result = parser.load_from_file(path).expect("failed to load registry");
+    let result = parser
+        .load_from_file(path)
+        .expect("failed to load registry");
     RegistryResult {
         root_key: result.root_key,
         relative_base: result.relative_base,
@@ -236,4 +247,3 @@ where
     f(&mut dsl);
     registry
 }
-

@@ -3,16 +3,16 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use winemu_core::addr::Gpa;
+use crate::file_io::FileTable;
 use crate::memory::GuestMemory;
 use crate::vaspace::VaSpace;
-use crate::file_io::FileTable;
+use winemu_core::addr::Gpa;
 
 // NT 状态码
-pub const STATUS_SUCCESS:           u64 = 0x0000_0000;
-pub const STATUS_INVALID_HANDLE:    u64 = 0xC000_0008;
+pub const STATUS_SUCCESS: u64 = 0x0000_0000;
+pub const STATUS_INVALID_HANDLE: u64 = 0xC000_0008;
 pub const STATUS_INVALID_PARAMETER: u64 = 0xC000_000D;
-pub const STATUS_NO_MEMORY:         u64 = 0xC000_0017;
+pub const STATUS_NO_MEMORY: u64 = 0xC000_0017;
 
 /// Section 的后端数据来源
 enum SectionBacking {
@@ -51,13 +51,7 @@ impl SectionTable {
     /// NtCreateSection
     /// file_handle == 0  → anonymous (pagefile-backed)
     /// file_handle != 0  → file-backed (snapshot read from FileTable)
-    pub fn create(
-        &self,
-        file_handle: u64,
-        size: u64,
-        prot: u32,
-        files: &FileTable,
-    ) -> (u64, u64) {
+    pub fn create(&self, file_handle: u64, size: u64, prot: u32, files: &FileTable) -> (u64, u64) {
         let backing = if file_handle == 0 {
             if size == 0 {
                 return (STATUS_INVALID_PARAMETER, 0);
@@ -69,7 +63,11 @@ impl SectionTable {
             if st != STATUS_SUCCESS {
                 return (STATUS_INVALID_HANDLE, 0);
             }
-            let read_size = if size == 0 { file_size } else { size.min(file_size) } as usize;
+            let read_size = if size == 0 {
+                file_size
+            } else {
+                size.min(file_size)
+            } as usize;
             let mut data = vec![0u8; read_size];
             let (st2, _) = files.read(file_handle, &mut data, Some(0));
             if st2 != STATUS_SUCCESS && st2 != 0xC000_011B {
@@ -80,7 +78,10 @@ impl SectionTable {
         };
 
         let h = self.alloc_handle();
-        self.sections.lock().unwrap().insert(h, Section { backing, prot });
+        self.sections
+            .lock()
+            .unwrap()
+            .insert(h, Section { backing, prot });
         log::debug!("NT_CREATE_SECTION: handle={:#x} prot={:#x}", h, prot);
         (STATUS_SUCCESS, h)
     }
@@ -111,7 +112,11 @@ impl SectionTable {
 
         // Determine actual mapping size
         let avail = section_size.saturating_sub(offset);
-        let actual_size = if map_size == 0 { avail } else { map_size.min(avail) };
+        let actual_size = if map_size == 0 {
+            avail
+        } else {
+            map_size.min(avail)
+        };
         if actual_size == 0 {
             return (STATUS_INVALID_PARAMETER, 0);
         }
@@ -129,14 +134,19 @@ impl SectionTable {
         // Copy file data if file-backed
         if !data_slice.is_empty() {
             let src_start = offset as usize;
-            let src_end   = (src_start + actual_size as usize).min(data_slice.len());
+            let src_end = (src_start + actual_size as usize).min(data_slice.len());
             if src_start < data_slice.len() {
                 mem.write_bytes(Gpa(va), &data_slice[src_start..src_end]);
             }
         }
 
-        log::debug!("NT_MAP_VIEW: section={:#x} va={:#x} size={:#x} offset={:#x}",
-            section_handle, va, actual_size, offset);
+        log::debug!(
+            "NT_MAP_VIEW: section={:#x} va={:#x} size={:#x} offset={:#x}",
+            section_handle,
+            va,
+            actual_size,
+            offset
+        );
         (STATUS_SUCCESS, va)
     }
 

@@ -268,7 +268,6 @@ impl HvfVcpu {
         }
         self.parse_exit()
     }
-
 }
 
 impl Vcpu for HvfVcpu {

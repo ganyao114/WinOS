@@ -4,7 +4,12 @@ use crate::registry_value::{RegistryValue, RegistryValueData, REG_BINARY};
 pub struct TextDiffExporter;
 
 impl TextDiffExporter {
-    pub fn export(&self, diff: &DiffResult, from_file: Option<&str>, to_file: Option<&str>) -> String {
+    pub fn export(
+        &self,
+        diff: &DiffResult,
+        from_file: Option<&str>,
+        to_file: Option<&str>,
+    ) -> String {
         let mut out = String::new();
         out.push_str("# Registry Patch File\n");
         out.push_str("# Generated: ");
@@ -24,7 +29,8 @@ impl TextDiffExporter {
             return out;
         }
 
-        let mut grouped: std::collections::BTreeMap<String, Vec<RegistryChange>> = std::collections::BTreeMap::new();
+        let mut grouped: std::collections::BTreeMap<String, Vec<RegistryChange>> =
+            std::collections::BTreeMap::new();
         for change in &diff.changes {
             let key = match change {
                 RegistryChange::KeyAdded(p) => parent_path(p),
@@ -113,7 +119,8 @@ impl TextDiffParser {
     pub fn parse(&self, text: &str) -> Result<DiffResult, String> {
         let mut path = String::new();
         let mut changes = Vec::new();
-        let mut key_props: std::collections::BTreeMap<String, Vec<KeyPropertyChange>> = std::collections::BTreeMap::new();
+        let mut key_props: std::collections::BTreeMap<String, Vec<KeyPropertyChange>> =
+            std::collections::BTreeMap::new();
 
         for (idx, line) in text.lines().enumerate() {
             let trimmed = line.trim();
@@ -142,21 +149,44 @@ impl TextDiffParser {
             if trimmed.starts_with("~className:") {
                 let rest = &trimmed["~className:".len()..];
                 let (old, newv) = split_arrow(rest)?;
-                key_props.entry(path.clone()).or_default().push(KeyPropertyChange::ClassNameChange(parse_property_value(old), parse_property_value(newv)));
+                key_props.entry(path.clone()).or_default().push(
+                    KeyPropertyChange::ClassNameChange(
+                        parse_property_value(old),
+                        parse_property_value(newv),
+                    ),
+                );
                 continue;
             }
             if trimmed.starts_with("~isSymlink:") {
                 let (old, newv) = split_arrow(&trimmed["~isSymlink:".len()..])?;
-                let old_b = old.trim().parse::<bool>().map_err(|_| format!("line {}", idx + 1))?;
-                let new_b = newv.trim().parse::<bool>().map_err(|_| format!("line {}", idx + 1))?;
-                key_props.entry(path.clone()).or_default().push(KeyPropertyChange::SymlinkChange(old_b, new_b));
+                let old_b = old
+                    .trim()
+                    .parse::<bool>()
+                    .map_err(|_| format!("line {}", idx + 1))?;
+                let new_b = newv
+                    .trim()
+                    .parse::<bool>()
+                    .map_err(|_| format!("line {}", idx + 1))?;
+                key_props
+                    .entry(path.clone())
+                    .or_default()
+                    .push(KeyPropertyChange::SymlinkChange(old_b, new_b));
                 continue;
             }
             if trimmed.starts_with("~isVolatile:") {
                 let (old, newv) = split_arrow(&trimmed["~isVolatile:".len()..])?;
-                let old_b = old.trim().parse::<bool>().map_err(|_| format!("line {}", idx + 1))?;
-                let new_b = newv.trim().parse::<bool>().map_err(|_| format!("line {}", idx + 1))?;
-                key_props.entry(path.clone()).or_default().push(KeyPropertyChange::VolatileChange(old_b, new_b));
+                let old_b = old
+                    .trim()
+                    .parse::<bool>()
+                    .map_err(|_| format!("line {}", idx + 1))?;
+                let new_b = newv
+                    .trim()
+                    .parse::<bool>()
+                    .map_err(|_| format!("line {}", idx + 1))?;
+                key_props
+                    .entry(path.clone())
+                    .or_default()
+                    .push(KeyPropertyChange::VolatileChange(old_b, new_b));
                 continue;
             }
             if trimmed.starts_with("+\"") || trimmed.starts_with("-\"") {
@@ -174,7 +204,12 @@ impl TextDiffParser {
             if trimmed.starts_with("~\"") {
                 let val_part = &trimmed[1..];
                 let (name, old_value, new_value) = parse_value_modification(val_part)?;
-                changes.push(RegistryChange::ValueModified(path.clone(), name, old_value, new_value));
+                changes.push(RegistryChange::ValueModified(
+                    path.clone(),
+                    name,
+                    old_value,
+                    new_value,
+                ));
                 continue;
             }
         }
@@ -188,11 +223,15 @@ impl TextDiffParser {
 }
 
 fn parent_path(path: &str) -> String {
-    path.rsplit_once('\\').map(|(p, _)| p.to_string()).unwrap_or_else(|| "".into())
+    path.rsplit_once('\\')
+        .map(|(p, _)| p.to_string())
+        .unwrap_or_else(|| "".into())
 }
 
 fn leaf_name(path: &str) -> String {
-    path.rsplit_once('\\').map(|(_, n)| n.to_string()).unwrap_or_else(|| path.to_string())
+    path.rsplit_once('\\')
+        .map(|(_, n)| n.to_string())
+        .unwrap_or_else(|| path.to_string())
 }
 
 fn join_path(base: &str, name: &str) -> String {
@@ -224,14 +263,26 @@ fn format_value_data(value: &RegistryValue) -> String {
         RegistryValueData::String(v) => format!("string:\"{}\"", escape_string(v)),
         RegistryValueData::ExpandString(v) => format!("expand_string:\"{}\"", escape_string(v)),
         RegistryValueData::MultiString(vs) => {
-            let joined = vs.iter().map(|s| format!("\"{}\"", escape_string(s))).collect::<Vec<_>>().join(",");
+            let joined = vs
+                .iter()
+                .map(|s| format!("\"{}\"", escape_string(s)))
+                .collect::<Vec<_>>()
+                .join(",");
             format!("multi_string:[{}]", joined)
         }
         RegistryValueData::Dword(v) => format!("dword:{:08x}", v),
         RegistryValueData::Qword(v) => format!("qword:{:016x}", v),
         RegistryValueData::Binary(bytes, ty) => {
-            let prefix = if *ty == REG_BINARY { "hex:".to_string() } else { format!("hex({:x}):", ty) };
-            let body = bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(",");
+            let prefix = if *ty == REG_BINARY {
+                "hex:".to_string()
+            } else {
+                format!("hex({:x}):", ty)
+            };
+            let body = bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(",");
             format!("{}{}", prefix, body)
         }
     }
@@ -282,12 +333,24 @@ fn parse_value_modification(line: &str) -> Result<(String, RegistryValue, Regist
 fn parse_value_data_part(data: &str) -> Result<RegistryValue, String> {
     let trimmed = data.trim();
     if trimmed.starts_with("string:") {
-        let s = trimmed["string:".len()..].trim().trim_matches('"').to_string();
-        return Ok(RegistryValue::new("", RegistryValueData::String(unescape(&s))));
+        let s = trimmed["string:".len()..]
+            .trim()
+            .trim_matches('"')
+            .to_string();
+        return Ok(RegistryValue::new(
+            "",
+            RegistryValueData::String(unescape(&s)),
+        ));
     }
     if trimmed.starts_with("expand_string:") {
-        let s = trimmed["expand_string:".len()..].trim().trim_matches('"').to_string();
-        return Ok(RegistryValue::new("", RegistryValueData::ExpandString(unescape(&s))));
+        let s = trimmed["expand_string:".len()..]
+            .trim()
+            .trim_matches('"')
+            .to_string();
+        return Ok(RegistryValue::new(
+            "",
+            RegistryValueData::ExpandString(unescape(&s)),
+        ));
     }
     if trimmed.starts_with("multi_string:") {
         let content = trimmed["multi_string:".len()..].trim();
@@ -299,14 +362,19 @@ fn parse_value_data_part(data: &str) -> Result<RegistryValue, String> {
                 values.push(unescape(v));
             }
         }
-        return Ok(RegistryValue::new("", RegistryValueData::MultiString(values)));
+        return Ok(RegistryValue::new(
+            "",
+            RegistryValueData::MultiString(values),
+        ));
     }
     if trimmed.starts_with("dword:") {
-        let v = u32::from_str_radix(trimmed["dword:".len()..].trim(), 16).map_err(|e| e.to_string())?;
+        let v =
+            u32::from_str_radix(trimmed["dword:".len()..].trim(), 16).map_err(|e| e.to_string())?;
         return Ok(RegistryValue::new("", RegistryValueData::Dword(v)));
     }
     if trimmed.starts_with("qword:") {
-        let v = u64::from_str_radix(trimmed["qword:".len()..].trim(), 16).map_err(|e| e.to_string())?;
+        let v =
+            u64::from_str_radix(trimmed["qword:".len()..].trim(), 16).map_err(|e| e.to_string())?;
         return Ok(RegistryValue::new("", RegistryValueData::Qword(v)));
     }
     if trimmed.starts_with("hex(") {
@@ -317,7 +385,10 @@ fn parse_value_data_part(data: &str) -> Result<RegistryValue, String> {
     }
     if trimmed.starts_with("hex:") {
         let bytes = parse_hex_bytes(&trimmed["hex:".len()..])?;
-        return Ok(RegistryValue::new("", RegistryValueData::Binary(bytes, REG_BINARY)));
+        return Ok(RegistryValue::new(
+            "",
+            RegistryValueData::Binary(bytes, REG_BINARY),
+        ));
     }
     Err("unknown value format".into())
 }
@@ -356,4 +427,3 @@ fn unescape(s: &str) -> String {
     }
     out
 }
-

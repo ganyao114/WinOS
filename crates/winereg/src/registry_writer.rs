@@ -28,7 +28,10 @@ impl RegistryWriter {
     pub fn write_to_file<P: AsRef<Path>>(&self, root: &KeyNode, path: P) -> std::io::Result<()> {
         let content = self.write_to_string(root);
         let mut tmp = path.as_ref().to_path_buf();
-        let file_name = tmp.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "registry.reg".into());
+        let file_name = tmp
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "registry.reg".into());
         tmp.set_file_name(format!("{}.tmp", file_name));
         fs::write(&tmp, content.as_bytes())?;
         fs::rename(tmp, path)?;
@@ -197,4 +200,3 @@ fn escape_string(s: &str) -> String {
 }
 
 use std::rc::Rc;
-

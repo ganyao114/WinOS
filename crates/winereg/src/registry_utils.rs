@@ -13,7 +13,10 @@ pub fn filetime_to_timestamp(filetime: u64) -> u64 {
 }
 
 pub fn is_string_type(ty: u32) -> bool {
-    matches!(ty, crate::REG_SZ | crate::REG_EXPAND_SZ | crate::REG_MULTI_SZ)
+    matches!(
+        ty,
+        crate::REG_SZ | crate::REG_EXPAND_SZ | crate::REG_MULTI_SZ
+    )
 }
 
 pub fn data_type_prefix(ty: u32) -> &'static str {
@@ -38,10 +41,12 @@ pub fn hex_digit_value(c: char) -> Option<u8> {
 
 #[cfg(feature = "std")]
 pub fn set_current_time_recursive(node: &crate::registry_key::KeyNode) {
-    let now = timestamp_to_filetime(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs());
+    let now = timestamp_to_filetime(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    );
     set_time(node, now);
 }
 

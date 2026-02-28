@@ -1,15 +1,15 @@
-use std::sync::{Arc, RwLock, Mutex};
+use crate::dll::DllLoader;
+use crate::file_io::FileTable;
+use crate::host_file::HostFileTable;
+use crate::memory::GuestMemory;
+use crate::sched::sync::{EventObj, MutexObj, SemaphoreObj, SyncHandle, SyncObject};
+use crate::sched::{SchedResult, Scheduler, ThreadId};
+use crate::section::SectionTable;
+use crate::syscall::{DispatchResult, SyscallDispatcher};
+use crate::vaspace::VaSpace;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use winemu_core::hypercall::nr;
-use crate::memory::GuestMemory;
-use crate::vaspace::VaSpace;
-use crate::file_io::FileTable;
-use crate::dll::DllLoader;
-use crate::host_file::HostFileTable;
-use crate::sched::{Scheduler, ThreadId, SchedResult};
-use crate::sched::sync::{SyncHandle, SyncObject, EventObj, MutexObj, SemaphoreObj};
-use crate::syscall::{SyscallDispatcher, DispatchResult};
-use crate::section::SectionTable;
 
 pub enum HypercallResult {
     Sync(u64),
@@ -65,12 +65,17 @@ impl HypercallManager {
         match hypercall_nr {
             nr::KERNEL_READY => {
                 // args[0] = entry_va, args[1] = stack_va, args[2] = teb_gva, args[3] = heap_start
-                let entry_va   = args[0];
-                let stack_va   = args[1];
-                let teb_gva    = args[2];
+                let entry_va = args[0];
+                let stack_va = args[1];
+                let teb_gva = args[2];
                 let heap_start = args[3];
-                log::info!("Guest kernel ready: entry={:#x} stack={:#x} teb={:#x} heap={:#x}",
-                    entry_va, stack_va, teb_gva, heap_start);
+                log::info!(
+                    "Guest kernel ready: entry={:#x} stack={:#x} teb={:#x} heap={:#x}",
+                    entry_va,
+                    stack_va,
+                    teb_gva,
+                    heap_start
+                );
 
                 // Initialize user VaSpace from heap_start
                 if heap_start != 0 {
@@ -87,7 +92,7 @@ impl HypercallManager {
                     let mem = self.memory.read().unwrap();
                     let peb_off = winemu_shared::teb::PEB as u64;
                     let bytes = mem.read_bytes(winemu_core::addr::Gpa(teb_gva + peb_off), 8);
-                    u64::from_le_bytes(bytes.try_into().unwrap_or([0;8]))
+                    u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))
                 };
 
                 // 构建 Thread 0 上下文（参考 Wine signal_arm64.c call_init_thunk）
@@ -98,12 +103,12 @@ impl HypercallManager {
                 // x18 = teb_va（ARM64 thread register）
                 let tid = self.sched.alloc_tid();
                 let mut ctx = crate::sched::ThreadContext::default();
-                ctx.gpr[32] = entry_va;   // pc
-                ctx.gpr[31] = stack_va;   // sp
-                ctx.gpr[0]  = entry_va;   // x0 = entry
-                ctx.gpr[1]  = peb_va;     // x1 = peb
-                ctx.gpr[18] = teb_gva;    // x18 = teb (ARM64 thread register)
-                ctx.pstate  = 0x0;        // EL0t
+                ctx.gpr[32] = entry_va; // pc
+                ctx.gpr[31] = stack_va; // sp
+                ctx.gpr[0] = entry_va; // x0 = entry
+                ctx.gpr[1] = peb_va; // x1 = peb
+                ctx.gpr[18] = teb_gva; // x18 = teb (ARM64 thread register)
+                ctx.pstate = 0x0; // EL0t
                 self.sched.spawn(tid, ctx, teb_gva);
                 log::info!("Thread 0 created: tid={} entry={:#x}", tid.0, entry_va);
                 HypercallResult::Sync(tid.0 as u64)
@@ -135,7 +140,11 @@ impl HypercallManager {
                         let mut mem = self.memory.write().unwrap();
                         mem.write_bytes(gpa, &data[..write_len]);
                     }
-                    log::debug!("LOAD_SYSCALL_TABLE(exe): wrote {} bytes to gpa={:#x}", write_len, args[0]);
+                    log::debug!(
+                        "LOAD_SYSCALL_TABLE(exe): wrote {} bytes to gpa={:#x}",
+                        write_len,
+                        args[0]
+                    );
                     HypercallResult::Sync(write_len as u64)
                 }
             }
@@ -202,8 +211,8 @@ impl HypercallManager {
                 // args[2] = arg (passed in x0), args[3] = teb_gva
                 let entry_va = args[0];
                 let stack_va = args[1];
-                let arg      = args[2];
-                let teb_gva  = args[3];
+                let arg = args[2];
+                let teb_gva = args[3];
                 if entry_va == 0 {
                     return HypercallResult::Sync(u64::MAX);
                 }
@@ -211,10 +220,15 @@ impl HypercallManager {
                 let mut ctx = crate::sched::ThreadContext::default();
                 ctx.gpr[32] = entry_va;
                 ctx.gpr[31] = stack_va;
-                ctx.gpr[0]  = arg;
-                ctx.pstate  = 0x0; // EL0t
+                ctx.gpr[0] = arg;
+                ctx.pstate = 0x0; // EL0t
                 self.sched.spawn(new_tid, ctx, teb_gva);
-                log::debug!("THREAD_CREATE: tid={} entry={:#x} stack={:#x}", new_tid.0, entry_va, stack_va);
+                log::debug!(
+                    "THREAD_CREATE: tid={} entry={:#x} stack={:#x}",
+                    new_tid.0,
+                    entry_va,
+                    stack_va
+                );
                 HypercallResult::Sync(new_tid.0 as u64)
             }
             nr::THREAD_EXIT => {
@@ -251,20 +265,33 @@ impl HypercallManager {
                 // args[0] = addr to query
                 // Returns: (base << 32 | size_pages) — simplified
                 let addr = args[0];
-                let result = self.vaspace.lock().unwrap()
+                let result = self
+                    .vaspace
+                    .lock()
+                    .unwrap()
                     .query(addr)
                     .map(|r| (r.base, r.size, r.prot));
                 match result {
                     Some((base, size, prot)) => {
-                        log::debug!("NT_QUERY_VIRTUAL: addr={:#x} base={:#x} size={:#x} prot={:#x}",
-                            addr, base, size, prot);
+                        log::debug!(
+                            "NT_QUERY_VIRTUAL: addr={:#x} base={:#x} size={:#x} prot={:#x}",
+                            addr,
+                            base,
+                            size,
+                            prot
+                        );
                         HypercallResult::Sync(base)
                     }
                     None => HypercallResult::Sync(u64::MAX),
                 }
             }
             nr::NT_PROTECT_VIRTUAL => {
-                log::debug!("NT_PROTECT_VIRTUAL: va={:#x} size={:#x} prot={:#x}", args[0], args[1], args[2]);
+                log::debug!(
+                    "NT_PROTECT_VIRTUAL: va={:#x} size={:#x} prot={:#x}",
+                    args[0],
+                    args[1],
+                    args[2]
+                );
                 HypercallResult::Sync(0)
             }
             nr::NT_CREATE_FILE => {
@@ -280,13 +307,20 @@ impl HypercallManager {
                     let bytes = mem.read_bytes(path_gpa, path_len);
                     match std::str::from_utf8(bytes) {
                         Ok(s) => s.to_owned(),
-                        Err(_) => return HypercallResult::Sync(crate::file_io::STATUS_OBJECT_NOT_FOUND),
+                        Err(_) => {
+                            return HypercallResult::Sync(crate::file_io::STATUS_OBJECT_NOT_FOUND)
+                        }
                     }
                 };
                 let access = args[2] as u32;
                 let disposition = args[3] as u32;
                 let (status, handle) = self.files.create(&path, access, disposition);
-                log::debug!("NT_CREATE_FILE: path={} status={:#x} handle={}", path, status, handle);
+                log::debug!(
+                    "NT_CREATE_FILE: path={} status={:#x} handle={}",
+                    path,
+                    status,
+                    handle
+                );
                 // Pack status in high 32 bits, handle in low 32 bits
                 HypercallResult::Sync((status << 32) | handle)
             }
@@ -296,7 +330,11 @@ impl HypercallManager {
                 let handle = args[0];
                 let buf_gpa = winemu_core::addr::Gpa(args[1]);
                 let length = args[2] as usize;
-                let offset = if args[3] == u64::MAX { None } else { Some(args[3]) };
+                let offset = if args[3] == u64::MAX {
+                    None
+                } else {
+                    Some(args[3])
+                };
                 if length == 0 || length > 64 * 1024 * 1024 {
                     return HypercallResult::Sync(crate::file_io::STATUS_INVALID_HANDLE);
                 }
@@ -306,7 +344,12 @@ impl HypercallManager {
                     let mut mem = self.memory.write().unwrap();
                     mem.write_bytes(buf_gpa, &buf[..n]);
                 }
-                log::debug!("NT_READ_FILE: handle={} n={} status={:#x}", handle, n, status);
+                log::debug!(
+                    "NT_READ_FILE: handle={} n={} status={:#x}",
+                    handle,
+                    n,
+                    status
+                );
                 HypercallResult::Sync((status << 32) | n as u64)
             }
             nr::NT_WRITE_FILE => {
@@ -315,7 +358,11 @@ impl HypercallManager {
                 let handle = args[0];
                 let buf_gpa = winemu_core::addr::Gpa(args[1]);
                 let length = args[2] as usize;
-                let offset = if args[3] == u64::MAX { None } else { Some(args[3]) };
+                let offset = if args[3] == u64::MAX {
+                    None
+                } else {
+                    Some(args[3])
+                };
                 if length == 0 || length > 64 * 1024 * 1024 {
                     return HypercallResult::Sync(crate::file_io::STATUS_INVALID_HANDLE);
                 }
@@ -324,7 +371,12 @@ impl HypercallManager {
                     mem.read_bytes(buf_gpa, length).to_vec()
                 };
                 let (status, n) = self.files.write(handle, &buf, offset);
-                log::debug!("NT_WRITE_FILE: handle={} n={} status={:#x}", handle, n, status);
+                log::debug!(
+                    "NT_WRITE_FILE: handle={} n={} status={:#x}",
+                    handle,
+                    n,
+                    status
+                );
                 HypercallResult::Sync((status << 32) | n as u64)
             }
             nr::NT_CLOSE => {
@@ -342,24 +394,33 @@ impl HypercallManager {
             nr::NT_CREATE_SECTION => {
                 // args: [file_handle, size, prot, 0, 0, 0]
                 let file_handle = args[0];
-                let size        = args[1];
-                let prot        = args[2] as u32;
+                let size = args[1];
+                let prot = args[2] as u32;
                 let (status, handle) = self.sections.create(file_handle, size, prot, &self.files);
-                log::debug!("NT_CREATE_SECTION: status={:#x} handle={:#x}", status, handle);
+                log::debug!(
+                    "NT_CREATE_SECTION: status={:#x} handle={:#x}",
+                    status,
+                    handle
+                );
                 HypercallResult::Sync((status << 32) | handle)
             }
             nr::NT_MAP_VIEW_OF_SECTION => {
                 // args: [section_handle, base_hint, size, offset, prot, 0]
                 let section_handle = args[0];
-                let base_hint      = args[1];
-                let map_size       = args[2];
-                let offset         = args[3];
-                let prot           = args[4] as u32;
+                let base_hint = args[1];
+                let map_size = args[2];
+                let offset = args[3];
+                let prot = args[4] as u32;
                 let mut vaspace = self.vaspace.lock().unwrap();
-                let mut mem     = self.memory.write().unwrap();
+                let mut mem = self.memory.write().unwrap();
                 let (status, va) = self.sections.map_view(
-                    section_handle, base_hint, map_size, offset, prot,
-                    &mut vaspace, &mut mem,
+                    section_handle,
+                    base_hint,
+                    map_size,
+                    offset,
+                    prot,
+                    &mut vaspace,
+                    &mut mem,
                 );
                 log::debug!("NT_MAP_VIEW_OF_SECTION: status={:#x} va={:#x}", status, va);
                 HypercallResult::Sync((status << 32) | va)
@@ -369,14 +430,23 @@ impl HypercallManager {
                 let base_va = args[0];
                 let mut vaspace = self.vaspace.lock().unwrap();
                 let status = self.sections.unmap_view(base_va, &mut vaspace);
-                log::debug!("NT_UNMAP_VIEW_OF_SECTION: status={:#x} va={:#x}", status, base_va);
+                log::debug!(
+                    "NT_UNMAP_VIEW_OF_SECTION: status={:#x} va={:#x}",
+                    status,
+                    base_va
+                );
                 HypercallResult::Sync(status)
             }
             nr::NT_QUERY_INFO_FILE => {
                 // args[0] = handle — returns file size
                 let handle = args[0];
                 let (status, size) = self.files.query_size(handle);
-                log::debug!("NT_QUERY_INFO_FILE: handle={} size={} status={:#x}", handle, size, status);
+                log::debug!(
+                    "NT_QUERY_INFO_FILE: handle={} size={} status={:#x}",
+                    handle,
+                    size,
+                    status
+                );
                 HypercallResult::Sync((status << 32) | size)
             }
             // ── NT 同步对象 ──────────────────────────────────
@@ -385,8 +455,14 @@ impl HypercallManager {
                 let manual = args[0] != 0;
                 let initial = args[1] != 0;
                 let h = self.sched.alloc_handle();
-                self.sched.insert_object(h, SyncObject::Event(EventObj::new(manual, initial)));
-                log::debug!("NT_CREATE_EVENT: handle={} manual={} initial={}", h.0, manual, initial);
+                self.sched
+                    .insert_object(h, SyncObject::Event(EventObj::new(manual, initial)));
+                log::debug!(
+                    "NT_CREATE_EVENT: handle={} manual={} initial={}",
+                    h.0,
+                    manual,
+                    initial
+                );
                 HypercallResult::Sync(h.0 as u64)
             }
             nr::NT_SET_EVENT => {
@@ -408,7 +484,10 @@ impl HypercallManager {
                 let shard = Scheduler::object_shard_pub(h);
                 let mut objects = self.sched.objects[shard].lock().unwrap();
                 match objects.get_mut(&h) {
-                    Some(SyncObject::Event(e)) => { e.reset(); HypercallResult::Sync(0) }
+                    Some(SyncObject::Event(e)) => {
+                        e.reset();
+                        HypercallResult::Sync(0)
+                    }
                     _ => HypercallResult::Sync(0xC000_0008),
                 }
             }
@@ -416,7 +495,8 @@ impl HypercallManager {
                 // args[0] = initial_owner (1 = caller owns it)
                 let owner = if args[0] != 0 { Some(tid) } else { None };
                 let h = self.sched.alloc_handle();
-                self.sched.insert_object(h, SyncObject::Mutex(MutexObj::new(owner)));
+                self.sched
+                    .insert_object(h, SyncObject::Mutex(MutexObj::new(owner)));
                 log::debug!("NT_CREATE_MUTEX: handle={} owner={:?}", h.0, owner);
                 HypercallResult::Sync(h.0 as u64)
             }
@@ -444,8 +524,16 @@ impl HypercallManager {
                 let initial = args[0] as i64;
                 let maximum = args[1] as i64;
                 let h = self.sched.alloc_handle();
-                self.sched.insert_object(h, SyncObject::Semaphore(SemaphoreObj::new(initial, maximum)));
-                log::debug!("NT_CREATE_SEMAPHORE: handle={} initial={} max={}", h.0, initial, maximum);
+                self.sched.insert_object(
+                    h,
+                    SyncObject::Semaphore(SemaphoreObj::new(initial, maximum)),
+                );
+                log::debug!(
+                    "NT_CREATE_SEMAPHORE: handle={} initial={} max={}",
+                    h.0,
+                    initial,
+                    maximum
+                );
                 HypercallResult::Sync(h.0 as u64)
             }
             nr::NT_RELEASE_SEMAPHORE => {
@@ -478,20 +566,22 @@ impl HypercallManager {
                 // args[0] = GPA of handle array, args[1] = count
                 // args[2] = wait_all, args[3] = timeout_100ns
                 let arr_gpa = winemu_core::addr::Gpa(args[0]);
-                let count   = args[1] as usize;
+                let count = args[1] as usize;
                 let wait_all = args[2] != 0;
-                let timeout  = args[3] as i64;
+                let timeout = args[3] as i64;
                 if count == 0 || count > 64 {
                     return HypercallResult::Sync(0xC000_000D); // STATUS_INVALID_PARAMETER
                 }
                 let handles: Vec<SyncHandle> = {
                     let mem = self.memory.read().unwrap();
-                    (0..count).map(|i| {
-                        let gpa = winemu_core::addr::Gpa(arr_gpa.0 + i as u64 * 4);
-                        let bytes = mem.read_bytes(gpa, 4);
-                        let v = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                        SyncHandle(v)
-                    }).collect()
+                    (0..count)
+                        .map(|i| {
+                            let gpa = winemu_core::addr::Gpa(arr_gpa.0 + i as u64 * 4);
+                            let bytes = mem.read_bytes(gpa, 4);
+                            let v = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                            SyncHandle(v)
+                        })
+                        .collect()
                 };
                 HypercallResult::Sched(self.sched.wait_multiple(tid, handles, wait_all, timeout))
             }
@@ -500,9 +590,7 @@ impl HypercallManager {
                 let ok = self.sched.close_handle(h);
                 HypercallResult::Sync(if ok { 0 } else { 0xC000_0008 })
             }
-            nr::NT_YIELD_EXECUTION => {
-                HypercallResult::Sched(SchedResult::Yield)
-            }
+            nr::NT_YIELD_EXECUTION => HypercallResult::Sched(SchedResult::Yield),
             // ── Host 文件操作 ──────────────────────────────────
             nr::HOST_OPEN => {
                 let path_gpa = winemu_core::addr::Gpa(args[0]);
@@ -549,7 +637,8 @@ impl HypercallManager {
                 }
                 let buf = {
                     let mem = self.memory.read().unwrap();
-                    mem.read_bytes(winemu_core::addr::Gpa(src_gpa), len).to_vec()
+                    mem.read_bytes(winemu_core::addr::Gpa(src_gpa), len)
+                        .to_vec()
                 };
                 let written = self.host_files.write(fd, &buf, offset);
                 HypercallResult::Sync(written as u64)
@@ -572,7 +661,11 @@ impl HypercallManager {
                     return HypercallResult::Sync(0);
                 }
                 // Allocate VA space for the mapping
-                let va = self.vaspace.lock().unwrap().alloc(0, size as u64, args[3] as u32);
+                let va = self
+                    .vaspace
+                    .lock()
+                    .unwrap()
+                    .alloc(0, size as u64, args[3] as u32);
                 match va {
                     Some(gpa) => {
                         let mut buf = vec![0u8; size];
@@ -581,7 +674,13 @@ impl HypercallManager {
                             let mut mem = self.memory.write().unwrap();
                             mem.write_bytes(winemu_core::addr::Gpa(gpa), &buf[..got]);
                         }
-                        log::debug!("HOST_MMAP: fd={} off={:#x} size={:#x} → gpa={:#x}", fd, offset, size, gpa);
+                        log::debug!(
+                            "HOST_MMAP: fd={} off={:#x} size={:#x} → gpa={:#x}",
+                            fd,
+                            offset,
+                            size,
+                            gpa
+                        );
                         HypercallResult::Sync(gpa)
                     }
                     None => {
@@ -653,9 +752,14 @@ impl HypercallManager {
     /// NT_SYSCALL with full register layout:
     /// args = [syscall_nr, table_nr, x0, x1, x2, x3, x4, x5, x6, x7]
     /// guest_sp = user stack pointer at SVC time
-    pub fn dispatch_nt_syscall(&self, args: [u64; 10], guest_sp: u64, tid: ThreadId) -> HypercallResult {
+    pub fn dispatch_nt_syscall(
+        &self,
+        args: [u64; 10],
+        guest_sp: u64,
+        tid: ThreadId,
+    ) -> HypercallResult {
         let syscall_nr = args[0];
-        let table_nr   = args[1];
+        let table_nr = args[1];
         let dispatch_args = [syscall_nr, table_nr, args[2], args[3], args[4], args[5]];
         let result = self.syscall_disp.dispatch_full(
             dispatch_args,
@@ -669,7 +773,7 @@ impl HypercallManager {
             guest_sp,
         );
         match result {
-            DispatchResult::Sync(v)  => HypercallResult::Sync(v),
+            DispatchResult::Sync(v) => HypercallResult::Sync(v),
             DispatchResult::Sched(s) => HypercallResult::Sched(s),
         }
     }

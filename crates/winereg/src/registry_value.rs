@@ -51,7 +51,10 @@ impl RegistryValue {
     pub fn raw_bytes(&self) -> Vec<u8> {
         match &self.data {
             RegistryValueData::String(v) | RegistryValueData::ExpandString(v) => {
-                let mut bytes = v.encode_utf16().flat_map(|c| c.to_le_bytes()).collect::<Vec<_>>();
+                let mut bytes = v
+                    .encode_utf16()
+                    .flat_map(|c| c.to_le_bytes())
+                    .collect::<Vec<_>>();
                 bytes.extend_from_slice(&[0, 0]);
                 bytes
             }
