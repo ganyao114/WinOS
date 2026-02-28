@@ -20,6 +20,10 @@ pub fn process_accepts_new_threads(pid: u32) -> bool {
     .unwrap_or(false)
 }
 
+pub fn process_signaled(pid: u32) -> bool {
+    with_process(pid, |p| p.state == ProcessState::Terminated).unwrap_or(false)
+}
+
 pub fn init_boot_process(image_base: u64, peb_va: u64) -> bool {
     let existing = boot_pid();
     if existing != 0 && process_exists(existing) {
@@ -112,10 +116,11 @@ pub fn on_thread_terminated(pid: u32, tid: u32) {
         if p.main_thread_tid == tid {
             p.main_thread_tid = 0;
         }
-        if p.thread_count == 0 && p.state == ProcessState::Terminating {
+        if p.thread_count == 0 {
             p.state = ProcessState::Terminated;
         }
     });
+    finalize_process_if_no_threads(pid);
 }
 
 pub fn terminate_process(pid: u32, exit_status: u32) -> u32 {
@@ -139,16 +144,13 @@ pub fn terminate_process(pid: u32, exit_status: u32) -> u32 {
         }
     }
 
-    let _ = with_process_mut(pid, |p| {
-        if p.thread_count == 0 {
-            p.state = ProcessState::Terminated;
-        }
-    });
+    let _ = crate::sched::sync::close_all_handles_for_pid(pid);
+    finalize_process_if_no_threads(pid);
     status::SUCCESS
 }
 
 pub fn last_handle_closed(pid: u32) {
-    maybe_free_terminated(pid);
+    finalize_process_if_no_threads(pid);
 }
 
 pub fn switch_to_thread_process(tid: u32) {
@@ -173,17 +175,35 @@ pub fn process_exit_status(pid: u32) -> Option<u32> {
     with_process(pid, |p| p.exit_status)
 }
 
-fn maybe_free_terminated(pid: u32) {
+fn finalize_process_if_no_threads(pid: u32) {
     if pid == 0 {
         return;
     }
-    let Some((state, thread_count)) = with_process(pid, |p| (p.state, p.thread_count)) else {
+    let Some(thread_count) = with_process(pid, |p| p.thread_count) else {
         return;
     };
-    if state != ProcessState::Terminated || thread_count != 0 {
+    if thread_count != 0 {
         return;
     }
-    if pid == boot_pid() {
+
+    let _ = with_process_mut(pid, |p| p.state = ProcessState::Terminated);
+    crate::nt::state::cleanup_process_owned_resources(pid);
+    crate::sched::sync::process_notify_terminated(pid);
+    maybe_free_if_unreferenced(pid);
+}
+
+fn maybe_free_if_unreferenced(pid: u32) {
+    if pid == 0 || pid == boot_pid() {
+        return;
+    }
+
+    let Some(thread_count) = with_process(pid, |p| p.thread_count) else {
+        return;
+    };
+    if thread_count != 0 {
+        return;
+    }
+    if crate::sched::sync::object_ref_count(crate::sched::sync::HANDLE_TYPE_PROCESS, pid) != 0 {
         return;
     }
 

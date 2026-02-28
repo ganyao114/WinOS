@@ -23,6 +23,7 @@ typedef struct {
 } PROCESS_BASIC_INFORMATION;
 
 #define STATUS_SUCCESS 0x00000000U
+#define STATUS_TIMEOUT 0x00000102U
 #define STATUS_INVALID_HANDLE 0xC0000008U
 
 #define STDOUT_HANDLE ((HANDLE)(uint64_t)0xFFFFFFFFFFFFFFF5ULL)
@@ -201,8 +202,22 @@ static inline NTSTATUS nt_create_thread_ex(
     );
 }
 
+static inline NTSTATUS nt_wait_single_ex(HANDLE handle, int64_t* timeout) {
+    return (NTSTATUS)svc8(
+        NR_WAIT_SINGLE,
+        (uint64_t)handle,
+        0,
+        (uint64_t)timeout,
+        0,
+        0,
+        0,
+        0,
+        0
+    );
+}
+
 static inline NTSTATUS nt_wait_single(HANDLE handle) {
-    return (NTSTATUS)svc8(NR_WAIT_SINGLE, (uint64_t)handle, 0, 0, 0, 0, 0, 0, 0);
+    return nt_wait_single_ex(handle, NULL);
 }
 
 static inline NTSTATUS nt_terminate_process(HANDLE process, NTSTATUS code) {
@@ -337,6 +352,10 @@ void mainCRTStartup(void) {
         child_pbi.InheritedFromUniqueProcessId == self_pbi.UniqueProcessId
     );
 
+    int64_t timeout_now = 0;
+    st = nt_wait_single_ex(child, &timeout_now);
+    check("Wait child process immediate timeout before terminate", st == STATUS_TIMEOUT);
+
     HANDLE dup_child = NULL;
     st = nt_duplicate_object(
         NT_CURRENT_PROCESS,
@@ -346,6 +365,15 @@ void mainCRTStartup(void) {
     );
     check("NtDuplicateObject(child) success", st == STATUS_SUCCESS);
     check("Duplicated child handle valid", dup_child != NULL);
+
+    HANDLE dup_from_child = NULL;
+    st = nt_duplicate_object(
+        child,
+        child,
+        NT_CURRENT_PROCESS,
+        &dup_from_child
+    );
+    check("DuplicateObject validates source-process handle table", st == STATUS_INVALID_HANDLE);
 
     HANDLE child_thread = NULL;
     st = nt_create_thread_ex(
@@ -373,6 +401,8 @@ void mainCRTStartup(void) {
 
     st = nt_terminate_process(child, 0x55667788U);
     check("NtTerminateProcess(child) success", st == STATUS_SUCCESS);
+    st = nt_wait_single(child);
+    check("Wait terminated child process success", st == STATUS_SUCCESS);
 
     PROCESS_BASIC_INFORMATION child_after;
     ULONG child_after_ret_len = 0;

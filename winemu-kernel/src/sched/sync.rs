@@ -260,6 +260,7 @@ struct SyncState {
     handles: UnsafeCell<Option<ObjectStore<HandleEntry>>>,
     refs: UnsafeCell<Option<Vec<ObjectRef>>>,
     thread_waiters: UnsafeCell<Option<Vec<WaitQueue>>>,
+    process_waiters: UnsafeCell<Option<Vec<WaitQueue>>>,
 }
 
 unsafe impl Sync for SyncState {}
@@ -271,6 +272,7 @@ static SYNC_STATE: SyncState = SyncState {
     handles: UnsafeCell::new(None),
     refs: UnsafeCell::new(None),
     thread_waiters: UnsafeCell::new(None),
+    process_waiters: UnsafeCell::new(None),
 };
 
 fn events_store_mut() -> &'static mut ObjectStore<KEvent> {
@@ -345,6 +347,48 @@ fn thread_waiters_ptr(tid: u32) -> *mut WaitQueue {
     }
 }
 
+fn process_waiters_mut() -> &'static mut Vec<WaitQueue> {
+    unsafe {
+        let slot = &mut *SYNC_STATE.process_waiters.get();
+        if slot.is_none() {
+            let mut v = Vec::new();
+            let _ = v.try_reserve(1);
+            v.push(WaitQueue::new()); // index 0 unused
+            *slot = Some(v);
+        }
+        slot.as_mut().unwrap()
+    }
+}
+
+fn ensure_process_waiters_slot(pid: u32) -> bool {
+    let idx = pid as usize;
+    let waiters = process_waiters_mut();
+    if idx < waiters.len() {
+        return true;
+    }
+    let need = idx + 1 - waiters.len();
+    if waiters.try_reserve(need).is_err() {
+        return false;
+    }
+    while waiters.len() <= idx {
+        waiters.push(WaitQueue::new());
+    }
+    true
+}
+
+fn process_waiters_ptr(pid: u32) -> *mut WaitQueue {
+    let idx = pid as usize;
+    unsafe {
+        let Some(waiters) = (&mut *SYNC_STATE.process_waiters.get()).as_mut() else {
+            return null_mut();
+        };
+        if idx >= waiters.len() {
+            return null_mut();
+        }
+        &mut waiters[idx] as *mut WaitQueue
+    }
+}
+
 fn event_ptr(idx: u32) -> *mut KEvent {
     events_store_mut().get_ptr(idx)
 }
@@ -373,6 +417,7 @@ pub const HANDLE_TYPE_PROCESS: u64 = 8;
 #[derive(Clone, Copy)]
 struct HandleEntry {
     key: u32,
+    owner_pid: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -461,14 +506,26 @@ fn ref_dec_is_last(key: u32) -> bool {
     true
 }
 
-fn alloc_handle_instance_for_key(key: u32) -> Option<u64> {
+fn current_handle_owner_pid() -> u32 {
+    let pid = crate::process::current_pid();
+    if pid != 0 {
+        pid
+    } else {
+        crate::process::boot_pid()
+    }
+}
+
+fn alloc_handle_instance_for_key(key: u32, owner_pid: u32) -> Option<u64> {
+    if owner_pid == 0 {
+        return None;
+    }
     if key_type(key) == 0 || key_idx(key) == 0 {
         return None;
     }
     if !ref_inc(key) {
         return None;
     }
-    let id = match handles_store_mut().alloc_with(|_| HandleEntry { key }) {
+    let id = match handles_store_mut().alloc_with(|_| HandleEntry { key, owner_pid }) {
         Some(v) => v,
         None => {
             let _ = ref_dec_is_last(key);
@@ -478,7 +535,10 @@ fn alloc_handle_instance_for_key(key: u32) -> Option<u64> {
     Some(make_handle(key_type(key), id))
 }
 
-fn resolve_user_handle(h: u64) -> Option<(u32, u64, u32, u32)> {
+fn resolve_user_handle_for_pid(h: u64, owner_pid: u32) -> Option<(u32, u64, u32, u32)> {
+    if owner_pid == 0 {
+        return None;
+    }
     let htype = (h >> HANDLE_SLOT_BITS) & HANDLE_TYPE_MASK;
     if htype == 0 {
         return None;
@@ -489,10 +549,17 @@ fn resolve_user_handle(h: u64) -> Option<(u32, u64, u32, u32)> {
         return None;
     }
     let entry = unsafe { *ptr };
+    if entry.owner_pid != owner_pid {
+        return None;
+    }
     if key_type(entry.key) != htype {
         return None;
     }
     Some((hid, htype, key_idx(entry.key), entry.key))
+}
+
+fn resolve_user_handle(h: u64) -> Option<(u32, u64, u32, u32)> {
+    resolve_user_handle_for_pid(h, current_handle_owner_pid())
 }
 
 fn resolve_handle_key(h: u64) -> Option<u32> {
@@ -510,6 +577,43 @@ fn handles_same_object(a: u64, b: u64) -> bool {
     match (resolve_handle_key(a), resolve_handle_key(b)) {
         (Some(ka), Some(kb)) => ka == kb,
         _ => false,
+    }
+}
+
+fn resolve_handle_key_for_pid(h: u64, owner_pid: u32) -> Option<u32> {
+    if let Some((_hid, _htype, _idx, key)) = resolve_user_handle_for_pid(h, owner_pid) {
+        return Some(key);
+    }
+    let key = handle_key(h);
+    if key_type(key) == 0 || key_idx(key) == 0 {
+        return None;
+    }
+    Some(key)
+}
+
+fn handles_same_object_for_pid(a: u64, b: u64, owner_pid: u32) -> bool {
+    match (
+        resolve_handle_key_for_pid(a, owner_pid),
+        resolve_handle_key_for_pid(b, owner_pid),
+    ) {
+        (Some(ka), Some(kb)) => ka == kb,
+        _ => false,
+    }
+}
+
+fn handle_type_for_pid(h: u64, owner_pid: u32) -> u64 {
+    if let Some((_hid, htype, _idx, _key)) = resolve_user_handle_for_pid(h, owner_pid) {
+        htype
+    } else {
+        0
+    }
+}
+
+fn handle_idx_for_pid(h: u64, owner_pid: u32) -> u32 {
+    if let Some((_hid, _htype, idx, _key)) = resolve_user_handle_for_pid(h, owner_pid) {
+        idx
+    } else {
+        0
     }
 }
 
@@ -541,25 +645,98 @@ fn resolve_handle_idx_by_type(h: u64, expected_type: u64) -> Option<u32> {
 }
 
 pub fn make_new_handle(htype: u64, obj_idx: u32) -> Option<u64> {
-    alloc_handle_instance_for_key(make_handle(htype, obj_idx) as u32)
+    make_new_handle_for_pid(current_handle_owner_pid(), htype, obj_idx)
+}
+
+pub fn make_new_handle_for_pid(owner_pid: u32, htype: u64, obj_idx: u32) -> Option<u64> {
+    alloc_handle_instance_for_key(make_handle(htype, obj_idx) as u32, owner_pid)
 }
 
 pub fn duplicate_handle(h: u64) -> Option<u64> {
-    let (_hid, _htype, _idx, key) = resolve_user_handle(h)?;
-    alloc_handle_instance_for_key(key)
+    let owner_pid = current_handle_owner_pid();
+    duplicate_handle_between(owner_pid, h, owner_pid).ok()
 }
 
-pub fn close_handle_info(h: u64) -> Option<HandleCloseInfo> {
-    let (hid, htype, obj_idx, key) = resolve_user_handle(h)?;
+pub fn duplicate_handle_between(
+    source_pid: u32,
+    source_handle: u64,
+    target_pid: u32,
+) -> Result<u64, u32> {
+    let (_hid, _htype, _idx, key) = resolve_user_handle_for_pid(source_handle, source_pid)
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    alloc_handle_instance_for_key(key, target_pid).ok_or(status::NO_MEMORY)
+}
+
+fn close_handle_slot_for_pid(hid: u32, owner_pid: u32) -> Option<HandleCloseInfo> {
+    let ptr = handles_store_mut().get_ptr(hid);
+    if ptr.is_null() {
+        return None;
+    }
+    let entry = unsafe { *ptr };
+    if entry.owner_pid != owner_pid {
+        return None;
+    }
+    let htype = key_type(entry.key);
+    let obj_idx = key_idx(entry.key);
+    if htype == 0 || obj_idx == 0 {
+        return None;
+    }
     if !handles_store_mut().free(hid) {
         return None;
     }
-    let destroy_object = ref_dec_is_last(key);
+    let destroy_object = ref_dec_is_last(entry.key);
     Some(HandleCloseInfo {
         htype,
         obj_idx,
         destroy_object,
     })
+}
+
+pub fn close_handle_info(h: u64) -> Option<HandleCloseInfo> {
+    let (hid, _htype, _obj_idx, _key) = resolve_user_handle(h)?;
+    close_handle_slot_for_pid(hid, current_handle_owner_pid())
+}
+
+pub fn close_all_handles_for_pid(owner_pid: u32) -> usize {
+    if owner_pid == 0 {
+        return 0;
+    }
+
+    let mut handle_ids = Vec::new();
+    handles_store_mut().for_each_live_ptr(|hid, ptr| unsafe {
+        if (*ptr).owner_pid == owner_pid {
+            let _ = handle_ids.try_reserve(1);
+            handle_ids.push(hid);
+        }
+    });
+
+    let mut closed = 0usize;
+    for hid in handle_ids {
+        let Some(info) = close_handle_slot_for_pid(hid, owner_pid) else {
+            continue;
+        };
+        closed += 1;
+        if info.destroy_object {
+            let _ = destroy_object_by_type(info.htype, info.obj_idx);
+        }
+    }
+    closed
+}
+
+pub fn object_ref_count(htype: u64, obj_idx: u32) -> u32 {
+    if htype == 0 || obj_idx == 0 {
+        return 0;
+    }
+    let key = make_handle(htype, obj_idx) as u32;
+    let refs = refs_mut();
+    let mut i = 0usize;
+    while i < refs.len() {
+        if refs[i].key == key {
+            return refs[i].refs;
+        }
+        i += 1;
+    }
+    0
 }
 
 fn recompute_owned_mutex_priority_locked(owner_tid: u32) {
@@ -630,9 +807,22 @@ fn validate_thread_target_tid(target_tid: u32) -> bool {
     state != ThreadState::Free
 }
 
+fn waiter_owner_pid(waiter_tid: u32) -> u32 {
+    if waiter_tid != 0 {
+        if let Some(pid) = crate::sched::thread_pid(waiter_tid) {
+            if pid != 0 {
+                return pid;
+            }
+        }
+    }
+    current_handle_owner_pid()
+}
+
 fn validate_waitable_handle_locked(h: u64) -> u32 {
-    let idx = handle_idx(h);
-    match handle_type(h) {
+    let owner_pid = waiter_owner_pid(current_tid());
+    let htype = handle_type_for_pid(h, owner_pid);
+    let idx = handle_idx_for_pid(h, owner_pid);
+    match htype {
         HANDLE_TYPE_EVENT => {
             if idx == 0 || event_ptr(idx).is_null() {
                 STATUS_INVALID_HANDLE
@@ -661,13 +851,22 @@ fn validate_waitable_handle_locked(h: u64) -> u32 {
                 STATUS_INVALID_HANDLE
             }
         }
+        HANDLE_TYPE_PROCESS => {
+            if idx != 0 && crate::process::process_exists(idx) {
+                STATUS_SUCCESS
+            } else {
+                STATUS_INVALID_HANDLE
+            }
+        }
         _ => STATUS_INVALID_HANDLE,
     }
 }
 
 fn is_handle_signaled_locked(waiter_tid: u32, h: u64) -> bool {
-    let idx = handle_idx(h);
-    match handle_type(h) {
+    let owner_pid = waiter_owner_pid(waiter_tid);
+    let htype = handle_type_for_pid(h, owner_pid);
+    let idx = handle_idx_for_pid(h, owner_pid);
+    match htype {
         HANDLE_TYPE_EVENT => {
             let ev = event_ptr(idx);
             if ev.is_null() {
@@ -698,13 +897,16 @@ fn is_handle_signaled_locked(waiter_tid: u32, h: u64) -> bool {
                 state == ThreadState::Terminated || state == ThreadState::Free
             }
         }
+        HANDLE_TYPE_PROCESS => idx != 0 && crate::process::process_signaled(idx),
         _ => false,
     }
 }
 
 fn consume_handle_signal_locked(waiter_tid: u32, h: u64) -> bool {
-    let idx = handle_idx(h);
-    match handle_type(h) {
+    let owner_pid = waiter_owner_pid(waiter_tid);
+    let htype = handle_type_for_pid(h, owner_pid);
+    let idx = handle_idx_for_pid(h, owner_pid);
+    match htype {
         HANDLE_TYPE_EVENT => {
             let ev = event_ptr(idx);
             if ev.is_null() {
@@ -754,6 +956,7 @@ fn consume_handle_signal_locked(waiter_tid: u32, h: u64) -> bool {
             true
         }
         HANDLE_TYPE_THREAD => is_handle_signaled_locked(waiter_tid, h),
+        HANDLE_TYPE_PROCESS => is_handle_signaled_locked(waiter_tid, h),
         _ => false,
     }
 }
@@ -798,8 +1001,10 @@ fn consume_wait_all_locked(tid: u32, handles: &[u64]) -> bool {
 }
 
 fn register_waiter_on_handle_locked(h: u64, tid: u32) {
-    let idx = handle_idx(h);
-    match handle_type(h) {
+    let owner_pid = waiter_owner_pid(tid);
+    let htype = handle_type_for_pid(h, owner_pid);
+    let idx = handle_idx_for_pid(h, owner_pid);
+    match htype {
         HANDLE_TYPE_EVENT => {
             let ev = event_ptr(idx);
             if !ev.is_null() {
@@ -833,13 +1038,23 @@ fn register_waiter_on_handle_locked(h: u64, tid: u32) {
                 }
             }
         }
+        HANDLE_TYPE_PROCESS => {
+            if idx != 0 && crate::process::process_exists(idx) && ensure_process_waiters_slot(idx) {
+                let q = process_waiters_ptr(idx);
+                if !q.is_null() {
+                    unsafe { (*q).enqueue(tid) };
+                }
+            }
+        }
         _ => {}
     }
 }
 
 fn remove_waiter_from_handle_locked(h: u64, tid: u32) {
-    let idx = handle_idx(h);
-    match handle_type(h) {
+    let owner_pid = waiter_owner_pid(tid);
+    let htype = handle_type_for_pid(h, owner_pid);
+    let idx = handle_idx_for_pid(h, owner_pid);
+    match htype {
         HANDLE_TYPE_EVENT => {
             let ev = event_ptr(idx);
             if !ev.is_null() {
@@ -864,6 +1079,12 @@ fn remove_waiter_from_handle_locked(h: u64, tid: u32) {
                 unsafe { (*q).remove(tid) };
             }
         }
+        HANDLE_TYPE_PROCESS => {
+            let q = process_waiters_ptr(idx);
+            if !q.is_null() {
+                unsafe { (*q).remove(tid) };
+            }
+        }
         _ => {}
     }
 }
@@ -878,11 +1099,12 @@ fn cleanup_wait_registration_locked(tid: u32) {
 }
 
 fn wait_index_for_handle_locked(tid: u32, h: u64) -> Option<usize> {
+    let owner_pid = waiter_owner_pid(tid);
     with_thread(tid, |t| {
         let count = t.wait_count as usize;
         let mut i = 0usize;
         while i < count && i < MAX_WAIT_HANDLES {
-            if handles_same_object(t.wait_handles[i], h) {
+            if handles_same_object_for_pid(t.wait_handles[i], h, owner_pid) {
                 return Some(i);
             }
             i += 1;
@@ -906,7 +1128,8 @@ fn try_complete_waiter_for_handle_locked(tid: u32, signaled_handle: u64) -> bool
     match kind {
         WAIT_KIND_SINGLE => {
             let expected = with_thread(tid, |t| t.wait_handles[0]);
-            if !handles_same_object(expected, signaled_handle) {
+            let owner_pid = waiter_owner_pid(tid);
+            if !handles_same_object_for_pid(expected, signaled_handle, owner_pid) {
                 return false;
             }
             if !consume_handle_signal_locked(tid, expected) {
@@ -1088,6 +1311,23 @@ pub fn thread_notify_terminated(target_tid: u32) {
     sched_lock_acquire();
     let h = make_handle(HANDLE_TYPE_THREAD, target_tid);
     let q = thread_waiters_ptr(target_tid);
+    if !q.is_null() {
+        unsafe {
+            wake_queue_all_for_handle_locked(&mut *q, h);
+        }
+    }
+    sched_lock_release();
+}
+
+/// Notify synchronization subsystem that a process became terminated.
+/// Wakes waiters blocked on this process handle.
+pub fn process_notify_terminated(target_pid: u32) {
+    if target_pid == 0 {
+        return;
+    }
+    sched_lock_acquire();
+    let h = make_handle(HANDLE_TYPE_PROCESS, target_pid);
+    let q = process_waiters_ptr(target_pid);
     if !q.is_null() {
         unsafe {
             wake_queue_all_for_handle_locked(&mut *q, h);
