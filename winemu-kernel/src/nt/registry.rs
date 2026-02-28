@@ -1,3 +1,4 @@
+use crate::kobj::ObjectStore;
 use crate::rust_alloc::{string::{String, ToString}, vec::Vec};
 use crate::sched::sync::{self, make_handle, HANDLE_TYPE_KEY};
 use winemu_shared::status;
@@ -9,14 +10,13 @@ use winereg::{
 use super::common::{read_oa_path, read_unicode_direct};
 use super::SvcFrame;
 
-const MAX_KEY_HANDLES: usize = 1024;
 const MAX_PATH: usize = 256;
 const MAX_NAME_BYTES: usize = 256;
 const MAX_VALUE_NAME_UTF16: usize = 256;
 
 struct RegistryState {
     root: KeyNode,
-    handles: [Option<KeyNode>; MAX_KEY_HANDLES],
+    handles: ObjectStore<KeyNode>,
 }
 
 static mut REG_STATE: Option<RegistryState> = None;
@@ -26,7 +26,7 @@ fn ensure_state() -> &'static mut RegistryState {
         if REG_STATE.is_none() {
             REG_STATE = Some(RegistryState {
                 root: RegistryKey::create_root(),
-                handles: [const { None }; MAX_KEY_HANDLES],
+                handles: ObjectStore::new(),
             });
         }
         REG_STATE.as_mut().unwrap()
@@ -131,24 +131,19 @@ fn read_value_name(us_ptr: u64) -> String {
 }
 
 fn alloc_key_handle(state: &mut RegistryState, node: KeyNode) -> Option<u32> {
-    for i in 1..MAX_KEY_HANDLES {
-        if state.handles[i].is_none() {
-            state.handles[i] = Some(node);
-            return Some(i as u32);
-        }
-    }
-    None
+    state.handles.alloc_with(|_| node)
 }
 
 fn key_node_from_handle(state: &RegistryState, handle: u64) -> Option<KeyNode> {
     if sync::handle_type(handle) != HANDLE_TYPE_KEY {
         return None;
     }
-    let idx = sync::handle_idx(handle) as usize;
-    if idx == 0 || idx >= MAX_KEY_HANDLES {
+    let idx = sync::handle_idx(handle);
+    let ptr = state.handles.get_ptr(idx);
+    if ptr.is_null() {
         return None;
     }
-    state.handles[idx].clone()
+    Some(unsafe { (*ptr).clone() })
 }
 
 fn join_registry_path(base: &str, rel: &str) -> String {
@@ -271,17 +266,18 @@ fn write_ret_len(ptr: u64, len: usize) {
 }
 
 fn gc_key_handles(state: &mut RegistryState) {
-    for slot in state.handles.iter_mut().skip(1) {
-        let Some(node) = slot.as_ref() else {
-            continue;
-        };
-        let path = RegistryKey::get_full_path(node);
+    let mut stale = Vec::<u32>::new();
+    state.handles.for_each_live_ptr(|id, ptr| {
+        let path = RegistryKey::get_full_path(unsafe { &*ptr });
         if path.is_empty() {
-            continue;
+            return;
         }
         if RegistryKey::find_key(&state.root, &path).is_none() {
-            *slot = None;
+            stale.push(id);
         }
+    });
+    for id in stale {
+        let _ = state.handles.free(id);
     }
 }
 
@@ -290,15 +286,7 @@ pub(crate) fn close_key_handle(handle: u64) -> bool {
     if sync::handle_type(handle) != HANDLE_TYPE_KEY {
         return false;
     }
-    let idx = sync::handle_idx(handle) as usize;
-    if idx == 0 || idx >= MAX_KEY_HANDLES {
-        return false;
-    }
-    if state.handles[idx].is_none() {
-        return false;
-    }
-    state.handles[idx] = None;
-    true
+    state.handles.free(sync::handle_idx(handle))
 }
 
 pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
