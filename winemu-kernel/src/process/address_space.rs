@@ -391,7 +391,8 @@ fn decode_nt_prot(prot: u32) -> (bool, bool, bool) {
     match prot & 0xFF {
         0x01 => (false, false, false),      // PAGE_NOACCESS
         0x02 => (true, false, false),       // PAGE_READONLY
-        0x04 | 0x08 => (true, true, false), // PAGE_READWRITE / WRITECOPY
+        0x04 => (true, true, false),        // PAGE_READWRITE
+        0x08 => (true, false, false),       // PAGE_WRITECOPY: map RO, write fault triggers COW
         0x10 => (false, false, true),       // PAGE_EXECUTE
         0x20 => (true, false, true),        // PAGE_EXECUTE_READ
         0x40 | 0x80 => (true, false, true), // W^X: downgrade RWX to RX

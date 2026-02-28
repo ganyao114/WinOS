@@ -30,7 +30,8 @@ pub extern "C" fn el0_page_fault(far: u64, esr: u64, elr: u64) -> u64 {
     let is_el0_abort = ec == 0x20 || ec == 0x24;
     let is_translation_fault = (0x04..=0x07).contains(&fsc);
     let is_access_flag_fault = fsc == 0x09 || fsc == 0x0B;
-    if is_el0_abort && (is_translation_fault || is_access_flag_fault) {
+    let is_permission_fault = (0x0C..=0x0F).contains(&fsc);
+    if is_el0_abort && (is_translation_fault || is_access_flag_fault || is_permission_fault) {
         let access = if ec == 0x20 {
             crate::nt::state::VM_ACCESS_EXEC
         } else if wnr != 0 {

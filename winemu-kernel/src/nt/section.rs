@@ -10,11 +10,15 @@ use super::state::{
 use super::SvcFrame;
 use crate::mm::vaspace::VmaType;
 
+const SEC_IMAGE: u32 = 0x0100_0000;
+const PAGE_EXECUTE_READ: u32 = 0x20;
+
 // x0=*SectionHandle, x3=*MaximumSize, x4=Protection, x6=FileHandle
 pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
     let out_ptr = frame.x[0] as *mut u64;
     let max_size_ptr = frame.x[3] as *const u64;
     let prot = frame.x[4] as u32;
+    let alloc_attrs = frame.x[5] as u32;
     let file_handle = frame.x[6];
     let size = if max_size_ptr.is_null() {
         PAGE_SIZE_4K
@@ -22,6 +26,7 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
         align_up_4k(unsafe { max_size_ptr.read_volatile().max(PAGE_SIZE_4K) })
     };
     let owner_pid = crate::process::current_pid();
+    let is_image = (alloc_attrs & SEC_IMAGE) != 0;
     let file_fd = if file_handle == 0 {
         None
     } else {
@@ -35,8 +40,12 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     }
+    if is_image && file_fd.is_none() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
 
-    let idx = match section_alloc(owner_pid, size, prot, file_fd) {
+    let idx = match section_alloc(owner_pid, size, prot, file_fd, alloc_attrs) {
         Some(i) => i,
         None => {
             frame.x[0] = status::NO_MEMORY as u64;
@@ -79,6 +88,10 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     } else {
         unsafe { offset_ptr.read_volatile() }
     };
+    if sec.is_image && section_offset != 0 {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
     if (section_offset & (PAGE_SIZE_4K - 1)) != 0 {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
@@ -100,7 +113,9 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
         return;
     }
     let map_size = align_up_4k(raw_size.max(PAGE_SIZE_4K));
-    let prot = if win32_protect == 0 {
+    let prot = if sec.is_image {
+        PAGE_EXECUTE_READ
+    } else if win32_protect == 0 {
         sec.prot
     } else {
         win32_protect
@@ -124,7 +139,14 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     } else {
         None
     };
-    if !vm_set_section_backing(owner_pid, base, backing_fd, section_offset, map_size) {
+    if !vm_set_section_backing(
+        owner_pid,
+        base,
+        backing_fd,
+        section_offset,
+        map_size,
+        sec.is_image,
+    ) {
         let _ = vm_free_region(owner_pid, base);
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;

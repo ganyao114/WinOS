@@ -28,6 +28,7 @@ const NR_DUPLICATE_OBJECT: u64 = 0x003C;
 const STATUS_SUCCESS: u64 = 0;
 const STATUS_INVALID_PARAMETER: u64 = 0xC000000D;
 const PAGE_READWRITE: u64 = 0x04;
+const PAGE_WRITECOPY: u64 = 0x08;
 const PAGE_READONLY: u64 = 0x02;
 const PAGE_EXECUTE_READ: u64 = 0x20;
 const PAGE_EXECUTE_READWRITE: u64 = 0x40;
@@ -35,6 +36,8 @@ const MEM_COMMIT: u64 = 0x1000;
 const MEM_RESERVE: u64 = 0x2000;
 const MEM_DECOMMIT: u64 = 0x4000;
 const MEM_RELEASE: u64 = 0x8000;
+const SEC_COMMIT: u64 = 0x08000000;
+const SEC_IMAGE: u64 = 0x01000000;
 
 static mut PASS_COUNT: u32 = 0;
 static mut FAIL_COUNT: u32 = 0;
@@ -342,6 +345,57 @@ unsafe fn test_virtual_memory() {
         rd_u32(&wx_mbi, 36) as u64 == PAGE_EXECUTE_READ,
     );
 
+    // Convert second page to WRITECOPY, write should trigger COW and promote to RW.
+    let cow_addr = base + 0x1000;
+    let mut cow_base = cow_addr;
+    let mut cow_size: u64 = 0x1000;
+    let mut cow_old: u32 = 0;
+    let st = svc(
+        NR_PROTECT_VIRTUAL_MEMORY,
+        0xFFFFFFFFFFFFFFFF,
+        &mut cow_base as *mut u64 as u64,
+        &mut cow_size as *mut u64 as u64,
+        PAGE_WRITECOPY,
+        &mut cow_old as *mut u32 as u64,
+        0,
+        0,
+        0,
+    );
+    check(
+        b"NtProtectVirtualMemory WRITECOPY request returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+    check(
+        b"WRITECOPY request reports previous protection PAGE_READWRITE",
+        cow_old as u64 == PAGE_READWRITE,
+    );
+    let mut cow_mbi = [0u8; 48];
+    let st = nt_query_virtual(cow_addr, &mut cow_mbi);
+    check(
+        b"Query WRITECOPY page returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+    check(
+        b"Effective protect is PAGE_WRITECOPY before write",
+        rd_u32(&cow_mbi, 36) as u64 == PAGE_WRITECOPY,
+    );
+    let cow_ptr = cow_addr as *mut u8;
+    core::ptr::write_volatile(cow_ptr, 0x5A);
+    check(
+        b"Write to WRITECOPY page succeeds",
+        core::ptr::read_volatile(cow_ptr) == 0x5A,
+    );
+    let mut cow_after_mbi = [0u8; 48];
+    let st = nt_query_virtual(cow_addr, &mut cow_after_mbi);
+    check(
+        b"Query WRITECOPY page after write returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+    check(
+        b"WRITECOPY page promoted to PAGE_READWRITE after COW",
+        rd_u32(&cow_after_mbi, 36) as u64 == PAGE_READWRITE,
+    );
+
     // Decommit second page
     let mut decommit_base = base + 0x1000;
     let mut decommit_size: u64 = 0x1000;
@@ -453,6 +507,26 @@ unsafe fn test_virtual_memory() {
 unsafe fn test_section() {
     print(b"== Section ==\r\n");
 
+    // SEC_IMAGE requires a file-backed section.
+    let mut bad_sec: u64 = 0;
+    let mut bad_size: u64 = 0x1000;
+    let st = svc(
+        NR_CREATE_SECTION,
+        &mut bad_sec as *mut u64 as u64,
+        0x000F001F,
+        0,
+        &mut bad_size as *mut u64 as u64,
+        PAGE_EXECUTE_READ,
+        SEC_IMAGE,
+        0,
+        0,
+    );
+    check(
+        b"NtCreateSection SEC_IMAGE without file fails",
+        st == STATUS_INVALID_PARAMETER,
+    );
+    check(b"SEC_IMAGE failure does not return handle", bad_sec == 0);
+
     // Create pagefile-backed section (64KB)
     let mut sec_handle: u64 = 0;
     let mut sec_size: u64 = 0x10000;
@@ -463,7 +537,7 @@ unsafe fn test_section() {
         0,                                  // ObjectAttributes
         &mut sec_size as *mut u64 as u64,   // MaximumSize
         PAGE_READWRITE,                     // SectionPageProtection
-        0x08000000,                         // AllocationAttributes (SEC_COMMIT)
+        SEC_COMMIT,                         // AllocationAttributes (SEC_COMMIT)
         0,                                  // FileHandle (0 = pagefile)
         0,
     );

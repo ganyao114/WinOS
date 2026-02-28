@@ -11,7 +11,11 @@ use winemu_shared::status;
 
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
+const MEM_PRIVATE_TYPE: u32 = 0x0002_0000;
+const MEM_MAPPED_TYPE: u32 = 0x0004_0000;
+const MEM_IMAGE_TYPE: u32 = 0x0100_0000;
 const PAGE_NOACCESS: u32 = 0x01;
+const PAGE_WRITECOPY: u32 = 0x08;
 const PAGE_EXECUTE_READ: u32 = 0x20;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
@@ -32,6 +36,8 @@ pub(crate) struct GuestSection {
     pub(crate) prot: u32,
     pub(crate) file_fd: u64,
     pub(crate) file_backed: bool,
+    pub(crate) alloc_attrs: u32,
+    pub(crate) is_image: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +56,7 @@ pub(crate) struct VmRegion {
     pub(crate) section_file_offset: u64,
     pub(crate) section_view_size: u64,
     pub(crate) section_file_backed: bool,
+    pub(crate) section_is_image: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -58,6 +65,7 @@ pub(crate) struct VmQueryInfo {
     pub(crate) size: u64,
     pub(crate) prot: u32,
     pub(crate) state: u32,
+    pub(crate) mem_type: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -225,6 +233,7 @@ pub(crate) fn vm_set_section_backing(
     file_fd: Option<u64>,
     file_offset: u64,
     view_size: u64,
+    is_image: bool,
 ) -> bool {
     let Some((id, region)) = vm_find_region_by_base(owner_pid, base) else {
         return false;
@@ -241,6 +250,7 @@ pub(crate) fn vm_set_section_backing(
     region_mut.section_file_fd = file_fd.unwrap_or(0);
     region_mut.section_file_offset = file_offset;
     region_mut.section_view_size = view_size.min(region_mut.size);
+    region_mut.section_is_image = is_image;
     true
 }
 
@@ -397,6 +407,7 @@ pub(crate) fn vm_query_region(owner_pid: u32, addr: u64) -> Option<VmQueryInfo> 
         size: ((end - start) as u64) * PAGE_SIZE_4K,
         prot: if committed { prot } else { 0 },
         state,
+        mem_type: vm_region_mem_type(&region),
     })
 }
 
@@ -414,6 +425,14 @@ pub(crate) fn vm_handle_page_fault(owner_pid: u32, fault_addr: u64, access: u8) 
     }
 
     let prot = vm_sanitize_nt_prot(unsafe { *region.prot_pages.add(idx) });
+    if access == VM_ACCESS_WRITE && vm_is_copy_on_write_prot(prot) {
+        let ptr = regions_store_mut().get_ptr(id);
+        if ptr.is_null() {
+            return false;
+        }
+        let region_mut = unsafe { &mut *ptr };
+        return vm_handle_cow_fault(owner_pid, region_mut, idx, page_va, prot);
+    }
     if !vm_access_allowed(prot, access) {
         return false;
     }
@@ -488,13 +507,17 @@ pub(crate) fn section_alloc(
     size: u64,
     prot: u32,
     file_fd: Option<u64>,
+    alloc_attrs: u32,
 ) -> Option<u32> {
+    let is_image = (alloc_attrs & 0x0100_0000) != 0;
     sections_store_mut().alloc_with(|_| GuestSection {
         owner_pid,
         size,
         prot: vm_sanitize_nt_prot(prot),
         file_fd: file_fd.unwrap_or(0),
         file_backed: file_fd.is_some(),
+        alloc_attrs,
+        is_image,
     })
 }
 
@@ -724,6 +747,7 @@ fn vm_create_region(owner_pid: u32, base: u64, size: u64, prot: u32, kind: u8) -
         section_file_offset: 0,
         section_view_size: 0,
         section_file_backed: false,
+        section_is_image: false,
     });
 
     if id.is_none() {
@@ -910,6 +934,9 @@ fn vm_range_within_region(region: &VmRegion, base: u64, size: u64) -> bool {
 }
 
 fn vm_access_allowed(prot: u32, access: u8) -> bool {
+    if access == VM_ACCESS_WRITE && vm_is_copy_on_write_prot(prot) {
+        return true;
+    }
     let (read, write, exec) = vm_decode_nt_prot(prot);
     match access {
         VM_ACCESS_READ => read,
@@ -919,11 +946,83 @@ fn vm_access_allowed(prot: u32, access: u8) -> bool {
     }
 }
 
+fn vm_region_mem_type(region: &VmRegion) -> u32 {
+    match region.kind {
+        VM_KIND_SECTION => {
+            if region.section_is_image {
+                MEM_IMAGE_TYPE
+            } else {
+                MEM_MAPPED_TYPE
+            }
+        }
+        _ => MEM_PRIVATE_TYPE,
+    }
+}
+
+fn vm_is_copy_on_write_prot(prot: u32) -> bool {
+    matches!(prot & 0xFF, PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)
+}
+
+fn vm_promote_cow_prot(prot: u32) -> u32 {
+    match prot & 0xFF {
+        PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY => (prot & !0xFF) | 0x04, // PAGE_READWRITE
+        _ => prot,
+    }
+}
+
+fn vm_handle_cow_fault(
+    owner_pid: u32,
+    region: &mut VmRegion,
+    idx: usize,
+    page_va: u64,
+    prot: u32,
+) -> bool {
+    let old_gpa = unsafe { *region.phys_pages.add(idx) };
+    let Some(new_gpa) = crate::mm::phys::alloc_pages(1) else {
+        return false;
+    };
+
+    if old_gpa != 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(old_gpa as *const u8, new_gpa as *mut u8, PAGE_SIZE_4K as usize);
+        }
+    } else {
+        unsafe {
+            core::ptr::write_bytes(new_gpa as *mut u8, 0, PAGE_SIZE_4K as usize);
+        }
+        if region.kind == VM_KIND_SECTION && !vm_fill_section_page(region, idx, new_gpa) {
+            crate::mm::phys::free_pages(new_gpa, 1);
+            return false;
+        }
+    }
+
+    let promoted_prot = vm_promote_cow_prot(prot);
+    let mapped = crate::process::with_process_mut(owner_pid, |p| {
+        p.address_space
+            .map_user_range(page_va, new_gpa, PAGE_SIZE_4K, promoted_prot)
+    })
+    .unwrap_or(false);
+    if !mapped {
+        crate::mm::phys::free_pages(new_gpa, 1);
+        return false;
+    }
+
+    if old_gpa != 0 {
+        crate::mm::phys::free_pages(old_gpa, 1);
+    }
+    unsafe {
+        *region.phys_pages.add(idx) = new_gpa;
+        *region.prot_pages.add(idx) = promoted_prot;
+    }
+    true
+}
+
 fn vm_decode_nt_prot(prot: u32) -> (bool, bool, bool) {
     match prot & 0xFF {
         0x01 => (false, false, false),
         0x02 => (true, false, false),
-        0x04 | 0x08 => (true, true, false),
+        0x04 => (true, true, false),
+        0x08 => (true, false, false),
         0x10 => (false, false, true),
         0x20 => (true, false, true),
         0x40 | 0x80 => (true, false, true),
@@ -934,7 +1033,7 @@ fn vm_decode_nt_prot(prot: u32) -> (bool, bool, bool) {
 fn vm_sanitize_nt_prot(prot: u32) -> u32 {
     let base = prot & 0xFF;
     let sanitized_base = match base {
-        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY => PAGE_EXECUTE_READ,
+        PAGE_EXECUTE_READWRITE => PAGE_EXECUTE_READ,
         0 => 0x04,
         _ => base,
     };

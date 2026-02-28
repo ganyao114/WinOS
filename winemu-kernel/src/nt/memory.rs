@@ -169,10 +169,10 @@ pub(crate) fn handle_query_virtual_memory(frame: &mut SvcFrame) {
     }
     let owner_pid = crate::process::current_pid();
 
-    let (base, size, prot, state) = if let Some(q) = vm_query_region(owner_pid, addr) {
-        (q.base, q.size, q.prot, q.state)
+    let (base, size, prot, state, mem_type) = if let Some(q) = vm_query_region(owner_pid, addr) {
+        (q.base, q.size, q.prot, q.state, q.mem_type)
     } else {
-        (addr & PAGE_MASK_4K, PAGE_SIZE_4K, 0u32, 0u32)
+        (addr & PAGE_MASK_4K, PAGE_SIZE_4K, 0u32, 0u32, 0u32)
     };
 
     let mut mbi = [0u8; 48];
@@ -182,6 +182,7 @@ pub(crate) fn handle_query_virtual_memory(frame: &mut SvcFrame) {
     mbi[24..32].copy_from_slice(&size.to_le_bytes());
     mbi[32..36].copy_from_slice(&state.to_le_bytes());
     mbi[36..40].copy_from_slice(&prot.to_le_bytes());
+    mbi[40..44].copy_from_slice(&mem_type.to_le_bytes());
     unsafe {
         core::ptr::copy_nonoverlapping(mbi.as_ptr(), buf, 48);
     }
