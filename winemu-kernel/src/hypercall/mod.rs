@@ -98,29 +98,6 @@ pub fn unmap_view_of_section(base_va: u64) -> u64 {
     hypercall6(nr::NT_UNMAP_VIEW_OF_SECTION, base_va, 0, 0, 0, 0, 0)
 }
 
-/// 请求 VMM 加载 DLL，返回 guest_base（失败返回 u64::MAX）
-pub fn load_dll(name: &str) -> u64 {
-    hypercall(
-        nr::LOAD_DLL_IMAGE,
-        name.as_ptr() as u64,
-        name.len() as u64,
-        0,
-    )
-}
-
-/// 从已加载 DLL 的 export 表查找函数 VA（失败返回 0）
-pub fn get_proc_address(dll_base: u64, name: &str) -> u64 {
-    hypercall6(
-        nr::GET_PROC_ADDRESS,
-        dll_base,
-        name.as_ptr() as u64,
-        name.len() as u64,
-        0,
-        0,
-        0,
-    )
-}
-
 // ── Host 文件操作 ──────────────────────────────────────────
 
 /// HOST_OPEN — 打开宿主文件，返回 fd（失败返回 u64::MAX）
@@ -151,6 +128,18 @@ pub fn host_close(fd: u64) {
 /// HOST_STAT — 查询文件大小
 pub fn host_stat(fd: u64) -> u64 {
     hypercall(nr::HOST_STAT, fd, 0, 0)
+}
+
+/// HOST_MMAP — 映射宿主文件到 guest 地址空间
+/// 返回映射基址（失败返回 0）
+pub fn host_mmap(fd: u64, offset: u64, size: u64, prot: u32) -> u64 {
+    hypercall6(nr::HOST_MMAP, fd, offset, size, prot as u64, 0, 0)
+}
+
+/// HOST_MUNMAP — 解除映射
+/// 返回 0 表示成功
+pub fn host_munmap(base: u64, size: u64) -> u64 {
+    hypercall6(nr::HOST_MUNMAP, base, size, 0, 0, 0, 0)
 }
 
 /// QUERY_EXE_INFO — VMM 打开 exe 并返回 packed (size<<32 | fd)

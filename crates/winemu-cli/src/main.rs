@@ -5,7 +5,7 @@ fn main() -> Result<()> {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
-    let (exe_path, syscall_table_path, fs_root, extra_dll_paths) = parse_args(&args)?;
+    let (exe_path, syscall_table_path, fs_root, _extra_dll_paths) = parse_args(&args)?;
 
     let kernel_image =
         std::fs::read("winemu-kernel.bin").context("failed to read winemu-kernel.bin")?;
@@ -20,16 +20,11 @@ fn main() -> Result<()> {
     let hypervisor =
         winemu_hypervisor::create_hypervisor().context("failed to create hypervisor")?;
 
-    // DLL search order: fs_root, guest/sysroot, any --dll-path flags
-    let mut dll_paths = vec![fs_root.clone(), PathBuf::from("guest/sysroot")];
-    dll_paths.extend(extra_dll_paths);
-
     let mut vmm = winemu_vmm::Vmm::new(
         hypervisor,
         &kernel_image,
         syscall_table_toml,
         &fs_root,
-        dll_paths,
         &exe_path,
     )
     .context("failed to create VMM")?;

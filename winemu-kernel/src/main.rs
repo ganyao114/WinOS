@@ -6,6 +6,7 @@ extern crate alloc as rust_alloc;
 
 mod alloc;
 mod arch;
+mod dll;
 mod hypercall;
 mod kobj;
 mod ldr;
@@ -108,24 +109,7 @@ pub extern "C" fn kernel_main() -> ! {
 
     hypercall::debug_print("kernel: calling ldr::load_from_fd\n");
 
-    let loaded = unsafe {
-        ldr::load_from_fd(exe_fd, exe_size, |dll_name, imp| {
-            let dll_base = hypercall::load_dll(dll_name);
-            if dll_base == u64::MAX { return None; }
-            match imp {
-                ldr::ImportRef::Name(fn_name) => {
-                    let va = hypercall::get_proc_address(dll_base, fn_name);
-                    if va == 0 { None } else { Some(va) }
-                }
-                ldr::ImportRef::Ordinal(ord) => {
-                    let mut buf = [0u8; 8];
-                    let s = fmt_ordinal(&mut buf, ord);
-                    let va = hypercall::get_proc_address(dll_base, s);
-                    if va == 0 { None } else { Some(va) }
-                }
-            }
-        })
-    };
+    let loaded = unsafe { ldr::load_from_fd(exe_fd, exe_size, |dll_name, imp| dll::resolve_import(dll_name, imp)) };
 
     // 关闭 exe fd
     hypercall::host_close(exe_fd);
@@ -177,26 +161,6 @@ fn fmt_u64_hex<'a>(buf: &'a mut [u8; 32], val: u64) -> &'a str {
         buf[i] = hex[((val >> shift) & 0xF) as usize];
     }
     core::str::from_utf8(&buf[..16]).unwrap()
-}
-
-fn fmt_ordinal(buf: &mut [u8; 8], ord: u16) -> &str {
-    buf[0] = b'#';
-    let mut n = ord as u32;
-    let mut digits = [0u8; 5];
-    let mut len = 0usize;
-    if n == 0 {
-        digits[0] = b'0';
-        len = 1;
-    } else {
-        while n > 0 {
-            digits[len] = b'0' + (n % 10) as u8;
-            n /= 10;
-            len += 1;
-        }
-        digits[..len].reverse();
-    }
-    buf[1..1 + len].copy_from_slice(&digits[..len]);
-    core::str::from_utf8(&buf[..1 + len]).unwrap()
 }
 
 #[panic_handler]

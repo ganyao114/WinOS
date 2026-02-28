@@ -1,4 +1,3 @@
-pub mod dll;
 pub mod file_io;
 pub mod host_file;
 pub mod hypercall;
@@ -34,7 +33,6 @@ impl Vmm {
         kernel_image: &[u8],
         syscall_table_toml: String,
         fs_root: impl Into<std::path::PathBuf>,
-        dll_search_paths: Vec<std::path::PathBuf>,
         exe_path: impl Into<std::path::PathBuf>,
     ) -> Result<Self> {
         let host_cpus = num_cpus::get().max(1) as u32;
@@ -59,7 +57,6 @@ impl Vmm {
             Arc::clone(&memory),
             fs_root,
             Arc::clone(&sched),
-            dll_search_paths,
             exe_path,
         ));
 

@@ -1,4 +1,3 @@
-use crate::dll::DllLoader;
 use crate::file_io::FileTable;
 use crate::host_file::HostFileTable;
 use crate::memory::GuestMemory;
@@ -27,7 +26,6 @@ pub struct HypercallManager {
     sections: SectionTable,
     pub sched: Arc<Scheduler>,
     syscall_disp: SyscallDispatcher,
-    dll_loader: DllLoader,
     host_files: HostFileTable,
     mono_start: Instant,
 }
@@ -38,7 +36,6 @@ impl HypercallManager {
         memory: Arc<RwLock<GuestMemory>>,
         root: impl Into<std::path::PathBuf>,
         sched: Arc<Scheduler>,
-        dll_search_paths: Vec<std::path::PathBuf>,
         exe_path: impl Into<std::path::PathBuf>,
     ) -> Self {
         let exe_path: std::path::PathBuf = exe_path.into();
@@ -46,18 +43,20 @@ impl HypercallManager {
         let root_path: std::path::PathBuf = root.into();
         let syscall_disp = SyscallDispatcher::new(&syscall_table_toml);
         let host_files = HostFileTable::new(root_path.clone());
+        let mut vaspace = VaSpace::new();
+        let guest_base = memory.read().unwrap().base_gpa().0;
+        vaspace.set_base(guest_base);
         Self {
             syscall_table_toml,
             exe_image,
             exe_path,
             memory,
-            vaspace: Arc::new(Mutex::new(VaSpace::new())),
+            vaspace: Arc::new(Mutex::new(vaspace)),
             phys_pool: Mutex::new(crate::phys::PhysPagePool::new()),
             files: FileTable::new(root_path),
             sections: SectionTable::new(),
             sched,
             syscall_disp,
-            dll_loader: DllLoader::new(dll_search_paths),
             host_files,
             mono_start: Instant::now(),
         }
@@ -150,53 +149,7 @@ impl HypercallManager {
                     HypercallResult::Sync(write_len as u64)
                 }
             }
-            nr::LOAD_DLL_IMAGE => {
-                // args[0] = GPA of dll name string
-                // args[1] = name length
-                // args[2] = GPA of destination buffer (0 = query size)
-                // args[3] = destination buffer size
-                // Returns: image size on query, bytes written on load, u64::MAX on error
-                let name_gpa = winemu_core::addr::Gpa(args[0]);
-                let name_len = args[1] as usize;
-                if name_len == 0 || name_len > 512 {
-                    return HypercallResult::Sync(u64::MAX);
-                }
-                let dll_name = {
-                    let mem = self.memory.read().unwrap();
-                    let bytes = mem.read_bytes(name_gpa, name_len);
-                    match std::str::from_utf8(bytes) {
-                        Ok(s) => s.to_owned(),
-                        Err(_) => return HypercallResult::Sync(u64::MAX),
-                    }
-                };
-                log::info!("LOAD_DLL_IMAGE: {}", dll_name);
-                match self.dll_loader.load(&dll_name, &self.memory, &self.vaspace) {
-                    Ok(dll) => HypercallResult::Sync(dll.guest_base),
-                    Err(e) => {
-                        log::warn!("LOAD_DLL_IMAGE failed: {:?}", e);
-                        HypercallResult::Sync(u64::MAX)
-                    }
-                }
-            }
-            nr::GET_PROC_ADDRESS => {
-                // args[0] = dll guest_base
-                // args[1] = name_gpa
-                // args[2] = name_len
-                // Returns: function VA or 0
-                let dll_base = args[0];
-                let name_gpa = winemu_core::addr::Gpa(args[1]);
-                let name_len = (args[2] as usize).min(256);
-                let fn_name = {
-                    let mem = self.memory.read().unwrap();
-                    let bytes = mem.read_bytes(name_gpa, name_len);
-                    match std::str::from_utf8(bytes) {
-                        Ok(s) => s.to_owned(),
-                        Err(_) => return HypercallResult::Sync(0),
-                    }
-                };
-                let va = self.dll_loader.get_proc(dll_base, &fn_name, &self.memory);
-                HypercallResult::Sync(va.unwrap_or(0))
-            }
+            nr::LOAD_DLL_IMAGE | nr::GET_PROC_ADDRESS => HypercallResult::Sync(u64::MAX),
             nr::PROCESS_CREATE => {
                 // args[0] = image_base_gva
                 log::info!("PROCESS_CREATE: image_base={:#x}", args[0]);

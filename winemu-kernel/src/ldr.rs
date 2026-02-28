@@ -131,6 +131,12 @@ pub unsafe fn load(
     crate::hypercall::debug_print("ldr: alloc ok\n");
     let load_base = buf as u64;
 
+    // 先复制 PE headers（导出解析依赖 DOS/NT 头）
+    let hdr_copy = (hdrs.size_of_headers as usize).min(image.len());
+    if hdr_copy > 0 {
+        core::ptr::copy_nonoverlapping(image.as_ptr(), buf, hdr_copy);
+    }
+
     // 复制各 section
     for sec in hdrs.sections() {
         if sec.raw_size > 0 {
