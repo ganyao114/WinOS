@@ -69,6 +69,8 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         sysno::FREE_VIRTUAL_MEMORY => memory::handle_free_virtual_memory(frame),
         sysno::QUERY_VIRTUAL_MEMORY => memory::handle_query_virtual_memory(frame),
         sysno::PROTECT_VIRTUAL_MEMORY => memory::handle_protect_virtual_memory(frame),
+        sysno::READ_VIRTUAL_MEMORY => memory::handle_read_virtual_memory(frame),
+        sysno::WRITE_VIRTUAL_MEMORY => memory::handle_write_virtual_memory(frame),
 
         sysno::CREATE_SECTION => section::handle_create_section(frame),
         sysno::MAP_VIEW_OF_SECTION => section::handle_map_view_of_section(frame),

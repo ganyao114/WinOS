@@ -17,9 +17,11 @@
 #define NR_QUERY_PERFORMANCE_COUNTER 0x0031
 #define NR_QUERY_SYSTEM_INFORMATION 0x0036
 #define NR_DELAY_EXECUTION      0x0034
-#define NR_ALLOCATE_VIRTUAL_MEM 0x0018
+#define NR_ALLOCATE_VIRTUAL_MEM 0x0015
 #define NR_FREE_VIRTUAL_MEM     0x001E
 #define NR_QUERY_VIRTUAL_MEM    0x0023
+#define NR_WRITE_VIRTUAL_MEM    0x003A
+#define NR_READ_VIRTUAL_MEM     0x003F
 #define NR_QUERY_SYSTEM_TIME    0x005A
 #define NR_CREATE_SECTION       0x004A
 #define NR_CREATE_PROCESS_EX    0x004B
@@ -184,6 +186,34 @@ EXPORT NTSTATUS NtFreeVirtualMemory(
     return syscall4(NR_FREE_VIRTUAL_MEM,
         (uint64_t)process, (uint64_t)base_addr,
         (uint64_t)region_size, free_type);
+}
+
+EXPORT NTSTATUS NtReadVirtualMemory(
+    HANDLE process, const void* base_addr, void* buffer, size_t size, size_t* bytes_read)
+{
+    return syscall6(
+        NR_READ_VIRTUAL_MEM,
+        (uint64_t)process,
+        (uint64_t)base_addr,
+        (uint64_t)buffer,
+        (uint64_t)size,
+        (uint64_t)bytes_read,
+        0
+    );
+}
+
+EXPORT NTSTATUS NtWriteVirtualMemory(
+    HANDLE process, void* base_addr, const void* buffer, size_t size, size_t* bytes_written)
+{
+    return syscall6(
+        NR_WRITE_VIRTUAL_MEM,
+        (uint64_t)process,
+        (uint64_t)base_addr,
+        (uint64_t)buffer,
+        (uint64_t)size,
+        (uint64_t)bytes_written,
+        0
+    );
 }
 
 /* ── Heap ────────────────────────────────────────────────────── */

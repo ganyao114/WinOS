@@ -84,8 +84,9 @@ impl DllLoader {
         }
 
         let oh = guest_base + lfanew + 24;
-        let exp_rva = read_u32(&mem, oh + 96) as u64;
-        let exp_size = read_u32(&mem, oh + 100);
+        // PE32+ OptionalHeader: DataDirectory starts at +112.
+        let exp_rva = read_u32(&mem, oh + 112) as u64;
+        let exp_size = read_u32(&mem, oh + 116);
         if exp_rva == 0 || exp_size == 0 {
             return None;
         }
@@ -182,34 +183,72 @@ impl DllLoader {
         let reloc_dir = hdrs.data_dir(pe::DIR_BASERELOC);
         let import_dir = hdrs.data_dir(pe::DIR_IMPORT);
 
+        let (mem_base, mem_end) = {
+            let mem = memory.read().unwrap();
+            (mem.base_gpa().0, mem.base_gpa().0 + mem.size() as u64)
+        };
+        let alloc_end = mem_end.min(crate::phys::PHYS_POOL_BASE);
+
+        let fits_guest_window = |base: u64| -> bool {
+            if base < mem_base {
+                return false;
+            }
+            let Some(end) = base.checked_add(img_size as u64) else {
+                return false;
+            };
+            end <= alloc_end
+        };
+
         // 在 guest VA 空间分配
         let guest_base = {
             let mut va = vaspace.lock().unwrap();
-            va.alloc(image_base, img_size as u64, 0x20)
-                .ok_or(DllError::NoMemory)?
+            let mut chosen = None;
+
+            if fits_guest_window(image_base) {
+                chosen = va.alloc(image_base, img_size as u64, 0x20);
+            }
+
+            if chosen.is_none() {
+                for hint in [
+                    0x5800_0000u64,
+                    0x5400_0000u64,
+                    0x5000_0000u64,
+                    mem_base + 0x0800_0000,
+                    mem_base + 0x0400_0000,
+                ] {
+                    if !fits_guest_window(hint) {
+                        continue;
+                    }
+                    if let Some(base) = va.alloc(hint, img_size as u64, 0x20) {
+                        chosen = Some(base);
+                        break;
+                    }
+                }
+            }
+
+            chosen.ok_or(DllError::NoMemory)?
         };
 
         // 写入 guest 内存（sections + 重定位）
         {
             let mut mem = memory.write().unwrap();
-            let base_gpa = mem.base_gpa().0;
 
             let hdr_size = (hdrs.size_of_headers as usize).min(data.len());
-            write_guest(&mut mem, base_gpa + guest_base, &data[..hdr_size]);
+            write_guest(&mut mem, guest_base, &data[..hdr_size]);
 
             for sec in hdrs.sections() {
                 if sec.raw_size == 0 {
                     continue;
                 }
                 let src_off = sec.raw_off as usize;
-                let dst_va = guest_base + sec.vaddr as u64;
+                let dst_gpa = guest_base + sec.vaddr as u64;
                 let copy_len = (sec.raw_size as usize).min(sec.vsize as usize);
                 if src_off + copy_len > data.len() {
                     continue;
                 }
                 write_guest(
                     &mut mem,
-                    base_gpa + dst_va,
+                    dst_gpa,
                     &data[src_off..src_off + copy_len],
                 );
             }
@@ -220,7 +259,6 @@ impl DllLoader {
                     if dir.is_present() {
                         apply_relocs(
                             &mut mem,
-                            base_gpa,
                             guest_base,
                             dir.rva as usize,
                             dir.size as usize,
@@ -259,10 +297,8 @@ impl DllLoader {
                 let cache_snapshot: HashMap<String, LoadedDll> =
                     self.loaded.lock().unwrap().clone();
                 let mut mem = memory.write().unwrap();
-                let base_gpa = mem.base_gpa().0;
                 apply_imports_guest(
                     &mut mem,
-                    base_gpa,
                     guest_base,
                     imp_dir.rva as usize,
                     &cache_snapshot,
@@ -313,7 +349,6 @@ fn write_guest(mem: &mut GuestMemory, gpa: u64, data: &[u8]) {
 
 fn apply_relocs(
     mem: &mut GuestMemory,
-    mem_base_gpa: u64,
     image_base: u64,
     reloc_rva: usize,
     reloc_size: usize,
@@ -323,7 +358,7 @@ fn apply_relocs(
 
     let mut off = 0usize;
     while off + 8 <= reloc_size {
-        let blk_gpa = mem_base_gpa + image_base + reloc_rva as u64 + off as u64;
+        let blk_gpa = image_base + reloc_rva as u64 + off as u64;
         let page_rva = read_u32(mem, blk_gpa) as usize;
         let block_size = read_u32(mem, blk_gpa + 4) as usize;
         if block_size < 8 {
@@ -336,7 +371,7 @@ fn apply_relocs(
             let typ = (entry >> 12) as u8;
             let page_off = (entry & 0x0FFF) as u64;
             if typ == pe::REL_DIR64 {
-                let target_gpa = mem_base_gpa + image_base + page_rva as u64 + page_off;
+                let target_gpa = image_base + page_rva as u64 + page_off;
                 let val = read_u64(mem, target_gpa);
                 let new_val = (val as i64).wrapping_add(delta) as u64;
                 mem.write_bytes(Gpa(target_gpa), &new_val.to_le_bytes());
@@ -349,18 +384,27 @@ fn apply_relocs(
 fn read_u16(mem: &GuestMemory, gpa: u64) -> u16 {
     use winemu_core::addr::Gpa;
     let b = mem.read_bytes(Gpa(gpa), 2);
+    if b.len() < 2 {
+        return 0;
+    }
     u16::from_le_bytes([b[0], b[1]])
 }
 
 fn read_u32(mem: &GuestMemory, gpa: u64) -> u32 {
     use winemu_core::addr::Gpa;
     let b = mem.read_bytes(Gpa(gpa), 4);
+    if b.len() < 4 {
+        return 0;
+    }
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
 fn read_u64(mem: &GuestMemory, gpa: u64) -> u64 {
     use winemu_core::addr::Gpa;
     let b = mem.read_bytes(Gpa(gpa), 8);
+    if b.len() < 8 {
+        return 0;
+    }
     u64::from_le_bytes(b.try_into().unwrap_or([0; 8]))
 }
 
@@ -414,7 +458,6 @@ fn collect_import_dll_names(hdrs: &PeHeaders, data: &[u8]) -> Vec<String> {
 /// `cache` 是已加载 DLL 的映射（lowercase name → LoadedDll）。
 fn apply_imports_guest(
     mem: &mut GuestMemory,
-    base_gpa: u64,
     image_base: u64,
     imp_rva: usize,
     cache: &HashMap<String, LoadedDll>,
@@ -423,13 +466,13 @@ fn apply_imports_guest(
 
     let mut desc_off = imp_rva;
     loop {
-        let desc_gpa = base_gpa + image_base + desc_off as u64;
+        let desc_gpa = image_base + desc_off as u64;
         let name_rva = read_u32(mem, desc_gpa + 12) as usize;
         if name_rva == 0 {
             break;
         }
 
-        let dll_name = read_cstr(mem, base_gpa + image_base + name_rva as u64).to_ascii_lowercase();
+        let dll_name = read_cstr(mem, image_base + name_rva as u64).to_ascii_lowercase();
         let dep_base = match cache.get(&dll_name) {
             Some(d) => d.guest_base,
             None => {
@@ -450,7 +493,7 @@ fn apply_imports_guest(
 
         let mut slot = 0u64;
         loop {
-            let thunk_gpa = base_gpa + image_base + oft_rva + slot * 8;
+            let thunk_gpa = image_base + oft_rva + slot * 8;
             let thunk = read_u64(mem, thunk_gpa);
             if thunk == 0 {
                 break;
@@ -459,16 +502,16 @@ fn apply_imports_guest(
             let fn_va = if thunk & (1u64 << 63) != 0 {
                 // Import by ordinal
                 let ordinal = (thunk & 0xFFFF) as u64;
-                resolve_export_by_ordinal(mem, base_gpa, dep_base, ordinal)
+                resolve_export_by_ordinal(mem, dep_base, ordinal)
             } else {
                 // Import by name (skip 2-byte hint)
                 let ibn_rva = (thunk & 0x7FFF_FFFF_FFFF_FFFF) as u64;
-                let fn_name = read_cstr(mem, base_gpa + image_base + ibn_rva + 2);
-                resolve_export_by_name(mem, base_gpa, dep_base, &fn_name)
+                let fn_name = read_cstr(mem, image_base + ibn_rva + 2);
+                resolve_export_by_name(mem, dep_base, &fn_name)
             };
 
             if fn_va != 0 {
-                let iat_slot_gpa = base_gpa + image_base + iat_rva + slot * 8;
+                let iat_slot_gpa = image_base + iat_rva + slot * 8;
                 mem.write_bytes(Gpa(iat_slot_gpa), &fn_va.to_le_bytes());
             } else {
                 log::warn!(
@@ -483,16 +526,16 @@ fn apply_imports_guest(
     }
 }
 
-fn resolve_export_by_name(mem: &GuestMemory, base_gpa: u64, dll_base: u64, name: &str) -> u64 {
+fn resolve_export_by_name(mem: &GuestMemory, dll_base: u64, name: &str) -> u64 {
     let (fn_rva_tbl, name_tbl, ord_tbl, num_names, num_funcs, _exp_base) =
-        read_export_dir(mem, base_gpa, dll_base);
+        read_export_dir(mem, dll_base);
     for i in 0..num_names {
-        let name_rva = read_u32(mem, base_gpa + name_tbl + i * 4) as u64;
-        let export_name = read_cstr(mem, base_gpa + dll_base + name_rva);
+        let name_rva = read_u32(mem, name_tbl + i * 4) as u64;
+        let export_name = read_cstr(mem, dll_base + name_rva);
         if export_name == name {
-            let ord = read_u16(mem, base_gpa + ord_tbl + i * 2) as u64;
+            let ord = read_u16(mem, ord_tbl + i * 2) as u64;
             if ord < num_funcs {
-                let fn_rva = read_u32(mem, base_gpa + fn_rva_tbl + ord * 4) as u64;
+                let fn_rva = read_u32(mem, fn_rva_tbl + ord * 4) as u64;
                 if fn_rva != 0 {
                     return dll_base + fn_rva;
                 }
@@ -502,11 +545,11 @@ fn resolve_export_by_name(mem: &GuestMemory, base_gpa: u64, dll_base: u64, name:
     0
 }
 
-fn resolve_export_by_ordinal(mem: &GuestMemory, base_gpa: u64, dll_base: u64, ordinal: u64) -> u64 {
-    let (fn_rva_tbl, _, _, _, num_funcs, exp_base) = read_export_dir(mem, base_gpa, dll_base);
+fn resolve_export_by_ordinal(mem: &GuestMemory, dll_base: u64, ordinal: u64) -> u64 {
+    let (fn_rva_tbl, _, _, _, num_funcs, exp_base) = read_export_dir(mem, dll_base);
     let idx = ordinal.wrapping_sub(exp_base);
     if idx < num_funcs {
-        let fn_rva = read_u32(mem, base_gpa + fn_rva_tbl + idx * 4) as u64;
+        let fn_rva = read_u32(mem, fn_rva_tbl + idx * 4) as u64;
         if fn_rva != 0 {
             return dll_base + fn_rva;
         }
@@ -517,27 +560,26 @@ fn resolve_export_by_ordinal(mem: &GuestMemory, base_gpa: u64, dll_base: u64, or
 /// Returns (fn_rva_tbl, name_tbl, ord_tbl, num_names, num_funcs, ordinal_base)
 fn read_export_dir(
     mem: &GuestMemory,
-    base_gpa: u64,
     dll_base: u64,
 ) -> (u64, u64, u64, u64, u64, u64) {
-    let dos_sig = read_u16(mem, base_gpa + dll_base);
+    let dos_sig = read_u16(mem, dll_base);
     if dos_sig != pe::MZ_MAGIC {
         return (0, 0, 0, 0, 0, 0);
     }
-    let lfanew = read_u32(mem, base_gpa + dll_base + 60) as u64;
+    let lfanew = read_u32(mem, dll_base + 60) as u64;
     let oh = dll_base + lfanew + 24;
-    let exp_rva = read_u32(mem, base_gpa + oh + 96) as u64;
-    let exp_size = read_u32(mem, base_gpa + oh + 100);
+    let exp_rva = read_u32(mem, oh + 112) as u64;
+    let exp_size = read_u32(mem, oh + 116);
     if exp_rva == 0 || exp_size == 0 {
         return (0, 0, 0, 0, 0, 0);
     }
     let exp = dll_base + exp_rva;
-    let exp_base = read_u32(mem, base_gpa + exp + 16) as u64;
-    let num_funcs = read_u32(mem, base_gpa + exp + 20) as u64;
-    let num_names = read_u32(mem, base_gpa + exp + 24) as u64;
-    let fn_rva_tbl = dll_base + read_u32(mem, base_gpa + exp + 28) as u64;
-    let name_tbl = dll_base + read_u32(mem, base_gpa + exp + 32) as u64;
-    let ord_tbl = dll_base + read_u32(mem, base_gpa + exp + 36) as u64;
+    let exp_base = read_u32(mem, exp + 16) as u64;
+    let num_funcs = read_u32(mem, exp + 20) as u64;
+    let num_names = read_u32(mem, exp + 24) as u64;
+    let fn_rva_tbl = dll_base + read_u32(mem, exp + 28) as u64;
+    let name_tbl = dll_base + read_u32(mem, exp + 32) as u64;
+    let ord_tbl = dll_base + read_u32(mem, exp + 36) as u64;
     (
         fn_rva_tbl, name_tbl, ord_tbl, num_names, num_funcs, exp_base,
     )

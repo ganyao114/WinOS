@@ -1,8 +1,8 @@
 include ../common.mk
 
-OUT := $(SYSROOT)/syscall_sysinfo_test.exe
+OUT := $(SYSROOT)/vm_rw_test.exe
 
-$(OUT): syscall_sysinfo_test.c | $(SYSROOT)
+$(OUT): vm_rw_test.c | $(SYSROOT)
 	$(CC) $(CFLAGS) -nostartfiles -o $@ $< \
 		-L$(SYSROOT) -lntdll \
 		-Wl,-e,mainCRTStartup

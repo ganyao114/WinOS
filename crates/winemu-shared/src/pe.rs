@@ -139,7 +139,10 @@ impl PeHeaders {
         if ru16(oh) != OPT_MAGIC_PE32PLUS {
             return Err(PeError::NotPe32Plus);
         }
-        if oh_off + 96 > len {
+        // PE32+ OptionalHeader:
+        //   NumberOfRvaAndSizes @ +108
+        //   DataDirectory[0]     @ +112
+        if oh_off + 112 > len {
             return Err(PeError::TooSmall);
         }
 
@@ -149,7 +152,7 @@ impl PeHeaders {
         let size_of_headers = ru32(oh.add(60));
         let stack_reserve = ru64(oh.add(72));
         let stack_commit = ru64(oh.add(80));
-        let num_dirs = ru32(oh.add(92));
+        let num_dirs = ru32(oh.add(108));
 
         let sec_off = oh_off + opt_size;
 
@@ -180,7 +183,7 @@ impl PeHeaders {
         if idx >= self.num_dirs as usize {
             return None;
         }
-        let off = self.oh_off + 96 + idx * 8;
+        let off = self.oh_off + 112 + idx * 8;
         if off + 8 > self.len {
             return None;
         }
@@ -242,5 +245,49 @@ impl<'a> Iterator for SectionIter<'a> {
         let s = self.headers.section(self.idx)?;
         self.idx += 1;
         Some(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pe32plus_data_dir_offsets_are_correct() {
+        let mut image = [0u8; 0x240];
+
+        // DOS header
+        image[0..2].copy_from_slice(&MZ_MAGIC.to_le_bytes());
+        image[60..64].copy_from_slice(&(0x80u32).to_le_bytes()); // e_lfanew
+
+        // NT headers
+        let nt = 0x80usize;
+        image[nt..nt + 4].copy_from_slice(&PE_MAGIC.to_le_bytes());
+        let fh = nt + 4;
+        image[fh..fh + 2].copy_from_slice(&MACHINE_ARM64.to_le_bytes());
+        image[fh + 2..fh + 4].copy_from_slice(&(1u16).to_le_bytes()); // NumberOfSections
+        image[fh + 16..fh + 18].copy_from_slice(&(240u16).to_le_bytes()); // SizeOfOptionalHeader
+
+        let oh = fh + 20;
+        image[oh..oh + 2].copy_from_slice(&OPT_MAGIC_PE32PLUS.to_le_bytes());
+        image[oh + 16..oh + 20].copy_from_slice(&(0x1000u32).to_le_bytes()); // Entry
+        image[oh + 24..oh + 32].copy_from_slice(&(0x1400_0000_0u64).to_le_bytes()); // ImageBase
+        image[oh + 56..oh + 60].copy_from_slice(&(0x5000u32).to_le_bytes()); // SizeOfImage
+        image[oh + 60..oh + 64].copy_from_slice(&(0x400u32).to_le_bytes()); // SizeOfHeaders
+        image[oh + 72..oh + 80].copy_from_slice(&(0x10_0000u64).to_le_bytes()); // StackReserve
+        image[oh + 80..oh + 88].copy_from_slice(&(0x1000u64).to_le_bytes()); // StackCommit
+        image[oh + 108..oh + 112].copy_from_slice(&(16u32).to_le_bytes()); // NumberOfRvaAndSizes
+
+        // Import directory entry (index 1): RVA 0x20A0, Size 0x28.
+        let import_dir = oh + 112 + DIR_IMPORT * 8;
+        image[import_dir..import_dir + 4].copy_from_slice(&(0x20A0u32).to_le_bytes());
+        image[import_dir + 4..import_dir + 8].copy_from_slice(&(0x28u32).to_le_bytes());
+
+        let hdrs = PeHeaders::from_slice(&image).expect("parse should succeed");
+        assert_eq!(hdrs.num_dirs, 16);
+        let dir = hdrs.data_dir(DIR_IMPORT).expect("import dir should exist");
+        assert_eq!(dir.rva, 0x20A0);
+        assert_eq!(dir.size, 0x28);
+        assert!(dir.is_present());
     }
 }

@@ -191,3 +191,85 @@ pub(crate) fn handle_query_virtual_memory(frame: &mut SvcFrame) {
     }
     frame.x[0] = status::SUCCESS as u64;
 }
+
+// NtReadVirtualMemory:
+// x0=ProcessHandle, x1=BaseAddress, x2=Buffer, x3=Size, x4=*BytesRead(opt)
+pub(crate) fn handle_read_virtual_memory(frame: &mut SvcFrame) {
+    let process_handle = frame.x[0];
+    let src = frame.x[1] as *const u8;
+    let dst = frame.x[2] as *mut u8;
+    let size = frame.x[3] as usize;
+    let out_len = frame.x[4] as *mut u64;
+
+    let Some(pid) = crate::process::resolve_process_handle(process_handle) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+
+    if pid != crate::process::current_pid() {
+        frame.x[0] = status::NOT_IMPLEMENTED as u64;
+        return;
+    }
+
+    if size == 0 {
+        if !out_len.is_null() {
+            unsafe { out_len.write_volatile(0) };
+        }
+        frame.x[0] = status::SUCCESS as u64;
+        return;
+    }
+
+    if src.is_null() || dst.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+
+    unsafe {
+        core::ptr::copy(src, dst, size);
+    }
+    if !out_len.is_null() {
+        unsafe { out_len.write_volatile(size as u64) };
+    }
+    frame.x[0] = status::SUCCESS as u64;
+}
+
+// NtWriteVirtualMemory:
+// x0=ProcessHandle, x1=BaseAddress, x2=Buffer, x3=Size, x4=*BytesWritten(opt)
+pub(crate) fn handle_write_virtual_memory(frame: &mut SvcFrame) {
+    let process_handle = frame.x[0];
+    let dst = frame.x[1] as *mut u8;
+    let src = frame.x[2] as *const u8;
+    let size = frame.x[3] as usize;
+    let out_len = frame.x[4] as *mut u64;
+
+    let Some(pid) = crate::process::resolve_process_handle(process_handle) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+
+    if pid != crate::process::current_pid() {
+        frame.x[0] = status::NOT_IMPLEMENTED as u64;
+        return;
+    }
+
+    if size == 0 {
+        if !out_len.is_null() {
+            unsafe { out_len.write_volatile(0) };
+        }
+        frame.x[0] = status::SUCCESS as u64;
+        return;
+    }
+
+    if src.is_null() || dst.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+
+    unsafe {
+        core::ptr::copy(src, dst, size);
+    }
+    if !out_len.is_null() {
+        unsafe { out_len.write_volatile(size as u64) };
+    }
+    frame.x[0] = status::SUCCESS as u64;
+}
