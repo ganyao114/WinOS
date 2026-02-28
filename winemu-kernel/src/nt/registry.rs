@@ -1,6 +1,6 @@
 use crate::kobj::ObjectStore;
 use crate::rust_alloc::{string::{String, ToString}, vec::Vec};
-use crate::sched::sync::{self, make_handle, HANDLE_TYPE_KEY};
+use crate::sched::sync::{self, make_new_handle, HANDLE_TYPE_KEY};
 use winemu_shared::status;
 use winereg::{
     KeyNode, RegistryKey, RegistryValue, RegistryValueData, REG_BINARY, REG_DWORD, REG_EXPAND_SZ,
@@ -281,12 +281,9 @@ fn gc_key_handles(state: &mut RegistryState) {
     }
 }
 
-pub(crate) fn close_key_handle(handle: u64) -> bool {
+pub(crate) fn close_key_idx(idx: u32) -> bool {
     let state = ensure_state();
-    if sync::handle_type(handle) != HANDLE_TYPE_KEY {
-        return false;
-    }
-    state.handles.free(sync::handle_idx(handle))
+    state.handles.free(idx)
 }
 
 pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
@@ -310,7 +307,12 @@ pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
     };
 
     if !out_ptr.is_null() {
-        unsafe { out_ptr.write_volatile(make_handle(HANDLE_TYPE_KEY, handle_idx)) };
+        let Some(h) = make_new_handle(HANDLE_TYPE_KEY, handle_idx) else {
+            let _ = state.handles.free(handle_idx);
+            frame.x[0] = status::NO_MEMORY as u64;
+            return;
+        };
+        unsafe { out_ptr.write_volatile(h) };
     }
     frame.x[0] = status::SUCCESS as u64;
 }
@@ -342,7 +344,12 @@ pub(crate) fn handle_create_key(frame: &mut SvcFrame) {
         unsafe { disp_ptr.write_volatile(disp) };
     }
     if !out_ptr.is_null() {
-        unsafe { out_ptr.write_volatile(make_handle(HANDLE_TYPE_KEY, handle_idx)) };
+        let Some(h) = make_new_handle(HANDLE_TYPE_KEY, handle_idx) else {
+            let _ = state.handles.free(handle_idx);
+            frame.x[0] = status::NO_MEMORY as u64;
+            return;
+        };
+        unsafe { out_ptr.write_volatile(h) };
     }
     frame.x[0] = status::SUCCESS as u64;
 }

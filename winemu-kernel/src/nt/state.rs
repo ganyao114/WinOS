@@ -193,7 +193,3 @@ pub(crate) fn view_free(base: u64) -> bool {
     }
     store.free(id)
 }
-
-pub(crate) fn duplicate_handle(src: u64) -> u64 {
-    src
-}

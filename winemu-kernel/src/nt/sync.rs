@@ -1,5 +1,5 @@
 use crate::sched::sync::{
-    self, event_alloc, event_reset, event_set, make_handle, mutex_alloc, mutex_release,
+    self, event_alloc, event_reset, event_set, make_new_handle, mutex_alloc, mutex_release,
     semaphore_alloc, semaphore_release, wait_handle, wait_multiple, EventType, WaitDeadline,
     HANDLE_TYPE_EVENT, HANDLE_TYPE_MUTEX, HANDLE_TYPE_SEMAPHORE, STATUS_SUCCESS,
 };
@@ -18,7 +18,10 @@ pub(crate) fn handle_create_event(frame: &mut SvcFrame) {
     let initial = frame.x[4] != 0;
     match event_alloc(ev_type, initial) {
         Some(idx) => {
-            let h = make_handle(HANDLE_TYPE_EVENT, idx);
+            let Some(h) = make_new_handle(HANDLE_TYPE_EVENT, idx) else {
+                frame.x[0] = 0xC000_0017u64;
+                return;
+            };
             let out_ptr = frame.x[0] as *mut u64;
             unsafe { out_ptr.write_volatile(h) };
             frame.x[0] = STATUS_SUCCESS as u64;
@@ -86,7 +89,10 @@ pub(crate) fn handle_create_mutex(frame: &mut SvcFrame) {
     let initial_owner = frame.x[3] != 0;
     match mutex_alloc(initial_owner) {
         Some(idx) => {
-            let h = make_handle(HANDLE_TYPE_MUTEX, idx);
+            let Some(h) = make_new_handle(HANDLE_TYPE_MUTEX, idx) else {
+                frame.x[0] = 0xC000_0017u64;
+                return;
+            };
             let out_ptr = frame.x[0] as *mut u64;
             unsafe { out_ptr.write_volatile(h) };
             frame.x[0] = STATUS_SUCCESS as u64;
@@ -114,7 +120,10 @@ pub(crate) fn handle_create_semaphore(frame: &mut SvcFrame) {
     let maximum = frame.x[4] as i32;
     match semaphore_alloc(initial, maximum) {
         Some(idx) => {
-            let h = make_handle(HANDLE_TYPE_SEMAPHORE, idx);
+            let Some(h) = make_new_handle(HANDLE_TYPE_SEMAPHORE, idx) else {
+                frame.x[0] = 0xC000_0017u64;
+                return;
+            };
             let out_ptr = frame.x[0] as *mut u64;
             unsafe { out_ptr.write_volatile(h) };
             frame.x[0] = STATUS_SUCCESS as u64;

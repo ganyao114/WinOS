@@ -1,5 +1,5 @@
 use crate::hypercall;
-use crate::sched::sync::{make_handle, HANDLE_TYPE_FILE};
+use crate::sched::sync::{make_new_handle, HANDLE_TYPE_FILE};
 use winemu_shared::status;
 
 use super::common::{
@@ -47,7 +47,13 @@ pub(crate) fn handle_create_file(frame: &mut SvcFrame) {
         }
     };
     if !out_ptr.is_null() {
-        unsafe { out_ptr.write_volatile(make_handle(HANDLE_TYPE_FILE, idx)); }
+        let Some(h) = make_new_handle(HANDLE_TYPE_FILE, idx) else {
+            file_free(idx);
+            write_iosb(iosb_ptr, status::NO_MEMORY, 0);
+            frame.x[0] = status::NO_MEMORY as u64;
+            return;
+        };
+        unsafe { out_ptr.write_volatile(h) };
     }
     write_iosb(iosb_ptr, status::SUCCESS, 0);
     frame.x[0] = status::SUCCESS as u64;
@@ -169,6 +175,6 @@ pub(crate) fn handle_query_directory_file(frame: &mut SvcFrame) {
     frame.x[0] = status::NO_MORE_FILES as u64;
 }
 
-pub(crate) fn close_file_handle(handle: u64) {
-    file_free(crate::sched::sync::handle_idx(handle));
+pub(crate) fn close_file_idx(idx: u32) {
+    file_free(idx);
 }

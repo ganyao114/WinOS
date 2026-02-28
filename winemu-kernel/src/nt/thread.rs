@@ -1,5 +1,5 @@
 use crate::sched::sync::{
-    handle_idx, handle_type, make_handle, thread_notify_terminated, HANDLE_TYPE_THREAD,
+    handle_idx, handle_type, make_new_handle, thread_notify_terminated, HANDLE_TYPE_THREAD,
     STATUS_SUCCESS,
 };
 use crate::sched::{
@@ -137,7 +137,10 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
         frame.x[0] = 0xC000_0017u64;
         return;
     }
-    let handle = make_handle(HANDLE_TYPE_THREAD, tid);
+    let Some(handle) = make_new_handle(HANDLE_TYPE_THREAD, tid) else {
+        frame.x[0] = 0xC000_0017u64;
+        return;
+    };
     if !out_ptr.is_null() {
         unsafe { out_ptr.write_volatile(handle) };
     }

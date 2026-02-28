@@ -191,6 +191,8 @@ struct SyncState {
     events: UnsafeCell<Option<ObjectStore<KEvent>>>,
     mutexes: UnsafeCell<Option<ObjectStore<KMutex>>>,
     semaphores: UnsafeCell<Option<ObjectStore<KSemaphore>>>,
+    handles: UnsafeCell<Option<ObjectStore<HandleEntry>>>,
+    refs: UnsafeCell<Option<Vec<ObjectRef>>>,
     thread_waiters: UnsafeCell<Option<Vec<WaitQueue>>>,
 }
 
@@ -200,6 +202,8 @@ static SYNC_STATE: SyncState = SyncState {
     events: UnsafeCell::new(None),
     mutexes: UnsafeCell::new(None),
     semaphores: UnsafeCell::new(None),
+    handles: UnsafeCell::new(None),
+    refs: UnsafeCell::new(None),
     thread_waiters: UnsafeCell::new(None),
 };
 
@@ -288,7 +292,7 @@ fn semaphore_ptr(idx: u32) -> *mut KSemaphore {
 }
 
 // ── HandleTable ───────────────────────────────────────────────
-// Handle encoding: bits[31:28] = type, bits[27:0] = object id
+// Handle encoding: bits[31:28] = type, bits[27:0] = handle slot id
 // 保持在低 32 bit，兼容用户态把 HANDLE 临时存到 u32 的场景。
 
 pub const HANDLE_TYPE_EVENT: u64 = 1;
@@ -299,16 +303,185 @@ pub const HANDLE_TYPE_FILE: u64 = 5;
 pub const HANDLE_TYPE_SECTION: u64 = 6;
 pub const HANDLE_TYPE_KEY: u64 = 7;
 
+#[derive(Clone, Copy)]
+struct HandleEntry {
+    key: u32,
+}
+
+#[derive(Clone, Copy)]
+struct ObjectRef {
+    key: u32,
+    refs: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct HandleCloseInfo {
+    pub htype: u64,
+    pub obj_idx: u32,
+    pub destroy_object: bool,
+}
+
 pub fn make_handle(htype: u64, idx: u32) -> u64 {
     ((htype & 0xF) << 28) | ((idx as u64) & 0x0FFF_FFFF)
 }
 
+#[inline]
+fn handle_key(h: u64) -> u32 {
+    h as u32
+}
+
+#[inline]
+fn key_type(key: u32) -> u64 {
+    ((key as u64) >> 28) & 0xF
+}
+
+#[inline]
+fn key_idx(key: u32) -> u32 {
+    key & 0x0FFF_FFFF
+}
+
+fn handles_store_mut() -> &'static mut ObjectStore<HandleEntry> {
+    unsafe {
+        let slot = &mut *SYNC_STATE.handles.get();
+        if slot.is_none() {
+            *slot = Some(ObjectStore::new());
+        }
+        slot.as_mut().unwrap()
+    }
+}
+
+fn refs_mut() -> &'static mut Vec<ObjectRef> {
+    unsafe {
+        let slot = &mut *SYNC_STATE.refs.get();
+        if slot.is_none() {
+            *slot = Some(Vec::new());
+        }
+        slot.as_mut().unwrap()
+    }
+}
+
+fn ref_inc(key: u32) -> bool {
+    let refs = refs_mut();
+    let mut i = 0usize;
+    while i < refs.len() {
+        if refs[i].key == key {
+            refs[i].refs = refs[i].refs.saturating_add(1);
+            return true;
+        }
+        i += 1;
+    }
+    if refs.try_reserve(1).is_err() {
+        return false;
+    }
+    refs.push(ObjectRef { key, refs: 1 });
+    true
+}
+
+fn ref_dec_is_last(key: u32) -> bool {
+    let refs = refs_mut();
+    let mut i = 0usize;
+    while i < refs.len() {
+        if refs[i].key == key {
+            if refs[i].refs > 1 {
+                refs[i].refs -= 1;
+                return false;
+            }
+            refs.swap_remove(i);
+            return true;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn alloc_handle_instance_for_key(key: u32) -> Option<u64> {
+    if key_type(key) == 0 || key_idx(key) == 0 {
+        return None;
+    }
+    if !ref_inc(key) {
+        return None;
+    }
+    let id = match handles_store_mut().alloc_with(|_| HandleEntry { key }) {
+        Some(v) => v,
+        None => {
+            let _ = ref_dec_is_last(key);
+            return None;
+        }
+    };
+    Some(make_handle(key_type(key), id))
+}
+
+fn resolve_user_handle(h: u64) -> Option<(u32, u64, u32, u32)> {
+    let htype = (h >> 28) & 0xF;
+    if htype == 0 {
+        return None;
+    }
+    let hid = (h & 0x0FFF_FFFF) as u32;
+    let ptr = handles_store_mut().get_ptr(hid);
+    if ptr.is_null() {
+        return None;
+    }
+    let entry = unsafe { *ptr };
+    if key_type(entry.key) != htype {
+        return None;
+    }
+    Some((hid, htype, key_idx(entry.key), entry.key))
+}
+
+fn resolve_handle_key(h: u64) -> Option<u32> {
+    if let Some((_hid, _htype, _idx, key)) = resolve_user_handle(h) {
+        return Some(key);
+    }
+    let key = handle_key(h);
+    if key_type(key) == 0 || key_idx(key) == 0 {
+        return None;
+    }
+    Some(key)
+}
+
+fn handles_same_object(a: u64, b: u64) -> bool {
+    match (resolve_handle_key(a), resolve_handle_key(b)) {
+        (Some(ka), Some(kb)) => ka == kb,
+        _ => false,
+    }
+}
+
 pub fn handle_type(h: u64) -> u64 {
-    (h >> 28) & 0xF
+    if let Some((_hid, htype, _idx, _key)) = resolve_user_handle(h) {
+        htype
+    } else {
+        0
+    }
 }
 
 pub fn handle_idx(h: u64) -> u32 {
-    (h & 0x0FFF_FFFF) as u32
+    if let Some((_hid, _htype, idx, _key)) = resolve_user_handle(h) {
+        idx
+    } else {
+        0
+    }
+}
+
+pub fn make_new_handle(htype: u64, obj_idx: u32) -> Option<u64> {
+    alloc_handle_instance_for_key(make_handle(htype, obj_idx) as u32)
+}
+
+pub fn duplicate_handle(h: u64) -> Option<u64> {
+    let (_hid, _htype, _idx, key) = resolve_user_handle(h)?;
+    alloc_handle_instance_for_key(key)
+}
+
+pub fn close_handle_info(h: u64) -> Option<HandleCloseInfo> {
+    let (hid, htype, obj_idx, key) = resolve_user_handle(h)?;
+    if !handles_store_mut().free(hid) {
+        return None;
+    }
+    let destroy_object = ref_dec_is_last(key);
+    Some(HandleCloseInfo {
+        htype,
+        obj_idx,
+        destroy_object,
+    })
 }
 
 fn recompute_owned_mutex_priority_locked(owner_tid: u32) {
@@ -631,7 +804,7 @@ fn wait_index_for_handle_locked(tid: u32, h: u64) -> Option<usize> {
         let count = t.wait_count as usize;
         let mut i = 0usize;
         while i < count && i < MAX_WAIT_HANDLES {
-            if t.wait_handles[i] == h {
+            if handles_same_object(t.wait_handles[i], h) {
                 return Some(i);
             }
             i += 1;
@@ -655,7 +828,7 @@ fn try_complete_waiter_for_handle_locked(tid: u32, signaled_handle: u64) -> bool
     match kind {
         WAIT_KIND_SINGLE => {
             let expected = with_thread(tid, |t| t.wait_handles[0]);
-            if expected != signaled_handle {
+            if !handles_same_object(expected, signaled_handle) {
                 return false;
             }
             if !consume_handle_signal_locked(tid, expected) {
@@ -668,7 +841,8 @@ fn try_complete_waiter_for_handle_locked(tid: u32, signaled_handle: u64) -> bool
             let Some(index) = wait_index_for_handle_locked(tid, signaled_handle) else {
                 return false;
             };
-            if !consume_handle_signal_locked(tid, signaled_handle) {
+            let expected = with_thread(tid, |t| t.wait_handles[index]);
+            if !consume_handle_signal_locked(tid, expected) {
                 return false;
             }
             complete_wait_locked(tid, STATUS_SUCCESS + index as u32);
@@ -750,7 +924,7 @@ fn wait_common_locked(handles: &[u64], wait_all: bool, timeout: WaitDeadline) ->
         while i < handles.len() {
             let mut j = i + 1;
             while j < handles.len() {
-                if handles[i] == handles[j] {
+                if handles_same_object(handles[i], handles[j]) {
                     return STATUS_INVALID_PARAMETER;
                 }
                 j += 1;
@@ -1010,17 +1184,27 @@ pub fn semaphore_free(idx: u32) {
 // ── Handle wait / close ─────────────────────────────────────
 
 pub fn close_handle(h: u64) -> u32 {
-    match handle_type(h) {
+    let Some(info) = close_handle_info(h) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    if !info.destroy_object {
+        return STATUS_SUCCESS;
+    }
+    destroy_object_by_type(info.htype, info.obj_idx)
+}
+
+pub fn destroy_object_by_type(htype: u64, obj_idx: u32) -> u32 {
+    match htype {
         HANDLE_TYPE_EVENT => {
-            event_free(handle_idx(h));
+            event_free(obj_idx);
             STATUS_SUCCESS
         }
         HANDLE_TYPE_MUTEX => {
-            mutex_free(handle_idx(h));
+            mutex_free(obj_idx);
             STATUS_SUCCESS
         }
         HANDLE_TYPE_SEMAPHORE => {
-            semaphore_free(handle_idx(h));
+            semaphore_free(obj_idx);
             STATUS_SUCCESS
         }
         HANDLE_TYPE_THREAD => STATUS_SUCCESS,

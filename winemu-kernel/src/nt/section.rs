@@ -1,5 +1,5 @@
 use crate::hypercall;
-use crate::sched::sync::{self, make_handle, HANDLE_TYPE_FILE, HANDLE_TYPE_SECTION};
+use crate::sched::sync::{self, make_new_handle, HANDLE_TYPE_FILE, HANDLE_TYPE_SECTION};
 use winemu_shared::status;
 
 use super::common::align_up_4k;
@@ -28,7 +28,11 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
             return;
         }
     };
-    let handle = make_handle(HANDLE_TYPE_SECTION, idx);
+    let Some(handle) = make_new_handle(HANDLE_TYPE_SECTION, idx) else {
+        section_free(idx);
+        frame.x[0] = status::NO_MEMORY as u64;
+        return;
+    };
     if !out_ptr.is_null() {
         unsafe { out_ptr.write_volatile(handle) };
     }
@@ -105,6 +109,6 @@ pub(crate) fn handle_unmap_view_of_section(frame: &mut SvcFrame) {
     frame.x[0] = status::SUCCESS as u64;
 }
 
-pub(crate) fn close_section_handle(handle: u64) {
-    section_free(sync::handle_idx(handle));
+pub(crate) fn close_section_idx(idx: u32) {
+    section_free(idx);
 }
