@@ -428,12 +428,24 @@ impl AllocState {
         let pidx = page_idx as usize;
         let obj_size = self.caches[cache_idx].obj_size as usize;
         let obj_idx = self.pages[pidx].free_obj;
-        if obj_idx == NONE_U16 {
+        let total = self.pages[pidx].total;
+        if obj_idx == NONE_U16 || obj_idx >= total {
+            // Corrupted freelist head; quarantine this slab page from further allocs.
+            self.cache_remove_partial(cache_idx, pidx);
+            self.pages[pidx].free_obj = NONE_U16;
+            self.stats.alloc_failures = self.stats.alloc_failures.saturating_add(1);
             return null_mut();
         }
 
         let obj_ptr = (self.page_addr(pidx) + obj_idx as usize * obj_size) as *mut u8;
         let next = unsafe { (obj_ptr as *const u16).read_unaligned() };
+        if next != NONE_U16 && next >= total {
+            // Corrupted next pointer; stop using this slab page for allocation.
+            self.cache_remove_partial(cache_idx, pidx);
+            self.pages[pidx].free_obj = NONE_U16;
+            self.stats.alloc_failures = self.stats.alloc_failures.saturating_add(1);
+            return null_mut();
+        }
         self.pages[pidx].free_obj = next;
         self.pages[pidx].inuse = self.pages[pidx].inuse.saturating_add(1);
         if self.pages[pidx].free_obj == NONE_U16 {
@@ -446,24 +458,36 @@ impl AllocState {
     fn free_small(&mut self, page_idx: usize, ptr: usize) {
         let cache_idx = self.pages[page_idx].cache as usize;
         if cache_idx >= NUM_CACHES {
+            self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
             return;
         }
         let obj_size = self.caches[cache_idx].obj_size as usize;
         let page_base = self.page_addr(page_idx);
         if ptr < page_base || ptr >= page_base + PAGE_SIZE {
+            self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
             return;
         }
 
         let off = ptr - page_base;
         if off % obj_size != 0 {
+            self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
             return;
         }
         let obj_idx = (off / obj_size) as u16;
         if obj_idx >= self.pages[page_idx].total {
+            self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
             return;
         }
         if self.pages[page_idx].inuse == 0 {
+            self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
             return;
+        }
+        match self.slab_freelist_contains(page_idx, obj_idx, obj_size) {
+            Ok(true) | Err(()) => {
+                self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
+                return;
+            }
+            Ok(false) => {}
         }
 
         let was_full = self.pages[page_idx].free_obj == NONE_U16;
@@ -482,6 +506,41 @@ impl AllocState {
             self.mark_block_unused(page_idx, 0);
             self.buddy_free(page_idx, 0);
         }
+    }
+
+    fn slab_freelist_contains(
+        &self,
+        page_idx: usize,
+        obj_idx: u16,
+        obj_size: usize,
+    ) -> Result<bool, ()> {
+        let total = self.pages[page_idx].total as usize;
+        if total == 0 {
+            return Err(());
+        }
+        let page_base = self.page_addr(page_idx);
+        let mut cur = self.pages[page_idx].free_obj;
+        let mut steps = 0usize;
+        while cur != NONE_U16 {
+            let cur_usize = cur as usize;
+            if cur_usize >= total {
+                return Err(());
+            }
+            if cur == obj_idx {
+                return Ok(true);
+            }
+            let cur_ptr = (page_base + cur_usize * obj_size) as *const u16;
+            let next = unsafe { cur_ptr.read_unaligned() };
+            if next != NONE_U16 && next as usize >= total {
+                return Err(());
+            }
+            cur = next;
+            steps += 1;
+            if steps > total {
+                return Err(());
+            }
+        }
+        Ok(false)
     }
 
     fn pages_to_order(pages: usize) -> Option<usize> {
