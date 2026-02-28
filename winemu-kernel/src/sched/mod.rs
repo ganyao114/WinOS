@@ -12,7 +12,7 @@ use crate::nt::constants::{
     DEFAULT_THREAD_STACK_RESERVE, PAGE_SIZE_4K, PSEUDO_CURRENT_THREAD, PSEUDO_CURRENT_THREAD_ALT,
     THREAD_BASIC_INFORMATION_SIZE, THREAD_STACK_ALIGN,
 };
-use crate::nt::state::{vm_alloc_region_typed, vm_free_region};
+use crate::nt::state::{vm_alloc_region_typed, vm_free_region, vm_make_guard_page};
 use crate::rust_alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use winemu_shared::status;
@@ -634,7 +634,9 @@ pub fn spawn(
     let tid = thread_store_mut()
         .alloc_with(|id| {
             let mut t = KThread::zeroed();
-            t.init_spawned(id, pid, pc, sp, arg, teb_va, stack_base, stack_size, priority);
+            t.init_spawned(
+                id, pid, pc, sp, arg, teb_va, stack_base, stack_size, priority,
+            );
             t
         })
         .unwrap_or(0);
@@ -660,6 +662,7 @@ fn normalize_stack_size(max_stack_size_arg: u64) -> u64 {
     }
 }
 
+#[inline(never)]
 pub fn create_user_thread(
     pid: u32,
     entry_va: u64,
@@ -671,9 +674,14 @@ pub fn create_user_thread(
         return Err(CreateThreadError::InvalidParameter);
     }
 
-    let stack_size = normalize_stack_size(max_stack_size_arg);
+    let usable_stack_size = normalize_stack_size(max_stack_size_arg);
+    let stack_size = usable_stack_size.saturating_add(PAGE_SIZE_4K);
     let stack_base = vm_alloc_region_typed(pid, 0, stack_size, 0x04, VmaType::ThreadStack)
         .ok_or(CreateThreadError::NoMemory)?;
+    if !vm_make_guard_page(pid, stack_base) {
+        let _ = vm_free_region(pid, stack_base);
+        return Err(CreateThreadError::NoMemory);
+    }
     let teb_va =
         vm_alloc_region_typed(pid, 0, PAGE_SIZE_4K, 0x04, VmaType::Private).map_or(0, |v| v);
     if teb_va == 0 {
@@ -683,14 +691,7 @@ pub fn create_user_thread(
     let stack_top = stack_base + stack_size;
 
     let tid = spawn(
-        pid,
-        entry_va,
-        stack_top,
-        arg,
-        teb_va,
-        stack_base,
-        stack_size,
-        priority,
+        pid, entry_va, stack_top, arg, teb_va, stack_base, stack_size, priority,
     );
     if tid == 0 {
         let _ = vm_free_region(pid, stack_base);
@@ -752,8 +753,7 @@ pub fn thread_ids_by_pid(pid: u32) -> Vec<u32> {
         let mut tids = Vec::new();
         store.for_each_live_ptr(|tid, ptr| {
             let t = &*ptr;
-            if t.pid == pid && t.state != ThreadState::Free && t.state != ThreadState::Terminated
-            {
+            if t.pid == pid && t.state != ThreadState::Free && t.state != ThreadState::Terminated {
                 let _ = tids.try_reserve(1);
                 tids.push(tid);
             }
@@ -769,7 +769,12 @@ pub fn thread_ids_by_pid(pid: u32) -> Vec<u32> {
 pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32) {
     unsafe {
         let vcpu = &mut (*SCHED.vcpus.get())[vcpu_id];
-        let cur_tid = vcpu.current_tid;
+        let mut cur_tid = vcpu.current_tid;
+        if cur_tid != 0 && !thread_exists(cur_tid) {
+            vcpu.current_tid = 0;
+            set_tpidr_el1(vcpu_id, 0);
+            cur_tid = 0;
+        }
         let cur_running = cur_tid != 0 && with_thread(cur_tid, |t| t.state == ThreadState::Running);
 
         // Strict priority preemption:
@@ -831,9 +836,16 @@ pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32
 pub fn block_current(vcpu_id: usize, deadline: u64) -> (u32, u32) {
     unsafe {
         let vcpu = &mut (*SCHED.vcpus.get())[vcpu_id];
-        let cur_tid = vcpu.current_tid;
-        set_thread_state_locked(cur_tid, ThreadState::Waiting);
-        set_wait_deadline_locked(cur_tid, deadline);
+        let mut cur_tid = vcpu.current_tid;
+        if cur_tid != 0 && !thread_exists(cur_tid) {
+            vcpu.current_tid = 0;
+            set_tpidr_el1(vcpu_id, 0);
+            cur_tid = 0;
+        }
+        if cur_tid != 0 {
+            set_thread_state_locked(cur_tid, ThreadState::Waiting);
+            set_wait_deadline_locked(cur_tid, deadline);
+        }
 
         let next_tid = (*SCHED.ready.get()).pop_highest();
         if next_tid == 0 {
@@ -1117,8 +1129,14 @@ pub fn set_thread_base_priority_by_handle(thread_handle: u64, new_priority: i32)
 
 pub fn charge_current_runtime_locked(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> bool {
     unsafe {
-        let cur_tid = (*SCHED.vcpus.get())[vcpu_id].current_tid;
+        let vcpu = &mut (*SCHED.vcpus.get())[vcpu_id];
+        let cur_tid = vcpu.current_tid;
         if cur_tid == 0 {
+            return false;
+        }
+        if !thread_exists(cur_tid) {
+            vcpu.current_tid = 0;
+            set_tpidr_el1(vcpu_id, 0);
             return false;
         }
         let mut expired = false;
@@ -1148,8 +1166,14 @@ pub fn charge_current_runtime_locked(vcpu_id: usize, now_100ns: u64, quantum_100
 
 pub fn rotate_current_on_quantum_expire_locked(vcpu_id: usize, quantum_100ns: u64) {
     unsafe {
-        let cur_tid = (*SCHED.vcpus.get())[vcpu_id].current_tid;
+        let vcpu = &mut (*SCHED.vcpus.get())[vcpu_id];
+        let cur_tid = vcpu.current_tid;
         if cur_tid == 0 {
+            return;
+        }
+        if !thread_exists(cur_tid) {
+            vcpu.current_tid = 0;
+            set_tpidr_el1(vcpu_id, 0);
             return;
         }
         let is_running = with_thread(cur_tid, |t| t.state == ThreadState::Running);
@@ -1166,8 +1190,14 @@ pub fn rotate_current_on_quantum_expire_locked(vcpu_id: usize, quantum_100ns: u6
 
 pub fn current_slice_remaining_100ns(vcpu_id: usize, default_100ns: u64) -> u64 {
     unsafe {
-        let cur_tid = (*SCHED.vcpus.get())[vcpu_id].current_tid;
+        let vcpu = &mut (*SCHED.vcpus.get())[vcpu_id];
+        let cur_tid = vcpu.current_tid;
         if cur_tid == 0 {
+            return default_100ns.max(1);
+        }
+        if !thread_exists(cur_tid) {
+            vcpu.current_tid = 0;
+            set_tpidr_el1(vcpu_id, 0);
             return default_100ns.max(1);
         }
         with_thread(cur_tid, |t| {

@@ -438,11 +438,6 @@ pub fn make_handle(htype: u64, idx: u32) -> u64 {
 }
 
 #[inline]
-fn handle_key(h: u64) -> u32 {
-    h as u32
-}
-
-#[inline]
 fn key_type(key: u32) -> u64 {
     ((key as u64) >> HANDLE_SLOT_BITS) & HANDLE_TYPE_MASK
 }
@@ -562,39 +557,26 @@ fn resolve_user_handle(h: u64) -> Option<(u32, u64, u32, u32)> {
     resolve_user_handle_for_pid(h, current_handle_owner_pid())
 }
 
-fn resolve_handle_key(h: u64) -> Option<u32> {
-    if let Some((_hid, _htype, _idx, key)) = resolve_user_handle(h) {
-        return Some(key);
-    }
-    let key = handle_key(h);
+fn decode_object_key(h: u64) -> Option<u32> {
+    let key = h as u32;
     if key_type(key) == 0 || key_idx(key) == 0 {
         return None;
     }
     Some(key)
-}
-
-fn handles_same_object(a: u64, b: u64) -> bool {
-    match (resolve_handle_key(a), resolve_handle_key(b)) {
-        (Some(ka), Some(kb)) => ka == kb,
-        _ => false,
-    }
 }
 
 fn resolve_handle_key_for_pid(h: u64, owner_pid: u32) -> Option<u32> {
-    if let Some((_hid, _htype, _idx, key)) = resolve_user_handle_for_pid(h, owner_pid) {
-        return Some(key);
-    }
-    let key = handle_key(h);
-    if key_type(key) == 0 || key_idx(key) == 0 {
-        return None;
-    }
-    Some(key)
+    resolve_user_handle_for_pid(h, owner_pid).map(|(_hid, _htype, _idx, key)| key)
+}
+
+fn resolve_handle_key_for_pid_or_object_key(h: u64, owner_pid: u32) -> Option<u32> {
+    resolve_handle_key_for_pid(h, owner_pid).or_else(|| decode_object_key(h))
 }
 
 fn handles_same_object_for_pid(a: u64, b: u64, owner_pid: u32) -> bool {
     match (
         resolve_handle_key_for_pid(a, owner_pid),
-        resolve_handle_key_for_pid(b, owner_pid),
+        resolve_handle_key_for_pid_or_object_key(b, owner_pid),
     ) {
         (Some(ka), Some(kb)) => ka == kb,
         _ => false,
@@ -662,8 +644,8 @@ pub fn duplicate_handle_between(
     source_handle: u64,
     target_pid: u32,
 ) -> Result<u64, u32> {
-    let (_hid, _htype, _idx, key) = resolve_user_handle_for_pid(source_handle, source_pid)
-        .ok_or(STATUS_INVALID_HANDLE)?;
+    let (_hid, _htype, _idx, key) =
+        resolve_user_handle_for_pid(source_handle, source_pid).ok_or(STATUS_INVALID_HANDLE)?;
     alloc_handle_instance_for_key(key, target_pid).ok_or(status::NO_MEMORY)
 }
 
@@ -1221,11 +1203,12 @@ fn wait_common_locked(handles: &[u64], wait_all: bool, timeout: WaitDeadline) ->
     }
 
     if wait_all {
+        let owner_pid = waiter_owner_pid(current_tid());
         let mut i = 0usize;
         while i < handles.len() {
             let mut j = i + 1;
             while j < handles.len() {
-                if handles_same_object(handles[i], handles[j]) {
+                if handles_same_object_for_pid(handles[i], handles[j], owner_pid) {
                     return STATUS_INVALID_PARAMETER;
                 }
                 j += 1;

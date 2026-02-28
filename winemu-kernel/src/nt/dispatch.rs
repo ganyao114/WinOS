@@ -6,7 +6,8 @@ use crate::hypercall;
 use crate::sched::{
     charge_current_runtime_locked, check_timeouts, consume_pending_reschedule_locked,
     current_slice_remaining_100ns, current_tid, next_wait_deadline_locked, now_ticks,
-    register_thread0, rotate_current_on_quantum_expire_locked, sched_lock_acquire,
+    register_thread0,
+    rotate_current_on_quantum_expire_locked, sched_lock_acquire,
     sched_lock_release, schedule, set_vcpu_idle_locked, vcpu_id, with_thread_mut,
 };
 use crate::timer;
@@ -95,6 +96,9 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
 }
 
 fn save_ctx_for(tid: u32, frame: &SvcFrame) {
+    if tid == 0 || !crate::sched::thread_exists(tid) {
+        return;
+    }
     with_thread_mut(tid, |t| {
         t.ctx.x.copy_from_slice(&frame.x);
         t.ctx.sp = frame.sp_el0;
@@ -105,6 +109,9 @@ fn save_ctx_for(tid: u32, frame: &SvcFrame) {
 }
 
 fn restore_ctx_to_frame(tid: u32, frame: &mut SvcFrame) {
+    if tid == 0 || !crate::sched::thread_exists(tid) {
+        return;
+    }
     with_thread_mut(tid, |t| {
         frame.x.copy_from_slice(&t.ctx.x);
         frame.sp_el0 = t.ctx.sp;
