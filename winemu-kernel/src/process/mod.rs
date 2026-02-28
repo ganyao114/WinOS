@@ -9,11 +9,12 @@ use core::cell::UnsafeCell;
 pub use handle::{current_pid, resolve_process_handle};
 pub use lifecycle::{
     create_process, init_boot_process, last_handle_closed, on_thread_created, on_thread_terminated,
-    process_accepts_new_threads, process_exists, switch_to_thread_process, terminate_process,
+    process_accepts_new_threads, process_exists, process_signaled, switch_to_thread_process,
+    terminate_process,
 };
 pub use query::query_information_process;
 
-pub(crate) use address_space::ProcessAddressSpace;
+pub(crate) use address_space::{ProcessAddressSpace, USER_VA_BASE, USER_VA_LIMIT};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -116,16 +117,20 @@ pub(crate) fn alloc_process(
     peb_va: u64,
     address_space: ProcessAddressSpace,
 ) -> Option<u32> {
-    process_store_mut().alloc_with(|pid| {
-        KProcess::new(
+    let create_time = crate::hypercall::query_mono_time_100ns();
+    let store = process_store_mut();
+    let (pid, ptr) = store.alloc_slot_with_id()?;
+    unsafe {
+        ptr.write(KProcess::new(
             pid,
             parent_pid,
             image_base,
             peb_va,
             address_space,
-            crate::hypercall::query_mono_time_100ns(),
-        )
-    })
+            create_time,
+        ));
+    }
+    Some(pid)
 }
 
 pub(crate) fn free_process(pid: u32) -> bool {

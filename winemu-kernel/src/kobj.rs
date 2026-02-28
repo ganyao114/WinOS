@@ -114,15 +114,20 @@ impl<T> ObjectStore<T> {
         Some(id)
     }
 
-    pub fn alloc_with(&mut self, f: impl FnOnce(u32) -> T) -> Option<u32> {
+    pub fn alloc_slot_with_id(&mut self) -> Option<(u32, *mut T)> {
         let id = self.alloc_id()?;
         let Some(ptr) = self.pool.alloc_slot() else {
             return None;
         };
+        self.slots[id as usize] = ptr;
+        Some((id, ptr))
+    }
+
+    pub fn alloc_with(&mut self, f: impl FnOnce(u32) -> T) -> Option<u32> {
+        let (id, ptr) = self.alloc_slot_with_id()?;
         unsafe {
             ptr.write(f(id));
         }
-        self.slots[id as usize] = ptr;
         Some(id)
     }
 

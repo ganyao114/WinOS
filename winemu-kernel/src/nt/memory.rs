@@ -2,8 +2,9 @@ use winemu_shared::status;
 
 use super::common::{align_up_4k, MEM_COMMIT};
 use super::constants::{PAGE_MASK_4K, PAGE_SIZE_4K};
-use super::state::{vm_alloc_region, vm_find_region, vm_free_region, vm_set_region_prot};
+use super::state::{vm_alloc_region_typed, vm_find_region, vm_free_region, vm_set_region_prot};
 use super::SvcFrame;
+use crate::mm::vaspace::VmaType;
 
 // x1=*BaseAddress, x3=*RegionSize, x5=Protect
 pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
@@ -22,8 +23,13 @@ pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
     let prot = frame.x[5] as u32;
     let size = align_up_4k(req_size);
     let owner_pid = crate::process::current_pid();
+    let hint = if !base_ptr.is_null() {
+        unsafe { base_ptr.read_volatile() }
+    } else {
+        0
+    };
 
-    let base = match vm_alloc_region(owner_pid, size, prot) {
+    let base = match vm_alloc_region_typed(owner_pid, hint, size, prot, VmaType::Private) {
         Some(v) => v,
         None => {
             frame.x[0] = status::NO_MEMORY as u64;
@@ -64,7 +70,7 @@ pub(crate) fn handle_protect_virtual_memory(frame: &mut SvcFrame) {
         if !old_ptr.is_null() {
             unsafe { old_ptr.write_volatile(region.prot) };
         }
-        vm_set_region_prot(idx, frame.x[3] as u32);
+        let _ = vm_set_region_prot(idx, frame.x[3] as u32);
     } else if !old_ptr.is_null() {
         unsafe { old_ptr.write_volatile(0) };
     }

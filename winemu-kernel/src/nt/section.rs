@@ -5,10 +5,11 @@ use winemu_shared::status;
 use super::common::align_up_4k;
 use super::constants::PAGE_SIZE_4K;
 use super::state::{
-    file_host_fd, section_alloc, section_free, section_get, view_alloc, view_free, vm_alloc_region,
-    vm_free_region,
+    file_host_fd, section_alloc, section_free, section_get, view_alloc, view_free,
+    vm_alloc_region_typed, vm_find_region, vm_free_region, vm_set_region_prot,
 };
 use super::SvcFrame;
+use crate::mm::vaspace::VmaType;
 
 // x0=*SectionHandle, x3=*MaximumSize, x4=Protection, x6=FileHandle
 pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
@@ -73,9 +74,15 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     } else {
         win32_protect
     };
+    let alloc_prot = if sec.file_handle != 0 { 0x04 } else { prot };
     let owner_pid = crate::process::current_pid();
+    let hint = if !base_ptr.is_null() {
+        unsafe { base_ptr.read_volatile() }
+    } else {
+        0
+    };
 
-    let base = match vm_alloc_region(owner_pid, map_size, prot) {
+    let base = match vm_alloc_region_typed(owner_pid, hint, map_size, alloc_prot, VmaType::Section) {
         Some(v) => v,
         None => {
             frame.x[0] = status::NO_MEMORY as u64;
@@ -86,6 +93,12 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     if sec.file_handle != 0 && sync::handle_type(sec.file_handle) == HANDLE_TYPE_FILE {
         if let Some(fd) = file_host_fd(sync::handle_idx(sec.file_handle)) {
             let _ = hypercall::host_read(fd, base as *mut u8, map_size as usize, 0);
+        }
+    }
+
+    if alloc_prot != prot {
+        if let Some((id, _)) = vm_find_region(owner_pid, base) {
+            let _ = vm_set_region_prot(id, prot);
         }
     }
 
