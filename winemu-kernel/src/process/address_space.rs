@@ -16,7 +16,8 @@ const AP_EL1_RW: u64 = 0b00 << 6;
 const AP_EL0_RW: u64 = 0b01 << 6;
 const AP_EL0_RO: u64 = 0b11 << 6;
 
-const ATTR_MASK_PAGE: u64 = (0x7 << 2) | (0x3 << 6) | (0x3 << 8) | (1 << 10) | (1 << 53) | (1 << 54);
+const ATTR_MASK_PAGE: u64 =
+    (0x7 << 2) | (0x3 << 6) | (0x3 << 8) | (1 << 10) | (1 << 53) | (1 << 54);
 const PTE_COMMON: u64 = (0b11 << 8) | (1 << 10); // Inner shareable + AF
 const PTE_UXN: u64 = 1 << 54;
 const PTE_PXN: u64 = 1 << 53;
@@ -39,7 +40,11 @@ impl ProcessAddressSpace {
     }
 
     pub fn clone_from(parent: &ProcessAddressSpace) -> Option<Self> {
-        Self::clone_from_tables(parent.l0 as *const u64, parent.l1 as *const u64, parent.l2 as *const u64)
+        Self::clone_from_tables(
+            parent.l0 as *const u64,
+            parent.l1 as *const u64,
+            parent.l2 as *const u64,
+        )
     }
 
     pub fn ttbr0(&self) -> u64 {
@@ -108,7 +113,11 @@ impl ProcessAddressSpace {
         true
     }
 
-    fn clone_from_tables(src_l0: *const u64, src_l1: *const u64, src_l2: *const u64) -> Option<Self> {
+    fn clone_from_tables(
+        src_l0: *const u64,
+        src_l1: *const u64,
+        src_l2: *const u64,
+    ) -> Option<Self> {
         let l0 = alloc_table()?;
         let l1 = match alloc_table() {
             Some(ptr) => ptr,
@@ -380,12 +389,12 @@ fn l2_entry_in_user_window(idx: usize) -> bool {
 
 fn decode_nt_prot(prot: u32) -> (bool, bool, bool) {
     match prot & 0xFF {
-        0x01 => (false, false, false), // PAGE_NOACCESS
-        0x02 => (true, false, false),  // PAGE_READONLY
+        0x01 => (false, false, false),      // PAGE_NOACCESS
+        0x02 => (true, false, false),       // PAGE_READONLY
         0x04 | 0x08 => (true, true, false), // PAGE_READWRITE / WRITECOPY
-        0x10 => (false, false, true), // PAGE_EXECUTE
-        0x20 => (true, false, true),  // PAGE_EXECUTE_READ
-        0x40 | 0x80 => (true, true, true), // PAGE_EXECUTE_READWRITE / EXECUTE_WRITECOPY
+        0x10 => (false, false, true),       // PAGE_EXECUTE
+        0x20 => (true, false, true),        // PAGE_EXECUTE_READ
+        0x40 | 0x80 => (true, false, true), // W^X: downgrade RWX to RX
         _ => (true, true, false),
     }
 }

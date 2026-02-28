@@ -29,6 +29,8 @@ const STATUS_SUCCESS: u64 = 0;
 const STATUS_INVALID_PARAMETER: u64 = 0xC000000D;
 const PAGE_READWRITE: u64 = 0x04;
 const PAGE_READONLY: u64 = 0x02;
+const PAGE_EXECUTE_READ: u64 = 0x20;
+const PAGE_EXECUTE_READWRITE: u64 = 0x40;
 const MEM_COMMIT: u64 = 0x1000;
 const MEM_RESERVE: u64 = 0x2000;
 const MEM_DECOMMIT: u64 = 0x4000;
@@ -305,6 +307,39 @@ unsafe fn test_virtual_memory() {
     check(
         b"NtProtectVirtualMemory old protection is PAGE_READWRITE",
         old_prot as u64 == PAGE_READWRITE,
+    );
+
+    let mut wx_base = base;
+    let mut wx_size: u64 = 0x1000;
+    let mut wx_old: u32 = 0;
+    let st = svc(
+        NR_PROTECT_VIRTUAL_MEMORY,
+        0xFFFFFFFFFFFFFFFF,
+        &mut wx_base as *mut u64 as u64,
+        &mut wx_size as *mut u64 as u64,
+        PAGE_EXECUTE_READWRITE,
+        &mut wx_old as *mut u32 as u64,
+        0,
+        0,
+        0,
+    );
+    check(
+        b"NtProtectVirtualMemory RWX request returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+    check(
+        b"RWX request reports previous protection PAGE_READONLY",
+        wx_old as u64 == PAGE_READONLY,
+    );
+    let mut wx_mbi = [0u8; 48];
+    let st = nt_query_virtual(base, &mut wx_mbi);
+    check(
+        b"Query after RWX protect returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+    check(
+        b"W^X enforced: effective protect downgraded to PAGE_EXECUTE_READ",
+        rd_u32(&wx_mbi, 36) as u64 == PAGE_EXECUTE_READ,
     );
 
     // Decommit second page

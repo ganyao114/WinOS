@@ -11,6 +11,10 @@ use winemu_shared::status;
 
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
+const PAGE_NOACCESS: u32 = 0x01;
+const PAGE_EXECUTE_READ: u32 = 0x20;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
 
 const VM_KIND_PRIVATE: u8 = 1;
 const VM_KIND_SECTION: u8 = 2;
@@ -26,7 +30,8 @@ pub(crate) struct GuestSection {
     pub(crate) owner_pid: u32,
     pub(crate) size: u64,
     pub(crate) prot: u32,
-    pub(crate) file_handle: u64,
+    pub(crate) file_fd: u64,
+    pub(crate) file_backed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -37,10 +42,14 @@ pub(crate) struct VmRegion {
     pub(crate) default_prot: u32,
     pub(crate) kind: u8,
     pub(crate) page_count: usize,
-    pub(crate) phys_pages: *mut u64,   // per-page GPA; 0 => not mapped
-    pub(crate) prot_pages: *mut u32,   // per-page NT protection
-    pub(crate) commit_bits: *mut u64,  // bit=1 => committed
+    pub(crate) phys_pages: *mut u64,  // per-page GPA; 0 => not mapped
+    pub(crate) prot_pages: *mut u32,  // per-page NT protection
+    pub(crate) commit_bits: *mut u64, // bit=1 => committed
     pub(crate) commit_words: usize,
+    pub(crate) section_file_fd: u64,
+    pub(crate) section_file_offset: u64,
+    pub(crate) section_view_size: u64,
+    pub(crate) section_file_backed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -132,12 +141,14 @@ pub(crate) fn vm_alloc_region_typed(
     vma_type: VmaType,
 ) -> Option<u64> {
     let size = align_up_4k(size.max(PAGE_SIZE_4K));
+    let prot = vm_sanitize_nt_prot(prot);
     let base = vm_find_free_base(owner_pid, hint, size)?;
     let kind = vm_kind_from_vma_type(vma_type);
     let Some(id) = vm_create_region(owner_pid, base, size, prot, kind) else {
         return None;
     };
-    if !vm_commit_region_pages(owner_pid, id, base, size, prot, true) {
+    let eager_map = kind != VM_KIND_SECTION && kind != VM_KIND_THREAD_STACK;
+    if !vm_commit_region_pages(owner_pid, id, base, size, prot, eager_map) {
         let _ = vm_release_region_by_id(id);
         return None;
     }
@@ -165,6 +176,7 @@ pub(crate) fn vm_set_region_prot(id: u32, prot: u32) -> bool {
         return false;
     }
 
+    let prot = vm_sanitize_nt_prot(prot);
     let region = unsafe { &mut *ptr };
     region.default_prot = prot;
     unsafe {
@@ -181,6 +193,57 @@ pub(crate) fn vm_set_region_prot(id: u32, prot: u32) -> bool {
     true
 }
 
+pub(crate) fn vm_make_guard_page(owner_pid: u32, page_va: u64) -> bool {
+    let page_va = page_va & !(PAGE_SIZE_4K - 1);
+    let Some((id, region)) = vm_find_region(owner_pid, page_va) else {
+        return false;
+    };
+    if !vm_range_within_region(&region, page_va, PAGE_SIZE_4K) {
+        return false;
+    }
+    if !vm_decommit_region_pages(id, page_va, PAGE_SIZE_4K) {
+        return false;
+    }
+    let ptr = regions_store_mut().get_ptr(id);
+    if ptr.is_null() {
+        return false;
+    }
+    let region_mut = unsafe { &mut *ptr };
+    let idx = ((page_va - region_mut.base) / PAGE_SIZE_4K) as usize;
+    if idx >= region_mut.page_count {
+        return false;
+    }
+    unsafe {
+        *region_mut.prot_pages.add(idx) = PAGE_NOACCESS;
+    }
+    true
+}
+
+pub(crate) fn vm_set_section_backing(
+    owner_pid: u32,
+    base: u64,
+    file_fd: Option<u64>,
+    file_offset: u64,
+    view_size: u64,
+) -> bool {
+    let Some((id, region)) = vm_find_region_by_base(owner_pid, base) else {
+        return false;
+    };
+    if region.kind != VM_KIND_SECTION {
+        return false;
+    }
+    let ptr = regions_store_mut().get_ptr(id);
+    if ptr.is_null() {
+        return false;
+    }
+    let region_mut = unsafe { &mut *ptr };
+    region_mut.section_file_backed = file_fd.is_some();
+    region_mut.section_file_fd = file_fd.unwrap_or(0);
+    region_mut.section_file_offset = file_offset;
+    region_mut.section_view_size = view_size.min(region_mut.size);
+    true
+}
+
 pub(crate) fn vm_free_region(owner_pid: u32, base: u64) -> bool {
     let Some((id, _)) = vm_find_region_by_base(owner_pid, base) else {
         return false;
@@ -188,8 +251,14 @@ pub(crate) fn vm_free_region(owner_pid: u32, base: u64) -> bool {
     vm_release_region_by_id(id)
 }
 
-pub(crate) fn vm_reserve_private(owner_pid: u32, hint: u64, size: u64, prot: u32) -> Result<u64, u32> {
+pub(crate) fn vm_reserve_private(
+    owner_pid: u32,
+    hint: u64,
+    size: u64,
+    prot: u32,
+) -> Result<u64, u32> {
     let size = align_up_4k(size.max(PAGE_SIZE_4K));
+    let prot = vm_sanitize_nt_prot(prot);
     let Some(base) = vm_find_free_base(owner_pid, hint, size) else {
         return Err(status::NO_MEMORY);
     };
@@ -201,6 +270,7 @@ pub(crate) fn vm_reserve_private(owner_pid: u32, hint: u64, size: u64, prot: u32
 
 pub(crate) fn vm_commit_private(owner_pid: u32, base: u64, size: u64, prot: u32) -> u32 {
     let size = align_up_4k(size.max(PAGE_SIZE_4K));
+    let prot = vm_sanitize_nt_prot(prot);
     let Some((id, region)) = vm_find_region(owner_pid, base) else {
         return status::INVALID_PARAMETER;
     };
@@ -249,8 +319,14 @@ pub(crate) fn vm_release_private(owner_pid: u32, base: u64) -> u32 {
     }
 }
 
-pub(crate) fn vm_protect_range(owner_pid: u32, base: u64, size: u64, prot: u32) -> Result<u32, u32> {
+pub(crate) fn vm_protect_range(
+    owner_pid: u32,
+    base: u64,
+    size: u64,
+    prot: u32,
+) -> Result<u32, u32> {
     let size = align_up_4k(size.max(PAGE_SIZE_4K));
+    let prot = vm_sanitize_nt_prot(prot);
     let Some((id, region)) = vm_find_region(owner_pid, base) else {
         return Err(status::INVALID_PARAMETER);
     };
@@ -337,7 +413,7 @@ pub(crate) fn vm_handle_page_fault(owner_pid: u32, fault_addr: u64, access: u8) 
         return false;
     }
 
-    let prot = unsafe { *region.prot_pages.add(idx) };
+    let prot = vm_sanitize_nt_prot(unsafe { *region.prot_pages.add(idx) });
     if !vm_access_allowed(prot, access) {
         return false;
     }
@@ -350,7 +426,8 @@ pub(crate) fn vm_handle_page_fault(owner_pid: u32, fault_addr: u64, access: u8) 
     let gpa = unsafe { *region_mut.phys_pages.add(idx) };
     if gpa != 0 {
         return crate::process::with_process_mut(owner_pid, |p| {
-            p.address_space.map_user_range(page_va, gpa, PAGE_SIZE_4K, prot)
+            p.address_space
+                .map_user_range(page_va, gpa, PAGE_SIZE_4K, prot)
         })
         .unwrap_or(false);
     }
@@ -360,6 +437,10 @@ pub(crate) fn vm_handle_page_fault(owner_pid: u32, fault_addr: u64, access: u8) 
     };
     unsafe {
         core::ptr::write_bytes(new_gpa as *mut u8, 0, PAGE_SIZE_4K as usize);
+    }
+    if region_mut.kind == VM_KIND_SECTION && !vm_fill_section_page(region_mut, idx, new_gpa) {
+        crate::mm::phys::free_pages(new_gpa, 1);
+        return false;
     }
     let mapped = crate::process::with_process_mut(owner_pid, |p| {
         p.address_space
@@ -402,12 +483,18 @@ pub(crate) fn file_free(idx: u32) {
     let _ = store.free(idx);
 }
 
-pub(crate) fn section_alloc(owner_pid: u32, size: u64, prot: u32, file_handle: u64) -> Option<u32> {
+pub(crate) fn section_alloc(
+    owner_pid: u32,
+    size: u64,
+    prot: u32,
+    file_fd: Option<u64>,
+) -> Option<u32> {
     sections_store_mut().alloc_with(|_| GuestSection {
         owner_pid,
         size,
-        prot,
-        file_handle,
+        prot: vm_sanitize_nt_prot(prot),
+        file_fd: file_fd.unwrap_or(0),
+        file_backed: file_fd.is_some(),
     })
 }
 
@@ -597,6 +684,7 @@ fn vm_create_region(owner_pid: u32, base: u64, size: u64, prot: u32, kind: u8) -
     if page_count == 0 {
         return None;
     }
+    let prot = vm_sanitize_nt_prot(prot);
     let phys_pages = vm_alloc_zeroed_array::<u64>(page_count)?;
     let prot_pages = match vm_alloc_zeroed_array::<u32>(page_count) {
         Some(v) => v,
@@ -632,6 +720,10 @@ fn vm_create_region(owner_pid: u32, base: u64, size: u64, prot: u32, kind: u8) -
         prot_pages,
         commit_bits,
         commit_words: commit_words.max(1),
+        section_file_fd: 0,
+        section_file_offset: 0,
+        section_view_size: 0,
+        section_file_backed: false,
     });
 
     if id.is_none() {
@@ -680,6 +772,7 @@ fn vm_commit_region_pages(
         return false;
     }
 
+    let prot = vm_sanitize_nt_prot(prot);
     let start_idx = ((base - region.base) / PAGE_SIZE_4K) as usize;
     let page_count = (size / PAGE_SIZE_4K) as usize;
     for i in 0..page_count {
@@ -732,6 +825,7 @@ fn vm_decommit_region_pages(id: u32, base: u64, size: u64) -> bool {
 }
 
 fn vm_map_new_page(owner_pid: u32, region: &mut VmRegion, idx: usize, va: u64, prot: u32) -> bool {
+    let prot = vm_sanitize_nt_prot(prot);
     let Some(gpa) = crate::mm::phys::alloc_pages(1) else {
         return false;
     };
@@ -770,6 +864,7 @@ fn vm_unmap_free_page(owner_pid: u32, region: &VmRegion, idx: usize, va: u64) {
 }
 
 fn vm_apply_page_prot(owner_pid: u32, va: u64, prot: u32) -> bool {
+    let prot = vm_sanitize_nt_prot(prot);
     crate::process::with_process_mut(owner_pid, |p| {
         p.address_space.protect_user_range(va, PAGE_SIZE_4K, prot)
     })
@@ -831,9 +926,39 @@ fn vm_decode_nt_prot(prot: u32) -> (bool, bool, bool) {
         0x04 | 0x08 => (true, true, false),
         0x10 => (false, false, true),
         0x20 => (true, false, true),
-        0x40 | 0x80 => (true, true, true),
+        0x40 | 0x80 => (true, false, true),
         _ => (true, true, false),
     }
+}
+
+fn vm_sanitize_nt_prot(prot: u32) -> u32 {
+    let base = prot & 0xFF;
+    let sanitized_base = match base {
+        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY => PAGE_EXECUTE_READ,
+        0 => 0x04,
+        _ => base,
+    };
+    (prot & !0xFF) | sanitized_base
+}
+
+fn vm_fill_section_page(region: &VmRegion, idx: usize, gpa: u64) -> bool {
+    if !region.section_file_backed {
+        return true;
+    }
+    let page_off = (idx as u64) * PAGE_SIZE_4K;
+    if page_off >= region.section_view_size {
+        return true;
+    }
+    let remain = region.section_view_size - page_off;
+    let read_len = core::cmp::min(PAGE_SIZE_4K, remain) as usize;
+    let file_off = region.section_file_offset.saturating_add(page_off);
+    let read = hypercall::host_read(region.section_file_fd, gpa as *mut u8, read_len, file_off);
+    if read < read_len {
+        unsafe {
+            core::ptr::write_bytes((gpa as *mut u8).add(read), 0, read_len - read);
+        }
+    }
+    true
 }
 
 fn vm_alloc_zeroed_array<T>(count: usize) -> Option<*mut T> {
