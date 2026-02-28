@@ -22,6 +22,7 @@ pub struct HypercallManager {
     exe_path: std::path::PathBuf,
     memory: Arc<RwLock<GuestMemory>>,
     vaspace: Arc<Mutex<VaSpace>>,
+    phys_pool: Mutex<crate::phys::PhysPagePool>,
     files: FileTable,
     sections: SectionTable,
     pub sched: Arc<Scheduler>,
@@ -51,6 +52,7 @@ impl HypercallManager {
             exe_path,
             memory,
             vaspace: Arc::new(Mutex::new(VaSpace::new())),
+            phys_pool: Mutex::new(crate::phys::PhysPagePool::new()),
             files: FileTable::new(root_path),
             sections: SectionTable::new(),
             sched,
@@ -591,6 +593,27 @@ impl HypercallManager {
                 HypercallResult::Sync(if ok { 0 } else { 0xC000_0008 })
             }
             nr::NT_YIELD_EXECUTION => HypercallResult::Sched(SchedResult::Yield),
+            nr::ALLOC_PHYS_PAGES => {
+                let pages = args[0] as usize;
+                if pages == 0 {
+                    return HypercallResult::Sync(0);
+                }
+                let gpa = self
+                    .phys_pool
+                    .lock()
+                    .unwrap()
+                    .alloc_contiguous(pages)
+                    .unwrap_or(0);
+                log::debug!("ALLOC_PHYS_PAGES: pages={} gpa={:#x}", pages, gpa);
+                HypercallResult::Sync(gpa)
+            }
+            nr::FREE_PHYS_PAGES => {
+                let gpa = args[0];
+                let pages = args[1] as usize;
+                let ok = self.phys_pool.lock().unwrap().free_contiguous(gpa, pages);
+                log::debug!("FREE_PHYS_PAGES: gpa={:#x} pages={} ok={}", gpa, pages, ok);
+                HypercallResult::Sync(if ok { 0 } else { u64::MAX })
+            }
             // ── Host 文件操作 ──────────────────────────────────
             nr::HOST_OPEN => {
                 let path_gpa = winemu_core::addr::Gpa(args[0]);

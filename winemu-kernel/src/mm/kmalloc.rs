@@ -24,6 +24,29 @@ const PAGE_KIND_SLAB: u8 = 3;
 const PAGE_KIND_LARGE_HEAD: u8 = 4;
 const PAGE_KIND_LARGE_TAIL: u8 = 5;
 
+#[derive(Clone, Copy)]
+pub struct KmallocStats {
+    pub alloc_calls: u64,
+    pub free_calls: u64,
+    pub small_allocs: u64,
+    pub large_allocs: u64,
+    pub alloc_failures: u64,
+    pub invalid_frees: u64,
+}
+
+impl KmallocStats {
+    const fn new() -> Self {
+        Self {
+            alloc_calls: 0,
+            free_calls: 0,
+            small_allocs: 0,
+            large_allocs: 0,
+            alloc_failures: 0,
+            invalid_frees: 0,
+        }
+    }
+}
+
 struct SpinLock {
     locked: AtomicBool,
 }
@@ -112,6 +135,7 @@ struct AllocState {
     free_heads: [i16; NUM_ORDERS],
     pages: [PageMeta; MAX_PAGES],
     caches: [CacheMeta; NUM_CACHES],
+    stats: KmallocStats,
 }
 
 impl AllocState {
@@ -123,6 +147,7 @@ impl AllocState {
             free_heads: [NONE_I16; NUM_ORDERS],
             pages: [const { PageMeta::empty() }; MAX_PAGES],
             caches: [const { CacheMeta::empty() }; NUM_CACHES],
+            stats: KmallocStats::new(),
         }
     }
 
@@ -144,6 +169,7 @@ impl AllocState {
             self.caches[c].partial_head = NONE_I16;
             c += 1;
         }
+        self.stats = KmallocStats::new();
 
         // Build buddy free lists from available pages.
         let mut idx = 0usize;
@@ -413,6 +439,7 @@ impl AllocState {
         if self.pages[pidx].free_obj == NONE_U16 {
             self.cache_remove_partial(cache_idx, pidx);
         }
+        self.stats.small_allocs = self.stats.small_allocs.saturating_add(1);
         obj_ptr
     }
 
@@ -498,6 +525,7 @@ impl AllocState {
             None => return null_mut(),
         };
         self.mark_large_block(idx, order);
+        self.stats.large_allocs = self.stats.large_allocs.saturating_add(1);
         self.page_addr(idx) as *mut u8
     }
 
@@ -524,29 +552,51 @@ impl AllocState {
     }
 
     fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
+        self.stats.alloc_calls = self.stats.alloc_calls.saturating_add(1);
         if !self.initialized || size == 0 {
+            self.stats.alloc_failures = self.stats.alloc_failures.saturating_add(1);
             return null_mut();
         }
         let align = align.max(1);
         if let Some(cache_idx) = Self::cache_index_for(size, align) {
-            return self.alloc_small(cache_idx);
+            let ptr = self.alloc_small(cache_idx);
+            if ptr.is_null() {
+                self.stats.alloc_failures = self.stats.alloc_failures.saturating_add(1);
+            }
+            return ptr;
         }
-        self.alloc_large(size, align)
+        let ptr = self.alloc_large(size, align);
+        if ptr.is_null() {
+            self.stats.alloc_failures = self.stats.alloc_failures.saturating_add(1);
+        }
+        ptr
     }
 
     fn free(&mut self, ptr: *mut u8) {
+        self.stats.free_calls = self.stats.free_calls.saturating_add(1);
         if !self.initialized || ptr.is_null() {
+            self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
             return;
         }
         let p = ptr as usize;
         let Some(page_idx) = self.ptr_to_page(p) else {
+            self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
             return;
         };
         match self.pages[page_idx].kind {
             PAGE_KIND_SLAB => self.free_small(page_idx, p),
             PAGE_KIND_LARGE_HEAD => self.free_large(page_idx, p),
-            _ => {}
+            _ => {
+                self.stats.invalid_frees = self.stats.invalid_frees.saturating_add(1);
+            }
         }
+    }
+
+    fn contains(&self, ptr: *mut u8) -> bool {
+        if !self.initialized || ptr.is_null() {
+            return false;
+        }
+        self.ptr_to_page(ptr as usize).is_some()
     }
 }
 
@@ -591,4 +641,12 @@ pub fn alloc_zeroed(size: usize, align: usize) -> *mut u8 {
         }
     }
     ptr
+}
+
+pub fn contains(ptr: *mut u8) -> bool {
+    with_state_mut(|s| s.contains(ptr))
+}
+
+pub fn stats() -> KmallocStats {
+    with_state_mut(|s| s.stats)
 }

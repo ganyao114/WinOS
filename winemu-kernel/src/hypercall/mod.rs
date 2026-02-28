@@ -146,6 +146,16 @@ pub fn query_mono_time_100ns() -> u64 {
     hypercall(nr::QUERY_MONO_TIME, 0, 0, 0)
 }
 
+#[inline(always)]
+pub fn alloc_phys_pages(num_pages: u64) -> u64 {
+    hypercall6(nr::ALLOC_PHYS_PAGES, num_pages, 0, 0, 0, 0, 0)
+}
+
+#[inline(always)]
+pub fn free_phys_pages(gpa: u64, num_pages: u64) -> u64 {
+    hypercall6(nr::FREE_PHYS_PAGES, gpa, num_pages, 0, 0, 0, 0)
+}
+
 pub fn debug_u64(val: u64) {
     let hex = b"0123456789abcdef";
     let mut buf = [0u8; 18]; // "0x" + 16 hex digits

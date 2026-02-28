@@ -3,6 +3,7 @@ pub mod file_io;
 pub mod host_file;
 pub mod hypercall;
 pub mod memory;
+pub mod phys;
 pub mod sched;
 pub mod section;
 pub mod syscall;

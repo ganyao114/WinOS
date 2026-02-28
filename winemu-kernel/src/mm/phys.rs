@@ -9,6 +9,7 @@ use crate::hypercall;
 const CHUNK_PAGES: usize = 64;
 /// 每个 chunk 的字节大小
 const CHUNK_SIZE: usize = CHUNK_PAGES * 4096;
+const PAGE_SIZE: u64 = 4096;
 /// 最大 chunk 数
 const MAX_CHUNKS: usize = 64;
 /// 低水位：空闲页低于此值触发 grow
@@ -53,8 +54,8 @@ impl PhysAllocator {
             if chunk.bitmap != 0 {
                 let bit = chunk.bitmap.trailing_zeros() as u64;
                 chunk.bitmap &= !(1u64 << bit);
-                self.free_page_count -= 1;
-                return Some(chunk.base_gpa + bit * 4096);
+                self.free_page_count = self.free_page_count.saturating_sub(1);
+                return Some(chunk.base_gpa + bit * PAGE_SIZE);
             }
         }
         // Pool empty even after grow attempt — try once more
@@ -64,8 +65,8 @@ impl PhysAllocator {
             if chunk.bitmap != 0 {
                 let bit = chunk.bitmap.trailing_zeros() as u64;
                 chunk.bitmap &= !(1u64 << bit);
-                self.free_page_count -= 1;
-                return Some(chunk.base_gpa + bit * 4096);
+                self.free_page_count = self.free_page_count.saturating_sub(1);
+                return Some(chunk.base_gpa + bit * PAGE_SIZE);
             }
         }
         None
@@ -87,8 +88,8 @@ impl PhysAllocator {
                 if let Some(bit) = find_contiguous(self.chunks[i].bitmap, n, mask) {
                     let clear_mask = mask << bit;
                     self.chunks[i].bitmap &= !clear_mask;
-                    self.free_page_count -= n;
-                    return Some(self.chunks[i].base_gpa + (bit as u64) * 4096);
+                    self.free_page_count = self.free_page_count.saturating_sub(n);
+                    return Some(self.chunks[i].base_gpa + (bit as u64) * PAGE_SIZE);
                 }
             }
             if attempt == 0 { self.grow(); }
@@ -98,8 +99,15 @@ impl PhysAllocator {
 
     /// Free a single 4KB page.
     pub fn free_page(&mut self, gpa: u64) {
+        if (gpa & (PAGE_SIZE - 1)) != 0 {
+            return;
+        }
         if let Some((idx, bit)) = self.locate(gpa) {
-            self.chunks[idx].bitmap |= 1u64 << bit;
+            let mask = 1u64 << bit;
+            if (self.chunks[idx].bitmap & mask) != 0 {
+                return; // double free / invalid free
+            }
+            self.chunks[idx].bitmap |= mask;
             self.free_page_count += 1;
             self.try_shrink();
         }
@@ -107,9 +115,22 @@ impl PhysAllocator {
 
     /// Free n contiguous 4KB pages starting at gpa.
     pub fn free_pages(&mut self, gpa: u64, n: usize) {
-        if n == 0 { return; }
+        if n == 0 || n > CHUNK_PAGES || (gpa & (PAGE_SIZE - 1)) != 0 {
+            return;
+        }
         if let Some((idx, start_bit)) = self.locate(gpa) {
-            let mask = if n >= 64 { u64::MAX } else { ((1u64 << n) - 1) << start_bit };
+            let start = start_bit as usize;
+            if start + n > CHUNK_PAGES {
+                return;
+            }
+            let mask = if n == CHUNK_PAGES {
+                u64::MAX
+            } else {
+                ((1u64 << n) - 1) << start_bit
+            };
+            if (self.chunks[idx].bitmap & mask) != 0 {
+                return; // partially already free => invalid free
+            }
             self.chunks[idx].bitmap |= mask;
             self.free_page_count += n;
             self.try_shrink();
@@ -126,7 +147,7 @@ impl PhysAllocator {
         for i in 0..self.chunk_count {
             let c = &self.chunks[i];
             if gpa >= c.base_gpa && gpa < c.base_gpa + CHUNK_SIZE as u64 {
-                let bit = ((gpa - c.base_gpa) / 4096) as u32;
+                let bit = ((gpa - c.base_gpa) / PAGE_SIZE) as u32;
                 return Some((i, bit));
             }
         }

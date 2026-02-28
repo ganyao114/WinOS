@@ -32,8 +32,13 @@ impl VaSpace {
     pub fn set_base(&mut self, heap_start: u64) {
         // Align up to 64KB
         let base = (heap_start + 0xFFFF) & !0xFFFF;
-        // GuestMemory is 512MB: [0x40000000, 0x60000000)
-        let end = 0x6000_0000u64;
+        // GuestMemory is 512MB: [0x40000000, 0x60000000).
+        // Reserve top region for ALLOC_PHYS_PAGES pool.
+        let end = crate::phys::PHYS_POOL_BASE;
+        if base >= end {
+            self.regions.clear();
+            return;
+        }
         self.regions.clear();
         self.regions.insert(
             base,
