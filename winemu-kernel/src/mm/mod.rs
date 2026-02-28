@@ -9,6 +9,32 @@ static mut L0_TABLE: PageTable = PageTable([0u64; 512]);
 static mut L1_TABLE: PageTable = PageTable([0u64; 512]);
 static mut L2_TABLE: PageTable = PageTable([0u64; 512]);
 
+pub fn bootstrap_user_tables() -> (*const u64, *const u64, *const u64) {
+    unsafe {
+        (
+            (*core::ptr::addr_of!(L0_TABLE)).0.as_ptr(),
+            (*core::ptr::addr_of!(L1_TABLE)).0.as_ptr(),
+            (*core::ptr::addr_of!(L2_TABLE)).0.as_ptr(),
+        )
+    }
+}
+
+pub fn switch_process_ttbr0(new_ttbr0: u64) {
+    if new_ttbr0 == 0 {
+        return;
+    }
+    let cur = crate::arch::mmu::read_ttbr0_el1();
+    if (cur & !0xfff) == (new_ttbr0 & !0xfff) {
+        return;
+    }
+
+    crate::arch::mmu::write_ttbr0_el1(new_ttbr0);
+    crate::arch::mmu::dsb_ishst();
+    crate::arch::mmu::tlbi_vmalle1is();
+    crate::arch::mmu::dsb_ish();
+    crate::arch::mmu::isb();
+}
+
 pub fn init() {
     crate::hypercall::debug_print("mm::init: setup_mapping\n");
     unsafe { setup_kernel_mapping(); }

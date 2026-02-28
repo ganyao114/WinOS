@@ -1,7 +1,7 @@
 use crate::sched::sync::{
     self, close_handle_info, destroy_object_by_type, duplicate_handle, HANDLE_TYPE_EVENT,
     HANDLE_TYPE_FILE, HANDLE_TYPE_KEY, HANDLE_TYPE_MUTEX, HANDLE_TYPE_SECTION,
-    HANDLE_TYPE_SEMAPHORE, HANDLE_TYPE_THREAD, STATUS_SUCCESS,
+    HANDLE_TYPE_SEMAPHORE, HANDLE_TYPE_THREAD, HANDLE_TYPE_PROCESS, STATUS_SUCCESS,
 };
 use winemu_shared::status;
 
@@ -52,6 +52,7 @@ pub(crate) fn handle_close(frame: &mut SvcFrame) -> bool {
         || htype == HANDLE_TYPE_MUTEX
         || htype == HANDLE_TYPE_SEMAPHORE
         || htype == HANDLE_TYPE_THREAD
+        || htype == HANDLE_TYPE_PROCESS
     {
         frame.x[0] = destroy_object_by_type(htype, info.obj_idx) as u64;
         return true;

@@ -137,6 +137,7 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
             let (from_sched, to) = schedule(vid, now, quantum_100ns);
             if to != 0 {
                 set_vcpu_idle_locked(vid, false);
+                crate::process::switch_to_thread_process(to);
                 if from_sched != 0 && from_sched != to {
                     save_ctx_for(from_sched, frame);
                     restore_ctx_to_frame(to, frame);

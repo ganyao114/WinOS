@@ -11,6 +11,7 @@ mod kobj;
 mod ldr;
 mod mm;
 mod nt;
+mod process;
 mod sched;
 mod teb;
 mod timer;
@@ -132,6 +133,11 @@ pub extern "C" fn kernel_main() -> ! {
             hypercall::process_exit(1);
         }
     };
+
+    if !process::init_boot_process(loaded.base, teb_peb.peb_va) {
+        hypercall::debug_print("kernel: boot process init failed\n");
+        hypercall::process_exit(1);
+    }
 
     // ── 4. 通知 VMM 创建 Thread 0 ───────────────────────────
     let entry_va = loaded.base + loaded.entry_rva as u64;

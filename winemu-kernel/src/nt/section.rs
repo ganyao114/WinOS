@@ -21,8 +21,9 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
     } else {
         align_up_4k(unsafe { max_size_ptr.read_volatile().max(PAGE_SIZE_4K) })
     };
+    let owner_pid = crate::process::current_pid();
 
-    let idx = match section_alloc(size, prot, file_handle) {
+    let idx = match section_alloc(owner_pid, size, prot, file_handle) {
         Some(i) => i,
         None => {
             frame.x[0] = status::NO_MEMORY as u64;
@@ -72,8 +73,9 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     } else {
         win32_protect
     };
+    let owner_pid = crate::process::current_pid();
 
-    let base = match vm_alloc_region(map_size, prot) {
+    let base = match vm_alloc_region(owner_pid, map_size, prot) {
         Some(v) => v,
         None => {
             frame.x[0] = status::NO_MEMORY as u64;
@@ -87,8 +89,8 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
         }
     }
 
-    if !view_alloc(base, map_size) {
-        let _ = vm_free_region(base);
+    if !view_alloc(owner_pid, base, map_size) {
+        let _ = vm_free_region(owner_pid, base);
         frame.x[0] = status::NO_MEMORY as u64;
         return;
     }
@@ -105,8 +107,9 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
 // x1=BaseAddress
 pub(crate) fn handle_unmap_view_of_section(frame: &mut SvcFrame) {
     let base = frame.x[1];
-    let _ = view_free(base);
-    let _ = vm_free_region(base);
+    let owner_pid = crate::process::current_pid();
+    let _ = view_free(owner_pid, base);
+    let _ = vm_free_region(owner_pid, base);
     frame.x[0] = status::SUCCESS as u64;
 }
 

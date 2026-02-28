@@ -21,8 +21,9 @@ pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
     }
     let prot = frame.x[5] as u32;
     let size = align_up_4k(req_size);
+    let owner_pid = crate::process::current_pid();
 
-    let base = match vm_alloc_region(size, prot) {
+    let base = match vm_alloc_region(owner_pid, size, prot) {
         Some(v) => v,
         None => {
             frame.x[0] = status::NO_MEMORY as u64;
@@ -44,7 +45,8 @@ pub(crate) fn handle_free_virtual_memory(frame: &mut SvcFrame) {
         return;
     }
     let base = unsafe { base_ptr.read_volatile() };
-    let _ = vm_free_region(base);
+    let owner_pid = crate::process::current_pid();
+    let _ = vm_free_region(owner_pid, base);
     frame.x[0] = status::SUCCESS as u64;
 }
 
@@ -57,7 +59,8 @@ pub(crate) fn handle_protect_virtual_memory(frame: &mut SvcFrame) {
         return;
     }
     let base = unsafe { base_ptr.read_volatile() };
-    if let Some((idx, region)) = vm_find_region(base) {
+    let owner_pid = crate::process::current_pid();
+    if let Some((idx, region)) = vm_find_region(owner_pid, base) {
         if !old_ptr.is_null() {
             unsafe { old_ptr.write_volatile(region.prot) };
         }
@@ -78,8 +81,9 @@ pub(crate) fn handle_query_virtual_memory(frame: &mut SvcFrame) {
         frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
         return;
     }
+    let owner_pid = crate::process::current_pid();
 
-    let (base, size, prot, state) = if let Some((_, r)) = vm_find_region(addr) {
+    let (base, size, prot, state) = if let Some((_, r)) = vm_find_region(owner_pid, addr) {
         (r.base, r.size, r.prot, MEM_COMMIT)
     } else {
         (addr & PAGE_MASK_4K, PAGE_SIZE_4K, 0u32, 0u32)

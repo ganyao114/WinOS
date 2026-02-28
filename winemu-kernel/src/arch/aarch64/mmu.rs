@@ -57,6 +57,15 @@ pub fn write_ttbr0_el1(ttbr0: u64) {
 }
 
 #[inline(always)]
+pub fn read_ttbr0_el1() -> u64 {
+    let val: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) val, options(nostack));
+    }
+    val
+}
+
+#[inline(always)]
 pub fn read_sctlr_el1() -> u64 {
     let val: u64;
     unsafe {

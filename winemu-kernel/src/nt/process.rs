@@ -1,63 +1,50 @@
-use crate::hypercall;
 use winemu_shared::status;
 
 use super::SvcFrame;
 
-// x1=ProcessInformationClass, x2=Buffer, x3=BufferLength, x4=*ReturnLength
+// x0=ProcessHandle, x1=ProcessInformationClass, x2=Buffer, x3=BufferLength, x4=*ReturnLength
 pub(crate) fn handle_query_information_process(frame: &mut SvcFrame) {
+    let process_handle = frame.x[0];
     let info_class = frame.x[1] as u32;
     let buf = frame.x[2] as *mut u8;
     let buf_len = frame.x[3] as usize;
     let ret_len = frame.x[4] as *mut u32;
 
-    match info_class {
-        0 => {
-            if buf.is_null() || buf_len < 48 {
-                if !ret_len.is_null() {
-                    unsafe { ret_len.write_volatile(48) };
-                }
-                frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
-                return;
-            }
-            let mut pbi = [0u8; 48];
-            pbi[8..16].copy_from_slice(&0u64.to_le_bytes());
-            pbi[16..24].copy_from_slice(&1u64.to_le_bytes());
-            pbi[24..28].copy_from_slice(&8i32.to_le_bytes());
-            pbi[32..40].copy_from_slice(&1u64.to_le_bytes());
-            pbi[40..48].copy_from_slice(&0u64.to_le_bytes());
-            unsafe { core::ptr::copy_nonoverlapping(pbi.as_ptr(), buf, 48) };
-            if !ret_len.is_null() {
-                unsafe { ret_len.write_volatile(48) };
-            }
-            frame.x[0] = status::SUCCESS as u64;
-        }
-        27 => {
-            if buf.is_null() || buf_len < 16 {
-                if !ret_len.is_null() {
-                    unsafe { ret_len.write_volatile(16) };
-                }
-                frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
-                return;
-            }
-            unsafe { core::ptr::write_bytes(buf, 0, 16) };
-            if !ret_len.is_null() {
-                unsafe { ret_len.write_volatile(16) };
+    frame.x[0] =
+        crate::process::query_information_process(process_handle, info_class, buf, buf_len, ret_len)
+            as u64;
+}
+
+// NtCreateProcessEx:
+// x0=*ProcessHandle, x3=ParentProcess, x4=Flags, x5=SectionHandle
+pub(crate) fn handle_create_process(frame: &mut SvcFrame) {
+    let out_ptr = frame.x[0] as *mut u64;
+    let parent_handle = frame.x[3];
+    let flags = frame.x[4] as u32;
+    let section_handle = frame.x[5];
+
+    match crate::process::create_process(parent_handle, section_handle, flags) {
+        Ok(handle) => {
+            if !out_ptr.is_null() {
+                unsafe { out_ptr.write_volatile(handle) };
             }
             frame.x[0] = status::SUCCESS as u64;
         }
-        _ => {
-            frame.x[0] = status::INVALID_PARAMETER as u64;
+        Err(st) => {
+            frame.x[0] = st as u64;
         }
     }
 }
 
-pub(crate) fn handle_create_process(frame: &mut SvcFrame) {
-    let _ = frame.x[0];
-    frame.x[0] = status::NOT_IMPLEMENTED as u64;
-}
-
 // x0 = ProcessHandle, x1 = ExitStatus
 pub(crate) fn handle_terminate_process(frame: &mut SvcFrame) {
-    let code = frame.x[1] as u32;
-    hypercall::process_exit(code);
+    let process_handle = frame.x[0];
+    let exit_status = frame.x[1] as u32;
+
+    let Some(pid) = crate::process::resolve_process_handle(process_handle) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+
+    frame.x[0] = crate::process::terminate_process(pid, exit_status) as u64;
 }

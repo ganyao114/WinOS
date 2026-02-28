@@ -60,6 +60,7 @@ pub struct KThread {
     pub priority: u8, // NT priority 0–31 (31 = highest)
     pub base_priority: u8,
     pub tid: u32,
+    pub pid: u32,
     pub teb_va: u64,
     pub stack_base: u64,
     pub stack_size: u64,
@@ -91,6 +92,7 @@ impl KThread {
             priority: 8,
             base_priority: 8,
             tid: 0,
+            pid: 0,
             teb_va: 0,
             stack_base: 0,
             stack_size: 0,
@@ -118,6 +120,7 @@ impl KThread {
     fn init_spawned(
         &mut self,
         tid: u32,
+        pid: u32,
         pc: u64,
         sp: u64,
         arg: u64,
@@ -130,6 +133,7 @@ impl KThread {
         self.priority = priority;
         self.base_priority = priority;
         self.tid = tid;
+        self.pid = pid;
         self.teb_va = teb_va;
         self.stack_base = stack_base;
         self.stack_size = stack_size;
@@ -142,11 +146,12 @@ impl KThread {
         self.ctx.tpidr = teb_va;
     }
 
-    fn init_thread0(&mut self, tid: u32, teb_va: u64) {
+    fn init_thread0(&mut self, tid: u32, pid: u32, teb_va: u64) {
         self.state = ThreadState::Running;
         self.priority = 8;
         self.base_priority = 8;
         self.tid = tid;
+        self.pid = pid;
         self.teb_va = teb_va;
         self.ctx = ThreadContext::default();
         self.ctx.tpidr = teb_va;
@@ -155,7 +160,7 @@ impl KThread {
     pub fn basic_info_record(&self) -> [u8; THREAD_BASIC_INFORMATION_SIZE] {
         let mut tbi = [0u8; THREAD_BASIC_INFORMATION_SIZE];
         tbi[8..16].copy_from_slice(&self.teb_va.to_le_bytes());
-        tbi[16..24].copy_from_slice(&1u64.to_le_bytes());
+        tbi[16..24].copy_from_slice(&(self.pid as u64).to_le_bytes());
         tbi[24..32].copy_from_slice(&(self.tid as u64).to_le_bytes());
         tbi[32..40].copy_from_slice(&1u64.to_le_bytes());
         tbi[40..44].copy_from_slice(&(self.priority as i32).to_le_bytes());
@@ -614,6 +619,7 @@ pub(crate) fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
 
 /// 分配新 TID，初始化 KThread，加入就绪队列
 pub fn spawn(
+    pid: u32,
     pc: u64,
     sp: u64,
     arg: u64,
@@ -626,7 +632,7 @@ pub fn spawn(
     let tid = thread_store_mut()
         .alloc_with(|id| {
             let mut t = KThread::zeroed();
-            t.init_spawned(id, pc, sp, arg, teb_va, stack_base, stack_size, priority);
+            t.init_spawned(id, pid, pc, sp, arg, teb_va, stack_base, stack_size, priority);
             t
         })
         .unwrap_or(0);
@@ -653,6 +659,7 @@ fn normalize_stack_size(max_stack_size_arg: u64) -> u64 {
 }
 
 pub fn create_user_thread(
+    pid: u32,
     entry_va: u64,
     arg: u64,
     max_stack_size_arg: u64,
@@ -669,7 +676,16 @@ pub fn create_user_thread(
         .map_or(0, |p| p as u64);
     let stack_top = stack_base + stack_size;
 
-    let tid = spawn(entry_va, stack_top, arg, teb_va, stack_base, stack_size, priority);
+    let tid = spawn(
+        pid,
+        entry_va,
+        stack_top,
+        arg,
+        teb_va,
+        stack_base,
+        stack_size,
+        priority,
+    );
     if tid == 0 {
         crate::alloc::dealloc(stack_base as *mut u8);
         if teb_va != 0 {
@@ -677,6 +693,7 @@ pub fn create_user_thread(
         }
         return Err(CreateThreadError::NoMemory);
     }
+    crate::process::on_thread_created(pid, tid);
     Ok(tid)
 }
 
@@ -685,7 +702,8 @@ pub fn terminate_thread_by_tid(tid: u32) -> bool {
         return false;
     }
     sched_lock_acquire();
-    let (state, stack_base, teb_va) = with_thread(tid, |t| (t.state, t.stack_base, t.teb_va));
+    let (state, pid, stack_base, teb_va) =
+        with_thread(tid, |t| (t.state, t.pid, t.stack_base, t.teb_va));
     if state == ThreadState::Free || state == ThreadState::Terminated {
         sched_lock_release();
         return false;
@@ -705,6 +723,7 @@ pub fn terminate_thread_by_tid(tid: u32) -> bool {
     if teb_va != 0 {
         crate::alloc::dealloc(teb_va as *mut u8);
     }
+    crate::process::on_thread_terminated(pid, tid);
     true
 }
 
@@ -713,6 +732,34 @@ pub fn thread_basic_info(tid: u32) -> Option<[u8; THREAD_BASIC_INFORMATION_SIZE]
         return None;
     }
     Some(with_thread(tid, |t| t.basic_info_record()))
+}
+
+pub fn thread_pid(tid: u32) -> Option<u32> {
+    if tid == 0 || !thread_exists(tid) {
+        return None;
+    }
+    Some(with_thread(tid, |t| t.pid))
+}
+
+pub fn thread_ids_by_pid(pid: u32) -> Vec<u32> {
+    if pid == 0 {
+        return Vec::new();
+    }
+    unsafe {
+        let Some(store) = (&*SCHED.threads.get()).as_ref() else {
+            return Vec::new();
+        };
+        let mut tids = Vec::new();
+        store.for_each_live_ptr(|tid, ptr| {
+            let t = &*ptr;
+            if t.pid == pid && t.state != ThreadState::Free && t.state != ThreadState::Terminated
+            {
+                let _ = tids.try_reserve(1);
+                tids.push(tid);
+            }
+        });
+        tids
+    }
 }
 
 // ── 调度核心 ──────────────────────────────────────────────────
@@ -849,6 +896,9 @@ pub fn set_initial_thread(vcpu_id: usize, tid: u32) {
         vcpu.current_tid = tid;
         set_thread_state_locked(tid, ThreadState::Running);
         set_tpidr_el1(vcpu_id, tid);
+        if let Some(pid) = thread_pid(tid) {
+            crate::process::set_current_vcpu_pid(vcpu_id, pid);
+        }
     }
     sched_lock_release();
 }
@@ -856,19 +906,22 @@ pub fn set_initial_thread(vcpu_id: usize, tid: u32) {
 /// Lazily register Thread 0 on first SVC entry.
 /// Called at the top of svc_dispatch when current_tid() == 0.
 pub fn register_thread0(teb_va: u64) {
+    let pid = crate::process::boot_pid();
     let tid = thread_store_mut().alloc_with(|id| {
         let mut t = KThread::zeroed();
-        t.init_thread0(id, teb_va);
+        t.init_thread0(id, pid, teb_va);
         t
     });
     let Some(tid) = tid else {
         return;
     };
+    crate::process::on_thread_created(pid, tid);
     unsafe {
         let vid = vcpu_id().min(MAX_VCPUS - 1);
         let vcpu = &mut (*SCHED.vcpus.get())[vid];
         vcpu.current_tid = tid;
         set_tpidr_el1(vid, tid);
+        crate::process::set_current_vcpu_pid(vid, pid);
     }
 }
 /// Returns true if all allocated threads are Terminated or Free (process can exit).

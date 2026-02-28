@@ -37,7 +37,8 @@ pub(crate) fn handle_create_file(frame: &mut SvcFrame) {
         frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
         return;
     }
-    let idx = match file_alloc(fd) {
+    let owner_pid = crate::process::current_pid();
+    let idx = match file_alloc(owner_pid, fd) {
         Some(v) => v,
         None => {
             hypercall::host_close(fd);

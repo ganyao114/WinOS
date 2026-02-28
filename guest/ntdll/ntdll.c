@@ -7,13 +7,21 @@
 
 /* NT syscall numbers (Windows 11 ARM64) */
 #define NR_TERMINATE_PROCESS    0x002C
+#define NR_TERMINATE_THREAD     0x0053
 #define NR_WRITE_FILE           0x0008
+#define NR_WAIT_SINGLE          0x0004
+#define NR_CLOSE                0x000F
+#define NR_QUERY_INFORMATION_PROCESS 0x0019
+#define NR_DUPLICATE_OBJECT     0x003C
+#define NR_YIELD_EXECUTION      0x0046
 #define NR_ALLOCATE_VIRTUAL_MEM 0x0018
 #define NR_FREE_VIRTUAL_MEM     0x001E
 #define NR_QUERY_VIRTUAL_MEM    0x0023
 #define NR_CREATE_SECTION       0x004A
+#define NR_CREATE_PROCESS_EX    0x004B
 #define NR_MAP_VIEW_OF_SECTION  0x0028
 #define NR_UNMAP_VIEW_OF_SECTION 0x002A
+#define NR_CREATE_THREAD_EX     0x00C1
 #define NR_DELETE_VALUE_KEY     0x006A
 
 typedef uint32_t NTSTATUS;
@@ -71,15 +79,80 @@ static inline NTSTATUS syscall4(uint64_t nr,
 
 /* ── Process ─────────────────────────────────────────────────── */
 
-EXPORT __attribute__((noreturn))
-void NtTerminateProcess(HANDLE process, NTSTATUS exit_code) {
-    syscall2(NR_TERMINATE_PROCESS, (uint64_t)process, (uint64_t)exit_code);
-    __builtin_unreachable();
+EXPORT NTSTATUS NtTerminateProcess(HANDLE process, NTSTATUS exit_code) {
+    return syscall2(NR_TERMINATE_PROCESS, (uint64_t)process, (uint64_t)exit_code);
 }
 
 EXPORT __attribute__((noreturn))
 void RtlExitUserProcess(NTSTATUS exit_code) {
-    NtTerminateProcess((HANDLE)0, exit_code);
+    (void)NtTerminateProcess((HANDLE)0, exit_code);
+    for (;;) {}
+}
+
+EXPORT __attribute__((noreturn))
+void NtTerminateThread(HANDLE thread, NTSTATUS exit_code) {
+    syscall2(NR_TERMINATE_THREAD, (uint64_t)thread, (uint64_t)exit_code);
+    __builtin_unreachable();
+}
+
+EXPORT NTSTATUS NtYieldExecution(void) {
+    return syscall2(NR_YIELD_EXECUTION, 0, 0);
+}
+
+EXPORT NTSTATUS NtClose(HANDLE handle) {
+    return syscall2(NR_CLOSE, (uint64_t)handle, 0);
+}
+
+EXPORT NTSTATUS NtWaitForSingleObject(HANDLE handle, UCHAR alertable, int64_t* timeout) {
+    return syscall6(
+        NR_WAIT_SINGLE,
+        (uint64_t)handle,
+        (uint64_t)alertable,
+        (uint64_t)timeout,
+        0,
+        0,
+        0
+    );
+}
+
+EXPORT NTSTATUS NtQueryInformationProcess(
+    HANDLE process, ULONG info_class, void* buf, ULONG len, ULONG* ret_len)
+{
+    return syscall6(
+        NR_QUERY_INFORMATION_PROCESS,
+        (uint64_t)process,
+        (uint64_t)info_class,
+        (uint64_t)buf,
+        (uint64_t)len,
+        (uint64_t)ret_len,
+        0
+    );
+}
+
+__attribute__((naked))
+EXPORT NTSTATUS NtCreateProcessEx(
+    HANDLE* process_handle, ULONG access, void* object_attributes,
+    HANDLE parent_process, ULONG flags, HANDLE section_handle,
+    HANDLE debug_port, HANDLE exception_port, ULONG job_member_level)
+{
+    asm volatile(
+        "mov x8, %0\n"
+        "svc #0\n"
+        "ret\n"
+        :: "i"(NR_CREATE_PROCESS_EX));
+}
+
+__attribute__((naked))
+EXPORT NTSTATUS NtDuplicateObject(
+    HANDLE source_process, HANDLE source_handle,
+    HANDLE target_process, HANDLE* target_handle,
+    ULONG desired_access, ULONG attributes, ULONG options)
+{
+    asm volatile(
+        "mov x8, %0\n"
+        "svc #0\n"
+        "ret\n"
+        :: "i"(NR_DUPLICATE_OBJECT));
 }
 
 /* ── TEB ─────────────────────────────────────────────────────── */
@@ -293,6 +366,20 @@ EXPORT NTSTATUS NtMapViewOfSection(
 
 EXPORT NTSTATUS NtUnmapViewOfSection(void* process, void* base) {
     return syscall2(NR_UNMAP_VIEW_OF_SECTION, (uint64_t)process, (uint64_t)base);
+}
+
+__attribute__((naked))
+EXPORT NTSTATUS NtCreateThreadEx(
+    HANDLE* thread_handle, ULONG access, void* object_attributes,
+    HANDLE process_handle, void* start_routine, void* argument,
+    ULONG create_flags, size_t zero_bits, size_t stack_size,
+    size_t max_stack_size, void* attribute_list)
+{
+    asm volatile(
+        "mov x8, %0\n"
+        "svc #0\n"
+        "ret\n"
+        :: "i"(NR_CREATE_THREAD_EX));
 }
 
 /* ── Registry ────────────────────────────────────────────────── */
