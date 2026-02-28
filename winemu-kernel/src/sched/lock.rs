@@ -4,11 +4,11 @@ use super::{commit_deferred_scheduling_locked, vcpu_id, SCHED};
 // lock_owner 存 vcpu_id+1（0 = 未持有）。
 
 fn spinlock_acquire() {
-    crate::arch::spin::lock_u32(SCHED.spinlock.get());
+    crate::arch::spin::lock_word(SCHED.spinlock.get());
 }
 
 fn spinlock_release() {
-    crate::arch::spin::unlock_u32(SCHED.spinlock.get());
+    crate::arch::spin::unlock_word(SCHED.spinlock.get());
 }
 
 pub fn sched_lock_acquire() {

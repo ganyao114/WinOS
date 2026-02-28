@@ -24,16 +24,12 @@ pub fn switch_process_ttbr0(new_ttbr0: u64) {
     if new_ttbr0 == 0 {
         return;
     }
-    let cur = crate::arch::mmu::read_ttbr0_el1();
+    let cur = crate::arch::mmu::current_user_table_root();
     if (cur & !0xfff) == (new_ttbr0 & !0xfff) {
         return;
     }
 
-    crate::arch::mmu::write_ttbr0_el1(new_ttbr0);
-    crate::arch::mmu::dsb_ishst();
-    crate::arch::mmu::tlbi_vmalle1is();
-    crate::arch::mmu::dsb_ish();
-    crate::arch::mmu::isb();
+    crate::arch::mmu::switch_user_table_root(new_ttbr0);
 }
 
 pub fn init() {
@@ -71,19 +67,16 @@ unsafe fn setup_kernel_mapping() {
 }
 
 unsafe fn enable_mmu() {
-    crate::arch::mmu::dsb_ishst();
-    crate::arch::mmu::tlbi_vmalle1is();
-    crate::arch::mmu::dsb_ish();
-    crate::arch::mmu::isb();
+    crate::arch::mmu::flush_tlb_global();
     crate::hypercall::debug_print("mmu: tlbi done\n");
 
     // MAIR_EL1 attr0 = normal memory (inner/outer WB WA)
     let mair: u64 = 0x00ff;
-    crate::arch::mmu::write_mair_el1(mair);
-    crate::hypercall::debug_print("mmu: mair done\n");
+    crate::hypercall::debug_print("mmu: mair prepared\n");
 
-    let mmfr0 = crate::arch::mmu::read_id_aa64mmfr0_el1();
-    let parange = mmfr0 & 0xf;
+    let features = crate::arch::mmu::memory_features();
+    let mmfr0 = features.raw;
+    let parange = features.physical_addr_range as u64;
     let tgran4 = (mmfr0 >> 28) & 0xf;
     let tgran64 = (mmfr0 >> 24) & 0xf;
 
@@ -111,15 +104,13 @@ unsafe fn enable_mmu() {
     crate::hypercall::debug_print(" tcr=");
     crate::hypercall::debug_u64(tcr);
     crate::hypercall::debug_print("\n");
-    crate::arch::mmu::write_tcr_el1(tcr);
+    crate::arch::mmu::mmu_init(crate::arch::mmu::TranslationConfig {
+        memory_attrs: mair,
+        translation_control: tcr,
+        user_table_root: core::ptr::addr_of!(L0_TABLE) as u64,
+    });
     crate::hypercall::debug_print("mmu: tcr done\n");
-
-    let ttbr0 = core::ptr::addr_of!(L0_TABLE) as u64;
-    crate::arch::mmu::write_ttbr0_el1(ttbr0);
     crate::hypercall::debug_print("mmu: ttbr0 done\n");
-
-    crate::arch::mmu::dsb_ish();
-    crate::arch::mmu::isb();
 
     let l0_addr = core::ptr::addr_of!(L0_TABLE) as u64;
     let l1_addr = core::ptr::addr_of!(L1_TABLE) as u64;
@@ -147,7 +138,7 @@ unsafe fn enable_mmu() {
     crate::hypercall::debug_u64(l2e1);
     crate::hypercall::debug_print("\n");
 
-    let mut sctlr = crate::arch::mmu::read_sctlr_el1();
+    let mut sctlr = crate::arch::mmu::read_system_control();
     crate::hypercall::debug_print("mmu: sctlr before ");
     crate::hypercall::debug_u64(sctlr);
     crate::hypercall::debug_print("\n");
@@ -165,8 +156,8 @@ unsafe fn enable_mmu() {
     crate::hypercall::debug_print("\n");
     crate::hypercall::debug_print("mmu: enabling MMU...\n");
     crate::hypercall::debug_print("mmu: write sctlr\n");
-    crate::arch::mmu::write_sctlr_el1(sctlr);
+    crate::arch::mmu::write_system_control(sctlr);
     crate::hypercall::debug_print("mmu: wrote sctlr\n");
-    crate::arch::mmu::isb();
+    crate::arch::mmu::instruction_barrier();
     crate::hypercall::debug_print("mmu: isb after sctlr\n");
 }

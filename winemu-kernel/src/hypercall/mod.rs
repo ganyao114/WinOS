@@ -4,7 +4,7 @@ use winemu_shared::nr;
 /// x0 = nr, x1-x6 = args, 返回值在 x0
 #[inline(always)]
 pub fn hypercall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
-    crate::arch::hypercall::call6(nr, a0, a1, a2, a3, a4, a5)
+    crate::arch::hypercall::invoke6(nr, a0, a1, a2, a3, a4, a5)
 }
 
 #[inline(always)]
@@ -25,7 +25,7 @@ pub fn debug_print(msg: &str) {
 pub fn process_exit(code: u32) -> ! {
     hypercall(nr::PROCESS_EXIT, code as u64, 0, 0);
     loop {
-        crate::arch::cpu::wfi();
+        crate::arch::cpu::wait_for_interrupt();
     }
 }
 
@@ -36,7 +36,7 @@ pub fn thread_create(entry_va: u64, stack_va: u64, arg: u64, teb_gva: u64) -> u6
 pub fn thread_exit(code: u32) -> ! {
     hypercall(nr::THREAD_EXIT, code as u64, 0, 0);
     loop {
-        crate::arch::cpu::wfi();
+        crate::arch::cpu::wait_for_interrupt();
     }
 }
 

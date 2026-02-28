@@ -20,3 +20,13 @@ pub fn unlock_u32(spinlock_ptr: *mut u32) {
         core::arch::asm!("stlr wzr, [{}]", in(reg) spinlock_ptr, options(nostack));
     }
 }
+
+#[inline(always)]
+pub fn lock_word(lock_ptr: *mut u32) {
+    lock_u32(lock_ptr);
+}
+
+#[inline(always)]
+pub fn unlock_word(lock_ptr: *mut u32) {
+    unlock_u32(lock_ptr);
+}

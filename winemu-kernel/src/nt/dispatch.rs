@@ -154,13 +154,13 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
                 }
                 let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
                 sched_lock_release();
-                timer::arm_running_slice_100ns(now, next_deadline, slice_remaining);
+                timer::schedule_running_slice_100ns(now, next_deadline, slice_remaining);
                 return from_sched != to;
             }
 
             if !allow_idle_wait {
                 sched_lock_release();
-                timer::arm_running_slice_100ns(now, next_deadline, quantum_100ns);
+                timer::schedule_running_slice_100ns(now, next_deadline, quantum_100ns);
                 return false;
             }
 
@@ -181,7 +181,7 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
 
         let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
         sched_lock_release();
-        timer::arm_running_slice_100ns(now, next_deadline, slice_remaining);
+        timer::schedule_running_slice_100ns(now, next_deadline, slice_remaining);
         return false;
     }
 }
@@ -193,8 +193,8 @@ pub extern "C" fn timer_irq_dispatch(frame: &mut SvcFrame) {
 
 #[no_mangle]
 pub extern "C" fn el1_fault_dispatch(frame: &mut SvcFrame) {
-    let esr = crate::arch::cpu::read_esr_el1();
-    let far = crate::arch::cpu::read_far_el1();
+    let esr = crate::arch::cpu::current_fault_syndrome();
+    let far = crate::arch::cpu::current_fault_address();
     hypercall::debug_u64(EL1_FAULT_ESR_TAG | esr);
     hypercall::debug_u64(EL1_FAULT_FAR_TAG | far);
     hypercall::debug_u64(EL1_FAULT_ELR_TAG | frame.elr);
@@ -204,8 +204,8 @@ pub extern "C" fn el1_fault_dispatch(frame: &mut SvcFrame) {
 
 #[no_mangle]
 pub extern "C" fn el0_fault_dispatch(frame: &mut SvcFrame) {
-    let esr = crate::arch::cpu::read_esr_el1();
-    let far = crate::arch::cpu::read_far_el1();
+    let esr = crate::arch::cpu::current_fault_syndrome();
+    let far = crate::arch::cpu::current_fault_address();
     hypercall::debug_u64(EL0_FAULT_ESR_TAG | esr);
     hypercall::debug_u64(EL0_FAULT_FAR_TAG | far);
     hypercall::debug_u64(EL0_FAULT_ELR_TAG | frame.elr);

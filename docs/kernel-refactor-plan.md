@@ -21,6 +21,7 @@
 - Phase A：已完成
   - 已建立 `arch/` 抽象层并迁移 ARM64 启动、向量、中断计时器、系统寄存器、HVC/WFI、自旋锁和 MMU 寄存器访问。
   - 业务模块已改为通过 `arch::*` 调用平台能力。
+  - 已将后端绑定点统一为 `arch::backend`，并建立多架构能力契约文档：`docs/arch-backend-contract.md`。
 - Phase B：进行中（高优先级项已落地）
   - 已新增并接入 `nt/sysno.rs`、`nt/constants.rs`、`nt/status.rs`。
   - 已将 SVC tag 解析位段、关键结构尺寸、线程信息类、故障调试 tag、handle 编码位段等魔法值收敛为常量。

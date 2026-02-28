@@ -141,6 +141,11 @@ pub fn arm_running_slice_100ns(now_100ns: u64, next_deadline_100ns: u64, quantum
 }
 
 #[inline(always)]
+pub fn schedule_running_slice_100ns(now_100ns: u64, next_deadline_100ns: u64, quantum_100ns: u64) {
+    arm_running_slice_100ns(now_100ns, next_deadline_100ns, quantum_100ns);
+}
+
+#[inline(always)]
 pub fn idle_wait_until_deadline_100ns(now_100ns: u64, next_deadline_100ns: u64) {
     let delta = next_idle_sleep_100ns(now_100ns, next_deadline_100ns);
     arm_vtimer_oneshot_100ns(delta);

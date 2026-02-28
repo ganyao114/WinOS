@@ -279,3 +279,8 @@ pub fn install() {
         );
     }
 }
+
+#[inline(always)]
+pub fn install_exception_vectors() {
+    install();
+}

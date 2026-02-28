@@ -91,3 +91,28 @@ pub fn wfi() {
         core::arch::asm!("wfi", options(nostack));
     }
 }
+
+#[inline(always)]
+pub fn cpu_local_read() -> u64 {
+    read_tpidr_el1()
+}
+
+#[inline(always)]
+pub fn cpu_local_write(value: u64) {
+    write_tpidr_el1(value);
+}
+
+#[inline(always)]
+pub fn fault_syndrome_read() -> u64 {
+    read_esr_el1()
+}
+
+#[inline(always)]
+pub fn fault_address_read() -> u64 {
+    read_far_el1()
+}
+
+#[inline(always)]
+pub fn wait_for_interrupt() {
+    wfi();
+}

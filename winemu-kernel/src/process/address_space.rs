@@ -420,8 +420,5 @@ fn build_user_pte(pa: u64, prot: u32) -> u64 {
 }
 
 fn flush_tlb_all() {
-    crate::arch::mmu::dsb_ishst();
-    crate::arch::mmu::tlbi_vmalle1is();
-    crate::arch::mmu::dsb_ish();
-    crate::arch::mmu::isb();
+    crate::arch::mmu::flush_tlb_global();
 }

@@ -432,17 +432,17 @@ pub fn with_thread_mut<R>(tid: u32, f: impl FnOnce(&mut KThread) -> R) -> R {
 
 pub fn current_tid() -> u32 {
     // Read TPIDR_EL1 low 32 bits — set by svc_dispatch on entry.
-    crate::arch::cpu::read_tpidr_el1() as u32
+    crate::arch::cpu::current_cpu_local() as u32
 }
 
 pub fn vcpu_id() -> usize {
     // High 32 bits of TPIDR_EL1 hold vcpu_id.
-    (crate::arch::cpu::read_tpidr_el1() >> 32) as usize
+    (crate::arch::cpu::current_cpu_local() >> 32) as usize
 }
 
-pub fn set_tpidr_el1(vcpu_id: usize, tid: u32) {
+pub fn set_current_cpu_thread(vcpu_id: usize, tid: u32) {
     let val = ((vcpu_id as u64) << 32) | (tid as u64);
-    crate::arch::cpu::write_tpidr_el1(val);
+    crate::arch::cpu::set_current_cpu_local(val);
 }
 
 pub fn current_thread_mut<R>(f: impl FnOnce(&mut KThread) -> R) -> R {
@@ -772,7 +772,7 @@ pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32
         let mut cur_tid = vcpu.current_tid;
         if cur_tid != 0 && !thread_exists(cur_tid) {
             vcpu.current_tid = 0;
-            set_tpidr_el1(vcpu_id, 0);
+            set_current_cpu_thread(vcpu_id, 0);
             cur_tid = 0;
         }
         let cur_running = cur_tid != 0 && with_thread(cur_tid, |t| t.state == ThreadState::Running);
@@ -797,7 +797,7 @@ pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32
             }
             // No runnable threads at all → WFI
             vcpu.current_tid = 0;
-            set_tpidr_el1(vcpu_id, 0);
+            set_current_cpu_thread(vcpu_id, 0);
             return (cur_tid, 0);
         }
 
@@ -826,7 +826,7 @@ pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32
             t.last_start_100ns = now_100ns;
         });
         vcpu.current_tid = next_tid;
-        set_tpidr_el1(vcpu_id, next_tid);
+        set_current_cpu_thread(vcpu_id, next_tid);
 
         (cur_tid, next_tid)
     }
@@ -839,7 +839,7 @@ pub fn block_current(vcpu_id: usize, deadline: u64) -> (u32, u32) {
         let mut cur_tid = vcpu.current_tid;
         if cur_tid != 0 && !thread_exists(cur_tid) {
             vcpu.current_tid = 0;
-            set_tpidr_el1(vcpu_id, 0);
+            set_current_cpu_thread(vcpu_id, 0);
             cur_tid = 0;
         }
         if cur_tid != 0 {
@@ -854,7 +854,7 @@ pub fn block_current(vcpu_id: usize, deadline: u64) -> (u32, u32) {
 
         set_thread_state_locked(next_tid, ThreadState::Running);
         vcpu.current_tid = next_tid;
-        set_tpidr_el1(vcpu_id, next_tid);
+        set_current_cpu_thread(vcpu_id, next_tid);
         (cur_tid, next_tid)
     }
 }
@@ -907,7 +907,7 @@ pub fn set_initial_thread(vcpu_id: usize, tid: u32) {
         let vcpu = &mut (*SCHED.vcpus.get())[vcpu_id];
         vcpu.current_tid = tid;
         set_thread_state_locked(tid, ThreadState::Running);
-        set_tpidr_el1(vcpu_id, tid);
+        set_current_cpu_thread(vcpu_id, tid);
         if let Some(pid) = thread_pid(tid) {
             crate::process::set_current_vcpu_pid(vcpu_id, pid);
         }
@@ -932,7 +932,7 @@ pub fn register_thread0(teb_va: u64) {
         let vid = vcpu_id().min(MAX_VCPUS - 1);
         let vcpu = &mut (*SCHED.vcpus.get())[vid];
         vcpu.current_tid = tid;
-        set_tpidr_el1(vid, tid);
+        set_current_cpu_thread(vid, tid);
         crate::process::set_current_vcpu_pid(vid, pid);
     }
 }
@@ -1136,7 +1136,7 @@ pub fn charge_current_runtime_locked(vcpu_id: usize, now_100ns: u64, quantum_100
         }
         if !thread_exists(cur_tid) {
             vcpu.current_tid = 0;
-            set_tpidr_el1(vcpu_id, 0);
+            set_current_cpu_thread(vcpu_id, 0);
             return false;
         }
         let mut expired = false;
@@ -1173,7 +1173,7 @@ pub fn rotate_current_on_quantum_expire_locked(vcpu_id: usize, quantum_100ns: u6
         }
         if !thread_exists(cur_tid) {
             vcpu.current_tid = 0;
-            set_tpidr_el1(vcpu_id, 0);
+            set_current_cpu_thread(vcpu_id, 0);
             return;
         }
         let is_running = with_thread(cur_tid, |t| t.state == ThreadState::Running);
@@ -1197,7 +1197,7 @@ pub fn current_slice_remaining_100ns(vcpu_id: usize, default_100ns: u64) -> u64 
         }
         if !thread_exists(cur_tid) {
             vcpu.current_tid = 0;
-            set_tpidr_el1(vcpu_id, 0);
+            set_current_cpu_thread(vcpu_id, 0);
             return default_100ns.max(1);
         }
         with_thread(cur_tid, |t| {
