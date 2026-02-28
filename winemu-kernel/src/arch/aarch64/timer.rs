@@ -147,7 +147,19 @@ pub fn schedule_running_slice_100ns(now_100ns: u64, next_deadline_100ns: u64, qu
 
 #[inline(always)]
 pub fn idle_wait_until_deadline_100ns(now_100ns: u64, next_deadline_100ns: u64) {
-    let delta = next_idle_sleep_100ns(now_100ns, next_deadline_100ns);
-    arm_vtimer_oneshot_100ns(delta);
-    wait_for_timer_irq();
+    // NOTE:
+    // HVF WFI exits are currently handled in host vcpu loop that is still
+    // coupled with legacy host-side scheduling state. Using WFI here can
+    // deadlock delay wakeups when guest has no runnable thread.
+    //
+    // Keep running-thread preemption on vtimer IRQs, but use monotonic polling
+    // in idle path so timeout wakeups remain correct.
+    let target = if next_deadline_100ns > now_100ns {
+        next_deadline_100ns
+    } else {
+        now_100ns.saturating_add(10_000) // 1ms fallback
+    };
+    while crate::hypercall::query_mono_time_100ns() < target {
+        core::hint::spin_loop();
+    }
 }

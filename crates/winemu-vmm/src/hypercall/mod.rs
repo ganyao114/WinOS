@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use winemu_core::hypercall::nr;
 
+// HOST_MMAP can be used before KERNEL_READY (guest DLL resolve during boot).
+// Keep that early mapping away from kernel image/heap region to avoid clobbering.
+const EARLY_HOST_MMAP_BASE: u64 = 0x5000_0000;
+
 pub enum HypercallResult {
     Sync(u64),
     Sched(SchedResult),
@@ -44,8 +48,7 @@ impl HypercallManager {
         let syscall_disp = SyscallDispatcher::new(&syscall_table_toml);
         let host_files = HostFileTable::new(root_path.clone());
         let mut vaspace = VaSpace::new();
-        let guest_base = memory.read().unwrap().base_gpa().0;
-        vaspace.set_base(guest_base);
+        vaspace.set_base(EARLY_HOST_MMAP_BASE);
         Self {
             syscall_table_toml,
             exe_image,
