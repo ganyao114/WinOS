@@ -128,8 +128,12 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
     let stack_top = stack_base + stack_size;
     let teb_va = crate::alloc::alloc_zeroed(0x1000, 0x1000).map_or(0, |p| p as u64);
 
-    let tid = spawn(entry_va, stack_top, arg, teb_va, 8);
+    let tid = spawn(entry_va, stack_top, arg, teb_va, stack_base, stack_size, 8);
     if tid == 0 {
+        crate::alloc::dealloc(stack_base as *mut u8);
+        if teb_va != 0 {
+            crate::alloc::dealloc(teb_va as *mut u8);
+        }
         frame.x[0] = 0xC000_0017u64;
         return;
     }

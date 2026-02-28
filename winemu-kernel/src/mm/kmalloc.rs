@@ -7,8 +7,11 @@ const NONE_I16: i16 = -1;
 const NONE_U16: u16 = u16::MAX;
 
 const MAX_PAGES: usize = 1024; // 4 MiB / 4 KiB
+const MAX_ARENAS: usize = 8;
 const MAX_ORDER: usize = 10; // 2^10 pages = 1024 pages
 const NUM_ORDERS: usize = MAX_ORDER + 1;
+const DYNAMIC_ARENA_PAGES: usize = MAX_PAGES;
+const DYNAMIC_HIGH_WATER_PAGES: usize = DYNAMIC_ARENA_PAGES * 2;
 
 const SLAB_MIN_SHIFT: usize = 3; // 8 bytes
 const SLAB_MAX_SHIFT: usize = 11; // 2048 bytes
@@ -735,6 +738,24 @@ impl AllocState {
         self.ptr_to_page(ptr as usize).is_some()
     }
 
+    fn free_pages_total(&self) -> usize {
+        let mut total = 0usize;
+        let mut order = 0usize;
+        while order < NUM_ORDERS {
+            total = total.saturating_add((self.count_free_blocks_for_order(order) as usize) << order);
+            order += 1;
+        }
+        total
+    }
+
+    fn is_completely_free(&self) -> bool {
+        self.initialized && self.free_pages_total() == self.heap_pages
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
     fn count_free_blocks_for_order(&self, order: usize) -> u16 {
         let mut count = 0usize;
         let mut steps = 0usize;
@@ -809,20 +830,290 @@ impl AllocState {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ArenaMeta {
+    active: bool,
+    dynamic: bool,
+    base_gpa: u64,
+    pages: usize,
+}
+
+impl ArenaMeta {
+    const fn empty() -> Self {
+        Self {
+            active: false,
+            dynamic: false,
+            base_gpa: 0,
+            pages: 0,
+        }
+    }
+}
+
+struct KmallocManager {
+    arenas: [AllocState; MAX_ARENAS],
+    metas: [ArenaMeta; MAX_ARENAS],
+}
+
+impl KmallocManager {
+    const fn new() -> Self {
+        Self {
+            arenas: [const { AllocState::new() }; MAX_ARENAS],
+            metas: [const { ArenaMeta::empty() }; MAX_ARENAS],
+        }
+    }
+
+    fn init(&mut self, heap_base: usize, heap_size: usize) {
+        let mut i = 0usize;
+        while i < MAX_ARENAS {
+            self.arenas[i].reset();
+            self.metas[i] = ArenaMeta::empty();
+            i += 1;
+        }
+
+        self.arenas[0].init(heap_base, heap_size);
+        self.metas[0] = ArenaMeta {
+            active: true,
+            dynamic: false,
+            base_gpa: heap_base as u64,
+            pages: core::cmp::min(MAX_PAGES, heap_size / PAGE_SIZE),
+        };
+    }
+
+    fn find_free_slot(&self) -> Option<usize> {
+        let mut i = 1usize;
+        while i < MAX_ARENAS {
+            if !self.metas[i].active {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn grow_dynamic_arena(&mut self, min_pages: usize) -> Option<usize> {
+        let slot = self.find_free_slot()?;
+        let pages = core::cmp::max(DYNAMIC_ARENA_PAGES, min_pages);
+        if pages > MAX_PAGES {
+            return None;
+        }
+        let gpa = crate::mm::phys::alloc_pages(pages)?;
+        self.arenas[slot].init(gpa as usize, pages * PAGE_SIZE);
+        self.metas[slot] = ArenaMeta {
+            active: true,
+            dynamic: true,
+            base_gpa: gpa,
+            pages,
+        };
+        Some(slot)
+    }
+
+    fn release_dynamic_arena(&mut self, idx: usize) {
+        let meta = self.metas[idx];
+        if !meta.active || !meta.dynamic {
+            return;
+        }
+        crate::mm::phys::free_pages(meta.base_gpa, meta.pages);
+        self.arenas[idx].reset();
+        self.metas[idx] = ArenaMeta::empty();
+    }
+
+    fn dynamic_free_pages_total(&self) -> usize {
+        let mut total = 0usize;
+        let mut i = 1usize;
+        while i < MAX_ARENAS {
+            if self.metas[i].active && self.metas[i].dynamic {
+                total = total.saturating_add(self.arenas[i].free_pages_total());
+            }
+            i += 1;
+        }
+        total
+    }
+
+    fn try_shrink_dynamic(&mut self) {
+        while self.dynamic_free_pages_total() > DYNAMIC_HIGH_WATER_PAGES {
+            let mut victim = None;
+            let mut i = 1usize;
+            while i < MAX_ARENAS {
+                if self.metas[i].active
+                    && self.metas[i].dynamic
+                    && self.arenas[i].is_completely_free()
+                {
+                    victim = Some(i);
+                    break;
+                }
+                i += 1;
+            }
+            let Some(idx) = victim else {
+                break;
+            };
+            self.release_dynamic_arena(idx);
+        }
+    }
+
+    fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
+        let mut i = 0usize;
+        while i < MAX_ARENAS {
+            if self.metas[i].active {
+                let ptr = self.arenas[i].alloc(size, align);
+                if !ptr.is_null() {
+                    return ptr;
+                }
+            }
+            i += 1;
+        }
+
+        let need_pages = (size.max(1) + PAGE_SIZE - 1) / PAGE_SIZE;
+        let Some(idx) = self.grow_dynamic_arena(need_pages) else {
+            return null_mut();
+        };
+        let ptr = self.arenas[idx].alloc(size, align);
+        if ptr.is_null() {
+            self.release_dynamic_arena(idx);
+        }
+        ptr
+    }
+
+    fn dealloc(&mut self, ptr: *mut u8) {
+        if ptr.is_null() {
+            return;
+        }
+        let mut i = 0usize;
+        while i < MAX_ARENAS {
+            if self.metas[i].active && self.arenas[i].contains(ptr) {
+                self.arenas[i].free(ptr);
+                self.try_shrink_dynamic();
+                return;
+            }
+            i += 1;
+        }
+        // Keep invalid-free accounting behavior.
+        if self.metas[0].active {
+            self.arenas[0].free(ptr);
+        }
+    }
+
+    fn contains(&self, ptr: *mut u8) -> bool {
+        if ptr.is_null() {
+            return false;
+        }
+        let mut i = 0usize;
+        while i < MAX_ARENAS {
+            if self.metas[i].active && self.arenas[i].contains(ptr) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn stats(&self) -> KmallocStats {
+        let mut out = KmallocStats::new();
+        let mut i = 0usize;
+        while i < MAX_ARENAS {
+            if self.metas[i].active {
+                let s = self.arenas[i].stats;
+                out.alloc_calls = out.alloc_calls.saturating_add(s.alloc_calls);
+                out.free_calls = out.free_calls.saturating_add(s.free_calls);
+                out.small_allocs = out.small_allocs.saturating_add(s.small_allocs);
+                out.large_allocs = out.large_allocs.saturating_add(s.large_allocs);
+                out.alloc_failures = out.alloc_failures.saturating_add(s.alloc_failures);
+                out.invalid_frees = out.invalid_frees.saturating_add(s.invalid_frees);
+            }
+            i += 1;
+        }
+        out
+    }
+
+    fn snapshot(&self) -> KmallocSnapshot {
+        let mut out = KmallocSnapshot {
+            stats: KmallocStats::new(),
+            alloc_fail_precheck: 0,
+            alloc_fail_small_oom: 0,
+            alloc_fail_large_oom: 0,
+            alloc_fail_corruption: 0,
+            invalid_free_bad_ptr: 0,
+            invalid_free_double: 0,
+            small_alloc_by_cache: [0; NUM_CACHES],
+            small_free_by_cache: [0; NUM_CACHES],
+            large_alloc_by_order: [0; NUM_ORDERS],
+            free_blocks_by_order: [0; NUM_ORDERS],
+            partial_slabs_by_cache: [0; NUM_CACHES],
+            full_slabs_by_cache: [0; NUM_CACHES],
+            largest_free_order: 0,
+            free_pages_total: 0,
+        };
+
+        let mut i = 0usize;
+        while i < MAX_ARENAS {
+            if self.metas[i].active {
+                let s = self.arenas[i].snapshot();
+                out.stats.alloc_calls = out.stats.alloc_calls.saturating_add(s.stats.alloc_calls);
+                out.stats.free_calls = out.stats.free_calls.saturating_add(s.stats.free_calls);
+                out.stats.small_allocs = out.stats.small_allocs.saturating_add(s.stats.small_allocs);
+                out.stats.large_allocs = out.stats.large_allocs.saturating_add(s.stats.large_allocs);
+                out.stats.alloc_failures =
+                    out.stats.alloc_failures.saturating_add(s.stats.alloc_failures);
+                out.stats.invalid_frees = out.stats.invalid_frees.saturating_add(s.stats.invalid_frees);
+                out.alloc_fail_precheck =
+                    out.alloc_fail_precheck.saturating_add(s.alloc_fail_precheck);
+                out.alloc_fail_small_oom =
+                    out.alloc_fail_small_oom.saturating_add(s.alloc_fail_small_oom);
+                out.alloc_fail_large_oom =
+                    out.alloc_fail_large_oom.saturating_add(s.alloc_fail_large_oom);
+                out.alloc_fail_corruption =
+                    out.alloc_fail_corruption.saturating_add(s.alloc_fail_corruption);
+                out.invalid_free_bad_ptr =
+                    out.invalid_free_bad_ptr.saturating_add(s.invalid_free_bad_ptr);
+                out.invalid_free_double =
+                    out.invalid_free_double.saturating_add(s.invalid_free_double);
+                out.free_pages_total = out.free_pages_total.saturating_add(s.free_pages_total);
+                if s.largest_free_order > out.largest_free_order {
+                    out.largest_free_order = s.largest_free_order;
+                }
+
+                let mut c = 0usize;
+                while c < NUM_CACHES {
+                    out.small_alloc_by_cache[c] =
+                        out.small_alloc_by_cache[c].saturating_add(s.small_alloc_by_cache[c]);
+                    out.small_free_by_cache[c] =
+                        out.small_free_by_cache[c].saturating_add(s.small_free_by_cache[c]);
+                    out.partial_slabs_by_cache[c] = out.partial_slabs_by_cache[c]
+                        .saturating_add(s.partial_slabs_by_cache[c]);
+                    out.full_slabs_by_cache[c] =
+                        out.full_slabs_by_cache[c].saturating_add(s.full_slabs_by_cache[c]);
+                    c += 1;
+                }
+
+                let mut o = 0usize;
+                while o < NUM_ORDERS {
+                    out.large_alloc_by_order[o] =
+                        out.large_alloc_by_order[o].saturating_add(s.large_alloc_by_order[o]);
+                    out.free_blocks_by_order[o] =
+                        out.free_blocks_by_order[o].saturating_add(s.free_blocks_by_order[o]);
+                    o += 1;
+                }
+            }
+            i += 1;
+        }
+
+        out
+    }
+}
+
 struct GlobalKmalloc {
     lock: SpinLock,
-    state: UnsafeCell<AllocState>,
+    state: UnsafeCell<KmallocManager>,
 }
 
 unsafe impl Sync for GlobalKmalloc {}
 
 static KMALLOC: GlobalKmalloc = GlobalKmalloc {
     lock: SpinLock::new(),
-    state: UnsafeCell::new(AllocState::new()),
+    state: UnsafeCell::new(KmallocManager::new()),
 };
 
 #[inline]
-fn with_state_mut<R>(f: impl FnOnce(&mut AllocState) -> R) -> R {
+fn with_state_mut<R>(f: impl FnOnce(&mut KmallocManager) -> R) -> R {
     let _guard = KMALLOC.lock.lock();
     unsafe { f(&mut *KMALLOC.state.get()) }
 }
@@ -836,10 +1127,7 @@ pub fn alloc(size: usize, align: usize) -> *mut u8 {
 }
 
 pub fn dealloc(ptr: *mut u8) {
-    if ptr.is_null() {
-        return;
-    }
-    with_state_mut(|s| s.free(ptr));
+    with_state_mut(|s| s.dealloc(ptr));
 }
 
 pub fn alloc_zeroed(size: usize, align: usize) -> *mut u8 {
@@ -857,7 +1145,7 @@ pub fn contains(ptr: *mut u8) -> bool {
 }
 
 pub fn stats() -> KmallocStats {
-    with_state_mut(|s| s.stats)
+    with_state_mut(|s| s.stats())
 }
 
 pub fn snapshot() -> KmallocSnapshot {

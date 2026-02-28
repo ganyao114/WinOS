@@ -56,6 +56,8 @@ pub struct KThread {
     pub base_priority: u8,
     pub tid: u32,
     pub teb_va: u64,
+    pub stack_base: u64,
+    pub stack_size: u64,
 
     pub ctx: ThreadContext,
 
@@ -85,6 +87,8 @@ impl KThread {
             base_priority: 8,
             tid: 0,
             teb_va: 0,
+            stack_base: 0,
+            stack_size: 0,
             ctx: ThreadContext {
                 x: [0u64; 31],
                 sp: 0,
@@ -566,7 +570,15 @@ pub(crate) fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
 // ── 线程创建 ──────────────────────────────────────────────────
 
 /// 分配新 TID，初始化 KThread，加入就绪队列
-pub fn spawn(pc: u64, sp: u64, arg: u64, teb_va: u64, priority: u8) -> u32 {
+pub fn spawn(
+    pc: u64,
+    sp: u64,
+    arg: u64,
+    teb_va: u64,
+    stack_base: u64,
+    stack_size: u64,
+    priority: u8,
+) -> u32 {
     sched_lock_acquire();
     let tid = thread_store_mut()
         .alloc_with(|id| {
@@ -576,6 +588,8 @@ pub fn spawn(pc: u64, sp: u64, arg: u64, teb_va: u64, priority: u8) -> u32 {
             t.base_priority = priority;
             t.tid = id;
             t.teb_va = teb_va;
+            t.stack_base = stack_base;
+            t.stack_size = stack_size;
             t.ctx.pc = pc;
             t.ctx.sp = sp;
             t.ctx.x[0] = arg;
@@ -715,7 +729,20 @@ pub fn terminate_current_thread() {
     sched_lock_acquire();
     let cur = current_tid();
     if cur != 0 {
+        let (stack_base, teb_va) = with_thread(cur, |t| (t.stack_base, t.teb_va));
+        with_thread_mut(cur, |t| {
+            t.stack_base = 0;
+            t.stack_size = 0;
+            t.teb_va = 0;
+            t.ctx.tpidr = 0;
+        });
         set_thread_state_locked(cur, ThreadState::Terminated);
+        if stack_base != 0 {
+            crate::alloc::dealloc(stack_base as *mut u8);
+        }
+        if teb_va != 0 {
+            crate::alloc::dealloc(teb_va as *mut u8);
+        }
     }
     sched_lock_release();
 }
