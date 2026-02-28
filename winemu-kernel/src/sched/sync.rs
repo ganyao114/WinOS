@@ -3,9 +3,13 @@
 // 所有状态机在 guest 内完成，不走 HVC。
 
 use crate::kobj::ObjectStore;
+use crate::nt::constants::{
+    HANDLE_SLOT_BITS, HANDLE_SLOT_MASK, HANDLE_TYPE_MASK, NTSTATUS_ERROR_BIT,
+};
 use crate::rust_alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ptr::null_mut;
+use winemu_shared::status;
 
 use super::{
     boost_thread_priority_locked, clear_wait_deadline_locked, current_tid, sched_lock_acquire,
@@ -16,14 +20,14 @@ use super::{
 
 // ── NTSTATUS 常量 ─────────────────────────────────────────────
 
-pub const STATUS_SUCCESS: u32 = 0x0000_0000;
+pub const STATUS_SUCCESS: u32 = status::SUCCESS;
 pub const STATUS_PENDING: u32 = 0x0000_0103;
-pub const STATUS_TIMEOUT: u32 = 0x0000_0102;
-pub const STATUS_ABANDONED: u32 = 0x0000_0080;
-pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-pub const STATUS_MUTANT_NOT_OWNED: u32 = 0xC000_0046;
-pub const STATUS_SEMAPHORE_LIMIT_EXCEEDED: u32 = 0xC000_0047;
+pub const STATUS_TIMEOUT: u32 = status::TIMEOUT;
+pub const STATUS_ABANDONED: u32 = status::ABANDONED_WAIT_0;
+pub const STATUS_INVALID_HANDLE: u32 = status::INVALID_HANDLE;
+pub const STATUS_INVALID_PARAMETER: u32 = status::INVALID_PARAMETER;
+pub const STATUS_MUTANT_NOT_OWNED: u32 = status::MUTANT_NOT_OWNED;
+pub const STATUS_SEMAPHORE_LIMIT_EXCEEDED: u32 = status::SEMAPHORE_LIMIT_EXCEEDED;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WaitDeadline {
@@ -147,6 +151,23 @@ impl KEvent {
             waiters: WaitQueue::new(),
         }
     }
+
+    fn set_locked(&mut self, idx: u32) {
+        let h = make_handle(HANDLE_TYPE_EVENT, idx);
+        if self.ev_type == EventType::SynchronizationEvent {
+            self.signaled = true;
+            if wake_queue_one_for_handle_locked(&mut self.waiters, h) {
+                self.signaled = false;
+            }
+            return;
+        }
+        self.signaled = true;
+        let _ = wake_queue_all_for_handle_locked(&mut self.waiters, h);
+    }
+
+    fn reset(&mut self) {
+        self.signaled = false;
+    }
 }
 
 // ── KMutex ────────────────────────────────────────────────────
@@ -167,6 +188,29 @@ impl KMutex {
             waiters: WaitQueue::new(),
         }
     }
+
+    fn release_locked(&mut self, idx: u32, current_tid: u32) -> u32 {
+        if self.owner_tid != current_tid {
+            return STATUS_MUTANT_NOT_OWNED;
+        }
+
+        if self.recursion > 0 {
+            self.recursion -= 1;
+        }
+        if self.recursion > 0 {
+            return STATUS_SUCCESS;
+        }
+
+        self.owner_tid = 0;
+        let h = make_handle(HANDLE_TYPE_MUTEX, idx);
+        let _ = wake_queue_one_for_handle_locked(&mut self.waiters, h);
+
+        recompute_owned_mutex_priority_locked(current_tid);
+        if self.owner_tid != 0 {
+            recompute_owned_mutex_priority_locked(self.owner_tid);
+        }
+        STATUS_SUCCESS
+    }
 }
 
 // ── KSemaphore ────────────────────────────────────────────────
@@ -184,6 +228,28 @@ impl KSemaphore {
             maximum,
             waiters: WaitQueue::new(),
         }
+    }
+
+    fn release_locked(&mut self, idx: u32, count: i32) -> Result<u32, u32> {
+        if count <= 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let prev = self.count;
+        let new_count = self.count.saturating_add(count);
+        if new_count > self.maximum {
+            return Err(STATUS_SEMAPHORE_LIMIT_EXCEEDED);
+        }
+        self.count = new_count;
+
+        let h = make_handle(HANDLE_TYPE_SEMAPHORE, idx);
+        let mut rounds = self.waiters.len();
+        while rounds > 0 && self.count > 0 {
+            if !wake_queue_one_for_handle_locked(&mut self.waiters, h) {
+                break;
+            }
+            rounds -= 1;
+        }
+        Ok(prev as u32)
     }
 }
 
@@ -322,7 +388,7 @@ pub struct HandleCloseInfo {
 }
 
 pub fn make_handle(htype: u64, idx: u32) -> u64 {
-    ((htype & 0xF) << 28) | ((idx as u64) & 0x0FFF_FFFF)
+    ((htype & HANDLE_TYPE_MASK) << HANDLE_SLOT_BITS) | ((idx as u64) & HANDLE_SLOT_MASK)
 }
 
 #[inline]
@@ -332,12 +398,12 @@ fn handle_key(h: u64) -> u32 {
 
 #[inline]
 fn key_type(key: u32) -> u64 {
-    ((key as u64) >> 28) & 0xF
+    ((key as u64) >> HANDLE_SLOT_BITS) & HANDLE_TYPE_MASK
 }
 
 #[inline]
 fn key_idx(key: u32) -> u32 {
-    key & 0x0FFF_FFFF
+    key & (HANDLE_SLOT_MASK as u32)
 }
 
 fn handles_store_mut() -> &'static mut ObjectStore<HandleEntry> {
@@ -412,11 +478,11 @@ fn alloc_handle_instance_for_key(key: u32) -> Option<u64> {
 }
 
 fn resolve_user_handle(h: u64) -> Option<(u32, u64, u32, u32)> {
-    let htype = (h >> 28) & 0xF;
+    let htype = (h >> HANDLE_SLOT_BITS) & HANDLE_TYPE_MASK;
     if htype == 0 {
         return None;
     }
-    let hid = (h & 0x0FFF_FFFF) as u32;
+    let hid = (h & HANDLE_SLOT_MASK) as u32;
     let ptr = handles_store_mut().get_ptr(hid);
     if ptr.is_null() {
         return None;
@@ -460,6 +526,17 @@ pub fn handle_idx(h: u64) -> u32 {
     } else {
         0
     }
+}
+
+fn resolve_handle_idx_by_type(h: u64, expected_type: u64) -> Option<u32> {
+    if handle_type(h) != expected_type {
+        return None;
+    }
+    let idx = handle_idx(h);
+    if idx == 0 {
+        return None;
+    }
+    Some(idx)
 }
 
 pub fn make_new_handle(htype: u64, obj_idx: u32) -> Option<u64> {
@@ -1020,6 +1097,17 @@ pub fn thread_notify_terminated(target_tid: u32) {
 
 // ── Event API ────────────────────────────────────────────────
 
+pub fn create_event_handle(ev_type: EventType, initial_state: bool) -> Result<u64, u32> {
+    let Some(idx) = event_alloc(ev_type, initial_state) else {
+        return Err(status::NO_MEMORY);
+    };
+    let Some(h) = make_new_handle(HANDLE_TYPE_EVENT, idx) else {
+        event_free(idx);
+        return Err(status::NO_MEMORY);
+    };
+    Ok(h)
+}
+
 pub fn event_alloc(ev_type: EventType, initial_state: bool) -> Option<u32> {
     events_store_mut().alloc_with(|_| KEvent::new(ev_type, initial_state))
 }
@@ -1034,18 +1122,7 @@ pub fn event_set(idx: u32) -> u32 {
     }
 
     sched_lock_acquire();
-    let h = make_handle(HANDLE_TYPE_EVENT, idx);
-    unsafe {
-        if (*ev_ptr).ev_type == EventType::SynchronizationEvent {
-            (*ev_ptr).signaled = true;
-            if wake_queue_one_for_handle_locked(&mut (*ev_ptr).waiters, h) {
-                (*ev_ptr).signaled = false;
-            }
-        } else {
-            (*ev_ptr).signaled = true;
-            let _ = wake_queue_all_for_handle_locked(&mut (*ev_ptr).waiters, h);
-        }
-    }
+    unsafe { (*ev_ptr).set_locked(idx) };
     sched_lock_release();
 
     STATUS_SUCCESS
@@ -1059,10 +1136,24 @@ pub fn event_reset(idx: u32) -> u32 {
     if ev.is_null() {
         return STATUS_INVALID_HANDLE;
     }
-    unsafe {
-        (*ev).signaled = false;
-    }
+    sched_lock_acquire();
+    unsafe { (*ev).reset() };
+    sched_lock_release();
     STATUS_SUCCESS
+}
+
+pub fn event_set_by_handle(h: u64) -> u32 {
+    let Some(idx) = resolve_handle_idx_by_type(h, HANDLE_TYPE_EVENT) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    event_set(idx)
+}
+
+pub fn event_reset_by_handle(h: u64) -> u32 {
+    let Some(idx) = resolve_handle_idx_by_type(h, HANDLE_TYPE_EVENT) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    event_reset(idx)
 }
 
 pub fn event_free(idx: u32) {
@@ -1073,6 +1164,17 @@ pub fn event_free(idx: u32) {
 }
 
 // ── Mutex API ────────────────────────────────────────────────
+
+pub fn create_mutex_handle(initial_owner: bool) -> Result<u64, u32> {
+    let Some(idx) = mutex_alloc(initial_owner) else {
+        return Err(status::NO_MEMORY);
+    };
+    let Some(h) = make_new_handle(HANDLE_TYPE_MUTEX, idx) else {
+        mutex_free(idx);
+        return Err(status::NO_MEMORY);
+    };
+    Ok(h)
+}
 
 pub fn mutex_alloc(initial_owner: bool) -> Option<u32> {
     mutexes_store_mut().alloc_with(|_| KMutex::new(initial_owner))
@@ -1088,36 +1190,9 @@ pub fn mutex_release(idx: u32) -> u32 {
     }
 
     sched_lock_acquire();
-
-    let cur = current_tid();
-    unsafe {
-        if (*m_ptr).owner_tid != cur {
-            sched_lock_release();
-            return STATUS_MUTANT_NOT_OWNED;
-        }
-
-        if (*m_ptr).recursion > 0 {
-            (*m_ptr).recursion -= 1;
-        }
-        if (*m_ptr).recursion > 0 {
-            sched_lock_release();
-            return STATUS_SUCCESS;
-        }
-
-        (*m_ptr).owner_tid = 0;
-
-        let h = make_handle(HANDLE_TYPE_MUTEX, idx);
-        let _ = wake_queue_one_for_handle_locked(&mut (*m_ptr).waiters, h);
-
-        recompute_owned_mutex_priority_locked(cur);
-        let new_owner = (*m_ptr).owner_tid;
-        if new_owner != 0 {
-            recompute_owned_mutex_priority_locked(new_owner);
-        }
-    }
-
+    let st = unsafe { (*m_ptr).release_locked(idx, current_tid()) };
     sched_lock_release();
-    STATUS_SUCCESS
+    st
 }
 
 pub fn mutex_free(idx: u32) {
@@ -1127,7 +1202,28 @@ pub fn mutex_free(idx: u32) {
     let _ = mutexes_store_mut().free(idx);
 }
 
+pub fn mutex_release_by_handle(h: u64) -> u32 {
+    let Some(idx) = resolve_handle_idx_by_type(h, HANDLE_TYPE_MUTEX) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    mutex_release(idx)
+}
+
 // ── Semaphore API ────────────────────────────────────────────
+
+pub fn create_semaphore_handle(initial: i32, maximum: i32) -> Result<u64, u32> {
+    if maximum <= 0 || initial < 0 || initial > maximum {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let Some(idx) = semaphore_alloc(initial, maximum) else {
+        return Err(status::NO_MEMORY);
+    };
+    let Some(h) = make_new_handle(HANDLE_TYPE_SEMAPHORE, idx) else {
+        semaphore_free(idx);
+        return Err(status::NO_MEMORY);
+    };
+    Ok(h)
+}
 
 pub fn semaphore_alloc(initial: i32, maximum: i32) -> Option<u32> {
     if maximum <= 0 || initial < 0 || initial > maximum {
@@ -1141,9 +1237,6 @@ pub fn semaphore_release(idx: u32, count: i32) -> u32 {
     if idx == 0 {
         return STATUS_INVALID_HANDLE;
     }
-    if count <= 0 {
-        return STATUS_INVALID_PARAMETER;
-    }
 
     let s_ptr = semaphore_ptr(idx);
     if s_ptr.is_null() {
@@ -1151,27 +1244,14 @@ pub fn semaphore_release(idx: u32, count: i32) -> u32 {
     }
 
     sched_lock_acquire();
-    let prev;
-    unsafe {
-        prev = (*s_ptr).count;
-        let new_count = (*s_ptr).count.saturating_add(count);
-        if new_count > (*s_ptr).maximum {
-            sched_lock_release();
-            return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
+    let st = unsafe {
+        match (*s_ptr).release_locked(idx, count) {
+            Ok(prev) => prev,
+            Err(err) => err,
         }
-        (*s_ptr).count = new_count;
-
-        let h = make_handle(HANDLE_TYPE_SEMAPHORE, idx);
-        let mut rounds = (*s_ptr).waiters.len();
-        while rounds > 0 && (*s_ptr).count > 0 {
-            if !wake_queue_one_for_handle_locked(&mut (*s_ptr).waiters, h) {
-                break;
-            }
-            rounds -= 1;
-        }
-    }
+    };
     sched_lock_release();
-    prev as u32
+    st
 }
 
 pub fn semaphore_free(idx: u32) {
@@ -1179,6 +1259,18 @@ pub fn semaphore_free(idx: u32) {
         return;
     }
     let _ = semaphores_store_mut().free(idx);
+}
+
+pub fn semaphore_release_by_handle(h: u64, count: i32) -> Result<u32, u32> {
+    let Some(idx) = resolve_handle_idx_by_type(h, HANDLE_TYPE_SEMAPHORE) else {
+        return Err(STATUS_INVALID_HANDLE);
+    };
+    let prev_or_status = semaphore_release(idx, count);
+    if (prev_or_status & NTSTATUS_ERROR_BIT) != 0 {
+        Err(prev_or_status)
+    } else {
+        Ok(prev_or_status)
+    }
 }
 
 // ── Handle wait / close ─────────────────────────────────────

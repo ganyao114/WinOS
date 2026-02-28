@@ -3,6 +3,7 @@ use crate::kobj::ObjectStore;
 use core::cell::UnsafeCell;
 
 use super::common::align_up_4k;
+use super::constants::PAGE_SIZE_4K;
 
 #[derive(Clone, Copy)]
 pub(crate) struct GuestSection {
@@ -86,8 +87,9 @@ fn regions_store_mut() -> &'static mut ObjectStore<VmRegion> {
 }
 
 pub(crate) fn vm_alloc_region(size: u64, prot: u32) -> Option<u64> {
-    let size = align_up_4k(size.max(0x1000));
-    let base = crate::alloc::alloc_zeroed(size as usize, 0x1000).map(|p| p as u64)?;
+    let size = align_up_4k(size.max(PAGE_SIZE_4K));
+    let base =
+        crate::alloc::alloc_zeroed(size as usize, PAGE_SIZE_4K as usize).map(|p| p as u64)?;
     let id = regions_store_mut().alloc_with(|_| VmRegion { base, size, prot })?;
     let _ = id;
     Some(base)

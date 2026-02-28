@@ -3,6 +3,7 @@ use crate::sched::sync::{self, make_new_handle, HANDLE_TYPE_FILE, HANDLE_TYPE_SE
 use winemu_shared::status;
 
 use super::common::align_up_4k;
+use super::constants::PAGE_SIZE_4K;
 use super::state::{
     file_host_fd, section_alloc, section_free, section_get, view_alloc, view_free, vm_alloc_region,
     vm_free_region,
@@ -16,9 +17,9 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
     let prot = frame.x[4] as u32;
     let file_handle = frame.x[6];
     let size = if max_size_ptr.is_null() {
-        0x1000
+        PAGE_SIZE_4K
     } else {
-        align_up_4k(unsafe { max_size_ptr.read_volatile().max(0x1000) })
+        align_up_4k(unsafe { max_size_ptr.read_volatile().max(PAGE_SIZE_4K) })
     };
 
     let idx = match section_alloc(size, prot, file_handle) {
@@ -65,7 +66,7 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     } else {
         unsafe { view_size_ptr.read_volatile() }
     };
-    let map_size = align_up_4k(if req_size == 0 { sec.size } else { req_size }.max(0x1000));
+    let map_size = align_up_4k(if req_size == 0 { sec.size } else { req_size }.max(PAGE_SIZE_4K));
     let prot = if win32_protect == 0 {
         sec.prot
     } else {

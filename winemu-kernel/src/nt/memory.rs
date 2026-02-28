@@ -1,6 +1,7 @@
 use winemu_shared::status;
 
 use super::common::{align_up_4k, MEM_COMMIT};
+use super::constants::{PAGE_MASK_4K, PAGE_SIZE_4K};
 use super::state::{vm_alloc_region, vm_find_region, vm_free_region, vm_set_region_prot};
 use super::SvcFrame;
 
@@ -81,7 +82,7 @@ pub(crate) fn handle_query_virtual_memory(frame: &mut SvcFrame) {
     let (base, size, prot, state) = if let Some((_, r)) = vm_find_region(addr) {
         (r.base, r.size, r.prot, MEM_COMMIT)
     } else {
-        (addr & !0xFFF, 0x1000, 0u32, 0u32)
+        (addr & PAGE_MASK_4K, PAGE_SIZE_4K, 0u32, 0u32)
     };
 
     let mut mbi = [0u8; 48];

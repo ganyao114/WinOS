@@ -4,33 +4,11 @@ use super::{commit_deferred_scheduling_locked, vcpu_id, SCHED};
 // lock_owner 存 vcpu_id+1（0 = 未持有）。
 
 fn spinlock_acquire() {
-    unsafe {
-        let p = SCHED.spinlock.get();
-        loop {
-            // STXR/LDXR 自旋
-            core::arch::asm!(
-                "1: ldaxr {old:w}, [{p}]",
-                "   cbnz  {old:w}, 1b",
-                "   stxr  {old:w}, {one:w}, [{p}]",
-                "   cbnz  {old:w}, 1b",
-                p   = in(reg) p,
-                old = out(reg) _,
-                one = in(reg) 1u32,
-                options(nostack)
-            );
-            break;
-        }
-    }
+    crate::arch::spin::lock_u32(SCHED.spinlock.get());
 }
 
 fn spinlock_release() {
-    unsafe {
-        core::arch::asm!(
-            "stlr wzr, [{}]",
-            in(reg) SCHED.spinlock.get(),
-            options(nostack)
-        );
-    }
+    crate::arch::spin::unlock_u32(SCHED.spinlock.get());
 }
 
 pub fn sched_lock_acquire() {

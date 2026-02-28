@@ -7,8 +7,13 @@ mod lock;
 pub mod sync;
 
 use crate::kobj::ObjectStore;
+use crate::nt::constants::{
+    DEFAULT_THREAD_STACK_RESERVE, PAGE_SIZE_4K, PSEUDO_CURRENT_THREAD, PSEUDO_CURRENT_THREAD_ALT,
+    THREAD_BASIC_INFORMATION_SIZE, THREAD_STACK_ALIGN,
+};
 use crate::rust_alloc::vec::Vec;
 use core::cell::UnsafeCell;
+use winemu_shared::status;
 
 pub use lock::{sched_lock_acquire, sched_lock_release};
 
@@ -108,6 +113,54 @@ impl KThread {
             wait_next: 0,
             wait_handles: [0u64; MAX_WAIT_HANDLES],
         }
+    }
+
+    fn init_spawned(
+        &mut self,
+        tid: u32,
+        pc: u64,
+        sp: u64,
+        arg: u64,
+        teb_va: u64,
+        stack_base: u64,
+        stack_size: u64,
+        priority: u8,
+    ) {
+        self.state = ThreadState::Free;
+        self.priority = priority;
+        self.base_priority = priority;
+        self.tid = tid;
+        self.teb_va = teb_va;
+        self.stack_base = stack_base;
+        self.stack_size = stack_size;
+        self.ctx = ThreadContext::default();
+        self.ctx.pc = pc;
+        self.ctx.sp = sp;
+        self.ctx.x[0] = arg;
+        self.ctx.x[18] = teb_va;
+        self.ctx.pstate = 0x0; // EL0t
+        self.ctx.tpidr = teb_va;
+    }
+
+    fn init_thread0(&mut self, tid: u32, teb_va: u64) {
+        self.state = ThreadState::Running;
+        self.priority = 8;
+        self.base_priority = 8;
+        self.tid = tid;
+        self.teb_va = teb_va;
+        self.ctx = ThreadContext::default();
+        self.ctx.tpidr = teb_va;
+    }
+
+    pub fn basic_info_record(&self) -> [u8; THREAD_BASIC_INFORMATION_SIZE] {
+        let mut tbi = [0u8; THREAD_BASIC_INFORMATION_SIZE];
+        tbi[8..16].copy_from_slice(&self.teb_va.to_le_bytes());
+        tbi[16..24].copy_from_slice(&1u64.to_le_bytes());
+        tbi[24..32].copy_from_slice(&(self.tid as u64).to_le_bytes());
+        tbi[32..40].copy_from_slice(&1u64.to_le_bytes());
+        tbi[40..44].copy_from_slice(&(self.priority as i32).to_le_bytes());
+        tbi[44..48].copy_from_slice(&(self.base_priority as i32).to_le_bytes());
+        tbi
     }
 }
 
@@ -371,28 +424,18 @@ pub fn with_thread_mut<R>(tid: u32, f: impl FnOnce(&mut KThread) -> R) -> R {
 }
 
 pub fn current_tid() -> u32 {
-    // Read TPIDR_EL1 low 32 bits — set by svc_dispatch on entry
-    let val: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, tpidr_el1", out(reg) val, options(nostack, nomem));
-    }
-    val as u32
+    // Read TPIDR_EL1 low 32 bits — set by svc_dispatch on entry.
+    crate::arch::cpu::read_tpidr_el1() as u32
 }
 
 pub fn vcpu_id() -> usize {
-    // High 32 bits of TPIDR_EL1 hold vcpu_id
-    let val: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, tpidr_el1", out(reg) val, options(nostack, nomem));
-    }
-    (val >> 32) as usize
+    // High 32 bits of TPIDR_EL1 hold vcpu_id.
+    (crate::arch::cpu::read_tpidr_el1() >> 32) as usize
 }
 
 pub fn set_tpidr_el1(vcpu_id: usize, tid: u32) {
     let val = ((vcpu_id as u64) << 32) | (tid as u64);
-    unsafe {
-        core::arch::asm!("msr tpidr_el1, {}", in(reg) val, options(nostack, nomem));
-    }
+    crate::arch::cpu::write_tpidr_el1(val);
 }
 
 pub fn current_thread_mut<R>(f: impl FnOnce(&mut KThread) -> R) -> R {
@@ -583,19 +626,7 @@ pub fn spawn(
     let tid = thread_store_mut()
         .alloc_with(|id| {
             let mut t = KThread::zeroed();
-            t.state = ThreadState::Free;
-            t.priority = priority;
-            t.base_priority = priority;
-            t.tid = id;
-            t.teb_va = teb_va;
-            t.stack_base = stack_base;
-            t.stack_size = stack_size;
-            t.ctx.pc = pc;
-            t.ctx.sp = sp;
-            t.ctx.x[0] = arg;
-            t.ctx.x[18] = teb_va;
-            t.ctx.pstate = 0x0; // EL0t
-            t.ctx.tpidr = teb_va;
+            t.init_spawned(id, pc, sp, arg, teb_va, stack_base, stack_size, priority);
             t
         })
         .unwrap_or(0);
@@ -604,6 +635,84 @@ pub fn spawn(
     }
     sched_lock_release();
     tid
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateThreadError {
+    InvalidParameter,
+    NoMemory,
+}
+
+#[inline(always)]
+fn normalize_stack_size(max_stack_size_arg: u64) -> u64 {
+    if max_stack_size_arg == 0 {
+        DEFAULT_THREAD_STACK_RESERVE
+    } else {
+        (max_stack_size_arg + (THREAD_STACK_ALIGN - 1)) & !(THREAD_STACK_ALIGN - 1)
+    }
+}
+
+pub fn create_user_thread(
+    entry_va: u64,
+    arg: u64,
+    max_stack_size_arg: u64,
+    priority: u8,
+) -> Result<u32, CreateThreadError> {
+    if entry_va == 0 {
+        return Err(CreateThreadError::InvalidParameter);
+    }
+
+    let stack_size = normalize_stack_size(max_stack_size_arg);
+    let stack_base = crate::alloc::alloc_zeroed(stack_size as usize, THREAD_STACK_ALIGN as usize)
+        .ok_or(CreateThreadError::NoMemory)? as u64;
+    let teb_va = crate::alloc::alloc_zeroed(PAGE_SIZE_4K as usize, PAGE_SIZE_4K as usize)
+        .map_or(0, |p| p as u64);
+    let stack_top = stack_base + stack_size;
+
+    let tid = spawn(entry_va, stack_top, arg, teb_va, stack_base, stack_size, priority);
+    if tid == 0 {
+        crate::alloc::dealloc(stack_base as *mut u8);
+        if teb_va != 0 {
+            crate::alloc::dealloc(teb_va as *mut u8);
+        }
+        return Err(CreateThreadError::NoMemory);
+    }
+    Ok(tid)
+}
+
+pub fn terminate_thread_by_tid(tid: u32) -> bool {
+    if tid == 0 || !thread_exists(tid) {
+        return false;
+    }
+    sched_lock_acquire();
+    let (state, stack_base, teb_va) = with_thread(tid, |t| (t.state, t.stack_base, t.teb_va));
+    if state == ThreadState::Free || state == ThreadState::Terminated {
+        sched_lock_release();
+        return false;
+    }
+    with_thread_mut(tid, |t| {
+        t.stack_base = 0;
+        t.stack_size = 0;
+        t.teb_va = 0;
+        t.ctx.tpidr = 0;
+    });
+    set_thread_state_locked(tid, ThreadState::Terminated);
+    sched_lock_release();
+
+    if stack_base != 0 {
+        crate::alloc::dealloc(stack_base as *mut u8);
+    }
+    if teb_va != 0 {
+        crate::alloc::dealloc(teb_va as *mut u8);
+    }
+    true
+}
+
+pub fn thread_basic_info(tid: u32) -> Option<[u8; THREAD_BASIC_INFORMATION_SIZE]> {
+    if tid == 0 || !thread_exists(tid) {
+        return None;
+    }
+    Some(with_thread(tid, |t| t.basic_info_record()))
 }
 
 // ── 调度核心 ──────────────────────────────────────────────────
@@ -726,25 +835,10 @@ pub fn yield_current_thread() {
 }
 
 pub fn terminate_current_thread() {
-    sched_lock_acquire();
     let cur = current_tid();
     if cur != 0 {
-        let (stack_base, teb_va) = with_thread(cur, |t| (t.stack_base, t.teb_va));
-        with_thread_mut(cur, |t| {
-            t.stack_base = 0;
-            t.stack_size = 0;
-            t.teb_va = 0;
-            t.ctx.tpidr = 0;
-        });
-        set_thread_state_locked(cur, ThreadState::Terminated);
-        if stack_base != 0 {
-            crate::alloc::dealloc(stack_base as *mut u8);
-        }
-        if teb_va != 0 {
-            crate::alloc::dealloc(teb_va as *mut u8);
-        }
+        let _ = terminate_thread_by_tid(cur);
     }
-    sched_lock_release();
 }
 
 /// Initialize the first thread on a vCPU (called from kernel_main).
@@ -764,13 +858,7 @@ pub fn set_initial_thread(vcpu_id: usize, tid: u32) {
 pub fn register_thread0(teb_va: u64) {
     let tid = thread_store_mut().alloc_with(|id| {
         let mut t = KThread::zeroed();
-        t.state = ThreadState::Running;
-        t.priority = 8;
-        t.base_priority = 8;
-        t.tid = id;
-        t.teb_va = teb_va;
-        t.ctx = ThreadContext::default();
-        t.ctx.tpidr = teb_va;
+        t.init_thread0(id, teb_va);
         t
     });
     let Some(tid) = tid else {
@@ -851,14 +939,14 @@ pub fn check_timeouts(now_ticks: u64) -> bool {
         }
 
         with_thread_mut(ent.tid, |t| {
-            t.wait_result = 0x0000_0102; // STATUS_TIMEOUT
+            t.wait_result = status::TIMEOUT;
             t.wait_deadline = 0;
             t.wait_seq = t.wait_seq.wrapping_add(1);
             t.wait_kind = WAIT_KIND_NONE;
             t.wait_count = 0;
             t.wait_signaled = 0;
             t.wait_handles.fill(0);
-            t.ctx.x[0] = 0x0000_0102; // x0 = STATUS_TIMEOUT
+            t.ctx.x[0] = status::TIMEOUT as u64; // x0 = STATUS_TIMEOUT
         });
         set_thread_state_locked(ent.tid, ThreadState::Ready);
         woke_any = true;
@@ -937,6 +1025,39 @@ pub fn set_thread_base_priority(tid: u32, new_priority: u8) -> bool {
     }
     sched_lock_release();
     valid
+}
+
+pub fn resolve_thread_tid_from_handle(thread_handle: u64) -> Option<u32> {
+    if thread_handle == 0
+        || thread_handle == PSEUDO_CURRENT_THREAD
+        || thread_handle == PSEUDO_CURRENT_THREAD_ALT
+    {
+        return Some(current_tid());
+    }
+    if sync::handle_type(thread_handle) != sync::HANDLE_TYPE_THREAD {
+        return None;
+    }
+    let tid = sync::handle_idx(thread_handle);
+    if tid == 0 || !thread_exists(tid) {
+        return None;
+    }
+    if !with_thread(tid, |t| t.state != ThreadState::Free) {
+        return None;
+    }
+    Some(tid)
+}
+
+pub fn set_thread_base_priority_by_handle(thread_handle: u64, new_priority: i32) -> u32 {
+    if new_priority < 0 {
+        return status::INVALID_PARAMETER;
+    }
+    let Some(target_tid) = resolve_thread_tid_from_handle(thread_handle) else {
+        return status::INVALID_HANDLE;
+    };
+    if !set_thread_base_priority(target_tid, new_priority as u8) {
+        return status::INVALID_HANDLE;
+    }
+    status::SUCCESS
 }
 
 // ── 时间片记账（调用者必须持有 sched lock）──────────────────────

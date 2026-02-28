@@ -1,7 +1,7 @@
 use crate::sched::sync::{
-    self, event_alloc, event_reset, event_set, make_new_handle, mutex_alloc, mutex_release,
-    semaphore_alloc, semaphore_release, wait_handle, wait_multiple, EventType, WaitDeadline,
-    HANDLE_TYPE_EVENT, HANDLE_TYPE_MUTEX, HANDLE_TYPE_SEMAPHORE, STATUS_SUCCESS,
+    create_event_handle, create_mutex_handle, create_semaphore_handle, event_reset_by_handle,
+    event_set_by_handle, mutex_release_by_handle, semaphore_release_by_handle, wait_handle,
+    wait_multiple, EventType, WaitDeadline, STATUS_SUCCESS,
 };
 use winemu_shared::status;
 
@@ -16,38 +16,21 @@ pub(crate) fn handle_create_event(frame: &mut SvcFrame) {
         EventType::NotificationEvent
     };
     let initial = frame.x[4] != 0;
-    match event_alloc(ev_type, initial) {
-        Some(idx) => {
-            let Some(h) = make_new_handle(HANDLE_TYPE_EVENT, idx) else {
-                frame.x[0] = 0xC000_0017u64;
-                return;
-            };
-            let out_ptr = frame.x[0] as *mut u64;
-            unsafe { out_ptr.write_volatile(h) };
+    match create_event_handle(ev_type, initial) {
+        Ok(h) => {
+            write_out_handle(frame, h);
             frame.x[0] = STATUS_SUCCESS as u64;
         }
-        None => {
-            frame.x[0] = 0xC000_0017u64;
-        }
+        Err(st) => frame.x[0] = st as u64,
     }
 }
 
 pub(crate) fn handle_set_event(frame: &mut SvcFrame) {
-    let h = frame.x[0];
-    if sync::handle_type(h) != HANDLE_TYPE_EVENT {
-        frame.x[0] = sync::STATUS_INVALID_HANDLE as u64;
-        return;
-    }
-    frame.x[0] = event_set(sync::handle_idx(h)) as u64;
+    frame.x[0] = event_set_by_handle(frame.x[0]) as u64;
 }
 
 pub(crate) fn handle_reset_event(frame: &mut SvcFrame) {
-    let h = frame.x[0];
-    if sync::handle_type(h) != HANDLE_TYPE_EVENT {
-        frame.x[0] = sync::STATUS_INVALID_HANDLE as u64;
-        return;
-    }
-    frame.x[0] = event_reset(sync::handle_idx(h)) as u64;
+    frame.x[0] = event_reset_by_handle(frame.x[0]) as u64;
 }
 
 // x0 = Handle, x1 = Alertable, x2 = Timeout* (LARGE_INTEGER*)
@@ -87,30 +70,18 @@ pub(crate) fn handle_wait_multiple(frame: &mut SvcFrame) {
 // x3 = InitialOwner (bool)
 pub(crate) fn handle_create_mutex(frame: &mut SvcFrame) {
     let initial_owner = frame.x[3] != 0;
-    match mutex_alloc(initial_owner) {
-        Some(idx) => {
-            let Some(h) = make_new_handle(HANDLE_TYPE_MUTEX, idx) else {
-                frame.x[0] = 0xC000_0017u64;
-                return;
-            };
-            let out_ptr = frame.x[0] as *mut u64;
-            unsafe { out_ptr.write_volatile(h) };
+    match create_mutex_handle(initial_owner) {
+        Ok(h) => {
+            write_out_handle(frame, h);
             frame.x[0] = STATUS_SUCCESS as u64;
         }
-        None => {
-            frame.x[0] = 0xC000_0017u64;
-        }
+        Err(st) => frame.x[0] = st as u64,
     }
 }
 
 // x0 = MutantHandle, x1 = PreviousCount* (optional)
 pub(crate) fn handle_release_mutant(frame: &mut SvcFrame) {
-    let h = frame.x[0];
-    if sync::handle_type(h) != HANDLE_TYPE_MUTEX {
-        frame.x[0] = sync::STATUS_INVALID_HANDLE as u64;
-        return;
-    }
-    frame.x[0] = mutex_release(sync::handle_idx(h)) as u64;
+    frame.x[0] = mutex_release_by_handle(frame.x[0]) as u64;
 }
 
 // x0 = SemaphoreHandle* (out), x1 = DesiredAccess, x2 = ObjAttr*
@@ -118,19 +89,12 @@ pub(crate) fn handle_release_mutant(frame: &mut SvcFrame) {
 pub(crate) fn handle_create_semaphore(frame: &mut SvcFrame) {
     let initial = frame.x[3] as i32;
     let maximum = frame.x[4] as i32;
-    match semaphore_alloc(initial, maximum) {
-        Some(idx) => {
-            let Some(h) = make_new_handle(HANDLE_TYPE_SEMAPHORE, idx) else {
-                frame.x[0] = 0xC000_0017u64;
-                return;
-            };
-            let out_ptr = frame.x[0] as *mut u64;
-            unsafe { out_ptr.write_volatile(h) };
+    match create_semaphore_handle(initial, maximum) {
+        Ok(h) => {
+            write_out_handle(frame, h);
             frame.x[0] = STATUS_SUCCESS as u64;
         }
-        None => {
-            frame.x[0] = 0xC000_0017u64;
-        }
+        Err(st) => frame.x[0] = st as u64,
     }
 }
 
@@ -138,19 +102,22 @@ pub(crate) fn handle_create_semaphore(frame: &mut SvcFrame) {
 pub(crate) fn handle_release_semaphore(frame: &mut SvcFrame) {
     let h = frame.x[0];
     let count = frame.x[1] as i32;
-    if sync::handle_type(h) != HANDLE_TYPE_SEMAPHORE {
-        frame.x[0] = sync::STATUS_INVALID_HANDLE as u64;
-        return;
+    match semaphore_release_by_handle(h, count) {
+        Ok(prev) => {
+            if let Some(ptr) = unsafe { (frame.x[2] as *mut u32).as_mut() } {
+                unsafe { (ptr as *mut u32).write_volatile(prev) };
+            }
+            frame.x[0] = STATUS_SUCCESS as u64;
+        }
+        Err(st) => frame.x[0] = st as u64,
     }
-    let prev = semaphore_release(sync::handle_idx(h), count);
-    if let Some(ptr) = unsafe { (frame.x[2] as *mut u32).as_mut() } {
-        unsafe { (ptr as *mut u32).write_volatile(prev) };
+}
+
+fn write_out_handle(frame: &SvcFrame, handle: u64) {
+    let out_ptr = frame.x[0] as *mut u64;
+    if !out_ptr.is_null() {
+        unsafe { out_ptr.write_volatile(handle) };
     }
-    frame.x[0] = if prev & 0x8000_0000 != 0 {
-        prev as u64
-    } else {
-        STATUS_SUCCESS as u64
-    };
 }
 
 fn parse_timeout(timeout_ptr: *const i64) -> WaitDeadline {

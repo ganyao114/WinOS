@@ -44,21 +44,18 @@ unsafe fn setup_kernel_mapping() {
 }
 
 unsafe fn enable_mmu() {
-    use core::arch::asm;
-
-    asm!("dsb ishst", options(nostack));
-    asm!("tlbi vmalle1is", options(nostack));
-    asm!("dsb ish", options(nostack));
-    asm!("isb", options(nostack));
+    crate::arch::mmu::dsb_ishst();
+    crate::arch::mmu::tlbi_vmalle1is();
+    crate::arch::mmu::dsb_ish();
+    crate::arch::mmu::isb();
     crate::hypercall::debug_print("mmu: tlbi done\n");
 
     // MAIR_EL1 attr0 = normal memory (inner/outer WB WA)
     let mair: u64 = 0x00ff;
-    asm!("msr mair_el1, {}", in(reg) mair, options(nostack));
+    crate::arch::mmu::write_mair_el1(mair);
     crate::hypercall::debug_print("mmu: mair done\n");
 
-    let mmfr0: u64;
-    asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0, options(nostack));
+    let mmfr0 = crate::arch::mmu::read_id_aa64mmfr0_el1();
     let parange = mmfr0 & 0xf;
     let tgran4 = (mmfr0 >> 28) & 0xf;
     let tgran64 = (mmfr0 >> 24) & 0xf;
@@ -87,15 +84,15 @@ unsafe fn enable_mmu() {
     crate::hypercall::debug_print(" tcr=");
     crate::hypercall::debug_u64(tcr);
     crate::hypercall::debug_print("\n");
-    asm!("msr tcr_el1, {}", in(reg) tcr, options(nostack));
+    crate::arch::mmu::write_tcr_el1(tcr);
     crate::hypercall::debug_print("mmu: tcr done\n");
 
     let ttbr0 = core::ptr::addr_of!(L0_TABLE) as u64;
-    asm!("msr ttbr0_el1, {}", in(reg) ttbr0, options(nostack));
+    crate::arch::mmu::write_ttbr0_el1(ttbr0);
     crate::hypercall::debug_print("mmu: ttbr0 done\n");
 
-    asm!("dsb ish", options(nostack));
-    asm!("isb", options(nostack));
+    crate::arch::mmu::dsb_ish();
+    crate::arch::mmu::isb();
 
     let l0_addr = core::ptr::addr_of!(L0_TABLE) as u64;
     let l1_addr = core::ptr::addr_of!(L1_TABLE) as u64;
@@ -123,8 +120,7 @@ unsafe fn enable_mmu() {
     crate::hypercall::debug_u64(l2e1);
     crate::hypercall::debug_print("\n");
 
-    let mut sctlr: u64;
-    asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nostack));
+    let mut sctlr = crate::arch::mmu::read_sctlr_el1();
     crate::hypercall::debug_print("mmu: sctlr before ");
     crate::hypercall::debug_u64(sctlr);
     crate::hypercall::debug_print("\n");
@@ -142,8 +138,8 @@ unsafe fn enable_mmu() {
     crate::hypercall::debug_print("\n");
     crate::hypercall::debug_print("mmu: enabling MMU...\n");
     crate::hypercall::debug_print("mmu: write sctlr\n");
-    asm!("msr sctlr_el1, {}", in(reg) sctlr, options(nostack));
+    crate::arch::mmu::write_sctlr_el1(sctlr);
     crate::hypercall::debug_print("mmu: wrote sctlr\n");
-    asm!("isb", options(nostack));
+    crate::arch::mmu::isb();
     crate::hypercall::debug_print("mmu: isb after sctlr\n");
 }
