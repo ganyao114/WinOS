@@ -6,6 +6,7 @@ pub const DELETE_VALUE_KEY: u16 = 0x006A;
 pub const ENUMERATE_VALUE_KEY: u16 = 0x0010;
 pub const OPEN_KEY: u16 = 0x0012;
 pub const QUERY_VALUE_KEY: u16 = 0x0016;
+pub const QUERY_OBJECT: u16 = 0x0017;
 pub const CREATE_KEY: u16 = 0x001D;
 pub const ENUMERATE_KEY: u16 = 0x0032;
 pub const SET_VALUE_KEY: u16 = 0x003D;

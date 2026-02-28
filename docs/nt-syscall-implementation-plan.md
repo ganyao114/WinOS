@@ -24,7 +24,7 @@
 - 注册表：`NtOpenKey/NtCreateKey/NtDeleteKey/NtSetValueKey/NtQueryValueKey/NtEnumerateKey/NtEnumerateValueKey/NtDeleteValueKey`
 - 内存/Section：`NtAllocateVirtualMemory/NtFreeVirtualMemory/NtProtectVirtualMemory/NtQueryVirtualMemory/NtCreateSection/NtMapViewOfSection/NtUnmapViewOfSection`
 - 进程/线程：`NtCreateProcessEx/NtOpenProcess/NtTerminateProcess/NtQueryInformationProcess/NtCreateThreadEx/NtTerminateThread/NtQueryInformationThread/NtSetInformationThread/NtYieldExecution`
-- 对象：`NtDuplicateObject/NtClose`
+- 对象：`NtDuplicateObject/NtClose/NtQueryObject(ObjectBasicInformation)`
 
 ## 4. 程序常用但尚未在 guest 落地（按 Wine 频次）
 
@@ -86,7 +86,7 @@
 
 ### Phase 2（对象与进程信息补全）
 
-- `NtQueryObject`
+- `NtQueryObject`（补齐 ObjectTypeInformation 等类）
 - `NtSetInformationProcess`
 - `NtQueryInformationToken`
 - `NtOpenProcess`
@@ -135,5 +135,5 @@
 1. 已完成 Phase 1：  
    `NtQuerySystemInformation/NtQuerySystemTime/NtQueryPerformanceCounter/NtDelayExecution`
 2. 已新增并通过：`guest/syscall_sysinfo_test`
-3. 已开始 Phase 2：实现 `NtOpenProcess`，并新增 `guest/open_process_test`
+3. 已开始 Phase 2：实现 `NtOpenProcess` 与 `NtQueryObject(ObjectBasicInformation)`，并新增/扩展 `guest/open_process_test`
 4. 回归通过：`tests/full_test`、`tests/thread_test`、`tests/registry_test`、`tests/hello_win`

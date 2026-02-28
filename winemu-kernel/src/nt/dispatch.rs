@@ -88,6 +88,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         sysno::TERMINATE_THREAD => thread::handle_terminate_thread(frame),
 
         sysno::DUPLICATE_OBJECT => object::handle_duplicate_object(frame),
+        sysno::QUERY_OBJECT => object::handle_query_object(frame),
         sysno::CLOSE => {
             if !object::handle_close(frame) {
                 forward_to_vmm(frame, sysno::CLOSE, 0);

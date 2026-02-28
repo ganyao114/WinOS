@@ -33,6 +33,8 @@ typedef struct {
 
 #define STATUS_SUCCESS 0x00000000U
 #define STATUS_INVALID_PARAMETER 0xC000000DU
+#define STATUS_INFO_LENGTH_MISMATCH 0xC0000004U
+#define STATUS_INVALID_HANDLE 0xC0000008U
 
 __declspec(dllimport) NTSTATUS NtWriteFile(
     HANDLE file, HANDLE event, void* apc_routine, void* apc_ctx,
@@ -42,6 +44,8 @@ __declspec(dllimport) NTSTATUS NtQueryInformationProcess(
     HANDLE process, ULONG info_class, void* buf, ULONG len, ULONG* ret_len);
 __declspec(dllimport) NTSTATUS NtOpenProcess(
     HANDLE* process_handle, ULONG desired_access, void* object_attributes, CLIENT_ID* client_id);
+__declspec(dllimport) NTSTATUS NtQueryObject(
+    HANDLE handle, ULONG object_info_class, void* object_info, ULONG object_info_len, ULONG* ret_len);
 __declspec(dllimport) NTSTATUS NtClose(HANDLE handle);
 __declspec(dllimport) __attribute__((noreturn))
 void NtTerminateProcess(HANDLE process, NTSTATUS code);
@@ -84,6 +88,8 @@ void mainCRTStartup(void) {
     ULONG ret_len = 0;
     HANDLE opened_handle = 0;
     CLIENT_ID cid = {0};
+    uint8_t object_basic[56] = {0};
+    uint8_t short_object_basic[8] = {0};
 
     write_str("== open_process_test ==\r\n");
 
@@ -106,6 +112,20 @@ void mainCRTStartup(void) {
 
     st = NtClose(opened_handle);
     check("NtClose(opened process handle) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+
+    ret_len = 0;
+    st = NtQueryObject(NT_CURRENT_PROCESS, 0, object_basic, sizeof(object_basic), &ret_len);
+    check("NtQueryObject(process handle, basic) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtQueryObject basic return length is 56", ret_len == sizeof(object_basic));
+
+    ret_len = 0;
+    st = NtQueryObject(NT_CURRENT_PROCESS, 0, short_object_basic, sizeof(short_object_basic), &ret_len);
+    check("NtQueryObject short buffer returns STATUS_INFO_LENGTH_MISMATCH", st == STATUS_INFO_LENGTH_MISMATCH);
+    check("NtQueryObject short buffer reports required size", ret_len == sizeof(object_basic));
+
+    ret_len = 0;
+    st = NtQueryObject((HANDLE)(ULONG_PTR)0x7fffffffULL, 0, object_basic, sizeof(object_basic), &ret_len);
+    check("NtQueryObject(invalid handle) returns STATUS_INVALID_HANDLE", st == STATUS_INVALID_HANDLE);
 
     cid.UniqueProcess = (HANDLE)(ULONG_PTR)0x7fffffffULL;
     cid.UniqueThread = 0;
