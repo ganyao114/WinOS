@@ -72,10 +72,18 @@ impl PhysAllocator {
         None
     }
 
-    /// Allocate n contiguous 4KB pages (must fit in single chunk).
+    /// Allocate n contiguous 4KB pages. Small requests use chunk cache;
+    /// large requests bypass cache and request directly from VMM.
     /// Returns GPA of first page, or None.
     pub fn alloc_pages(&mut self, n: usize) -> Option<u64> {
-        if n == 0 || n > CHUNK_PAGES { return None; }
+        if n == 0 {
+            return None;
+        }
+        // Large allocations bypass the chunk cache and request contiguous pages
+        // directly from VMM to avoid the single-chunk (64 pages) limit.
+        if n > CHUNK_PAGES {
+            return self.alloc_pages_direct(n);
+        }
         if n == 1 { return self.alloc_page(); }
 
         if self.free_page_count < n + LOW_PAGES {
@@ -115,7 +123,11 @@ impl PhysAllocator {
 
     /// Free n contiguous 4KB pages starting at gpa.
     pub fn free_pages(&mut self, gpa: u64, n: usize) {
-        if n == 0 || n > CHUNK_PAGES || (gpa & (PAGE_SIZE - 1)) != 0 {
+        if n == 0 || (gpa & (PAGE_SIZE - 1)) != 0 {
+            return;
+        }
+        if n > CHUNK_PAGES {
+            self.free_pages_direct(gpa, n);
             return;
         }
         if let Some((idx, start_bit)) = self.locate(gpa) {
@@ -152,6 +164,23 @@ impl PhysAllocator {
             }
         }
         None
+    }
+
+    fn alloc_pages_direct(&mut self, n: usize) -> Option<u64> {
+        let pages = u64::try_from(n).ok()?;
+        let gpa = hypercall::alloc_phys_pages(pages);
+        if gpa == 0 {
+            None
+        } else {
+            Some(gpa)
+        }
+    }
+
+    fn free_pages_direct(&mut self, gpa: u64, n: usize) {
+        let Some(pages) = u64::try_from(n).ok() else {
+            return;
+        };
+        let _ = hypercall::free_phys_pages(gpa, pages);
     }
 
     /// Request a new chunk from VMM via ALLOC_PHYS_PAGES hypercall.
