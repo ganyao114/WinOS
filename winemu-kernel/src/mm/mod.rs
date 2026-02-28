@@ -1,4 +1,5 @@
 // MMU 初始化 — ARM64 EL1 (4KB granule)
+pub mod kmalloc;
 
 #[repr(C, align(4096))]
 struct PageTable([u64; 512]);
