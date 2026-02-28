@@ -10,8 +10,13 @@ const MAX_PAGES: usize = 1024; // 4 MiB / 4 KiB
 const MAX_ARENAS: usize = 8;
 const MAX_ORDER: usize = 10; // 2^10 pages = 1024 pages
 const NUM_ORDERS: usize = MAX_ORDER + 1;
-const DYNAMIC_ARENA_PAGES: usize = MAX_PAGES;
-const DYNAMIC_HIGH_WATER_PAGES: usize = DYNAMIC_ARENA_PAGES * 2;
+const DYNAMIC_MIN_ARENA_PAGES: usize = 64; // 256 KiB
+const DYNAMIC_MAX_ARENA_PAGES: usize = MAX_PAGES;
+const DYNAMIC_LOW_WATER_PAGES: usize = DYNAMIC_MIN_ARENA_PAGES * 8; // 2 MiB
+const DYNAMIC_HIGH_WATER_PAGES: usize = DYNAMIC_MIN_ARENA_PAGES * 16; // 4 MiB
+const RECLAIM_CHECK_INTERVAL_FREE_OPS: u32 = 64;
+const MAX_DIRECT_ALLOCS: usize = 64;
+const MAX_PENDING_PHYS_FREES: usize = MAX_ARENAS + MAX_DIRECT_ALLOCS;
 
 const SLAB_MIN_SHIFT: usize = 3; // 8 bytes
 const SLAB_MAX_SHIFT: usize = 11; // 2048 bytes
@@ -67,6 +72,52 @@ pub struct KmallocSnapshot {
     pub full_slabs_by_cache: [u16; NUM_CACHES],
     pub largest_free_order: u8,
     pub free_pages_total: usize,
+    pub dynamic_arena_count: usize,
+    pub dynamic_pages_total: usize,
+    pub dynamic_pages_peak: usize,
+    pub dynamic_arena_grow_count: u64,
+    pub dynamic_arena_release_count: u64,
+    pub reclaim_runs: u64,
+    pub reclaim_pages_released: u64,
+    pub direct_active_allocs: usize,
+    pub direct_pages_total: usize,
+    pub direct_pages_peak: usize,
+    pub direct_alloc_count: u64,
+    pub direct_free_count: u64,
+    pub direct_alloc_failures: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PendingPhysFree {
+    valid: bool,
+    gpa: u64,
+    pages: usize,
+}
+
+impl PendingPhysFree {
+    const fn empty() -> Self {
+        Self {
+            valid: false,
+            gpa: 0,
+            pages: 0,
+        }
+    }
+}
+
+#[inline]
+fn align_up(value: usize, align: usize) -> Option<usize> {
+    if !align.is_power_of_two() {
+        return None;
+    }
+    value.checked_add(align - 1).map(|v| v & !(align - 1))
+}
+
+#[inline]
+fn pages_for_bytes(bytes: usize) -> Option<usize> {
+    bytes
+        .max(1)
+        .checked_add(PAGE_SIZE - 1)
+        .map(|n| n / PAGE_SIZE)
 }
 
 struct SpinLock {
@@ -826,6 +877,19 @@ impl AllocState {
             full_slabs_by_cache,
             largest_free_order,
             free_pages_total,
+            dynamic_arena_count: 0,
+            dynamic_pages_total: 0,
+            dynamic_pages_peak: 0,
+            dynamic_arena_grow_count: 0,
+            dynamic_arena_release_count: 0,
+            reclaim_runs: 0,
+            reclaim_pages_released: 0,
+            direct_active_allocs: 0,
+            direct_pages_total: 0,
+            direct_pages_peak: 0,
+            direct_alloc_count: 0,
+            direct_free_count: 0,
+            direct_alloc_failures: 0,
         }
     }
 }
@@ -849,9 +913,74 @@ impl ArenaMeta {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ArenaRange {
+    start: usize,
+    end: usize,
+    arena_idx: u8,
+}
+
+impl ArenaRange {
+    const fn empty() -> Self {
+        Self {
+            start: 0,
+            end: 0,
+            arena_idx: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DirectAllocMeta {
+    active: bool,
+    user_ptr: usize,
+    size: usize,
+    base_gpa: u64,
+    pages: usize,
+}
+
+impl DirectAllocMeta {
+    const fn empty() -> Self {
+        Self {
+            active: false,
+            user_ptr: 0,
+            size: 0,
+            base_gpa: 0,
+            pages: 0,
+        }
+    }
+
+    fn end(&self) -> usize {
+        self.user_ptr.saturating_add(self.size)
+    }
+}
+
+enum AllocPlan {
+    Ready(*mut u8),
+    GrowDynamic { pages: usize },
+    Direct,
+}
+
 struct KmallocManager {
     arenas: [AllocState; MAX_ARENAS],
     metas: [ArenaMeta; MAX_ARENAS],
+    ranges: [ArenaRange; MAX_ARENAS],
+    range_count: usize,
+    alloc_hint: usize,
+    dynamic_pages_total: usize,
+    dynamic_pages_peak: usize,
+    dynamic_arena_grow_count: u64,
+    dynamic_arena_release_count: u64,
+    reclaim_runs: u64,
+    reclaim_pages_released: u64,
+    free_ops_since_reclaim: u32,
+    direct_allocs: [DirectAllocMeta; MAX_DIRECT_ALLOCS],
+    direct_active_allocs: usize,
+    direct_pages_total: usize,
+    direct_pages_peak: usize,
+    direct_alloc_count: u64,
+    direct_free_count: u64,
+    direct_alloc_failures: u64,
 }
 
 impl KmallocManager {
@@ -859,6 +988,23 @@ impl KmallocManager {
         Self {
             arenas: [const { AllocState::new() }; MAX_ARENAS],
             metas: [const { ArenaMeta::empty() }; MAX_ARENAS],
+            ranges: [const { ArenaRange::empty() }; MAX_ARENAS],
+            range_count: 0,
+            alloc_hint: 0,
+            dynamic_pages_total: 0,
+            dynamic_pages_peak: 0,
+            dynamic_arena_grow_count: 0,
+            dynamic_arena_release_count: 0,
+            reclaim_runs: 0,
+            reclaim_pages_released: 0,
+            free_ops_since_reclaim: 0,
+            direct_allocs: [const { DirectAllocMeta::empty() }; MAX_DIRECT_ALLOCS],
+            direct_active_allocs: 0,
+            direct_pages_total: 0,
+            direct_pages_peak: 0,
+            direct_alloc_count: 0,
+            direct_free_count: 0,
+            direct_alloc_failures: 0,
         }
     }
 
@@ -869,14 +1015,105 @@ impl KmallocManager {
             self.metas[i] = ArenaMeta::empty();
             i += 1;
         }
+        self.reset_bookkeeping();
 
         self.arenas[0].init(heap_base, heap_size);
+        let primary_pages = core::cmp::min(MAX_PAGES, heap_size / PAGE_SIZE);
         self.metas[0] = ArenaMeta {
             active: true,
             dynamic: false,
             base_gpa: heap_base as u64,
-            pages: core::cmp::min(MAX_PAGES, heap_size / PAGE_SIZE),
+            pages: primary_pages,
         };
+        if primary_pages != 0 {
+            self.insert_range(0, heap_base, heap_base + primary_pages * PAGE_SIZE);
+        }
+        self.alloc_hint = 0;
+    }
+
+    fn reset_bookkeeping(&mut self) {
+        self.ranges = [const { ArenaRange::empty() }; MAX_ARENAS];
+        self.range_count = 0;
+        self.alloc_hint = 0;
+        self.dynamic_pages_total = 0;
+        self.dynamic_pages_peak = 0;
+        self.dynamic_arena_grow_count = 0;
+        self.dynamic_arena_release_count = 0;
+        self.reclaim_runs = 0;
+        self.reclaim_pages_released = 0;
+        self.free_ops_since_reclaim = 0;
+        self.direct_allocs = [const { DirectAllocMeta::empty() }; MAX_DIRECT_ALLOCS];
+        self.direct_active_allocs = 0;
+        self.direct_pages_total = 0;
+        self.direct_pages_peak = 0;
+        self.direct_alloc_count = 0;
+        self.direct_free_count = 0;
+        self.direct_alloc_failures = 0;
+    }
+
+    fn insert_range(&mut self, arena_idx: usize, start: usize, end: usize) {
+        if self.range_count >= MAX_ARENAS || start >= end {
+            return;
+        }
+        let mut pos = 0usize;
+        while pos < self.range_count && self.ranges[pos].start < start {
+            pos += 1;
+        }
+        let mut i = self.range_count;
+        while i > pos {
+            self.ranges[i] = self.ranges[i - 1];
+            i -= 1;
+        }
+        self.ranges[pos] = ArenaRange {
+            start,
+            end,
+            arena_idx: arena_idx as u8,
+        };
+        self.range_count += 1;
+    }
+
+    fn remove_range(&mut self, arena_idx: usize) {
+        let mut pos = 0usize;
+        while pos < self.range_count {
+            if self.ranges[pos].arena_idx as usize == arena_idx {
+                break;
+            }
+            pos += 1;
+        }
+        if pos >= self.range_count {
+            return;
+        }
+        while pos + 1 < self.range_count {
+            self.ranges[pos] = self.ranges[pos + 1];
+            pos += 1;
+        }
+        self.range_count -= 1;
+        self.ranges[self.range_count] = ArenaRange::empty();
+    }
+
+    fn find_arena_by_ptr(&self, ptr: usize) -> Option<usize> {
+        if self.range_count == 0 {
+            return None;
+        }
+        let mut lo = 0usize;
+        let mut hi = self.range_count;
+        while lo < hi {
+            let mid = lo + ((hi - lo) >> 1);
+            if self.ranges[mid].start <= ptr {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            return None;
+        }
+        let entry = self.ranges[lo - 1];
+        if ptr < entry.end {
+            Some(entry.arena_idx as usize)
+        } else {
+            None
+        }
     }
 
     fn find_free_slot(&self) -> Option<usize> {
@@ -890,13 +1127,33 @@ impl KmallocManager {
         None
     }
 
-    fn grow_dynamic_arena(&mut self, min_pages: usize) -> Option<usize> {
-        let slot = self.find_free_slot()?;
-        let pages = core::cmp::max(DYNAMIC_ARENA_PAGES, min_pages);
-        if pages > MAX_PAGES {
+    fn choose_dynamic_arena_pages(min_pages: usize) -> Option<usize> {
+        if min_pages == 0 {
+            return Some(DYNAMIC_MIN_ARENA_PAGES);
+        }
+        if min_pages > DYNAMIC_MAX_ARENA_PAGES {
             return None;
         }
-        let gpa = crate::mm::phys::alloc_pages(pages)?;
+        let mut pages = DYNAMIC_MIN_ARENA_PAGES;
+        while pages < min_pages {
+            pages <<= 1;
+            if pages > DYNAMIC_MAX_ARENA_PAGES {
+                return None;
+            }
+        }
+        Some(pages)
+    }
+
+    fn plan_dynamic_growth(&self, size: usize, align: usize) -> Option<usize> {
+        if self.find_free_slot().is_none() {
+            return None;
+        }
+        let needed_pages = pages_for_bytes(size.max(align.max(1)))?;
+        Self::choose_dynamic_arena_pages(needed_pages)
+    }
+
+    fn install_dynamic_arena(&mut self, gpa: u64, pages: usize) -> Option<usize> {
+        let slot = self.find_free_slot()?;
         self.arenas[slot].init(gpa as usize, pages * PAGE_SIZE);
         self.metas[slot] = ArenaMeta {
             active: true,
@@ -904,17 +1161,45 @@ impl KmallocManager {
             base_gpa: gpa,
             pages,
         };
+        self.insert_range(slot, gpa as usize, gpa as usize + pages * PAGE_SIZE);
+        self.dynamic_pages_total = self.dynamic_pages_total.saturating_add(pages);
+        if self.dynamic_pages_total > self.dynamic_pages_peak {
+            self.dynamic_pages_peak = self.dynamic_pages_total;
+        }
+        self.dynamic_arena_grow_count = self.dynamic_arena_grow_count.saturating_add(1);
         Some(slot)
     }
 
-    fn release_dynamic_arena(&mut self, idx: usize) {
+    fn detach_dynamic_arena(&mut self, idx: usize) -> PendingPhysFree {
         let meta = self.metas[idx];
         if !meta.active || !meta.dynamic {
-            return;
+            return PendingPhysFree::empty();
         }
-        crate::mm::phys::free_pages(meta.base_gpa, meta.pages);
+        self.remove_range(idx);
+        if self.alloc_hint == idx {
+            self.alloc_hint = 0;
+        }
         self.arenas[idx].reset();
         self.metas[idx] = ArenaMeta::empty();
+        self.dynamic_pages_total = self.dynamic_pages_total.saturating_sub(meta.pages);
+        self.dynamic_arena_release_count = self.dynamic_arena_release_count.saturating_add(1);
+        PendingPhysFree {
+            valid: true,
+            gpa: meta.base_gpa,
+            pages: meta.pages,
+        }
+    }
+
+    fn push_pending_free(
+        pending: &mut [PendingPhysFree; MAX_PENDING_PHYS_FREES],
+        pending_count: &mut usize,
+        rec: PendingPhysFree,
+    ) {
+        if !rec.valid || *pending_count >= MAX_PENDING_PHYS_FREES {
+            return;
+        }
+        pending[*pending_count] = rec;
+        *pending_count += 1;
     }
 
     fn dynamic_free_pages_total(&self) -> usize {
@@ -929,63 +1214,261 @@ impl KmallocManager {
         total
     }
 
-    fn try_shrink_dynamic(&mut self) {
-        while self.dynamic_free_pages_total() > DYNAMIC_HIGH_WATER_PAGES {
-            let mut victim = None;
-            let mut i = 1usize;
-            while i < MAX_ARENAS {
-                if self.metas[i].active
-                    && self.metas[i].dynamic
-                    && self.arenas[i].is_completely_free()
-                {
+    fn pick_reclaim_victim(&self) -> Option<usize> {
+        let mut victim = None;
+        let mut victim_pages = 0usize;
+        let mut i = 1usize;
+        while i < MAX_ARENAS {
+            if self.metas[i].active && self.metas[i].dynamic && self.arenas[i].is_completely_free() {
+                let pages = self.metas[i].pages;
+                if pages > victim_pages {
                     victim = Some(i);
-                    break;
+                    victim_pages = pages;
                 }
-                i += 1;
             }
-            let Some(idx) = victim else {
+            i += 1;
+        }
+        victim
+    }
+
+    fn maybe_collect_reclaim_candidates(
+        &mut self,
+        pending: &mut [PendingPhysFree; MAX_PENDING_PHYS_FREES],
+        pending_count: &mut usize,
+        force: bool,
+    ) {
+        let dynamic_free = self.dynamic_free_pages_total();
+        if !force {
+            self.free_ops_since_reclaim = self.free_ops_since_reclaim.saturating_add(1);
+            let urgent = dynamic_free >= DYNAMIC_HIGH_WATER_PAGES.saturating_mul(2);
+            if !urgent && self.free_ops_since_reclaim < RECLAIM_CHECK_INTERVAL_FREE_OPS {
+                return;
+            }
+            self.free_ops_since_reclaim = 0;
+        }
+        if dynamic_free <= DYNAMIC_HIGH_WATER_PAGES {
+            return;
+        }
+
+        self.reclaim_runs = self.reclaim_runs.saturating_add(1);
+        let mut free_pages = dynamic_free;
+        while free_pages > DYNAMIC_LOW_WATER_PAGES {
+            let Some(idx) = self.pick_reclaim_victim() else {
                 break;
             };
-            self.release_dynamic_arena(idx);
+            let rec = self.detach_dynamic_arena(idx);
+            if !rec.valid {
+                break;
+            }
+            free_pages = free_pages.saturating_sub(rec.pages);
+            self.reclaim_pages_released =
+                self.reclaim_pages_released.saturating_add(rec.pages as u64);
+            Self::push_pending_free(pending, pending_count, rec);
         }
     }
 
-    fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
+    fn alloc_from_existing_arenas(&mut self, size: usize, align: usize) -> *mut u8 {
+        let hint = self.alloc_hint.min(MAX_ARENAS - 1);
+        if self.metas[hint].active {
+            let ptr = self.arenas[hint].alloc(size, align);
+            if !ptr.is_null() {
+                self.alloc_hint = hint;
+                return ptr;
+            }
+        }
+
         let mut i = 0usize;
         while i < MAX_ARENAS {
-            if self.metas[i].active {
+            if i != hint && self.metas[i].active {
                 let ptr = self.arenas[i].alloc(size, align);
                 if !ptr.is_null() {
+                    self.alloc_hint = i;
                     return ptr;
                 }
             }
             i += 1;
         }
-
-        let need_pages = (size.max(1) + PAGE_SIZE - 1) / PAGE_SIZE;
-        let Some(idx) = self.grow_dynamic_arena(need_pages) else {
-            return null_mut();
-        };
-        let ptr = self.arenas[idx].alloc(size, align);
-        if ptr.is_null() {
-            self.release_dynamic_arena(idx);
-        }
-        ptr
+        null_mut()
     }
 
-    fn dealloc(&mut self, ptr: *mut u8) {
-        if ptr.is_null() {
-            return;
+    fn finish_grow_and_alloc(
+        &mut self,
+        size: usize,
+        align: usize,
+        gpa: u64,
+        pages: usize,
+        pending: &mut [PendingPhysFree; MAX_PENDING_PHYS_FREES],
+        pending_count: &mut usize,
+    ) -> *mut u8 {
+        let Some(slot) = self.install_dynamic_arena(gpa, pages) else {
+            Self::push_pending_free(
+                pending,
+                pending_count,
+                PendingPhysFree {
+                    valid: true,
+                    gpa,
+                    pages,
+                },
+            );
+            return self.alloc_from_existing_arenas(size, align);
+        };
+
+        self.alloc_hint = slot;
+        let ptr = self.arenas[slot].alloc(size, align);
+        if !ptr.is_null() {
+            return ptr;
         }
+
+        let rec = self.detach_dynamic_arena(slot);
+        Self::push_pending_free(pending, pending_count, rec);
+        null_mut()
+    }
+
+    fn should_use_direct_path(&self, size: usize, align: usize) -> bool {
+        let align = align.max(1);
+        let Some(needed_pages) = pages_for_bytes(size.max(align)) else {
+            return true;
+        };
+        if needed_pages > MAX_PAGES {
+            return true;
+        }
+        let Some(align_pages) = pages_for_bytes(align) else {
+            return true;
+        };
+        align_pages > MAX_PAGES
+    }
+
+    fn alloc_plan(&mut self, size: usize, align: usize) -> AllocPlan {
+        if self.should_use_direct_path(size, align) {
+            return AllocPlan::Direct;
+        }
+        let ptr = self.alloc_from_existing_arenas(size, align);
+        if !ptr.is_null() {
+            return AllocPlan::Ready(ptr);
+        }
+        match self.plan_dynamic_growth(size, align) {
+            Some(pages) => AllocPlan::GrowDynamic { pages },
+            None => AllocPlan::Direct,
+        }
+    }
+
+    fn find_free_direct_slot(&self) -> Option<usize> {
         let mut i = 0usize;
-        while i < MAX_ARENAS {
-            if self.metas[i].active && self.arenas[i].contains(ptr) {
-                self.arenas[i].free(ptr);
-                self.try_shrink_dynamic();
-                return;
+        while i < MAX_DIRECT_ALLOCS {
+            if !self.direct_allocs[i].active {
+                return Some(i);
             }
             i += 1;
         }
+        None
+    }
+
+    fn find_direct_alloc_exact(&self, ptr: usize) -> Option<usize> {
+        let mut i = 0usize;
+        while i < MAX_DIRECT_ALLOCS {
+            let meta = self.direct_allocs[i];
+            if meta.active && meta.user_ptr == ptr {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn contains_direct_range(&self, ptr: usize) -> bool {
+        let mut i = 0usize;
+        while i < MAX_DIRECT_ALLOCS {
+            let meta = self.direct_allocs[i];
+            if meta.active && ptr >= meta.user_ptr && ptr < meta.end() {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn alloc_direct_install(
+        &mut self,
+        user_ptr: usize,
+        size: usize,
+        gpa: u64,
+        pages: usize,
+    ) -> bool {
+        let Some(slot) = self.find_free_direct_slot() else {
+            self.direct_alloc_failures = self.direct_alloc_failures.saturating_add(1);
+            return false;
+        };
+        self.direct_allocs[slot] = DirectAllocMeta {
+            active: true,
+            user_ptr,
+            size,
+            base_gpa: gpa,
+            pages,
+        };
+        self.direct_active_allocs = self.direct_active_allocs.saturating_add(1);
+        self.direct_pages_total = self.direct_pages_total.saturating_add(pages);
+        if self.direct_pages_total > self.direct_pages_peak {
+            self.direct_pages_peak = self.direct_pages_total;
+        }
+        self.direct_alloc_count = self.direct_alloc_count.saturating_add(1);
+        true
+    }
+
+    fn remove_direct_alloc(&mut self, slot: usize) -> PendingPhysFree {
+        if slot >= MAX_DIRECT_ALLOCS {
+            return PendingPhysFree::empty();
+        }
+        let meta = self.direct_allocs[slot];
+        if !meta.active {
+            return PendingPhysFree::empty();
+        }
+        self.direct_allocs[slot] = DirectAllocMeta::empty();
+        self.direct_active_allocs = self.direct_active_allocs.saturating_sub(1);
+        self.direct_pages_total = self.direct_pages_total.saturating_sub(meta.pages);
+        self.direct_free_count = self.direct_free_count.saturating_add(1);
+        PendingPhysFree {
+            valid: true,
+            gpa: meta.base_gpa,
+            pages: meta.pages,
+        }
+    }
+
+    fn note_direct_alloc_failure(&mut self) {
+        self.direct_alloc_failures = self.direct_alloc_failures.saturating_add(1);
+    }
+
+    fn dealloc(
+        &mut self,
+        ptr: *mut u8,
+        pending: &mut [PendingPhysFree; MAX_PENDING_PHYS_FREES],
+        pending_count: &mut usize,
+    ) {
+        if ptr.is_null() {
+            return;
+        }
+
+        let addr = ptr as usize;
+        if let Some(slot) = self.find_direct_alloc_exact(addr) {
+            let rec = self.remove_direct_alloc(slot);
+            Self::push_pending_free(pending, pending_count, rec);
+            return;
+        }
+
+        if let Some(idx) = self.find_arena_by_ptr(addr) {
+            self.arenas[idx].free(ptr);
+            if self.metas[idx].dynamic {
+                self.maybe_collect_reclaim_candidates(pending, pending_count, false);
+            }
+            return;
+        }
+
+        if self.contains_direct_range(addr) {
+            if self.metas[0].active {
+                self.arenas[0].free(ptr);
+            }
+            return;
+        }
+
         // Keep invalid-free accounting behavior.
         if self.metas[0].active {
             self.arenas[0].free(ptr);
@@ -996,14 +1479,11 @@ impl KmallocManager {
         if ptr.is_null() {
             return false;
         }
-        let mut i = 0usize;
-        while i < MAX_ARENAS {
-            if self.metas[i].active && self.arenas[i].contains(ptr) {
-                return true;
-            }
-            i += 1;
+        let addr = ptr as usize;
+        if self.find_arena_by_ptr(addr).is_some() {
+            return true;
         }
-        false
+        self.contains_direct_range(addr)
     }
 
     fn stats(&self) -> KmallocStats {
@@ -1021,6 +1501,13 @@ impl KmallocManager {
             }
             i += 1;
         }
+        out.alloc_calls = out
+            .alloc_calls
+            .saturating_add(self.direct_alloc_count)
+            .saturating_add(self.direct_alloc_failures);
+        out.free_calls = out.free_calls.saturating_add(self.direct_free_count);
+        out.large_allocs = out.large_allocs.saturating_add(self.direct_alloc_count);
+        out.alloc_failures = out.alloc_failures.saturating_add(self.direct_alloc_failures);
         out
     }
 
@@ -1041,6 +1528,19 @@ impl KmallocManager {
             full_slabs_by_cache: [0; NUM_CACHES],
             largest_free_order: 0,
             free_pages_total: 0,
+            dynamic_arena_count: 0,
+            dynamic_pages_total: self.dynamic_pages_total,
+            dynamic_pages_peak: self.dynamic_pages_peak,
+            dynamic_arena_grow_count: self.dynamic_arena_grow_count,
+            dynamic_arena_release_count: self.dynamic_arena_release_count,
+            reclaim_runs: self.reclaim_runs,
+            reclaim_pages_released: self.reclaim_pages_released,
+            direct_active_allocs: self.direct_active_allocs,
+            direct_pages_total: self.direct_pages_total,
+            direct_pages_peak: self.direct_pages_peak,
+            direct_alloc_count: self.direct_alloc_count,
+            direct_free_count: self.direct_free_count,
+            direct_alloc_failures: self.direct_alloc_failures,
         };
 
         let mut i = 0usize;
@@ -1092,9 +1592,25 @@ impl KmallocManager {
                         out.free_blocks_by_order[o].saturating_add(s.free_blocks_by_order[o]);
                     o += 1;
                 }
+
+                if self.metas[i].dynamic {
+                    out.dynamic_arena_count = out.dynamic_arena_count.saturating_add(1);
+                }
             }
             i += 1;
         }
+
+        out.stats.alloc_calls = out
+            .stats
+            .alloc_calls
+            .saturating_add(self.direct_alloc_count)
+            .saturating_add(self.direct_alloc_failures);
+        out.stats.free_calls = out.stats.free_calls.saturating_add(self.direct_free_count);
+        out.stats.large_allocs = out.stats.large_allocs.saturating_add(self.direct_alloc_count);
+        out.stats.alloc_failures = out
+            .stats
+            .alloc_failures
+            .saturating_add(self.direct_alloc_failures);
 
         out
     }
@@ -1118,16 +1634,117 @@ fn with_state_mut<R>(f: impl FnOnce(&mut KmallocManager) -> R) -> R {
     unsafe { f(&mut *KMALLOC.state.get()) }
 }
 
+fn drain_pending_frees(pending: &[PendingPhysFree; MAX_PENDING_PHYS_FREES], pending_count: usize) {
+    let mut i = 0usize;
+    while i < pending_count {
+        let rec = pending[i];
+        if rec.valid {
+            crate::mm::phys::free_pages(rec.gpa, rec.pages);
+        }
+        i += 1;
+    }
+}
+
+fn alloc_direct(size: usize, align: usize) -> *mut u8 {
+    let size = size.max(1);
+    let align = align.max(1);
+    if !align.is_power_of_two() {
+        with_state_mut(|s| s.note_direct_alloc_failure());
+        return null_mut();
+    }
+    let total = match size.checked_add(align - 1) {
+        Some(v) => v,
+        None => {
+            with_state_mut(|s| s.note_direct_alloc_failure());
+            return null_mut();
+        }
+    };
+    let pages = match pages_for_bytes(total) {
+        Some(v) => v,
+        None => {
+            with_state_mut(|s| s.note_direct_alloc_failure());
+            return null_mut();
+        }
+    };
+    let Some(gpa) = crate::mm::phys::alloc_pages(pages) else {
+        with_state_mut(|s| s.note_direct_alloc_failure());
+        return null_mut();
+    };
+    let base = gpa as usize;
+    let Some(user_ptr) = align_up(base, align) else {
+        crate::mm::phys::free_pages(gpa, pages);
+        with_state_mut(|s| s.note_direct_alloc_failure());
+        return null_mut();
+    };
+    let ok = with_state_mut(|s| s.alloc_direct_install(user_ptr, size, gpa, pages));
+    if !ok {
+        crate::mm::phys::free_pages(gpa, pages);
+        return null_mut();
+    }
+    user_ptr as *mut u8
+}
+
 pub fn init(heap_base: usize, heap_size: usize) {
     with_state_mut(|s| s.init(heap_base, heap_size));
 }
 
 pub fn alloc(size: usize, align: usize) -> *mut u8 {
-    with_state_mut(|s| s.alloc(size, align))
+    let plan = {
+        let _guard = KMALLOC.lock.lock();
+        let state = unsafe { &mut *KMALLOC.state.get() };
+        state.alloc_plan(size, align.max(1))
+    };
+
+    match plan {
+        AllocPlan::Ready(ptr) => ptr,
+        AllocPlan::Direct => alloc_direct(size, align),
+        AllocPlan::GrowDynamic { pages } => {
+            let Some(gpa) = crate::mm::phys::alloc_pages(pages) else {
+                return alloc_direct(size, align);
+            };
+            let mut pending = [const { PendingPhysFree::empty() }; MAX_PENDING_PHYS_FREES];
+            let mut pending_count = 0usize;
+            let ptr = {
+                let _guard = KMALLOC.lock.lock();
+                let state = unsafe { &mut *KMALLOC.state.get() };
+                state.finish_grow_and_alloc(
+                    size,
+                    align.max(1),
+                    gpa,
+                    pages,
+                    &mut pending,
+                    &mut pending_count,
+                )
+            };
+            drain_pending_frees(&pending, pending_count);
+            if !ptr.is_null() {
+                return ptr;
+            }
+            alloc_direct(size, align)
+        }
+    }
 }
 
 pub fn dealloc(ptr: *mut u8) {
-    with_state_mut(|s| s.dealloc(ptr));
+    let mut pending = [const { PendingPhysFree::empty() }; MAX_PENDING_PHYS_FREES];
+    let mut pending_count = 0usize;
+    {
+        let _guard = KMALLOC.lock.lock();
+        let state = unsafe { &mut *KMALLOC.state.get() };
+        state.dealloc(ptr, &mut pending, &mut pending_count);
+    }
+    drain_pending_frees(&pending, pending_count);
+}
+
+pub fn reclaim_idle_dynamic() {
+    let mut pending = [const { PendingPhysFree::empty() }; MAX_PENDING_PHYS_FREES];
+    let mut pending_count = 0usize;
+    {
+        let _guard = KMALLOC.lock.lock();
+        let state = unsafe { &mut *KMALLOC.state.get() };
+        state.maybe_collect_reclaim_candidates(&mut pending, &mut pending_count, true);
+    }
+    drain_pending_frees(&pending, pending_count);
 }
 
 pub fn alloc_zeroed(size: usize, align: usize) -> *mut u8 {
