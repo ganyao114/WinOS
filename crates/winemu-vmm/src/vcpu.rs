@@ -24,6 +24,9 @@ pub fn vcpu_thread(
         match exit {
             VmExit::Wfi => {
                 let _ = vcpu.advance_pc(4);
+                if let Some(wait) = bounded_wfi_wait(vcpu.as_ref()) {
+                    std::thread::park_timeout(wait);
+                }
                 continue 'kernel;
             }
             VmExit::Timer => {
@@ -117,6 +120,11 @@ pub fn vcpu_thread(
             VmExit::Wfi => {
                 // HVF traps WFI/WFE as a synchronous exit. Emulate completion.
                 let _ = vcpu.advance_pc(4);
+                if let Some(wait) = bounded_wfi_wait(vcpu.as_ref()) {
+                    sched.set_vcpu_idle(vcpu_id, true);
+                    std::thread::park_timeout(wait);
+                    sched.set_vcpu_idle(vcpu_id, false);
+                }
                 let ctx = save_ctx(&mut *vcpu);
                 sched.save_ctx(tid, ctx);
                 continue 'run;
@@ -270,4 +278,11 @@ fn save_ctx(vcpu: &mut dyn Vcpu) -> ThreadContext {
 
 fn set_x0(vcpu: &mut dyn Vcpu, val: u64) {
     vcpu.set_return_value(val).unwrap();
+}
+
+fn bounded_wfi_wait(vcpu: &dyn Vcpu) -> Option<Duration> {
+    let hint = vcpu.wfi_idle_hint()?;
+    let min_wait = Duration::from_micros(20);
+    let max_wait = Duration::from_millis(10);
+    Some(hint.clamp(min_wait, max_wait))
 }

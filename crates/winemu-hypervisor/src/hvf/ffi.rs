@@ -30,6 +30,7 @@ pub const HV_SYS_REG_VBAR_EL1: u16 = 0xc600;
 pub const HV_SYS_REG_SP_EL1: u16 = 0xe208;
 pub const HV_SYS_REG_CPACR_EL1: u16 = 0xc082;
 pub const HV_SYS_REG_CNTV_CTL_EL0: u16 = 0xdf19;
+pub const HV_SYS_REG_CNTV_CVAL_EL0: u16 = 0xdf1a;
 
 #[repr(C)]
 pub struct hv_vcpu_exit_t {
@@ -43,6 +44,12 @@ pub struct hv_vcpu_exit_exception_t {
     pub syndrome: u64,
     pub virtual_address: u64,
     pub physical_address: u64,
+}
+
+#[repr(C)]
+pub struct mach_timebase_info_data_t {
+    pub numer: u32,
+    pub denom: u32,
 }
 
 extern "C" {
@@ -74,6 +81,10 @@ extern "C" {
         pending: bool,
     ) -> hv_return_t;
     pub fn hv_vcpu_set_vtimer_mask(vcpu: hv_vcpuid_t, vtimer_is_masked: bool) -> hv_return_t;
+    pub fn hv_vcpu_get_vtimer_offset(vcpu: hv_vcpuid_t, vtimer_offset: *mut u64) -> hv_return_t;
+
+    pub fn mach_absolute_time() -> u64;
+    pub fn mach_timebase_info(info: *mut mach_timebase_info_data_t) -> i32;
 }
 
 // ARM64 general-purpose register IDs (hv_reg_t = u32)

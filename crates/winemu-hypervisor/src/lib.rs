@@ -33,6 +33,11 @@ pub trait Vcpu: Send {
     fn spsr_el1(&self) -> Result<u64>;
     /// SP_EL0 — user stack pointer
     fn sp_el0(&self) -> Result<u64>;
+    /// Optional host-side idle hint for trapped WFI flows.
+    /// When available, VMM can park host thread roughly until this deadline.
+    fn wfi_idle_hint(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// 根据当前平台创建默认 Hypervisor 实例

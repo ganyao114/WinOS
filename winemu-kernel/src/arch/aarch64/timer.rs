@@ -85,57 +85,53 @@ global_asm!(
 );
 
 pub const DEFAULT_TIMESLICE_100NS: u64 = 150_000; // 15ms
+const IDLE_FALLBACK_SLEEP_100NS: u64 = 10_000; // 1ms
 
 #[inline(always)]
-fn next_idle_sleep_100ns(now_100ns: u64, next_deadline_100ns: u64) -> u64 {
-    if next_deadline_100ns > now_100ns {
-        next_deadline_100ns - now_100ns
+fn sleep_delta_100ns(now_100ns: u64, deadline_100ns: u64, fallback_100ns: u64) -> u64 {
+    if deadline_100ns > now_100ns {
+        (deadline_100ns - now_100ns).max(1)
     } else {
-        10_000 // 1ms fallback when there is no finite deadline.
+        fallback_100ns.max(1)
+    }
+}
+
+#[inline(always)]
+fn timer_frequency() -> u64 {
+    let freq = crate::arch::cpu::read_cntfrq_el0();
+    if freq == 0 {
+        24_000_000
+    } else {
+        freq
     }
 }
 
 #[inline(always)]
 fn arm_vtimer_oneshot_100ns(delta_100ns: u64) {
-    let mut freq: u64;
-    let mut now: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nostack, nomem));
-        core::arch::asm!("mrs {}, cntvct_el0", out(reg) now, options(nostack, nomem));
-    }
-    if freq == 0 {
-        freq = 24_000_000;
-    }
+    let freq = timer_frequency();
+    let now = crate::arch::cpu::read_cntvct_el0();
     let delta_ticks = (((delta_100ns.max(1) as u128) * (freq as u128)) / 10_000_000u128) as u64;
     let cval = now.saturating_add(delta_ticks.max(1));
-    unsafe {
-        // ENABLE=1, IMASK=0
-        core::arch::asm!("msr cntv_cval_el0, {}", in(reg) cval, options(nostack));
-        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64, options(nostack));
-        core::arch::asm!("isb", options(nostack, nomem));
-    }
+    // ENABLE=1, IMASK=0
+    crate::arch::cpu::write_cntv_cval_el0(cval);
+    crate::arch::cpu::write_cntv_ctl_el0(1);
+    crate::arch::cpu::isb();
 }
 
 #[inline(always)]
 fn wait_for_timer_irq() {
-    unsafe {
-        core::arch::asm!(
-            "msr daifclr, #2", // unmask IRQ while sleeping
-            "wfi",
-            "msr daifset, #2", // re-mask IRQ in scheduler critical path
-            options(nostack)
-        );
-    }
+    // Mirror HOS-style flow: program one-shot, unmask IRQ, sleep in WFI,
+    // then re-mask on return so scheduler critical path keeps explicit IRQ control.
+    crate::arch::cpu::daifclr_irq();
+    crate::arch::cpu::wait_for_interrupt();
+    crate::arch::cpu::daifset_irq();
 }
 
 #[inline(always)]
 pub fn arm_running_slice_100ns(now_100ns: u64, next_deadline_100ns: u64, quantum_100ns: u64) {
     let mut delta = quantum_100ns.max(1);
     if next_deadline_100ns > now_100ns {
-        let wait_delta = next_deadline_100ns - now_100ns;
-        if wait_delta < delta {
-            delta = wait_delta.max(1);
-        }
+        delta = delta.min(next_deadline_100ns - now_100ns).max(1);
     }
     arm_vtimer_oneshot_100ns(delta);
 }
@@ -147,19 +143,7 @@ pub fn schedule_running_slice_100ns(now_100ns: u64, next_deadline_100ns: u64, qu
 
 #[inline(always)]
 pub fn idle_wait_until_deadline_100ns(now_100ns: u64, next_deadline_100ns: u64) {
-    // NOTE:
-    // HVF WFI exits are currently handled in host vcpu loop that is still
-    // coupled with legacy host-side scheduling state. Using WFI here can
-    // deadlock delay wakeups when guest has no runnable thread.
-    //
-    // Keep running-thread preemption on vtimer IRQs, but use monotonic polling
-    // in idle path so timeout wakeups remain correct.
-    let target = if next_deadline_100ns > now_100ns {
-        next_deadline_100ns
-    } else {
-        now_100ns.saturating_add(10_000) // 1ms fallback
-    };
-    while crate::hypercall::query_mono_time_100ns() < target {
-        core::hint::spin_loop();
-    }
+    let delta = sleep_delta_100ns(now_100ns, next_deadline_100ns, IDLE_FALLBACK_SLEEP_100NS);
+    arm_vtimer_oneshot_100ns(delta);
+    wait_for_timer_irq();
 }

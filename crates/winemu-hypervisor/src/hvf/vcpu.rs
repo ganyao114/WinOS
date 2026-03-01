@@ -6,6 +6,8 @@ use crate::{
     types::{Regs, SpecialRegs, VmExit},
     Vcpu,
 };
+use std::sync::OnceLock;
+use std::time::Duration;
 use winemu_core::{Result, WinemuError};
 
 pub struct HvfVcpu {
@@ -19,6 +21,30 @@ pub struct HvfVcpu {
 unsafe impl Send for HvfVcpu {}
 
 impl HvfVcpu {
+    fn wfi_idle_hint_inner(&self) -> Option<Duration> {
+        let cntv_ctl = self.get_sys_reg(ffi::HV_SYS_REG_CNTV_CTL_EL0).ok()?;
+        let enabled = (cntv_ctl & 0x1) != 0;
+        let masked = (cntv_ctl & 0x2) != 0;
+        if !enabled || masked {
+            return None;
+        }
+
+        let cval = self.get_sys_reg(ffi::HV_SYS_REG_CNTV_CVAL_EL0).ok()?;
+        let mut offset = 0u64;
+        let ret = unsafe { ffi::hv_vcpu_get_vtimer_offset(self.id, &mut offset as *mut u64) };
+        if ret != ffi::HV_SUCCESS {
+            return None;
+        }
+
+        let now_abs = unsafe { ffi::mach_absolute_time() };
+        let now_cntvct = now_abs.saturating_sub(offset);
+        let remain_ticks = cval.saturating_sub(now_cntvct);
+        if remain_ticks == 0 {
+            return Some(Duration::from_micros(20));
+        }
+        Some(mach_ticks_to_duration(remain_ticks))
+    }
+
     pub fn new() -> Result<Self> {
         let mut id: hv_vcpuid_t = 0;
         let mut exit: *const hv_vcpu_exit_t = std::ptr::null();
@@ -356,4 +382,30 @@ impl Vcpu for HvfVcpu {
     fn sp_el0(&self) -> Result<u64> {
         self.get_sys_reg(ffi::HV_SYS_REG_SP_EL0)
     }
+
+    fn wfi_idle_hint(&self) -> Option<Duration> {
+        self.wfi_idle_hint_inner()
+    }
+}
+
+fn mach_ticks_to_duration(ticks: u64) -> Duration {
+    let (numer, denom) = mach_timebase();
+    if denom == 0 {
+        return Duration::from_micros(200);
+    }
+    let nanos = ((ticks as u128) * (numer as u128) / (denom as u128)) as u64;
+    Duration::from_nanos(nanos)
+}
+
+fn mach_timebase() -> (u32, u32) {
+    static TIMEBASE: OnceLock<(u32, u32)> = OnceLock::new();
+    *TIMEBASE.get_or_init(|| {
+        let mut info = ffi::mach_timebase_info_data_t { numer: 0, denom: 0 };
+        let ret = unsafe { ffi::mach_timebase_info(&mut info as *mut _) };
+        if ret != 0 || info.denom == 0 {
+            (1, 1)
+        } else {
+            (info.numer, info.denom)
+        }
+    })
 }
