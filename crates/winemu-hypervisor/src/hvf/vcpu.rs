@@ -62,7 +62,7 @@ impl HvfVcpu {
             use_vtimer_exit: std::env::var("WINEMU_HVF_VTIMER_EXIT")
                 .ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(true),
+                .unwrap_or(false),
         };
         vcpu.init_el1()?;
         Ok(vcpu)

@@ -207,7 +207,12 @@ impl ReadyQueue {
         if self.tails[p] != 0 {
             // append to tail
             let tail_tid = self.tails[p];
-            with_thread_mut(tail_tid, |tail| tail.sched_next = t.tid);
+            if thread_exists(tail_tid) {
+                with_thread_mut(tail_tid, |tail| tail.sched_next = t.tid);
+            } else {
+                // Corrupted tail; reset this priority queue to a single-node list.
+                self.heads[p] = t.tid;
+            }
         } else {
             self.heads[p] = t.tid;
         }
@@ -216,21 +221,30 @@ impl ReadyQueue {
     }
 
     pub fn pop_highest(&mut self) -> u32 {
-        if self.present == 0 {
-            return 0;
+        while self.present != 0 {
+            let p = 31 - self.present.leading_zeros() as usize;
+            let tid = self.heads[p];
+            if tid == 0 || !thread_exists(tid) {
+                self.heads[p] = 0;
+                self.tails[p] = 0;
+                self.present &= !(1u32 << p);
+                continue;
+            }
+
+            let mut next = with_thread(tid, |t| t.sched_next);
+            if next != 0 && !thread_exists(next) {
+                next = 0;
+                with_thread_mut(tid, |t| t.sched_next = 0);
+            }
+            self.heads[p] = next;
+            if next == 0 {
+                self.tails[p] = 0;
+                self.present &= !(1u32 << p);
+            }
+            with_thread_mut(tid, |t| t.sched_next = 0);
+            return tid;
         }
-        let p = 31 - self.present.leading_zeros() as usize;
-        let tid = self.heads[p];
-        if tid == 0 {
-            return 0;
-        }
-        let next = with_thread(tid, |t| t.sched_next);
-        self.heads[p] = next;
-        if next == 0 {
-            self.tails[p] = 0;
-            self.present &= !(1u32 << p);
-        }
-        tid
+        0
     }
 
     pub fn pop_highest_prefer_vcpu(&mut self, prefer_vcpu: usize) -> u32 {
@@ -247,9 +261,23 @@ impl ReadyQueue {
         let mut prev = 0u32;
         let mut cur = head;
         while cur != 0 {
+            if !thread_exists(cur) {
+                if prev == 0 {
+                    self.heads[p] = 0;
+                    self.tails[p] = 0;
+                    self.present &= !(1u32 << p);
+                } else {
+                    with_thread_mut(prev, |t| t.sched_next = 0);
+                    self.tails[p] = prev;
+                }
+                break;
+            }
             let cur_hint = with_thread(cur, |t| t.last_vcpu_hint);
             if cur_hint == hint {
-                let next = with_thread(cur, |t| t.sched_next);
+                let mut next = with_thread(cur, |t| t.sched_next);
+                if next != 0 && !thread_exists(next) {
+                    next = 0;
+                }
                 if prev == 0 {
                     self.heads[p] = next;
                 } else {
@@ -261,10 +289,16 @@ impl ReadyQueue {
                 if self.heads[p] == 0 {
                     self.present &= !(1u32 << p);
                 }
+                with_thread_mut(cur, |t| t.sched_next = 0);
                 return cur;
             }
             prev = cur;
-            cur = with_thread(cur, |t| t.sched_next);
+            let mut next = with_thread(cur, |t| t.sched_next);
+            if next != 0 && !thread_exists(next) {
+                next = 0;
+                with_thread_mut(cur, |t| t.sched_next = 0);
+            }
+            cur = next;
         }
 
         self.pop_highest()
@@ -284,7 +318,23 @@ impl ReadyQueue {
             let mut prev = 0u32;
             let mut cur = self.heads[p];
             while cur != 0 {
-                let next = with_thread(cur, |t| t.sched_next);
+                if !thread_exists(cur) {
+                    if prev == 0 {
+                        self.heads[p] = 0;
+                        self.tails[p] = 0;
+                    } else {
+                        with_thread_mut(prev, |t| t.sched_next = 0);
+                        self.tails[p] = prev;
+                    }
+                    self.present &= !(1u32 << p);
+                    break;
+                }
+
+                let mut next = with_thread(cur, |t| t.sched_next);
+                if next != 0 && !thread_exists(next) {
+                    next = 0;
+                    with_thread_mut(cur, |t| t.sched_next = 0);
+                }
                 if cur == tid {
                     if prev == 0 {
                         self.heads[p] = next;
@@ -297,6 +347,7 @@ impl ReadyQueue {
                     if self.heads[p] == 0 {
                         self.present &= !(1u32 << p);
                     }
+                    with_thread_mut(cur, |t| t.sched_next = 0);
                     return;
                 }
                 prev = cur;
@@ -647,7 +698,11 @@ pub(crate) fn sched_lock_held_by_current_vcpu() -> bool {
 }
 
 pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
+    crate::hypercall::debug_u64(0xD101_0001);
+    crate::hypercall::debug_u64(tid as u64);
+    crate::hypercall::debug_u64(deadline);
     if tid == 0 || !thread_exists(tid) {
+        crate::hypercall::debug_u64(0xD101_E001);
         return false;
     }
     let old_handle = with_thread_mut(tid, |t| {
@@ -664,6 +719,7 @@ pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
         if old_handle.is_valid() {
             let _ = timer::cancel_task(old_handle);
         }
+        crate::hypercall::debug_u64(0xD101_0002);
         return true;
     }
 
@@ -673,6 +729,9 @@ pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
                 t.wait_timer_task_id = handle.id;
                 t.wait_timer_generation = handle.generation;
             });
+            crate::hypercall::debug_u64(0xD101_0003);
+            crate::hypercall::debug_u64(handle.id as u64);
+            crate::hypercall::debug_u64(handle.generation as u64);
             return true;
         }
         let _ = timer::cancel_task(old_handle);
@@ -683,6 +742,9 @@ pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
             t.wait_timer_task_id = handle.id;
             t.wait_timer_generation = handle.generation;
         });
+        crate::hypercall::debug_u64(0xD101_0004);
+        crate::hypercall::debug_u64(handle.id as u64);
+        crate::hypercall::debug_u64(handle.generation as u64);
         return true;
     }
 
@@ -691,6 +753,7 @@ pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
         t.wait_timer_task_id = 0;
         t.wait_timer_generation = 0;
     });
+    crate::hypercall::debug_u64(0xD101_E002);
     false
 }
 
@@ -736,6 +799,9 @@ pub(crate) fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
             t.state = new_state;
             if new_state != ThreadState::Running {
                 t.last_start_100ns = 0;
+            }
+            if new_state != ThreadState::Ready {
+                t.sched_next = 0;
             }
         });
 
@@ -1115,7 +1181,7 @@ pub fn check_timeouts(now_ticks: u64) -> bool {
         if !still_waiting {
             return;
         }
-        crate::sched::sync::cleanup_wait_registration(tid);
+        crate::sched::sync::cleanup_wait_registration_locked(tid);
         let _ = set_wait_deadline_locked(tid, 0);
         with_thread_mut(tid, |t| {
             let timeout_result = if t.wait_kind == WAIT_KIND_DELAY {
@@ -1159,13 +1225,50 @@ pub fn check_timeouts(now_ticks: u64) -> bool {
         timeout_now(tid);
     }
 
+    // Fallback scan: if timer task indexing becomes stale/corrupted, we still
+    // honor absolute wait deadlines and avoid indefinite waits.
+    unsafe {
+        if let Some(store) = (&*SCHED.threads.get()).as_ref() {
+            store.for_each_live_id(|tid| {
+                if tid == 0 {
+                    return;
+                }
+                let due = with_thread(tid, |t| {
+                    t.state == ThreadState::Waiting && t.wait_deadline != 0 && t.wait_deadline <= now_ticks
+                });
+                if due {
+                    timeout_now(tid);
+                }
+            });
+        }
+    }
+
     woke_any
 }
 
 /// Return the earliest waiting deadline (100ns), 0 if none.
 /// Caller must hold scheduler lock.
 pub fn next_wait_deadline_locked() -> u64 {
-    timer::next_deadline_locked()
+    let timer_deadline = timer::next_deadline_locked();
+    if timer_deadline != 0 {
+        return timer_deadline;
+    }
+
+    let mut best = 0u64;
+    unsafe {
+        if let Some(store) = (&*SCHED.threads.get()).as_ref() {
+            store.for_each_live_ptr(|_tid, ptr| {
+                let t = &*ptr;
+                if t.state != ThreadState::Waiting || t.wait_deadline == 0 {
+                    return;
+                }
+                if best == 0 || t.wait_deadline < best {
+                    best = t.wait_deadline;
+                }
+            });
+        }
+    }
+    best
 }
 
 /// Locking wrapper for callers that are not already in scheduler critical section.

@@ -1083,7 +1083,7 @@ fn remove_waiter_from_handle_locked(h: u64, tid: u32) {
     }
 }
 
-fn cleanup_wait_registration_locked(tid: u32) {
+pub(crate) fn cleanup_wait_registration_locked(tid: u32) {
     let (handles, count) = copy_wait_handles_for_thread(tid);
     let mut i = 0usize;
     while i < count {
