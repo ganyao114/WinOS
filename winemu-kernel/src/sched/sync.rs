@@ -832,147 +832,307 @@ fn waiter_owner_pid(waiter_tid: u32) -> u32 {
     current_handle_owner_pid()
 }
 
-fn validate_waitable_handle_locked(h: u64) -> u32 {
-    let owner_pid = waiter_owner_pid(current_tid());
-    let htype = handle_type_for_pid(h, owner_pid);
-    let idx = handle_idx_for_pid(h, owner_pid);
+struct WaitableObjectOps {
+    validate: fn(obj_idx: u32) -> bool,
+    is_signaled: fn(waiter_tid: u32, obj_idx: u32) -> bool,
+    consume_signal: fn(waiter_tid: u32, obj_idx: u32) -> bool,
+    register_waiter: fn(obj_idx: u32, waiter_tid: u32),
+    remove_waiter: fn(obj_idx: u32, waiter_tid: u32),
+}
+
+const EVENT_WAITABLE_OPS: WaitableObjectOps = WaitableObjectOps {
+    validate: event_validate_waitable,
+    is_signaled: event_is_signaled,
+    consume_signal: event_consume_signal,
+    register_waiter: event_register_waiter,
+    remove_waiter: event_remove_waiter,
+};
+
+const MUTEX_WAITABLE_OPS: WaitableObjectOps = WaitableObjectOps {
+    validate: mutex_validate_waitable,
+    is_signaled: mutex_is_signaled,
+    consume_signal: mutex_consume_signal,
+    register_waiter: mutex_register_waiter,
+    remove_waiter: mutex_remove_waiter,
+};
+
+const SEMAPHORE_WAITABLE_OPS: WaitableObjectOps = WaitableObjectOps {
+    validate: semaphore_validate_waitable,
+    is_signaled: semaphore_is_signaled,
+    consume_signal: semaphore_consume_signal,
+    register_waiter: semaphore_register_waiter,
+    remove_waiter: semaphore_remove_waiter,
+};
+
+const THREAD_WAITABLE_OPS: WaitableObjectOps = WaitableObjectOps {
+    validate: thread_validate_waitable,
+    is_signaled: thread_is_signaled,
+    consume_signal: thread_consume_signal,
+    register_waiter: thread_register_waiter,
+    remove_waiter: thread_remove_waiter,
+};
+
+const PROCESS_WAITABLE_OPS: WaitableObjectOps = WaitableObjectOps {
+    validate: process_validate_waitable,
+    is_signaled: process_is_signaled,
+    consume_signal: process_consume_signal,
+    register_waiter: process_register_waiter,
+    remove_waiter: process_remove_waiter,
+};
+
+fn waitable_ops_for_type(htype: u64) -> Option<&'static WaitableObjectOps> {
     match htype {
-        HANDLE_TYPE_EVENT => {
-            if idx == 0 || event_ptr(idx).is_null() {
-                STATUS_INVALID_HANDLE
-            } else {
-                STATUS_SUCCESS
-            }
+        HANDLE_TYPE_EVENT => Some(&EVENT_WAITABLE_OPS),
+        HANDLE_TYPE_MUTEX => Some(&MUTEX_WAITABLE_OPS),
+        HANDLE_TYPE_SEMAPHORE => Some(&SEMAPHORE_WAITABLE_OPS),
+        HANDLE_TYPE_THREAD => Some(&THREAD_WAITABLE_OPS),
+        HANDLE_TYPE_PROCESS => Some(&PROCESS_WAITABLE_OPS),
+        _ => None,
+    }
+}
+
+fn resolve_waitable_target_for_waiter(
+    waiter_tid: u32,
+    h: u64,
+) -> Option<(&'static WaitableObjectOps, u32)> {
+    let owner_pid = waiter_owner_pid(waiter_tid);
+    let htype = handle_type_for_pid(h, owner_pid);
+    let obj_idx = handle_idx_for_pid(h, owner_pid);
+    Some((waitable_ops_for_type(htype)?, obj_idx))
+}
+
+fn event_validate_waitable(idx: u32) -> bool {
+    idx != 0 && !event_ptr(idx).is_null()
+}
+
+fn event_is_signaled(_waiter_tid: u32, idx: u32) -> bool {
+    let ev = event_ptr(idx);
+    if ev.is_null() {
+        return false;
+    }
+    unsafe { (*ev).signaled }
+}
+
+fn event_consume_signal(_waiter_tid: u32, idx: u32) -> bool {
+    let ev = event_ptr(idx);
+    if ev.is_null() {
+        return false;
+    }
+    unsafe {
+        if !(*ev).signaled {
+            return false;
         }
-        HANDLE_TYPE_MUTEX => {
-            if idx == 0 || mutex_ptr(idx).is_null() {
-                STATUS_INVALID_HANDLE
-            } else {
-                STATUS_SUCCESS
-            }
+        if (*ev).ev_type == EventType::SynchronizationEvent {
+            (*ev).signaled = false;
         }
-        HANDLE_TYPE_SEMAPHORE => {
-            if idx == 0 || semaphore_ptr(idx).is_null() {
-                STATUS_INVALID_HANDLE
-            } else {
-                STATUS_SUCCESS
-            }
+    }
+    true
+}
+
+fn event_register_waiter(idx: u32, waiter_tid: u32) {
+    let ev = event_ptr(idx);
+    if ev.is_null() {
+        return;
+    }
+    unsafe { (*ev).waiters.enqueue(waiter_tid) };
+}
+
+fn event_remove_waiter(idx: u32, waiter_tid: u32) {
+    let ev = event_ptr(idx);
+    if ev.is_null() {
+        return;
+    }
+    unsafe { (*ev).waiters.remove(waiter_tid) };
+}
+
+fn mutex_validate_waitable(idx: u32) -> bool {
+    idx != 0 && !mutex_ptr(idx).is_null()
+}
+
+fn mutex_is_signaled(waiter_tid: u32, idx: u32) -> bool {
+    let m = mutex_ptr(idx);
+    if m.is_null() {
+        return false;
+    }
+    unsafe { (*m).owner_tid == 0 || (*m).owner_tid == waiter_tid }
+}
+
+fn mutex_consume_signal(waiter_tid: u32, idx: u32) -> bool {
+    let m = mutex_ptr(idx);
+    if m.is_null() {
+        return false;
+    }
+    unsafe {
+        if (*m).owner_tid == 0 {
+            (*m).owner_tid = waiter_tid;
+            (*m).recursion = 1;
+            recompute_owned_mutex_priority_locked(waiter_tid);
+            return true;
         }
-        HANDLE_TYPE_THREAD => {
-            if validate_thread_target_tid(idx) {
-                STATUS_SUCCESS
-            } else {
-                STATUS_INVALID_HANDLE
-            }
+        if (*m).owner_tid == waiter_tid {
+            (*m).recursion = (*m).recursion.saturating_add(1);
+            recompute_owned_mutex_priority_locked(waiter_tid);
+            return true;
         }
-        HANDLE_TYPE_PROCESS => {
-            if idx != 0 && crate::process::process_exists(idx) {
-                STATUS_SUCCESS
-            } else {
-                STATUS_INVALID_HANDLE
-            }
+    }
+    false
+}
+
+fn mutex_register_waiter(idx: u32, waiter_tid: u32) {
+    let m = mutex_ptr(idx);
+    if m.is_null() {
+        return;
+    }
+    unsafe {
+        (*m).waiters.enqueue(waiter_tid);
+        let owner_tid = (*m).owner_tid;
+        if owner_tid != 0 && owner_tid != waiter_tid {
+            let waiter_prio = with_thread(waiter_tid, |t| t.priority);
+            boost_thread_priority_locked(owner_tid, waiter_prio);
         }
-        _ => STATUS_INVALID_HANDLE,
+    }
+}
+
+fn mutex_remove_waiter(idx: u32, waiter_tid: u32) {
+    let m = mutex_ptr(idx);
+    if m.is_null() {
+        return;
+    }
+    unsafe { (*m).waiters.remove(waiter_tid) };
+}
+
+fn semaphore_validate_waitable(idx: u32) -> bool {
+    idx != 0 && !semaphore_ptr(idx).is_null()
+}
+
+fn semaphore_is_signaled(_waiter_tid: u32, idx: u32) -> bool {
+    let s = semaphore_ptr(idx);
+    if s.is_null() {
+        return false;
+    }
+    unsafe { (*s).count > 0 }
+}
+
+fn semaphore_consume_signal(_waiter_tid: u32, idx: u32) -> bool {
+    let s = semaphore_ptr(idx);
+    if s.is_null() {
+        return false;
+    }
+    unsafe {
+        if (*s).count <= 0 {
+            return false;
+        }
+        (*s).count -= 1;
+    }
+    true
+}
+
+fn semaphore_register_waiter(idx: u32, waiter_tid: u32) {
+    let s = semaphore_ptr(idx);
+    if s.is_null() {
+        return;
+    }
+    unsafe { (*s).waiters.enqueue(waiter_tid) };
+}
+
+fn semaphore_remove_waiter(idx: u32, waiter_tid: u32) {
+    let s = semaphore_ptr(idx);
+    if s.is_null() {
+        return;
+    }
+    unsafe { (*s).waiters.remove(waiter_tid) };
+}
+
+fn thread_validate_waitable(idx: u32) -> bool {
+    validate_thread_target_tid(idx)
+}
+
+fn thread_is_signaled(_waiter_tid: u32, idx: u32) -> bool {
+    let tid = idx;
+    if tid == 0 || !thread_exists(tid) {
+        return false;
+    }
+    let state = with_thread(tid, |t| t.state);
+    state == ThreadState::Terminated || state == ThreadState::Free
+}
+
+fn thread_consume_signal(waiter_tid: u32, idx: u32) -> bool {
+    thread_is_signaled(waiter_tid, idx)
+}
+
+fn thread_register_waiter(idx: u32, waiter_tid: u32) {
+    if !validate_thread_target_tid(idx) || !ensure_thread_waiters_slot(idx) {
+        return;
+    }
+    let q = thread_waiters_ptr(idx);
+    if q.is_null() {
+        return;
+    }
+    unsafe { (*q).enqueue(waiter_tid) };
+}
+
+fn thread_remove_waiter(idx: u32, waiter_tid: u32) {
+    let q = thread_waiters_ptr(idx);
+    if q.is_null() {
+        return;
+    }
+    unsafe { (*q).remove(waiter_tid) };
+}
+
+fn process_validate_waitable(idx: u32) -> bool {
+    idx != 0 && crate::process::process_exists(idx)
+}
+
+fn process_is_signaled(_waiter_tid: u32, idx: u32) -> bool {
+    idx != 0 && crate::process::process_signaled(idx)
+}
+
+fn process_consume_signal(waiter_tid: u32, idx: u32) -> bool {
+    process_is_signaled(waiter_tid, idx)
+}
+
+fn process_register_waiter(idx: u32, waiter_tid: u32) {
+    if idx == 0 || !crate::process::process_exists(idx) || !ensure_process_waiters_slot(idx) {
+        return;
+    }
+    let q = process_waiters_ptr(idx);
+    if q.is_null() {
+        return;
+    }
+    unsafe { (*q).enqueue(waiter_tid) };
+}
+
+fn process_remove_waiter(idx: u32, waiter_tid: u32) {
+    let q = process_waiters_ptr(idx);
+    if q.is_null() {
+        return;
+    }
+    unsafe { (*q).remove(waiter_tid) };
+}
+
+fn validate_waitable_handle_locked(h: u64) -> u32 {
+    let Some((ops, idx)) = resolve_waitable_target_for_waiter(current_tid(), h) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    if (ops.validate)(idx) {
+        STATUS_SUCCESS
+    } else {
+        STATUS_INVALID_HANDLE
     }
 }
 
 fn is_handle_signaled_locked(waiter_tid: u32, h: u64) -> bool {
-    let owner_pid = waiter_owner_pid(waiter_tid);
-    let htype = handle_type_for_pid(h, owner_pid);
-    let idx = handle_idx_for_pid(h, owner_pid);
-    match htype {
-        HANDLE_TYPE_EVENT => {
-            let ev = event_ptr(idx);
-            if ev.is_null() {
-                return false;
-            }
-            unsafe { (*ev).signaled }
-        }
-        HANDLE_TYPE_MUTEX => {
-            let m = mutex_ptr(idx);
-            if m.is_null() {
-                return false;
-            }
-            unsafe { (*m).owner_tid == 0 || (*m).owner_tid == waiter_tid }
-        }
-        HANDLE_TYPE_SEMAPHORE => {
-            let s = semaphore_ptr(idx);
-            if s.is_null() {
-                return false;
-            }
-            unsafe { (*s).count > 0 }
-        }
-        HANDLE_TYPE_THREAD => {
-            let tid = idx;
-            if tid == 0 || !thread_exists(tid) {
-                false
-            } else {
-                let state = with_thread(tid, |t| t.state);
-                state == ThreadState::Terminated || state == ThreadState::Free
-            }
-        }
-        HANDLE_TYPE_PROCESS => idx != 0 && crate::process::process_signaled(idx),
-        _ => false,
-    }
+    let Some((ops, idx)) = resolve_waitable_target_for_waiter(waiter_tid, h) else {
+        return false;
+    };
+    (ops.is_signaled)(waiter_tid, idx)
 }
 
 fn consume_handle_signal_locked(waiter_tid: u32, h: u64) -> bool {
-    let owner_pid = waiter_owner_pid(waiter_tid);
-    let htype = handle_type_for_pid(h, owner_pid);
-    let idx = handle_idx_for_pid(h, owner_pid);
-    match htype {
-        HANDLE_TYPE_EVENT => {
-            let ev = event_ptr(idx);
-            if ev.is_null() {
-                return false;
-            }
-            unsafe {
-                if !(*ev).signaled {
-                    return false;
-                }
-                if (*ev).ev_type == EventType::SynchronizationEvent {
-                    (*ev).signaled = false;
-                }
-            }
-            true
-        }
-        HANDLE_TYPE_MUTEX => {
-            let m = mutex_ptr(idx);
-            if m.is_null() {
-                return false;
-            }
-            unsafe {
-                if (*m).owner_tid == 0 {
-                    (*m).owner_tid = waiter_tid;
-                    (*m).recursion = 1;
-                    recompute_owned_mutex_priority_locked(waiter_tid);
-                    return true;
-                }
-                if (*m).owner_tid == waiter_tid {
-                    (*m).recursion = (*m).recursion.saturating_add(1);
-                    recompute_owned_mutex_priority_locked(waiter_tid);
-                    return true;
-                }
-            }
-            false
-        }
-        HANDLE_TYPE_SEMAPHORE => {
-            let s = semaphore_ptr(idx);
-            if s.is_null() {
-                return false;
-            }
-            unsafe {
-                if (*s).count <= 0 {
-                    return false;
-                }
-                (*s).count -= 1;
-            }
-            true
-        }
-        HANDLE_TYPE_THREAD => is_handle_signaled_locked(waiter_tid, h),
-        HANDLE_TYPE_PROCESS => is_handle_signaled_locked(waiter_tid, h),
-        _ => false,
-    }
+    let Some((ops, idx)) = resolve_waitable_target_for_waiter(waiter_tid, h) else {
+        return false;
+    };
+    (ops.consume_signal)(waiter_tid, idx)
 }
 
 fn copy_wait_handles_for_thread(tid: u32) -> ([u64; MAX_WAIT_HANDLES], usize) {
@@ -1015,92 +1175,20 @@ fn consume_wait_all_locked(tid: u32, handles: &[u64]) -> bool {
 }
 
 fn register_waiter_on_handle_locked(h: u64, tid: u32) {
-    let owner_pid = waiter_owner_pid(tid);
-    let htype = handle_type_for_pid(h, owner_pid);
-    let idx = handle_idx_for_pid(h, owner_pid);
-    match htype {
-        HANDLE_TYPE_EVENT => {
-            let ev = event_ptr(idx);
-            if !ev.is_null() {
-                unsafe { (*ev).waiters.enqueue(tid) };
-            }
-        }
-        HANDLE_TYPE_MUTEX => {
-            let m = mutex_ptr(idx);
-            if !m.is_null() {
-                unsafe {
-                    (*m).waiters.enqueue(tid);
-                    let owner_tid = (*m).owner_tid;
-                    if owner_tid != 0 && owner_tid != tid {
-                        let waiter_prio = with_thread(tid, |t| t.priority);
-                        boost_thread_priority_locked(owner_tid, waiter_prio);
-                    }
-                }
-            }
-        }
-        HANDLE_TYPE_SEMAPHORE => {
-            let s = semaphore_ptr(idx);
-            if !s.is_null() {
-                unsafe { (*s).waiters.enqueue(tid) };
-            }
-        }
-        HANDLE_TYPE_THREAD => {
-            if validate_thread_target_tid(idx) && ensure_thread_waiters_slot(idx) {
-                let q = thread_waiters_ptr(idx);
-                if !q.is_null() {
-                    unsafe { (*q).enqueue(tid) };
-                }
-            }
-        }
-        HANDLE_TYPE_PROCESS => {
-            if idx != 0 && crate::process::process_exists(idx) && ensure_process_waiters_slot(idx) {
-                let q = process_waiters_ptr(idx);
-                if !q.is_null() {
-                    unsafe { (*q).enqueue(tid) };
-                }
-            }
-        }
-        _ => {}
+    let Some((ops, idx)) = resolve_waitable_target_for_waiter(tid, h) else {
+        return;
+    };
+    if !(ops.validate)(idx) {
+        return;
     }
+    (ops.register_waiter)(idx, tid);
 }
 
 fn remove_waiter_from_handle_locked(h: u64, tid: u32) {
-    let owner_pid = waiter_owner_pid(tid);
-    let htype = handle_type_for_pid(h, owner_pid);
-    let idx = handle_idx_for_pid(h, owner_pid);
-    match htype {
-        HANDLE_TYPE_EVENT => {
-            let ev = event_ptr(idx);
-            if !ev.is_null() {
-                unsafe { (*ev).waiters.remove(tid) };
-            }
-        }
-        HANDLE_TYPE_MUTEX => {
-            let m = mutex_ptr(idx);
-            if !m.is_null() {
-                unsafe { (*m).waiters.remove(tid) };
-            }
-        }
-        HANDLE_TYPE_SEMAPHORE => {
-            let s = semaphore_ptr(idx);
-            if !s.is_null() {
-                unsafe { (*s).waiters.remove(tid) };
-            }
-        }
-        HANDLE_TYPE_THREAD => {
-            let q = thread_waiters_ptr(idx);
-            if !q.is_null() {
-                unsafe { (*q).remove(tid) };
-            }
-        }
-        HANDLE_TYPE_PROCESS => {
-            let q = process_waiters_ptr(idx);
-            if !q.is_null() {
-                unsafe { (*q).remove(tid) };
-            }
-        }
-        _ => {}
-    }
+    let Some((ops, idx)) = resolve_waitable_target_for_waiter(tid, h) else {
+        return;
+    };
+    (ops.remove_waiter)(idx, tid);
 }
 
 pub(crate) fn cleanup_wait_registration_locked(tid: u32) {

@@ -47,6 +47,14 @@
 
 范围：将 `sched/sync.rs` 的 wait/signal 大分支改为对象 ops 调用。
 
+- [x] 新增 `WaitableObjectOps` 统一分发层（`event/mutex/semaphore/thread/process`）。
+- [x] `validate_waitable_handle_locked` 改为 ops 分发。
+- [x] `is_handle_signaled_locked` 改为 ops 分发。
+- [x] `consume_handle_signal_locked` 改为 ops 分发。
+- [x] `register_waiter_on_handle_locked` 改为 ops 分发。
+- [x] `remove_waiter_from_handle_locked` 改为 ops 分发。
+- [x] 回归测试通过：`open_process_test`、`syscall_file_control_test`、`syscall_directory_test`、`syscall_directory_notify_test`。
+
 ### Phase C
 
 范围：统一对象统计/可观测接口（类型计数、对象计数、句柄计数）。
