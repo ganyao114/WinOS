@@ -14,7 +14,6 @@ const NR_CLOSE: u64             = 0x000F;
 const NR_SET_INFORMATION_THREAD: u64 = 0x000D;
 const NR_TERMINATE_PROCESS: u64 = 0x002C;
 const NR_TERMINATE_THREAD: u64  = 0x0053;
-const NR_RESET_EVENT: u64       = 0x0034;
 const NR_CREATE_EVENT: u64      = 0x0048;
 const NR_CREATE_MUTEX: u64      = 0x00A9;
 const NR_RELEASE_MUTANT: u64    = 0x001C;
@@ -28,6 +27,7 @@ const PREEMPT_A_WORK: u32 = 12_000_000;
 const PREEMPT_B_WORK: u32 = 500_000;
 const PI_LOW_WORK: u32 = 500_000;
 const PI_MED_WORK: u32 = 1_000_000;
+const BURST_WAITERS: usize = 16;
 
 // ── Shared state ────────────────────────────────────────────
 static COUNTER_A: AtomicU32 = AtomicU32::new(0);
@@ -49,6 +49,8 @@ static LOW_DONE: AtomicU32 = AtomicU32::new(0);
 static HIGH_DONE: AtomicU32 = AtomicU32::new(0);
 static MED_DONE: AtomicU32 = AtomicU32::new(0);
 static HIGH_BEFORE_MED_DONE: AtomicU32 = AtomicU32::new(0);
+static BURST_EVENT: AtomicU32 = AtomicU32::new(0);
+static BURST_DONE: AtomicU32 = AtomicU32::new(0);
 
 static mut PASS_COUNT: u32 = 0;
 static mut FAIL_COUNT: u32 = 0;
@@ -385,6 +387,14 @@ extern "C" fn thread_timeout_wait(_arg: u64) -> ! {
     unsafe { exit_thread() }
 }
 
+extern "C" fn thread_burst_waiter(_arg: u64) -> ! {
+    let ev = BURST_EVENT.load(Ordering::Acquire) as u64;
+    if unsafe { wait_single(ev) } == STATUS_SUCCESS {
+        BURST_DONE.fetch_add(1, Ordering::AcqRel);
+    }
+    unsafe { exit_thread() }
+}
+
 // ── Tests ───────────────────────────────────────────────────
 
 unsafe fn wait_flag_with_yield(flag: &AtomicU32, max_iters: u32) -> bool {
@@ -603,6 +613,42 @@ unsafe fn test_mutex_priority_inheritance() {
     close(med_go);
 }
 
+unsafe fn test_wait_wake_burst() {
+    print(b"== Wait/Wake Burst ==\r\n");
+
+    BURST_DONE.store(0, Ordering::Relaxed);
+    let (st_ev, ev) = create_event(true, false);
+    check(b"Create burst event", st_ev == STATUS_SUCCESS);
+    BURST_EVENT.store(ev as u32, Ordering::Release);
+
+    let mut handles = [0u64; BURST_WAITERS];
+    let mut ok_create = true;
+    let mut i = 0usize;
+    while i < BURST_WAITERS {
+        let (st, h) = create_thread(thread_burst_waiter as *const () as u64, 0, 0x10000);
+        if st != STATUS_SUCCESS || h == 0 {
+            ok_create = false;
+        }
+        handles[i] = h;
+        i += 1;
+    }
+    check(b"Burst waiter threads created", ok_create);
+
+    for _ in 0..64u32 {
+        yield_exec();
+    }
+
+    let st_set = set_event(ev);
+    check(b"Set burst event", st_set == STATUS_SUCCESS);
+    let all_done = wait_flag_with_yield(&BURST_DONE, 40_000);
+    check(
+        b"All burst waiters woke",
+        all_done && BURST_DONE.load(Ordering::Acquire) == BURST_WAITERS as u32,
+    );
+
+    let _ = handles;
+}
+
 // ── Entry point ─────────────────────────────────────────────
 
 #[no_mangle]
@@ -628,6 +674,9 @@ pub extern "C" fn mainCRTStartup() -> ! {
         print(b"\r\n");
 
         test_mutex_priority_inheritance();
+        print(b"\r\n");
+
+        test_wait_wake_burst();
         print(b"\r\n");
 
         // Summary

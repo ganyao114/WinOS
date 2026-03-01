@@ -145,6 +145,7 @@ impl TimerTaskState {
 struct TimerTaskRegistry {
     state: UnsafeCell<Option<TimerTaskState>>,
     lock: UnsafeCell<u32>,
+    lock_owner: UnsafeCell<u32>,
 }
 
 unsafe impl Sync for TimerTaskRegistry {}
@@ -152,16 +153,36 @@ unsafe impl Sync for TimerTaskRegistry {}
 static TIMER_TASKS: TimerTaskRegistry = TimerTaskRegistry {
     state: UnsafeCell::new(None),
     lock: UnsafeCell::new(0),
+    lock_owner: UnsafeCell::new(0),
 };
 
 #[inline(always)]
 fn timer_lock() {
+    let owner_key = (crate::sched::vcpu_id() as u32).wrapping_add(1);
+    unsafe {
+        debug_assert!(
+            *TIMER_TASKS.lock_owner.get() != owner_key,
+            "timer lock recursion is not supported"
+        );
+    }
     crate::arch::spin::lock_word(TIMER_TASKS.lock.get());
+    unsafe {
+        *TIMER_TASKS.lock_owner.get() = owner_key;
+    }
 }
 
 #[inline(always)]
 fn timer_unlock() {
+    unsafe {
+        *TIMER_TASKS.lock_owner.get() = 0;
+    }
     crate::arch::spin::unlock_word(TIMER_TASKS.lock.get());
+}
+
+#[inline(always)]
+pub(crate) fn timer_lock_held_by_current_vcpu() -> bool {
+    let owner_key = (crate::sched::vcpu_id() as u32).wrapping_add(1);
+    unsafe { *TIMER_TASKS.lock_owner.get() == owner_key && owner_key != 0 }
 }
 
 fn with_timer_state<R>(f: impl FnOnce(&mut TimerTaskState) -> R) -> R {

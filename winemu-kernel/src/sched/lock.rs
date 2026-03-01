@@ -21,6 +21,10 @@ pub fn sched_lock_acquire() {
             *count += 1;
             return;
         }
+        debug_assert!(
+            !crate::timer::timer_lock_held_by_current_vcpu(),
+            "lock order violation: acquire sched lock before timer lock"
+        );
         spinlock_acquire();
         *owner = owner_key;
         *count = 1;
