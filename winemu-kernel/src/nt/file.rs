@@ -2,9 +2,8 @@ use crate::hypercall;
 use crate::sched::sync::{make_new_handle, HANDLE_TYPE_FILE};
 use winemu_shared::status;
 
-use super::common::{
-    file_handle_to_host_fd, map_open_flags, read_oa_path, write_iosb, IoStatusBlock, FILE_OPEN,
-};
+use super::common::{file_handle_to_host_fd, map_open_flags, write_iosb, IoStatusBlock, FILE_OPEN};
+use super::path::read_oa_path;
 use super::state::{file_alloc, file_free};
 use super::SvcFrame;
 

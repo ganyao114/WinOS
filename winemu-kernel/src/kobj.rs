@@ -38,8 +38,21 @@ impl<T> SlabPool<T> {
     }
 
     fn grow(&mut self) -> bool {
+        // Defensive recovery: if allocator metadata was clobbered by a transient bug,
+        // rebuild the layout from type information instead of panicking.
+        if self.align == 0 || !self.align.is_power_of_two() || self.stride == 0 {
+            self.align = align_of::<T>().max(align_of::<FreeNode>());
+            self.stride = align_up(size_of::<T>().max(size_of::<FreeNode>()), self.align);
+            if self.stride == 0 {
+                return false;
+            }
+            self.slab_bytes = self.slab_bytes.max(self.stride).max(DEFAULT_SLAB_BYTES);
+        }
+
         let objs = (self.slab_bytes / self.stride).max(1);
-        let bytes = objs * self.stride;
+        let Some(bytes) = objs.checked_mul(self.stride) else {
+            return false;
+        };
         let Some(base) = crate::alloc::alloc_zeroed(bytes, self.align) else {
             return false;
         };
@@ -103,23 +116,34 @@ impl<T> ObjectStore<T> {
     }
 
     fn alloc_id(&mut self) -> Option<u32> {
+        crate::hypercall::debug_u64(0xC510_0001);
         if let Some(id) = self.free_ids.pop() {
+            crate::hypercall::debug_u64(0xC510_0002);
             return Some(id);
         }
         let id = self.slots.len() as u32;
+        crate::hypercall::debug_u64(0xC510_0003);
         if self.slots.try_reserve(1).is_err() {
+            crate::hypercall::debug_u64(0xC510_E001);
             return None;
         }
+        crate::hypercall::debug_u64(0xC510_0004);
         self.slots.push(null_mut());
+        crate::hypercall::debug_u64(0xC510_0005);
         Some(id)
     }
 
     pub fn alloc_slot_with_id(&mut self) -> Option<(u32, *mut T)> {
+        crate::hypercall::debug_u64(0xC511_0001);
         let id = self.alloc_id()?;
+        crate::hypercall::debug_u64(0xC511_0002);
         let Some(ptr) = self.pool.alloc_slot() else {
+            crate::hypercall::debug_u64(0xC511_E001);
             return None;
         };
+        crate::hypercall::debug_u64(0xC511_0003);
         self.slots[id as usize] = ptr;
+        crate::hypercall::debug_u64(0xC511_0004);
         Some((id, ptr))
     }
 

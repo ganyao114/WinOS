@@ -55,6 +55,7 @@ pub(crate) fn handle_open_process(frame: &mut SvcFrame) {
 // NtCreateProcessEx:
 // x0=*ProcessHandle, x3=ParentProcess, x4=Flags, x5=SectionHandle
 pub(crate) fn handle_create_process(frame: &mut SvcFrame) {
+    crate::hypercall::debug_u64(0xC501_0001);
     let out_ptr = frame.x[0] as *mut u64;
     let parent_handle = frame.x[3];
     let flags = frame.x[4] as u32;
@@ -62,12 +63,14 @@ pub(crate) fn handle_create_process(frame: &mut SvcFrame) {
 
     match crate::process::create_process(parent_handle, section_handle, flags) {
         Ok(handle) => {
+            crate::hypercall::debug_u64(0xC501_0002);
             if !out_ptr.is_null() {
                 unsafe { out_ptr.write_volatile(handle) };
             }
             frame.x[0] = status::SUCCESS as u64;
         }
         Err(st) => {
+            crate::hypercall::debug_u64(0xC501_1000 | st as u64);
             frame.x[0] = st as u64;
         }
     }

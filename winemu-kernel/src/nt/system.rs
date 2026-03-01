@@ -158,14 +158,28 @@ pub(crate) fn should_dispatch_delay_execution(frame: &SvcFrame) -> bool {
 pub(crate) fn handle_delay_execution(frame: &mut SvcFrame) {
     let _alertable = frame.x[0] != 0;
     let timeout_ptr = frame.x[1] as *const i64;
+    crate::hypercall::debug_u64(0xD100_0001);
+    crate::hypercall::debug_u64(timeout_ptr as u64);
     if timeout_ptr.is_null() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
 
     let raw = unsafe { timeout_ptr.read_volatile() };
+    crate::hypercall::debug_u64(0xD100_0002);
+    crate::hypercall::debug_u64(raw as u64);
     let timeout = parse_delay_timeout(raw);
-    frame.x[0] = crate::sched::sync::delay_current_thread(timeout) as u64;
+    let deadline_dbg = match timeout {
+        WaitDeadline::Infinite => 0,
+        WaitDeadline::Immediate => 1,
+        WaitDeadline::DeadlineTicks(t) => t,
+    };
+    crate::hypercall::debug_u64(0xD100_0003);
+    crate::hypercall::debug_u64(deadline_dbg);
+    let st = crate::sched::sync::delay_current_thread(timeout);
+    crate::hypercall::debug_u64(0xD100_0004);
+    crate::hypercall::debug_u64(st as u64);
+    frame.x[0] = st as u64;
 }
 
 fn parse_delay_timeout(raw: i64) -> WaitDeadline {

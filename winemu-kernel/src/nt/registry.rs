@@ -7,7 +7,7 @@ use winereg::{
     REG_MULTI_SZ, REG_QWORD, REG_SZ,
 };
 
-use super::common::{read_oa_path, read_unicode_direct};
+use super::path::{bytes_path_to_registry, normalize_registry_path, read_oa_path, read_unicode_direct};
 use super::SvcFrame;
 
 const MAX_PATH: usize = 256;
@@ -31,93 +31,6 @@ fn ensure_state() -> &'static mut RegistryState {
         }
         REG_STATE.as_mut().unwrap()
     }
-}
-
-fn lower_ascii(b: u8) -> u8 {
-    if b >= b'A' && b <= b'Z' {
-        b + 32
-    } else {
-        b
-    }
-}
-
-fn normalize_registry_path(path: &mut [u8], mut len: usize) -> (usize, bool) {
-    for b in path.iter_mut().take(len) {
-        if *b == b'\\' {
-            *b = b'/';
-        }
-    }
-
-    let mut start = 0usize;
-    while start < len && path[start] == b'/' {
-        start += 1;
-    }
-    if start != 0 {
-        for i in start..len {
-            path[i - start] = path[i];
-        }
-        len -= start;
-    }
-
-    let prefixes: [&[u8]; 5] = [
-        b"registry/machine/",
-        b"registry/user/",
-        b"hkey_local_machine/",
-        b"hklm/",
-        b"registry/",
-    ];
-
-    for prefix in prefixes {
-        if len < prefix.len() {
-            continue;
-        }
-        let mut matches = true;
-        for i in 0..prefix.len() {
-            if lower_ascii(path[i]) != prefix[i] {
-                matches = false;
-                break;
-            }
-        }
-        if !matches {
-            continue;
-        }
-
-        for i in prefix.len()..len {
-            path[i - prefix.len()] = path[i];
-        }
-        len -= prefix.len();
-        while len > 0 && path[0] == b'/' {
-            for i in 1..len {
-                path[i - 1] = path[i];
-            }
-            len -= 1;
-        }
-        return (len, true);
-    }
-
-    (len, false)
-}
-
-fn bytes_path_to_registry(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    let mut prev_sep = false;
-    for b in bytes {
-        let ch = if *b == b'/' || *b == b'\\' { '\\' } else { *b as char };
-        if ch == '\\' {
-            if prev_sep {
-                continue;
-            }
-            prev_sep = true;
-            out.push('\\');
-        } else {
-            prev_sep = false;
-            out.push(ch);
-        }
-    }
-    while out.ends_with('\\') {
-        out.pop();
-    }
-    out
 }
 
 fn read_value_name(us_ptr: u64) -> String {

@@ -164,6 +164,30 @@ fn fmt_u64_hex<'a>(buf: &'a mut [u8; 32], val: u64) -> &'a str {
 }
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    hypercall::debug_print("KERNEL_PANIC");
+    if let Some(loc) = info.location() {
+        hypercall::debug_print(" at ");
+        hypercall::debug_print(loc.file());
+        hypercall::debug_print(":");
+        let mut buf = [0u8; 32];
+        let s = fmt_u64_dec(&mut buf, loc.line() as u64);
+        hypercall::debug_print(s);
+    }
+    hypercall::debug_print("\n");
     loop { core::hint::spin_loop(); }
+}
+
+fn fmt_u64_dec<'a>(buf: &'a mut [u8; 32], mut val: u64) -> &'a str {
+    if val == 0 {
+        buf[0] = b'0';
+        return core::str::from_utf8(&buf[..1]).unwrap_or("0");
+    }
+    let mut i = buf.len();
+    while val != 0 && i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+    }
+    core::str::from_utf8(&buf[i..]).unwrap_or("0")
 }
