@@ -180,6 +180,11 @@ void mainCRTStartup(void) {
     check("NtOpenProcessToken(current) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     check("NtOpenProcessToken returns non-zero handle", token != 0);
 
+    HANDLE invalid_token = 0;
+    st = NtOpenProcessToken(NT_CURRENT_PROCESS, 0x80000000U, &invalid_token);
+    check("NtOpenProcessToken(invalid desired access) returns STATUS_ACCESS_DENIED", st == STATUS_ACCESS_DENIED);
+    check("NtOpenProcessToken(invalid desired access) does not return handle", invalid_token == 0);
+
     ret_len = 0;
     st = NtQueryInformationToken(token, TOKEN_USER_CLASS, user_buf, (ULONG)sizeof(user_buf), &ret_len);
     check("NtQueryInformationToken(TokenUser) returns STATUS_SUCCESS", st == STATUS_SUCCESS);

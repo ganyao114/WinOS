@@ -44,7 +44,7 @@ pub fn is_valid_token_handle(token_handle: u64) -> bool {
 // x0=ProcessHandle, x1=DesiredAccess, x2=*TokenHandle
 pub(crate) fn handle_open_process_token(frame: &mut SvcFrame) {
     let process_handle = frame.x[0];
-    let _desired_access = frame.x[1] as u32;
+    let desired_access = frame.x[1] as u32;
     let out_ptr = frame.x[2] as *mut u64;
 
     if out_ptr.is_null() {
@@ -56,6 +56,15 @@ pub(crate) fn handle_open_process_token(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     };
+
+    let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_TOKEN) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+    if (desired_access & !meta.valid_access_mask) != 0 {
+        frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
 
     let Some(token_handle) = crate::sched::sync::make_new_handle(HANDLE_TYPE_TOKEN, pid) else {
         frame.x[0] = status::NO_MEMORY as u64;

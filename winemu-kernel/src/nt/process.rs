@@ -64,6 +64,15 @@ pub(crate) fn handle_open_process(frame: &mut SvcFrame) {
         return;
     }
 
+    let Some(meta) = super::kobject::object_type_meta(crate::sched::sync::HANDLE_TYPE_PROCESS) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+    if (desired_access & !meta.valid_access_mask) != 0 {
+        frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
+
     match crate::process::open_process(target_pid, desired_access) {
         Ok(handle) => {
             unsafe { out_ptr.write_volatile(handle) };

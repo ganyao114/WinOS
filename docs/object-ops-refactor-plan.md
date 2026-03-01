@@ -75,6 +75,7 @@
 - [x] `File` 对象命名接入（创建/打开时保留路径，支持 `ObjectNameInformation`）。
 - [x] `NtDuplicateObject` 接入 `valid_access_mask` 校验（支持 `DUPLICATE_SAME_ACCESS`）。
 - [x] `NtDuplicateObject` 接入 `DUPLICATE_CLOSE_SOURCE` 语义（复制后关闭源句柄）。
+- [x] `NtOpenProcess` / `NtOpenProcessToken` 接入 `valid_access_mask` 校验。
 
 ## 5. 风险与控制
 

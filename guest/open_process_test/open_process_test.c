@@ -35,6 +35,7 @@ typedef struct {
 #define STATUS_INVALID_PARAMETER 0xC000000DU
 #define STATUS_INFO_LENGTH_MISMATCH 0xC0000004U
 #define STATUS_INVALID_HANDLE 0xC0000008U
+#define STATUS_ACCESS_DENIED 0xC0000022U
 
 __declspec(dllimport) NTSTATUS NtWriteFile(
     HANDLE file, HANDLE event, void* apc_routine, void* apc_ctx,
@@ -135,6 +136,13 @@ void mainCRTStartup(void) {
 
     st = NtOpenProcess(0, 0x001FFFFF, 0, &cid);
     check("NtOpenProcess(NULL out handle) returns STATUS_INVALID_PARAMETER", st == STATUS_INVALID_PARAMETER);
+
+    cid.UniqueProcess = (HANDLE)(ULONG_PTR)self.UniqueProcessId;
+    cid.UniqueThread = 0;
+    opened_handle = 0;
+    st = NtOpenProcess(&opened_handle, 0x80000000U, 0, &cid);
+    check("NtOpenProcess(invalid desired access) returns STATUS_ACCESS_DENIED", st == STATUS_ACCESS_DENIED);
+    check("NtOpenProcess(invalid desired access) does not return handle", opened_handle == 0);
 
     write_str("open_process_test summary complete\r\n");
     terminate_current_process(g_fail == 0 ? 0 : 1);
