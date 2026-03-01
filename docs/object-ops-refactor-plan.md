@@ -59,6 +59,10 @@
 
 范围：统一对象统计/可观测接口（类型计数、对象计数、句柄计数）。
 
+- [x] 在 `sync` 层新增统一统计结构 `ObjectTypeStats` 与 `object_type_stats(htype)`。
+- [x] 在 `nt/kobject.rs` 暴露统一统计入口，供上层 syscall 查询使用。
+- [x] `NtQueryObject(ObjectTypeInformation)` 接入统一统计（对象总数/句柄总数/高水位字段）。
+
 ### Phase D（可选）
 
 范围：逐步接入命名对象、安全描述符、访问映射等扩展接口。

@@ -429,6 +429,12 @@ struct ObjectRef {
     refs: u32,
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct ObjectTypeStats {
+    pub object_count: u32,
+    pub handle_count: u32,
+}
+
 #[derive(Clone, Copy)]
 pub struct HandleCloseInfo {
     pub htype: u64,
@@ -741,6 +747,24 @@ pub fn object_ref_count(htype: u64, obj_idx: u32) -> u32 {
         i += 1;
     }
     0
+}
+
+pub fn object_type_stats(htype: u64) -> ObjectTypeStats {
+    if htype == 0 {
+        return ObjectTypeStats::default();
+    }
+    let refs = refs_mut();
+    let mut stats = ObjectTypeStats::default();
+    let mut i = 0usize;
+    while i < refs.len() {
+        let entry = refs[i];
+        if key_type(entry.key) == htype {
+            stats.object_count = stats.object_count.saturating_add(1);
+            stats.handle_count = stats.handle_count.saturating_add(entry.refs);
+        }
+        i += 1;
+    }
+    stats
 }
 
 fn recompute_owned_mutex_priority_locked(owner_tid: u32) {

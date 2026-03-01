@@ -146,6 +146,13 @@ static int equal_utf16_ascii(const WCHAR *wstr, USHORT wbytes, const char *ascii
     return ascii[count] == '\0';
 }
 
+static uint32_t read_u32_le(const uint8_t *buf, size_t off) {
+    return (uint32_t)buf[off] |
+           ((uint32_t)buf[off + 1] << 8) |
+           ((uint32_t)buf[off + 2] << 16) |
+           ((uint32_t)buf[off + 3] << 24);
+}
+
 void mainCRTStartup(void) {
     NTSTATUS st;
     HANDLE token = 0;
@@ -249,6 +256,14 @@ void mainCRTStartup(void) {
         check("ObjectTypeInformation(process) name is Process",
               obj_type->TypeName.Buffer &&
               equal_utf16_ascii(obj_type->TypeName.Buffer, obj_type->TypeName.Length, "Process"));
+        check("ObjectTypeInformation(process) total objects >= 1",
+              read_u32_le(obj_buf, 16) >= 1);
+        check("ObjectTypeInformation(process) total handles >= 1",
+              read_u32_le(obj_buf, 20) >= 1);
+        check("ObjectTypeInformation(process) high-water objects >= total objects",
+              read_u32_le(obj_buf, 40) >= read_u32_le(obj_buf, 16));
+        check("ObjectTypeInformation(process) high-water handles >= total handles",
+              read_u32_le(obj_buf, 44) >= read_u32_le(obj_buf, 20));
     }
 
     ret_len = 0;
@@ -258,6 +273,14 @@ void mainCRTStartup(void) {
         check("ObjectTypeInformation(token) name is Token",
               obj_type->TypeName.Buffer &&
               equal_utf16_ascii(obj_type->TypeName.Buffer, obj_type->TypeName.Length, "Token"));
+        check("ObjectTypeInformation(token) total objects >= 1",
+              read_u32_le(obj_buf, 16) >= 1);
+        check("ObjectTypeInformation(token) total handles >= 1",
+              read_u32_le(obj_buf, 20) >= 1);
+        check("ObjectTypeInformation(token) high-water objects >= total objects",
+              read_u32_le(obj_buf, 40) >= read_u32_le(obj_buf, 16));
+        check("ObjectTypeInformation(token) high-water handles >= total handles",
+              read_u32_le(obj_buf, 44) >= read_u32_le(obj_buf, 20));
     }
 
     ret_len = 0;

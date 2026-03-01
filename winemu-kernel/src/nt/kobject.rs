@@ -12,6 +12,12 @@ pub(crate) struct KObjectOps {
     pub(crate) close_last_ref: fn(u32) -> u32,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct KObjectTypeStats {
+    pub(crate) object_count: u32,
+    pub(crate) handle_count: u32,
+}
+
 const PROCESS_NAME: &[u16] = &[80, 114, 111, 99, 101, 115, 115];
 const THREAD_NAME: &[u16] = &[84, 104, 114, 101, 97, 100];
 const EVENT_NAME: &[u16] = &[69, 118, 101, 110, 116];
@@ -153,4 +159,12 @@ pub(crate) fn resolve_handle_target(handle: u64) -> Option<(u64, u32)> {
 
 pub(crate) fn object_ref_count(htype: u64, obj_idx: u32) -> u32 {
     sync::object_ref_count(htype, obj_idx)
+}
+
+pub(crate) fn object_type_stats(htype: u64) -> KObjectTypeStats {
+    let stats = sync::object_type_stats(htype);
+    KObjectTypeStats {
+        object_count: stats.object_count,
+        handle_count: stats.handle_count,
+    }
 }

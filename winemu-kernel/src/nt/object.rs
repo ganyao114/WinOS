@@ -145,6 +145,9 @@ fn query_object_type(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -
     }
 
     let refs = kobject::object_ref_count(htype, obj_idx).max(1);
+    let type_stats = kobject::object_type_stats(htype);
+    let total_objects = type_stats.object_count.max(1);
+    let total_handles = type_stats.handle_count.max(refs);
     let name_ptr = unsafe { buf.add(OBJECT_TYPE_INFORMATION_SIZE) };
     let name_addr = name_ptr as u64;
 
@@ -153,10 +156,12 @@ fn query_object_type(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -
         (buf.add(2) as *mut u16).write_volatile(type_name_bytes as u16);
         (buf.add(8) as *mut u64).write_volatile(name_addr);
 
-        (buf.add(16) as *mut u32).write_volatile(refs);
-        (buf.add(20) as *mut u32).write_volatile(refs);
-        (buf.add(40) as *mut u32).write_volatile(refs);
-        (buf.add(44) as *mut u32).write_volatile(refs);
+        // OBJECT_TYPE_INFORMATION counters:
+        // TotalNumberOfObjects / TotalNumberOfHandles / HighWater*.
+        (buf.add(16) as *mut u32).write_volatile(total_objects);
+        (buf.add(20) as *mut u32).write_volatile(total_handles);
+        (buf.add(40) as *mut u32).write_volatile(total_objects);
+        (buf.add(44) as *mut u32).write_volatile(total_handles);
 
         (buf.add(84) as *mut u32).write_volatile(0x001F_FFFF);
         (buf.add(90) as *mut u8).write_volatile(htype as u8);
