@@ -9,8 +9,10 @@
 #define NR_TERMINATE_PROCESS    0x002C
 #define NR_TERMINATE_THREAD     0x0053
 #define NR_WRITE_FILE           0x0008
+#define NR_DEVICE_IO_CONTROL_FILE 0x0007
 #define NR_WAIT_SINGLE          0x0004
 #define NR_CLOSE                0x000F
+#define NR_QUERY_ATTRIBUTES_FILE 0x0014
 #define NR_QUERY_KEY            0x0013
 #define NR_CREATE_KEY           0x001D
 #define NR_SET_VALUE_KEY        0x003D
@@ -29,6 +31,7 @@
 #define NR_FREE_VIRTUAL_MEM     0x001E
 #define NR_QUERY_VIRTUAL_MEM    0x0023
 #define NR_WRITE_VIRTUAL_MEM    0x003A
+#define NR_FS_CONTROL_FILE      0x0039
 #define NR_READ_VIRTUAL_MEM     0x003F
 #define NR_QUERY_SYSTEM_TIME    0x005A
 #define NR_QUERY_VOLUME_INFORMATION_FILE 0x0049
@@ -457,6 +460,40 @@ EXPORT NTSTATUS NtWriteFile(
     register uint64_t x7 asm("x7") = (uint64_t)byte_offset;
     asm volatile("svc #0" : "+r"(x0) : "r"(x8),"r"(x1),"r"(x2),"r"(x3),"r"(x4),"r"(x5),"r"(x6),"r"(x7) : "memory");
     return (NTSTATUS)x0;
+}
+
+__attribute__((naked))
+EXPORT NTSTATUS NtDeviceIoControlFile(
+    HANDLE file_handle, HANDLE event, void* apc_routine, void* apc_context,
+    void* io_status_block, ULONG io_control_code, void* input_buffer, ULONG input_buffer_length,
+    void* output_buffer, ULONG output_buffer_length)
+{
+    asm volatile(
+        "mov x8, %0\n"
+        "svc #0\n"
+        "ret\n"
+        :: "i"(NR_DEVICE_IO_CONTROL_FILE));
+}
+
+__attribute__((naked))
+EXPORT NTSTATUS NtFsControlFile(
+    HANDLE file_handle, HANDLE event, void* apc_routine, void* apc_context,
+    void* io_status_block, ULONG fs_control_code, void* input_buffer, ULONG input_buffer_length,
+    void* output_buffer, ULONG output_buffer_length)
+{
+    asm volatile(
+        "mov x8, %0\n"
+        "svc #0\n"
+        "ret\n"
+        :: "i"(NR_FS_CONTROL_FILE));
+}
+
+EXPORT NTSTATUS NtQueryAttributesFile(void* object_attributes, void* file_information) {
+    return syscall2(
+        NR_QUERY_ATTRIBUTES_FILE,
+        (uint64_t)object_attributes,
+        (uint64_t)file_information
+    );
 }
 
 EXPORT NTSTATUS NtQueryVolumeInformationFile(

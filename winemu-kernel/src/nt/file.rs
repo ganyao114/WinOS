@@ -2,10 +2,15 @@ use crate::hypercall;
 use crate::sched::sync::{make_new_handle, HANDLE_TYPE_FILE};
 use winemu_shared::status;
 
-use super::common::{file_handle_to_host_fd, map_open_flags, write_iosb, IoStatusBlock, FILE_OPEN};
+use super::common::{
+    file_handle_to_host_fd, map_open_flags, write_iosb, IoStatusBlock, FILE_OPEN, HOST_OPEN_READ,
+};
 use super::path::read_oa_path;
 use super::state::{file_alloc, file_free};
 use super::SvcFrame;
+
+const FILE_BASIC_INFORMATION_SIZE: usize = 40;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 
 const FILE_FS_SIZE_INFORMATION: u32 = 3;
 const FILE_FS_DEVICE_INFORMATION: u32 = 4;
@@ -18,6 +23,13 @@ const FILE_DEVICE_DISK: u32 = 0x0000_0007;
 const FILE_CASE_SENSITIVE_SEARCH: u32 = 0x0000_0001;
 const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
 const FILE_UNICODE_ON_DISK: u32 = 0x0000_0004;
+
+fn write_file_basic_information(out_ptr: *mut u8, file_attributes: u32) {
+    unsafe {
+        core::ptr::write_bytes(out_ptr, 0, FILE_BASIC_INFORMATION_SIZE);
+        (out_ptr.add(32) as *mut u32).write_volatile(file_attributes);
+    }
+}
 
 // x0=*FileHandle, x1=DesiredAccess, x2=ObjectAttributes, x3=*IoStatusBlock
 // x7=CreateDisposition
@@ -185,6 +197,71 @@ pub(crate) fn handle_query_directory_file(frame: &mut SvcFrame) {
     let iosb_ptr = frame.x[4] as *mut IoStatusBlock;
     write_iosb(iosb_ptr, status::NO_MORE_FILES, 0);
     frame.x[0] = status::NO_MORE_FILES as u64;
+}
+
+// x0=ObjectAttributes, x1=FileInformation
+pub(crate) fn handle_query_attributes_file(frame: &mut SvcFrame) {
+    let oa_ptr = frame.x[0];
+    let out_ptr = frame.x[1] as *mut u8;
+    let mut path_buf = [0u8; 512];
+
+    if out_ptr.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+
+    let path_len = read_oa_path(oa_ptr, &mut path_buf);
+    if path_len == 0 {
+        frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
+        return;
+    }
+    let path = match core::str::from_utf8(&path_buf[..path_len]) {
+        Ok(s) => s,
+        Err(_) => {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        }
+    };
+
+    let fd = hypercall::host_open(path, HOST_OPEN_READ);
+    if fd == u64::MAX {
+        frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
+        return;
+    }
+    hypercall::host_close(fd);
+
+    write_file_basic_information(out_ptr, FILE_ATTRIBUTE_NORMAL);
+    frame.x[0] = status::SUCCESS as u64;
+}
+
+// x0=FileHandle, x4=*IoStatusBlock
+pub(crate) fn handle_device_io_control_file(frame: &mut SvcFrame) {
+    let file_handle = frame.x[0];
+    let iosb_ptr = frame.x[4] as *mut IoStatusBlock;
+
+    if file_handle_to_host_fd(file_handle).is_none() {
+        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    }
+
+    write_iosb(iosb_ptr, status::NOT_IMPLEMENTED, 0);
+    frame.x[0] = status::NOT_IMPLEMENTED as u64;
+}
+
+// x0=FileHandle, x4=*IoStatusBlock
+pub(crate) fn handle_fs_control_file(frame: &mut SvcFrame) {
+    let file_handle = frame.x[0];
+    let iosb_ptr = frame.x[4] as *mut IoStatusBlock;
+
+    if file_handle_to_host_fd(file_handle).is_none() {
+        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    }
+
+    write_iosb(iosb_ptr, status::NOT_IMPLEMENTED, 0);
+    frame.x[0] = status::NOT_IMPLEMENTED as u64;
 }
 
 // x0=FileHandle, x1=*IoStatusBlock, x2=FsInformation, x3=Length, x4=FsInformationClass
