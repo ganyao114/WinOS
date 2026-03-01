@@ -42,3 +42,9 @@ pub fn sched_lock_release() {
         }
     }
 }
+
+#[inline(always)]
+pub fn sched_lock_held_by_current_vcpu() -> bool {
+    let owner_key = (vcpu_id() as u32) + 1;
+    unsafe { *SCHED.lock_owner.get() == owner_key && *SCHED.lock_count.get() != 0 }
+}

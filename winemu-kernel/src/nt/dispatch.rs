@@ -132,9 +132,9 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
     let quantum_100ns = timer::DEFAULT_TIMESLICE_100NS;
     let mut from = current_tid();
     loop {
+        let now = now_ticks();
         sched_lock_acquire();
         set_vcpu_idle_locked(vid, false);
-        let now = now_ticks();
         let pending_resched = consume_pending_reschedule_locked(vid);
         let quantum_expired = charge_current_runtime_locked(vid, now, quantum_100ns);
         if quantum_expired {

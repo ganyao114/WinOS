@@ -29,6 +29,7 @@ pub const STATUS_INVALID_HANDLE: u32 = status::INVALID_HANDLE;
 pub const STATUS_INVALID_PARAMETER: u32 = status::INVALID_PARAMETER;
 pub const STATUS_MUTANT_NOT_OWNED: u32 = status::MUTANT_NOT_OWNED;
 pub const STATUS_SEMAPHORE_LIMIT_EXCEEDED: u32 = status::SEMAPHORE_LIMIT_EXCEEDED;
+pub const STATUS_NO_MEMORY: u32 = status::NO_MEMORY;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WaitDeadline {
@@ -749,14 +750,13 @@ fn deadline_ticks(timeout: WaitDeadline) -> u64 {
     }
 }
 
-fn set_wait_metadata(tid: u32, kind: u8, handles: &[u64], timeout: WaitDeadline) {
+fn set_wait_metadata(tid: u32, kind: u8, handles: &[u64], timeout: WaitDeadline) -> u32 {
     let count = if handles.len() > MAX_WAIT_HANDLES {
         MAX_WAIT_HANDLES
     } else {
         handles.len()
     };
     let deadline = deadline_ticks(timeout);
-    set_thread_state_locked(tid, ThreadState::Waiting);
     with_thread_mut(tid, |t| {
         t.wait_result = STATUS_PENDING;
         t.wait_kind = kind;
@@ -769,7 +769,18 @@ fn set_wait_metadata(tid: u32, kind: u8, handles: &[u64], timeout: WaitDeadline)
             i += 1;
         }
     });
-    set_wait_deadline_locked(tid, deadline);
+    if !set_wait_deadline_locked(tid, deadline) {
+        with_thread_mut(tid, |t| {
+            t.wait_result = 0;
+            t.wait_kind = WAIT_KIND_NONE;
+            t.wait_count = 0;
+            t.wait_signaled = 0;
+            t.wait_handles.fill(0);
+        });
+        return STATUS_NO_MEMORY;
+    }
+    set_thread_state_locked(tid, ThreadState::Waiting);
+    STATUS_SUCCESS
 }
 
 fn clear_wait_metadata(tid: u32) {
@@ -1246,7 +1257,10 @@ fn wait_common_locked(handles: &[u64], wait_all: bool, timeout: WaitDeadline) ->
     } else {
         WAIT_KIND_MULTI_ANY
     };
-    set_wait_metadata(cur, kind, handles, timeout);
+    let prepare = set_wait_metadata(cur, kind, handles, timeout);
+    if prepare != STATUS_SUCCESS {
+        return prepare;
+    }
 
     let mut i = 0usize;
     while i < handles.len() {
@@ -1290,8 +1304,11 @@ pub fn delay_current_thread(timeout: WaitDeadline) -> u32 {
         return STATUS_INVALID_PARAMETER;
     }
 
-    set_wait_metadata(cur, WAIT_KIND_DELAY, &[], timeout);
-    set_thread_state_locked(cur, ThreadState::Waiting);
+    let prepare = set_wait_metadata(cur, WAIT_KIND_DELAY, &[], timeout);
+    if prepare != STATUS_SUCCESS {
+        sched_lock_release();
+        return prepare;
+    }
     sched_lock_release();
     STATUS_PENDING
 }

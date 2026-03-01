@@ -25,6 +25,8 @@ pub use lock::{sched_lock_acquire, sched_lock_release};
 pub const MAX_VCPUS: usize = 8;
 pub const IDLE_TID: u32 = 0;
 pub const MAX_WAIT_HANDLES: usize = 64;
+const READY_AGING_EPOCH_INTERVAL: u64 = 64;
+const READY_AGING_MAX_PRIORITY: u8 = 15;
 
 pub const WAIT_KIND_NONE: u8 = 0;
 pub const WAIT_KIND_SINGLE: u8 = 1;
@@ -83,6 +85,7 @@ pub struct KThread {
     // 时间片记账（100ns）
     pub slice_remaining_100ns: u64,
     pub last_start_100ns: u64,
+    pub ready_epoch: u64,
 
     // 侵入式链表节点（就绪队列 / 等待队列）
     pub sched_next: u32, // TID of next in ready queue (0 = end)
@@ -117,6 +120,7 @@ impl KThread {
             wait_signaled: 0,
             slice_remaining_100ns: 0,
             last_start_100ns: 0,
+            ready_epoch: 0,
             sched_next: 0,
             wait_next: 0,
             wait_handles: [0u64; MAX_WAIT_HANDLES],
@@ -287,6 +291,7 @@ pub struct Scheduler {
     pending_reschedule_mask: UnsafeCell<u32>,
     reschedule_mask: UnsafeCell<u32>,
     idle_vcpu_mask: UnsafeCell<u32>,
+    epoch: UnsafeCell<u64>,
     // 全局调度锁（可重入，保护 ready queue 和线程状态）
     // 多 vCPU：底层用原子自旋锁
     lock_count: UnsafeCell<u32>,
@@ -303,6 +308,7 @@ pub static SCHED: Scheduler = Scheduler {
     pending_reschedule_mask: UnsafeCell::new(0),
     reschedule_mask: UnsafeCell::new(0),
     idle_vcpu_mask: UnsafeCell::new(0),
+    epoch: UnsafeCell::new(0),
     lock_count: UnsafeCell::new(0),
     lock_owner: UnsafeCell::new(0),
     spinlock: UnsafeCell::new(0),
@@ -421,6 +427,88 @@ pub(crate) fn commit_deferred_scheduling_locked() {
     }
 }
 
+#[inline(always)]
+fn scheduler_epoch_locked() -> u64 {
+    unsafe { *SCHED.epoch.get() }
+}
+
+#[inline(always)]
+fn advance_scheduler_epoch_locked() -> u64 {
+    unsafe {
+        let slot = SCHED.epoch.get();
+        let mut next = (*slot).wrapping_add(1);
+        if next == 0 {
+            next = 1;
+        }
+        *slot = next;
+        next
+    }
+}
+
+fn mark_reschedule_targeted_locked(changed_tid: u32, ready_prio: Option<u8>) {
+    let local_vid = vcpu_id().min(MAX_VCPUS - 1);
+    mark_vcpu_needs_scheduling_locked(local_vid);
+
+    unsafe {
+        let idle_mask = *SCHED.idle_vcpu_mask.get();
+        for vid in 0..MAX_VCPUS {
+            let bit = vcpu_bit(vid);
+            if (idle_mask & bit) != 0 {
+                mark_vcpu_needs_scheduling_locked(vid);
+                continue;
+            }
+
+            let running_tid = (*SCHED.vcpus.get())[vid].current_tid;
+            if running_tid == changed_tid {
+                mark_vcpu_needs_scheduling_locked(vid);
+                continue;
+            }
+
+            if let Some(prio) = ready_prio {
+                if running_tid != 0 && thread_exists(running_tid) {
+                    let running_prio = with_thread(running_tid, |t| t.priority);
+                    if running_prio < prio {
+                        mark_vcpu_needs_scheduling_locked(vid);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn apply_ready_aging_locked(epoch: u64) {
+    if epoch == 0 || (epoch % READY_AGING_EPOCH_INTERVAL) != 0 {
+        return;
+    }
+
+    let mut boosts = Vec::new();
+    unsafe {
+        let Some(store) = (&*SCHED.threads.get()).as_ref() else {
+            return;
+        };
+        store.for_each_live_ptr(|tid, ptr| {
+            let t = &*ptr;
+            if t.state != ThreadState::Ready {
+                return;
+            }
+            if t.priority >= READY_AGING_MAX_PRIORITY || t.ready_epoch == 0 {
+                return;
+            }
+            if epoch.wrapping_sub(t.ready_epoch) < READY_AGING_EPOCH_INTERVAL {
+                return;
+            }
+            if boosts.try_reserve(1).is_ok() {
+                boosts.push((tid, (t.priority + 1).min(READY_AGING_MAX_PRIORITY)));
+            }
+        });
+    }
+
+    for (tid, new_prio) in boosts {
+        set_thread_priority_locked(tid, new_prio);
+        with_thread_mut(tid, |t| t.ready_epoch = epoch);
+    }
+}
+
 pub(crate) fn consume_pending_reschedule_locked(vid: usize) -> bool {
     unsafe {
         let bit = vcpu_bit(vid);
@@ -462,9 +550,14 @@ pub fn idle_vcpu_mask_snapshot() -> u32 {
     mask
 }
 
-pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) {
+#[inline(always)]
+pub(crate) fn sched_lock_held_by_current_vcpu() -> bool {
+    lock::sched_lock_held_by_current_vcpu()
+}
+
+pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
     if tid == 0 || !thread_exists(tid) {
-        return;
+        return false;
     }
     let old_handle = with_thread_mut(tid, |t| {
         let prev = TimerTaskHandle {
@@ -480,7 +573,7 @@ pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) {
         if old_handle.is_valid() {
             let _ = timer::cancel_task(old_handle);
         }
-        return;
+        return true;
     }
 
     if old_handle.is_valid() {
@@ -489,7 +582,7 @@ pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) {
                 t.wait_timer_task_id = handle.id;
                 t.wait_timer_generation = handle.generation;
             });
-            return;
+            return true;
         }
         let _ = timer::cancel_task(old_handle);
     }
@@ -499,11 +592,19 @@ pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) {
             t.wait_timer_task_id = handle.id;
             t.wait_timer_generation = handle.generation;
         });
+        return true;
     }
+
+    with_thread_mut(tid, |t| {
+        t.wait_deadline = 0;
+        t.wait_timer_task_id = 0;
+        t.wait_timer_generation = 0;
+    });
+    false
 }
 
 pub(crate) fn clear_wait_deadline_locked(tid: u32) {
-    set_wait_deadline_locked(tid, 0);
+    let _ = set_wait_deadline_locked(tid, 0);
 }
 
 // 调度状态变迁的唯一入口（调用者必须持有 sched lock）。
@@ -516,6 +617,7 @@ pub(crate) fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
         return;
     }
 
+    let ready_epoch = scheduler_epoch_locked();
     unsafe {
         if old_state == ThreadState::Ready {
             (*SCHED.ready.get()).remove(tid);
@@ -526,13 +628,23 @@ pub(crate) fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
             if new_state != ThreadState::Running {
                 t.last_start_100ns = 0;
             }
+            if new_state == ThreadState::Ready {
+                t.ready_epoch = ready_epoch;
+            } else {
+                t.ready_epoch = 0;
+            }
         });
 
         if new_state == ThreadState::Ready {
             with_thread_mut(tid, |t| (*SCHED.ready.get()).push(t));
         }
     }
-    mark_all_vcpus_needs_scheduling_locked();
+    let ready_prio = if new_state == ThreadState::Ready {
+        Some(with_thread(tid, |t| t.priority))
+    } else {
+        None
+    };
+    mark_reschedule_targeted_locked(tid, ready_prio);
 }
 
 // ── 线程创建 ──────────────────────────────────────────────────
@@ -686,6 +798,8 @@ pub fn thread_ids_by_pid(pid: u32) -> Vec<u32> {
 /// 返回 (from_tid, to_tid)；若无需切换则 from == to；to == 0 表示 WFI idle
 pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32) {
     unsafe {
+        let epoch = advance_scheduler_epoch_locked();
+        apply_ready_aging_locked(epoch);
         let vcpu = &mut (*SCHED.vcpus.get())[vcpu_id];
         let mut cur_tid = vcpu.current_tid;
         if cur_tid != 0 && !thread_exists(cur_tid) {
@@ -762,7 +876,9 @@ pub fn block_current(vcpu_id: usize, deadline: u64) -> (u32, u32) {
         }
         if cur_tid != 0 {
             set_thread_state_locked(cur_tid, ThreadState::Waiting);
-            set_wait_deadline_locked(cur_tid, deadline);
+            if !set_wait_deadline_locked(cur_tid, deadline) {
+                set_thread_state_locked(cur_tid, ThreadState::Ready);
+            }
         }
 
         let next_tid = (*SCHED.ready.get()).pop_highest();
@@ -785,7 +901,7 @@ pub fn wake(tid: u32, result: u32) {
         sched_lock_release();
         return;
     }
-    set_wait_deadline_locked(tid, 0);
+    let _ = set_wait_deadline_locked(tid, 0);
     with_thread_mut(tid, |t| {
         t.wait_result = result;
         t.wait_kind = WAIT_KIND_NONE;
@@ -887,7 +1003,7 @@ pub fn check_timeouts(now_ticks: u64) -> bool {
             return;
         }
         crate::sched::sync::cleanup_wait_registration(tid);
-        set_wait_deadline_locked(tid, 0);
+        let _ = set_wait_deadline_locked(tid, 0);
         with_thread_mut(tid, |t| {
             let timeout_result = if t.wait_kind == WAIT_KIND_DELAY {
                 status::SUCCESS
@@ -930,51 +1046,13 @@ pub fn check_timeouts(now_ticks: u64) -> bool {
         timeout_now(tid);
     }
 
-    // Fallback path: if a waiting thread failed to register TimerTask (e.g. OOM),
-    // still honor timeout via linear scan.
-    let mut fallback_tids = Vec::new();
-    unsafe {
-        if let Some(store) = (&*SCHED.threads.get()).as_ref() {
-            store.for_each_live_ptr(|tid, ptr| {
-                let t = &*ptr;
-                let has_timer_task = t.wait_timer_task_id != 0 && t.wait_timer_generation != 0;
-                if t.state == ThreadState::Waiting
-                    && t.wait_deadline != 0
-                    && t.wait_deadline <= now_ticks
-                    && !has_timer_task
-                {
-                    if fallback_tids.try_reserve(1).is_ok() {
-                        fallback_tids.push(tid);
-                    }
-                }
-            });
-        }
-    }
-    for tid in fallback_tids {
-        timeout_now(tid);
-    }
-
     woke_any
 }
 
 /// Return the earliest waiting deadline (100ns), 0 if none.
 /// Caller must hold scheduler lock.
 pub fn next_wait_deadline_locked() -> u64 {
-    let mut earliest = timer::next_deadline_locked();
-    unsafe {
-        if let Some(store) = (&*SCHED.threads.get()).as_ref() {
-            store.for_each_live_ptr(|_tid, ptr| {
-                let t = &*ptr;
-                let has_timer_task = t.wait_timer_task_id != 0 && t.wait_timer_generation != 0;
-                if t.state == ThreadState::Waiting && t.wait_deadline != 0 && !has_timer_task {
-                    if earliest == 0 || t.wait_deadline < earliest {
-                        earliest = t.wait_deadline;
-                    }
-                }
-            });
-        }
-    }
-    earliest
+    timer::next_deadline_locked()
 }
 
 /// Locking wrapper for callers that are not already in scheduler critical section.
@@ -1009,8 +1087,14 @@ pub(crate) fn set_thread_priority_locked(tid: u32, new_priority: u8) {
     with_thread_mut(tid, |t| t.priority = clamped);
     if state == ThreadState::Ready {
         with_thread_mut(tid, |t| unsafe { (*SCHED.ready.get()).push(t) });
+        with_thread_mut(tid, |t| t.ready_epoch = scheduler_epoch_locked());
     }
-    mark_all_vcpus_needs_scheduling_locked();
+    let ready_prio = if state == ThreadState::Ready {
+        Some(clamped)
+    } else {
+        None
+    };
+    mark_reschedule_targeted_locked(tid, ready_prio);
 }
 
 pub(crate) fn boost_thread_priority_locked(tid: u32, min_priority: u8) {

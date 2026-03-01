@@ -152,6 +152,14 @@ static TIMER_TASKS: TimerTaskRegistry = TimerTaskRegistry {
     state: UnsafeCell::new(None),
 };
 
+#[inline(always)]
+fn require_sched_lock() {
+    assert!(
+        crate::sched::sched_lock_held_by_current_vcpu(),
+        "timer task API requires scheduler lock"
+    );
+}
+
 fn state_mut() -> &'static mut TimerTaskState {
     unsafe {
         let slot = &mut *TIMER_TASKS.state.get();
@@ -235,6 +243,7 @@ pub fn register_task(
     target_id: u32,
     deadline_100ns: u64,
 ) -> Option<TimerTaskHandle> {
+    require_sched_lock();
     if target_id == 0 || deadline_100ns == 0 {
         return None;
     }
@@ -259,6 +268,7 @@ pub fn register_task(
 }
 
 pub fn rearm_task(handle: TimerTaskHandle, deadline_100ns: u64) -> Option<TimerTaskHandle> {
+    require_sched_lock();
     if !handle.is_valid() {
         return None;
     }
@@ -300,6 +310,7 @@ pub fn rearm_task(handle: TimerTaskHandle, deadline_100ns: u64) -> Option<TimerT
 }
 
 pub fn cancel_task(handle: TimerTaskHandle) -> bool {
+    require_sched_lock();
     if !handle.is_valid() {
         return false;
     }
@@ -318,6 +329,7 @@ pub fn cancel_task(handle: TimerTaskHandle) -> bool {
 }
 
 pub fn next_deadline_locked() -> u64 {
+    require_sched_lock();
     let state = state_mut();
     rebuild_heap_locked(state);
     prune_heap_locked(state);
@@ -325,6 +337,7 @@ pub fn next_deadline_locked() -> u64 {
 }
 
 pub fn pop_expired_task_locked(now_100ns: u64) -> Option<FiredTimerTask> {
+    require_sched_lock();
     let state = state_mut();
     rebuild_heap_locked(state);
     loop {
