@@ -82,6 +82,8 @@ struct PhysPageRef {
 struct GuestFile {
     owner_pid: u32,
     host_fd: u64,
+    path_len: u16,
+    path: [u8; MAX_FILE_PATH_BYTES],
 }
 
 #[derive(Clone, Copy)]
@@ -108,6 +110,8 @@ static NT_STATE: NtState = NtState {
     regions: UnsafeCell::new(None),
     page_refs: UnsafeCell::new(None),
 };
+
+const MAX_FILE_PATH_BYTES: usize = 512;
 
 fn files_store_mut() -> &'static mut ObjectStore<GuestFile> {
     unsafe {
@@ -585,8 +589,18 @@ pub(crate) fn vm_handle_page_fault(owner_pid: u32, fault_addr: u64, access: u8) 
     true
 }
 
-pub(crate) fn file_alloc(owner_pid: u32, host_fd: u64) -> Option<u32> {
-    files_store_mut().alloc_with(|_| GuestFile { owner_pid, host_fd })
+pub(crate) fn file_alloc(owner_pid: u32, host_fd: u64, path: &[u8]) -> Option<u32> {
+    let path_len = core::cmp::min(path.len(), MAX_FILE_PATH_BYTES);
+    let mut name = [0u8; MAX_FILE_PATH_BYTES];
+    if path_len != 0 {
+        name[..path_len].copy_from_slice(&path[..path_len]);
+    }
+    files_store_mut().alloc_with(|_| GuestFile {
+        owner_pid,
+        host_fd,
+        path_len: path_len as u16,
+        path: name,
+    })
 }
 
 pub(crate) fn file_host_fd(idx: u32) -> Option<u64> {
@@ -605,6 +619,28 @@ pub(crate) fn file_owner_pid(idx: u32) -> Option<u32> {
     } else {
         Some(unsafe { (*ptr).owner_pid })
     }
+}
+
+pub(crate) fn file_name_utf16(idx: u32) -> Option<Vec<u16>> {
+    let ptr = files_store_mut().get_ptr(idx);
+    if ptr.is_null() {
+        return None;
+    }
+    let file = unsafe { &*ptr };
+    let len = file.path_len as usize;
+    if len == 0 || len > MAX_FILE_PATH_BYTES {
+        return None;
+    }
+    let mut out = Vec::<u16>::new();
+    if out.try_reserve(len).is_err() {
+        return None;
+    }
+    let mut i = 0usize;
+    while i < len {
+        out.push(file.path[i] as u16);
+        i += 1;
+    }
+    Some(out)
 }
 
 pub(crate) fn file_free(idx: u32) {

@@ -93,7 +93,7 @@ const SEMAPHORE_OPS: KObjectOps = KObjectOps {
 const FILE_OPS: KObjectOps = KObjectOps {
     type_name_utf16: FILE_NAME,
     close_last_ref: close_file,
-    query_name_utf16: query_name_none,
+    query_name_utf16: query_name_file,
     valid_access_mask: ACCESS_MASK_FILE,
     security_required: false,
     maintain_handle_count: true,
@@ -133,6 +133,10 @@ fn query_name_key(idx: u32) -> Option<Vec<u16>> {
 
 fn query_name_section(idx: u32) -> Option<Vec<u16>> {
     section::section_name_utf16(idx)
+}
+
+fn query_name_file(idx: u32) -> Option<Vec<u16>> {
+    file::file_name_utf16(idx)
 }
 
 #[inline(always)]

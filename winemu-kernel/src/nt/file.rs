@@ -9,7 +9,7 @@ use super::common::{
     IoStatusBlock, FILE_OPEN, HOST_OPEN_READ,
 };
 use super::path::{read_oa_path, read_unicode_direct};
-use super::state::{file_alloc, file_free, file_owner_pid};
+use super::state::{file_alloc, file_free, file_name_utf16 as state_file_name_utf16, file_owner_pid};
 use super::SvcFrame;
 
 const FILE_BASIC_INFORMATION_SIZE: usize = 40;
@@ -396,7 +396,7 @@ pub(crate) fn handle_create_file(frame: &mut SvcFrame) {
         return;
     }
     let owner_pid = crate::process::current_pid();
-    let idx = match file_alloc(owner_pid, fd) {
+    let idx = match file_alloc(owner_pid, fd, &path_buf[..path_len]) {
         Some(v) => v,
         None => {
             hypercall::host_close(fd);
@@ -416,6 +416,10 @@ pub(crate) fn handle_create_file(frame: &mut SvcFrame) {
     }
     write_iosb(iosb_ptr, status::SUCCESS, 0);
     frame.x[0] = status::SUCCESS as u64;
+}
+
+pub(crate) fn file_name_utf16(idx: u32) -> Option<Vec<u16>> {
+    state_file_name_utf16(idx)
 }
 
 // x0=*FileHandle, x1=DesiredAccess, x2=ObjectAttributes, x3=*IoStatusBlock

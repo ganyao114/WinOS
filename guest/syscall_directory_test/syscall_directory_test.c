@@ -44,6 +44,7 @@ typedef struct {
 #define STATUS_SUCCESS 0x00000000U
 #define STATUS_INVALID_PARAMETER 0xC000000DU
 #define STATUS_NO_MORE_FILES 0x80000006U
+#define STATUS_INFO_LENGTH_MISMATCH 0xC0000004U
 
 #define OBJ_CASE_INSENSITIVE 0x40U
 
@@ -56,6 +57,7 @@ typedef struct {
 #define FILE_SYNCHRONOUS_IO_NONALERT 0x00000020U
 
 #define FILE_NAMES_INFORMATION_CLASS 12U
+#define OBJECT_NAME_INFORMATION_CLASS 1U
 
 __declspec(dllimport) NTSTATUS NtWriteFile(
     HANDLE file, HANDLE event, void* apc_routine, void* apc_ctx,
@@ -70,6 +72,8 @@ __declspec(dllimport) NTSTATUS NtQueryDirectoryFile(
     HANDLE file_handle, HANDLE event, void* apc_routine, void* apc_context,
     IO_STATUS_BLOCK* io_status_block, void* file_information, ULONG length, ULONG file_information_class,
     UCHAR return_single_entry, UNICODE_STRING* file_name, UCHAR restart_scan);
+__declspec(dllimport) NTSTATUS NtQueryObject(
+    HANDLE handle, ULONG object_info_class, void* object_info, ULONG object_info_len, ULONG* ret_len);
 __declspec(dllimport) NTSTATUS NtClose(HANDLE handle);
 
 static uint32_t g_pass = 0;
@@ -180,6 +184,9 @@ void mainCRTStartup(void) {
     int saw_exe = 0;
     int reached_end = 0;
     int i;
+    ULONG ret_len = 0;
+    uint8_t obj_name_buf[256];
+    uint8_t short_obj_name_buf[8];
 
     write_str("== syscall_directory_test ==\r\n");
 
@@ -204,6 +211,34 @@ void mainCRTStartup(void) {
     if (st != STATUS_SUCCESS || dir_handle == 0) {
         terminate_current_process(1);
     }
+
+    ret_len = 0;
+    st = NtQueryObject(
+        dir_handle,
+        OBJECT_NAME_INFORMATION_CLASS,
+        obj_name_buf,
+        (ULONG)sizeof(obj_name_buf),
+        &ret_len);
+    check("NtQueryObject(directory, ObjectNameInformation) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    if (st == STATUS_SUCCESS && ret_len >= 16) {
+        USHORT name_len = *(USHORT*)(obj_name_buf + 0);
+        uint64_t name_ptr = *(uint64_t*)(obj_name_buf + 8);
+        check("ObjectNameInformation(directory) name length is non-zero", name_len != 0);
+        check("ObjectNameInformation(directory) buffer pointer is non-zero", name_ptr != 0);
+        check("ObjectNameInformation(directory) ends with guest/sysroot",
+              unicode_ends_with_ascii_ci((const WCHAR*)(obj_name_buf + 16), (uint32_t)name_len, "guest/sysroot"));
+    }
+
+    ret_len = 0;
+    st = NtQueryObject(
+        dir_handle,
+        OBJECT_NAME_INFORMATION_CLASS,
+        short_obj_name_buf,
+        (ULONG)sizeof(short_obj_name_buf),
+        &ret_len);
+    check("NtQueryObject(ObjectNameInformation, short) returns STATUS_INFO_LENGTH_MISMATCH",
+          st == STATUS_INFO_LENGTH_MISMATCH);
+    check("NtQueryObject(ObjectNameInformation, short) reports required length > 16", ret_len > 16);
 
     iosb.Status = 0;
     iosb.Information = 0;
