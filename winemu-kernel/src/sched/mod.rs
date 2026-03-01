@@ -13,6 +13,7 @@ use crate::nt::constants::{
     THREAD_BASIC_INFORMATION_SIZE, THREAD_STACK_ALIGN,
 };
 use crate::nt::state::{vm_alloc_region_typed, vm_free_region, vm_make_guard_page};
+use crate::timer::{self, TimerTaskHandle, TimerTaskKind};
 use crate::rust_alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use winemu_shared::status;
@@ -73,7 +74,8 @@ pub struct KThread {
     // 等待信息
     pub wait_result: u32,   // NTSTATUS written on wake
     pub wait_deadline: u64, // deadline in CNTVCT ticks (0 = no timeout)
-    pub wait_seq: u32,      // generation used by timeout min-heap stale filtering
+    pub wait_timer_task_id: u32,
+    pub wait_timer_generation: u32,
     pub wait_kind: u8,      // WAIT_KIND_*
     pub wait_count: u8,     // number of handles in wait_handles
     pub wait_signaled: u64, // bitmask for WAIT_KIND_MULTI_ALL
@@ -108,7 +110,8 @@ impl KThread {
             },
             wait_result: 0,
             wait_deadline: 0,
-            wait_seq: 0,
+            wait_timer_task_id: 0,
+            wait_timer_generation: 0,
             wait_kind: WAIT_KIND_NONE,
             wait_count: 0,
             wait_signaled: 0,
@@ -260,77 +263,6 @@ impl ReadyQueue {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct TimeoutEntry {
-    deadline: u64,
-    tid: u32,
-    seq: u32,
-}
-
-struct TimeoutMinHeap {
-    data: Vec<TimeoutEntry>,
-}
-
-impl TimeoutMinHeap {
-    fn new() -> Self {
-        Self { data: Vec::new() }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    fn push(&mut self, ent: TimeoutEntry) -> bool {
-        if self.data.try_reserve(1).is_err() {
-            return false;
-        }
-        self.data.push(ent);
-        let mut idx = self.data.len() - 1;
-        while idx > 0 {
-            let parent = (idx - 1) / 2;
-            if self.data[parent].deadline <= self.data[idx].deadline {
-                break;
-            }
-            self.data.swap(parent, idx);
-            idx = parent;
-        }
-        true
-    }
-
-    fn peek(&self) -> Option<TimeoutEntry> {
-        self.data.first().copied()
-    }
-
-    fn pop(&mut self) -> Option<TimeoutEntry> {
-        if self.data.is_empty() {
-            return None;
-        }
-        let top = self.data[0];
-        let tail = self.data.pop().unwrap();
-        if !self.data.is_empty() {
-            self.data[0] = tail;
-            let mut idx = 0usize;
-            loop {
-                let left = idx * 2 + 1;
-                let right = left + 1;
-                if left >= self.data.len() {
-                    break;
-                }
-                let mut smallest = left;
-                if right < self.data.len() && self.data[right].deadline < self.data[left].deadline {
-                    smallest = right;
-                }
-                if self.data[idx].deadline <= self.data[smallest].deadline {
-                    break;
-                }
-                self.data.swap(idx, smallest);
-                idx = smallest;
-            }
-        }
-        Some(top)
-    }
-}
-
 // ── 全局调度器状态（静态分配）────────────────────────────────
 
 // 每 vCPU 调度器：记录当前运行线程
@@ -351,12 +283,10 @@ impl KScheduler {
 pub struct Scheduler {
     threads: UnsafeCell<Option<ObjectStore<KThread>>>,
     ready: UnsafeCell<ReadyQueue>,
-    timeouts: UnsafeCell<Option<TimeoutMinHeap>>,
     vcpus: UnsafeCell<[KScheduler; MAX_VCPUS]>,
     pending_reschedule_mask: UnsafeCell<u32>,
     reschedule_mask: UnsafeCell<u32>,
     idle_vcpu_mask: UnsafeCell<u32>,
-    timeout_overflow: UnsafeCell<bool>,
     // 全局调度锁（可重入，保护 ready queue 和线程状态）
     // 多 vCPU：底层用原子自旋锁
     lock_count: UnsafeCell<u32>,
@@ -369,12 +299,10 @@ unsafe impl Sync for Scheduler {}
 pub static SCHED: Scheduler = Scheduler {
     threads: UnsafeCell::new(None),
     ready: UnsafeCell::new(ReadyQueue::new()),
-    timeouts: UnsafeCell::new(None),
     vcpus: UnsafeCell::new([const { KScheduler::new() }; MAX_VCPUS]),
     pending_reschedule_mask: UnsafeCell::new(0),
     reschedule_mask: UnsafeCell::new(0),
     idle_vcpu_mask: UnsafeCell::new(0),
-    timeout_overflow: UnsafeCell::new(false),
     lock_count: UnsafeCell::new(0),
     lock_owner: UnsafeCell::new(0),
     spinlock: UnsafeCell::new(0),
@@ -387,16 +315,6 @@ fn thread_store_mut() -> &'static mut ObjectStore<KThread> {
         let slot = &mut *SCHED.threads.get();
         if slot.is_none() {
             *slot = Some(ObjectStore::new());
-        }
-        slot.as_mut().unwrap()
-    }
-}
-
-fn timeout_heap_mut() -> &'static mut TimeoutMinHeap {
-    unsafe {
-        let slot = &mut *SCHED.timeouts.get();
-        if slot.is_none() {
-            *slot = Some(TimeoutMinHeap::new());
         }
         slot.as_mut().unwrap()
     }
@@ -544,44 +462,43 @@ pub fn idle_vcpu_mask_snapshot() -> u32 {
     mask
 }
 
-fn timeout_entry_is_live(entry: TimeoutEntry) -> bool {
-    if entry.tid == 0 || !thread_exists(entry.tid) {
-        return false;
-    }
-    with_thread(entry.tid, |t| {
-        t.state == ThreadState::Waiting
-            && t.wait_deadline == entry.deadline
-            && t.wait_seq == entry.seq
-    })
-}
-
-fn prune_timeout_heap_head_locked() {
-    let heap = timeout_heap_mut();
-    while let Some(head) = heap.peek() {
-        if timeout_entry_is_live(head) {
-            break;
-        }
-        let _ = heap.pop();
-    }
-}
-
 pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) {
     if tid == 0 || !thread_exists(tid) {
         return;
     }
-    let seq = with_thread_mut(tid, |t| {
+    let old_handle = with_thread_mut(tid, |t| {
+        let prev = TimerTaskHandle {
+            id: t.wait_timer_task_id,
+            generation: t.wait_timer_generation,
+        };
         t.wait_deadline = deadline;
-        t.wait_seq = t.wait_seq.wrapping_add(1);
-        t.wait_seq
+        t.wait_timer_task_id = 0;
+        t.wait_timer_generation = 0;
+        prev
     });
     if deadline == 0 {
+        if old_handle.is_valid() {
+            let _ = timer::cancel_task(old_handle);
+        }
         return;
     }
-    let ok = timeout_heap_mut().push(TimeoutEntry { deadline, tid, seq });
-    if !ok {
-        unsafe {
-            *SCHED.timeout_overflow.get() = true;
+
+    if old_handle.is_valid() {
+        if let Some(handle) = timer::rearm_task(old_handle, deadline) {
+            with_thread_mut(tid, |t| {
+                t.wait_timer_task_id = handle.id;
+                t.wait_timer_generation = handle.generation;
+            });
+            return;
         }
+        let _ = timer::cancel_task(old_handle);
+    }
+
+    if let Some(handle) = timer::register_task(TimerTaskKind::ThreadTimeout, tid, deadline) {
+        with_thread_mut(tid, |t| {
+            t.wait_timer_task_id = handle.id;
+            t.wait_timer_generation = handle.generation;
+        });
     }
 }
 
@@ -868,10 +785,9 @@ pub fn wake(tid: u32, result: u32) {
         sched_lock_release();
         return;
     }
+    set_wait_deadline_locked(tid, 0);
     with_thread_mut(tid, |t| {
         t.wait_result = result;
-        t.wait_seq = t.wait_seq.wrapping_add(1);
-        t.wait_deadline = 0;
         t.wait_kind = WAIT_KIND_NONE;
         t.wait_count = 0;
         t.wait_signaled = 0;
@@ -962,65 +878,80 @@ pub fn all_threads_done() -> bool {
 pub fn check_timeouts(now_ticks: u64) -> bool {
     let mut woke_any = false;
 
-    unsafe {
-        if *SCHED.timeout_overflow.get() {
-            *SCHED.timeout_overflow.get() = false;
-            *SCHED.timeouts.get() = Some(TimeoutMinHeap::new());
-            if let Some(store) = (&*SCHED.threads.get()).as_ref() {
-                store.for_each_live_ptr(|tid, ptr| {
-                    let (state, deadline, seq) =
-                        ((*ptr).state, (*ptr).wait_deadline, (*ptr).wait_seq);
-                    if state == ThreadState::Waiting && deadline != 0 {
-                        let _ = timeout_heap_mut().push(TimeoutEntry { deadline, tid, seq });
-                    }
-                });
-            }
+    let mut timeout_now = |tid: u32| {
+        if tid == 0 || !thread_exists(tid) {
+            return;
         }
-    }
-
-    loop {
-        prune_timeout_heap_head_locked();
-        let head = timeout_heap_mut().peek();
-        let Some(ent) = head else {
-            break;
-        };
-        if ent.deadline > now_ticks {
-            break;
-        }
-        let _ = timeout_heap_mut().pop();
-        if !timeout_entry_is_live(ent) {
-            continue;
-        }
-
-        // Remove stale waiter links from all objects before re-queueing.
-        crate::sched::sync::cleanup_wait_registration(ent.tid);
-
-        let still_waiting = with_thread(ent.tid, |t| {
-            t.state == ThreadState::Waiting
-                && t.wait_deadline == ent.deadline
-                && t.wait_seq == ent.seq
-        });
+        let still_waiting = with_thread(tid, |t| t.state == ThreadState::Waiting);
         if !still_waiting {
-            continue;
+            return;
         }
-
-        with_thread_mut(ent.tid, |t| {
+        crate::sched::sync::cleanup_wait_registration(tid);
+        set_wait_deadline_locked(tid, 0);
+        with_thread_mut(tid, |t| {
             let timeout_result = if t.wait_kind == WAIT_KIND_DELAY {
                 status::SUCCESS
             } else {
                 status::TIMEOUT
             };
             t.wait_result = timeout_result;
-            t.wait_deadline = 0;
-            t.wait_seq = t.wait_seq.wrapping_add(1);
             t.wait_kind = WAIT_KIND_NONE;
             t.wait_count = 0;
             t.wait_signaled = 0;
             t.wait_handles.fill(0);
             t.ctx.x[0] = timeout_result as u64;
         });
-        set_thread_state_locked(ent.tid, ThreadState::Ready);
+        set_thread_state_locked(tid, ThreadState::Ready);
         woke_any = true;
+    };
+
+    loop {
+        let Some(fired) = timer::pop_expired_task_locked(now_ticks) else {
+            break;
+        };
+        if fired.kind != TimerTaskKind::ThreadTimeout {
+            continue;
+        }
+        let tid = fired.target_id;
+        if tid == 0 || !thread_exists(tid) {
+            continue;
+        }
+
+        let still_waiting = with_thread(tid, |t| {
+            t.state == ThreadState::Waiting
+                && t.wait_deadline == fired.deadline_100ns
+                && t.wait_timer_task_id == fired.handle.id
+                && t.wait_timer_generation == fired.handle.generation
+        });
+        if !still_waiting {
+            continue;
+        }
+
+        timeout_now(tid);
+    }
+
+    // Fallback path: if a waiting thread failed to register TimerTask (e.g. OOM),
+    // still honor timeout via linear scan.
+    let mut fallback_tids = Vec::new();
+    unsafe {
+        if let Some(store) = (&*SCHED.threads.get()).as_ref() {
+            store.for_each_live_ptr(|tid, ptr| {
+                let t = &*ptr;
+                let has_timer_task = t.wait_timer_task_id != 0 && t.wait_timer_generation != 0;
+                if t.state == ThreadState::Waiting
+                    && t.wait_deadline != 0
+                    && t.wait_deadline <= now_ticks
+                    && !has_timer_task
+                {
+                    if fallback_tids.try_reserve(1).is_ok() {
+                        fallback_tids.push(tid);
+                    }
+                }
+            });
+        }
+    }
+    for tid in fallback_tids {
+        timeout_now(tid);
     }
 
     woke_any
@@ -1029,12 +960,21 @@ pub fn check_timeouts(now_ticks: u64) -> bool {
 /// Return the earliest waiting deadline (100ns), 0 if none.
 /// Caller must hold scheduler lock.
 pub fn next_wait_deadline_locked() -> u64 {
-    prune_timeout_heap_head_locked();
-    if timeout_heap_mut().is_empty() {
-        0
-    } else {
-        timeout_heap_mut().peek().map_or(0, |e| e.deadline)
+    let mut earliest = timer::next_deadline_locked();
+    unsafe {
+        if let Some(store) = (&*SCHED.threads.get()).as_ref() {
+            store.for_each_live_ptr(|_tid, ptr| {
+                let t = &*ptr;
+                let has_timer_task = t.wait_timer_task_id != 0 && t.wait_timer_generation != 0;
+                if t.state == ThreadState::Waiting && t.wait_deadline != 0 && !has_timer_task {
+                    if earliest == 0 || t.wait_deadline < earliest {
+                        earliest = t.wait_deadline;
+                    }
+                }
+            });
+        }
     }
+    earliest
 }
 
 /// Locking wrapper for callers that are not already in scheduler critical section.
