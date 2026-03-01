@@ -28,6 +28,11 @@ const PREEMPT_B_WORK: u32 = 500_000;
 const PI_LOW_WORK: u32 = 500_000;
 const PI_MED_WORK: u32 = 1_000_000;
 const BURST_WAITERS: usize = 16;
+const FAIR_WORKERS: usize = 8;
+const FAIR_MAX_SPINS: u32 = 4_000_000;
+const TIMEOUT_STORM_THREADS: usize = 24;
+const MUTEX_STRESS_THREADS: usize = 8;
+const MUTEX_STRESS_ITERS: u32 = 300;
 
 // ── Shared state ────────────────────────────────────────────
 static COUNTER_A: AtomicU32 = AtomicU32::new(0);
@@ -51,6 +56,17 @@ static MED_DONE: AtomicU32 = AtomicU32::new(0);
 static HIGH_BEFORE_MED_DONE: AtomicU32 = AtomicU32::new(0);
 static BURST_EVENT: AtomicU32 = AtomicU32::new(0);
 static BURST_DONE: AtomicU32 = AtomicU32::new(0);
+static FAIR_START_EVENT: AtomicU32 = AtomicU32::new(0);
+static FAIR_STOP: AtomicU32 = AtomicU32::new(0);
+static FAIR_DONE: AtomicU32 = AtomicU32::new(0);
+static FAIR_COUNTERS: [AtomicU32; FAIR_WORKERS] = [const { AtomicU32::new(0) }; FAIR_WORKERS];
+static TIMEOUT_STORM_EVENT: AtomicU32 = AtomicU32::new(0);
+static TIMEOUT_STORM_DONE: AtomicU32 = AtomicU32::new(0);
+static TIMEOUT_STORM_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+static MUTEX_STRESS_START: AtomicU32 = AtomicU32::new(0);
+static MUTEX_STRESS_HANDLE: AtomicU32 = AtomicU32::new(0);
+static MUTEX_STRESS_DONE: AtomicU32 = AtomicU32::new(0);
+static MUTEX_STRESS_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 static mut PASS_COUNT: u32 = 0;
 static mut FAIL_COUNT: u32 = 0;
@@ -395,11 +411,69 @@ extern "C" fn thread_burst_waiter(_arg: u64) -> ! {
     unsafe { exit_thread() }
 }
 
+extern "C" fn thread_fair_worker(arg: u64) -> ! {
+    let idx = (arg as usize) % FAIR_WORKERS;
+    let ev = FAIR_START_EVENT.load(Ordering::Acquire) as u64;
+    unsafe { wait_single(ev); }
+
+    let mut spins = 0u32;
+    loop {
+        FAIR_COUNTERS[idx].fetch_add(1, Ordering::Relaxed);
+        spins = spins.wrapping_add(1);
+        if (spins & 0x3fff) == 0 {
+            if FAIR_STOP.load(Ordering::Acquire) != 0 || spins >= FAIR_MAX_SPINS {
+                break;
+            }
+        }
+    }
+    FAIR_DONE.fetch_add(1, Ordering::AcqRel);
+    unsafe { exit_thread() }
+}
+
+extern "C" fn thread_timeout_storm_waiter(_arg: u64) -> ! {
+    let ev = TIMEOUT_STORM_EVENT.load(Ordering::Acquire) as u64;
+    let st = unsafe { wait_single_timeout_rel(ev, -20_000) };
+    if st == STATUS_TIMEOUT {
+        TIMEOUT_STORM_TIMEOUTS.fetch_add(1, Ordering::AcqRel);
+    }
+    TIMEOUT_STORM_DONE.fetch_add(1, Ordering::AcqRel);
+    unsafe { exit_thread() }
+}
+
+extern "C" fn thread_mutex_stress(_arg: u64) -> ! {
+    let go = MUTEX_STRESS_START.load(Ordering::Acquire) as u64;
+    unsafe { wait_single(go); }
+    let mutex = MUTEX_STRESS_HANDLE.load(Ordering::Acquire) as u64;
+    let mut i = 0u32;
+    while i < MUTEX_STRESS_ITERS {
+        if unsafe { wait_single(mutex) } == STATUS_SUCCESS {
+            MUTEX_STRESS_COUNTER.fetch_add(1, Ordering::AcqRel);
+            unsafe { release_mutant(mutex); }
+        }
+        if (i & 31) == 0 {
+            unsafe { yield_exec(); }
+        }
+        i += 1;
+    }
+    MUTEX_STRESS_DONE.fetch_add(1, Ordering::AcqRel);
+    unsafe { exit_thread() }
+}
+
 // ── Tests ───────────────────────────────────────────────────
 
 unsafe fn wait_flag_with_yield(flag: &AtomicU32, max_iters: u32) -> bool {
     for _ in 0..max_iters {
         if flag.load(Ordering::Acquire) != 0 {
+            return true;
+        }
+        yield_exec();
+    }
+    false
+}
+
+unsafe fn wait_counter_at_least(counter: &AtomicU32, target: u32, max_iters: u32) -> bool {
+    for _ in 0..max_iters {
+        if counter.load(Ordering::Acquire) >= target {
             return true;
         }
         yield_exec();
@@ -649,6 +723,114 @@ unsafe fn test_wait_wake_burst() {
     let _ = handles;
 }
 
+unsafe fn test_cpu_contention_fairness() {
+    print(b"== CPU Contention Fairness ==\r\n");
+
+    FAIR_STOP.store(0, Ordering::Relaxed);
+    FAIR_DONE.store(0, Ordering::Relaxed);
+    for i in 0..FAIR_WORKERS {
+        FAIR_COUNTERS[i].store(0, Ordering::Relaxed);
+    }
+
+    let (st_ev, ev) = create_event(true, false);
+    check(b"Create fairness start event", st_ev == STATUS_SUCCESS);
+    FAIR_START_EVENT.store(ev as u32, Ordering::Release);
+
+    let mut ok_create = true;
+    for i in 0..FAIR_WORKERS {
+        let (st, h) = create_thread(thread_fair_worker as *const () as u64, i as u64, 0x10000);
+        if st != STATUS_SUCCESS || h == 0 {
+            ok_create = false;
+        }
+    }
+    check(b"Fairness workers created", ok_create);
+
+    let st_set = set_event(ev);
+    check(b"Start fairness workers", st_set == STATUS_SUCCESS);
+    for _ in 0..4_000u32 {
+        yield_exec();
+    }
+    FAIR_STOP.store(1, Ordering::Release);
+
+    let done = wait_counter_at_least(&FAIR_DONE, FAIR_WORKERS as u32, 200_000);
+    check(b"Fairness workers completed", done);
+
+    let mut all_progress = true;
+    let mut min = u32::MAX;
+    let mut max = 0u32;
+    for i in 0..FAIR_WORKERS {
+        let v = FAIR_COUNTERS[i].load(Ordering::Acquire);
+        if v == 0 {
+            all_progress = false;
+        }
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+    check(b"All fairness workers made progress", all_progress);
+    let bounded_skew = min > 0 && max / min < 200;
+    check(b"Fairness skew is bounded", bounded_skew);
+}
+
+unsafe fn test_timeout_storm() {
+    print(b"== Timeout Storm ==\r\n");
+
+    TIMEOUT_STORM_DONE.store(0, Ordering::Relaxed);
+    TIMEOUT_STORM_TIMEOUTS.store(0, Ordering::Relaxed);
+    let (st_ev, ev) = create_event(false, false);
+    check(b"Create timeout storm event", st_ev == STATUS_SUCCESS);
+    TIMEOUT_STORM_EVENT.store(ev as u32, Ordering::Release);
+
+    let mut ok_create = true;
+    for _ in 0..TIMEOUT_STORM_THREADS {
+        let (st, h) = create_thread(thread_timeout_storm_waiter as *const () as u64, 0, 0x10000);
+        if st != STATUS_SUCCESS || h == 0 {
+            ok_create = false;
+        }
+    }
+    check(b"Timeout storm waiters created", ok_create);
+
+    let done = wait_counter_at_least(&TIMEOUT_STORM_DONE, TIMEOUT_STORM_THREADS as u32, 220_000);
+    check(b"Timeout storm waiters completed", done);
+    check(
+        b"Timeout storm all timed out",
+        done && TIMEOUT_STORM_TIMEOUTS.load(Ordering::Acquire) == TIMEOUT_STORM_THREADS as u32,
+    );
+}
+
+unsafe fn test_mutex_contention_stress() {
+    print(b"== Mutex Contention Stress ==\r\n");
+
+    MUTEX_STRESS_DONE.store(0, Ordering::Relaxed);
+    MUTEX_STRESS_COUNTER.store(0, Ordering::Relaxed);
+    let (st_start, start_ev) = create_event(true, false);
+    let (st_mutex, mutex) = create_mutex(false);
+    check(b"Create mutex stress start event", st_start == STATUS_SUCCESS);
+    check(b"Create mutex stress mutex", st_mutex == STATUS_SUCCESS);
+    MUTEX_STRESS_START.store(start_ev as u32, Ordering::Release);
+    MUTEX_STRESS_HANDLE.store(mutex as u32, Ordering::Release);
+
+    let mut ok_create = true;
+    for _ in 0..MUTEX_STRESS_THREADS {
+        let (st, h) = create_thread(thread_mutex_stress as *const () as u64, 0, 0x10000);
+        if st != STATUS_SUCCESS || h == 0 {
+            ok_create = false;
+        }
+    }
+    check(b"Mutex stress workers created", ok_create);
+
+    let st_set = set_event(start_ev);
+    check(b"Start mutex stress workers", st_set == STATUS_SUCCESS);
+    let done = wait_counter_at_least(&MUTEX_STRESS_DONE, MUTEX_STRESS_THREADS as u32, 220_000);
+    check(b"Mutex stress workers completed", done);
+    let expected = (MUTEX_STRESS_THREADS as u32) * MUTEX_STRESS_ITERS;
+    let actual = MUTEX_STRESS_COUNTER.load(Ordering::Acquire);
+    check(b"Mutex stress protected counter exact", done && actual == expected);
+}
+
 // ── Entry point ─────────────────────────────────────────────
 
 #[no_mangle]
@@ -677,6 +859,15 @@ pub extern "C" fn mainCRTStartup() -> ! {
         print(b"\r\n");
 
         test_wait_wake_burst();
+        print(b"\r\n");
+
+        test_cpu_contention_fairness();
+        print(b"\r\n");
+
+        test_timeout_storm();
+        print(b"\r\n");
+
+        test_mutex_contention_stress();
         print(b"\r\n");
 
         // Summary
