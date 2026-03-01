@@ -1,12 +1,15 @@
+use crate::kobj::ObjectStore;
+use crate::rust_alloc::vec::Vec;
 use crate::hypercall;
-use crate::sched::sync::{make_new_handle, HANDLE_TYPE_FILE};
+use crate::sched::sync::{self, make_new_handle, HANDLE_TYPE_FILE};
 use winemu_shared::status;
 
 use super::common::{
-    file_handle_to_host_fd, map_open_flags, write_iosb, IoStatusBlock, FILE_OPEN, HOST_OPEN_READ,
+    file_handle_to_host_fd, file_handle_to_host_fd_for_pid, map_open_flags, write_iosb,
+    IoStatusBlock, FILE_OPEN, HOST_OPEN_READ,
 };
 use super::path::{read_oa_path, read_unicode_direct};
-use super::state::{file_alloc, file_free};
+use super::state::{file_alloc, file_free, file_owner_pid};
 use super::SvcFrame;
 
 const FILE_BASIC_INFORMATION_SIZE: usize = 40;
@@ -28,6 +31,7 @@ const HOST_NOTIFY_ACTION_MASK: u64 = 0x0000_00FF_0000_0000;
 const HOST_NOTIFY_ACTION_SHIFT: u64 = 32;
 
 const FILE_NOTIFY_INFORMATION_BASE: usize = 12;
+const STATUS_PENDING: u32 = 0x0000_0103;
 
 const FILE_FS_SIZE_INFORMATION: u32 = 3;
 const FILE_FS_DEVICE_INFORMATION: u32 = 4;
@@ -40,6 +44,68 @@ const FILE_DEVICE_DISK: u32 = 0x0000_0007;
 const FILE_CASE_SENSITIVE_SEARCH: u32 = 0x0000_0001;
 const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
 const FILE_UNICODE_ON_DISK: u32 = 0x0000_0004;
+
+#[derive(Clone, Copy)]
+struct PendingDirNotify {
+    owner_pid: u32,
+    file_idx: u32,
+    file_handle: u64,
+    event_handle: u64,
+    iosb_ptr: *mut IoStatusBlock,
+    out_ptr: *mut u8,
+    out_len: usize,
+    watch_tree: bool,
+    completion_filter: u32,
+}
+
+struct FileAsyncState {
+    pending_dir_notify: ObjectStore<PendingDirNotify>,
+}
+
+static mut FILE_ASYNC_STATE: Option<FileAsyncState> = None;
+
+fn async_state_mut() -> &'static mut FileAsyncState {
+    unsafe {
+        if FILE_ASYNC_STATE.is_none() {
+            FILE_ASYNC_STATE = Some(FileAsyncState {
+                pending_dir_notify: ObjectStore::new(),
+            });
+        }
+        FILE_ASYNC_STATE.as_mut().unwrap()
+    }
+}
+
+fn with_owner_ttbr0<R>(owner_pid: u32, f: impl FnOnce() -> R) -> Option<R> {
+    if owner_pid == 0 || !crate::process::process_exists(owner_pid) {
+        return None;
+    }
+    let current_pid = crate::process::current_pid();
+    if current_pid == owner_pid {
+        return Some(f());
+    }
+
+    let target_ttbr0 = crate::process::with_process(owner_pid, |p| p.address_space.ttbr0())?;
+    let restore_ttbr0 = crate::process::with_process(current_pid, |p| p.address_space.ttbr0());
+
+    crate::mm::switch_process_ttbr0(target_ttbr0);
+    let out = f();
+    if let Some(ttbr0) = restore_ttbr0 {
+        crate::mm::switch_process_ttbr0(ttbr0);
+    }
+    Some(out)
+}
+
+fn complete_pending_notify(req: &PendingDirNotify, st: u32, info: u64, signal_event: bool) {
+    if !crate::process::process_exists(req.owner_pid) {
+        return;
+    }
+    let _ = with_owner_ttbr0(req.owner_pid, || {
+        write_iosb(req.iosb_ptr, st, info);
+    });
+    if signal_event && req.event_handle != 0 {
+        let _ = sync::event_set_by_handle_for_pid(req.owner_pid, req.event_handle);
+    }
+}
 
 fn write_file_basic_information(out_ptr: *mut u8, file_attributes: u32) {
     unsafe {
@@ -185,6 +251,119 @@ fn write_notify_record(out_ptr: *mut u8, out_len: usize, action: u32, name: &[u8
         write_name_utf16(out_ptr.add(FILE_NOTIFY_INFORMATION_BASE), name);
     }
     Ok(rec_len)
+}
+
+fn queue_pending_dir_notify(req: PendingDirNotify) -> u32 {
+    if async_state_mut()
+        .pending_dir_notify
+        .alloc_with(|_| req)
+        .is_some()
+    {
+        status::SUCCESS
+    } else {
+        status::NO_MEMORY
+    }
+}
+
+fn cancel_pending_dir_notify_for_file(owner_pid: u32, file_idx: u32) {
+    let mut to_remove = Vec::new();
+    async_state_mut()
+        .pending_dir_notify
+        .for_each_live_ptr(|id, ptr| unsafe {
+            let req = *ptr;
+            if req.owner_pid == owner_pid && req.file_idx == file_idx {
+                let _ = to_remove.try_reserve(1);
+                to_remove.push(id);
+            }
+        });
+    for id in to_remove {
+        let _ = async_state_mut().pending_dir_notify.free(id);
+    }
+}
+
+pub(crate) fn cancel_pending_dir_notify_for_pid(owner_pid: u32) {
+    let mut to_remove = Vec::new();
+    async_state_mut()
+        .pending_dir_notify
+        .for_each_live_ptr(|id, ptr| unsafe {
+            let req = *ptr;
+            if req.owner_pid == owner_pid {
+                let _ = to_remove.try_reserve(1);
+                to_remove.push(id);
+            }
+        });
+    for id in to_remove {
+        let _ = async_state_mut().pending_dir_notify.free(id);
+    }
+}
+
+pub(crate) fn poll_async_file_completions() {
+    let mut to_remove = Vec::new();
+    async_state_mut()
+        .pending_dir_notify
+        .for_each_live_ptr(|id, ptr| unsafe {
+            let req = *ptr;
+
+            if !crate::process::process_exists(req.owner_pid) {
+                let _ = to_remove.try_reserve(1);
+                to_remove.push(id);
+                return;
+            }
+
+            let host_fd = match file_handle_to_host_fd_for_pid(req.owner_pid, req.file_handle) {
+                Some(fd) => fd,
+                None => {
+                    complete_pending_notify(&req, status::INVALID_HANDLE, 0, true);
+                    let _ = to_remove.try_reserve(1);
+                    to_remove.push(id);
+                    return;
+                }
+            };
+
+            let mut name_buf = [0u8; 512];
+            let packed = hypercall::host_notify_dir(
+                host_fd,
+                name_buf.as_mut_ptr(),
+                name_buf.len(),
+                req.watch_tree,
+                req.completion_filter,
+            );
+
+            if packed == 0 {
+                return;
+            }
+            if packed == u64::MAX {
+                complete_pending_notify(&req, status::INVALID_PARAMETER, 0, true);
+                let _ = to_remove.try_reserve(1);
+                to_remove.push(id);
+                return;
+            }
+
+            let action = ((packed & HOST_NOTIFY_ACTION_MASK) >> HOST_NOTIFY_ACTION_SHIFT) as u32;
+            let name_len = (packed & HOST_DIRENT_NAME_LEN_MASK) as usize;
+            if action == 0 || name_len == 0 || name_len > name_buf.len() {
+                complete_pending_notify(&req, status::SUCCESS, 0, true);
+                let _ = to_remove.try_reserve(1);
+                to_remove.push(id);
+                return;
+            }
+
+            let completion = with_owner_ttbr0(req.owner_pid, || {
+                write_notify_record(req.out_ptr, req.out_len, action, &name_buf[..name_len])
+            });
+            match completion {
+                Some(Ok(written)) => complete_pending_notify(&req, status::SUCCESS, written as u64, true),
+                Some(Err(st)) => complete_pending_notify(&req, st, 0, true),
+                None => {}
+            }
+
+            let _ = to_remove.try_reserve(1);
+            to_remove.push(id);
+        });
+
+    for id in to_remove {
+        let _ = async_state_mut().pending_dir_notify.free(id);
+    }
 }
 
 // x0=*FileHandle, x1=DesiredAccess, x2=ObjectAttributes, x3=*IoStatusBlock
@@ -437,12 +616,31 @@ pub(crate) fn handle_query_directory_file(frame: &mut SvcFrame) {
 // x0=FileHandle, x1=Event, x2=ApcRoutine, x3=ApcContext, x4=*IoStatusBlock
 // x5=Buffer, x6=Length, x7=CompletionFilter, stack0=WatchTree
 pub(crate) fn handle_notify_change_directory_file(frame: &mut SvcFrame) {
+    let owner_pid = crate::process::current_pid();
     let file_handle = frame.x[0];
+    let event_handle = frame.x[1];
     let iosb_ptr = frame.x[4] as *mut IoStatusBlock;
     let out_ptr = frame.x[5] as *mut u8;
     let out_len = frame.x[6] as usize;
     let completion_filter = frame.x[7] as u32;
     let watch_tree = unsafe { (frame.sp_el0 as *const u64).read_volatile() != 0 };
+
+    if sync::handle_type_by_owner(file_handle, owner_pid) != HANDLE_TYPE_FILE {
+        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    }
+    if event_handle != 0 && sync::handle_type_by_owner(event_handle, owner_pid) != sync::HANDLE_TYPE_EVENT {
+        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    }
+    let file_idx = sync::handle_idx_by_owner(file_handle, owner_pid);
+    if file_idx == 0 {
+        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    }
 
     let host_fd = match file_handle_to_host_fd(file_handle) {
         Some(fd) => fd,
@@ -474,30 +672,48 @@ pub(crate) fn handle_notify_change_directory_file(frame: &mut SvcFrame) {
         return;
     }
 
-    if packed == 0 {
-        write_iosb(iosb_ptr, status::SUCCESS, 0);
-        frame.x[0] = status::SUCCESS as u64;
-        return;
-    }
-
-    let action = ((packed & HOST_NOTIFY_ACTION_MASK) >> HOST_NOTIFY_ACTION_SHIFT) as u32;
-    let name_len = (packed & HOST_DIRENT_NAME_LEN_MASK) as usize;
-    if action == 0 || name_len == 0 || name_len > name_buf.len() {
-        write_iosb(iosb_ptr, status::SUCCESS, 0);
-        frame.x[0] = status::SUCCESS as u64;
-        return;
-    }
-
-    match write_notify_record(out_ptr, out_len, action, &name_buf[..name_len]) {
-        Ok(written) => {
-            write_iosb(iosb_ptr, status::SUCCESS, written as u64);
+    if packed != 0 {
+        let action = ((packed & HOST_NOTIFY_ACTION_MASK) >> HOST_NOTIFY_ACTION_SHIFT) as u32;
+        let name_len = (packed & HOST_DIRENT_NAME_LEN_MASK) as usize;
+        if action == 0 || name_len == 0 || name_len > name_buf.len() {
+            write_iosb(iosb_ptr, status::SUCCESS, 0);
             frame.x[0] = status::SUCCESS as u64;
+            return;
         }
-        Err(st) => {
-            write_iosb(iosb_ptr, st, 0);
-            frame.x[0] = st as u64;
+
+        match write_notify_record(out_ptr, out_len, action, &name_buf[..name_len]) {
+            Ok(written) => {
+                write_iosb(iosb_ptr, status::SUCCESS, written as u64);
+                frame.x[0] = status::SUCCESS as u64;
+            }
+            Err(st) => {
+                write_iosb(iosb_ptr, st, 0);
+                frame.x[0] = st as u64;
+            }
         }
+        return;
     }
+
+    let req = PendingDirNotify {
+        owner_pid,
+        file_idx,
+        file_handle,
+        event_handle,
+        iosb_ptr,
+        out_ptr,
+        out_len,
+        watch_tree,
+        completion_filter,
+    };
+    let st = queue_pending_dir_notify(req);
+    if st != status::SUCCESS {
+        write_iosb(iosb_ptr, st, 0);
+        frame.x[0] = st as u64;
+        return;
+    }
+
+    write_iosb(iosb_ptr, STATUS_PENDING, 0);
+    frame.x[0] = STATUS_PENDING as u64;
 }
 
 // x0=ObjectAttributes, x1=FileInformation
@@ -653,5 +869,8 @@ pub(crate) fn handle_query_volume_information_file(frame: &mut SvcFrame) {
 }
 
 pub(crate) fn close_file_idx(idx: u32) {
+    if let Some(owner_pid) = file_owner_pid(idx) {
+        cancel_pending_dir_notify_for_file(owner_pid, idx);
+    }
     file_free(idx);
 }

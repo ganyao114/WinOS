@@ -42,6 +42,8 @@ typedef struct {
 #define NT_CURRENT_PROCESS ((HANDLE)(uint64_t)-1)
 
 #define STATUS_SUCCESS 0x00000000U
+#define STATUS_TIMEOUT 0x00000102U
+#define STATUS_PENDING 0x00000103U
 #define OBJ_CASE_INSENSITIVE 0x40U
 
 #define FILE_LIST_DIRECTORY 0x00000001U
@@ -67,6 +69,9 @@ __declspec(dllimport) NTSTATUS NtCreateFile(
 __declspec(dllimport) NTSTATUS NtNotifyChangeDirectoryFile(
     HANDLE file_handle, HANDLE event, void* apc_routine, void* apc_context,
     void* io_status_block, void* buffer, ULONG length, ULONG completion_filter, UCHAR watch_tree);
+__declspec(dllimport) NTSTATUS NtCreateEvent(
+    HANDLE* event_handle, ULONG desired_access, void* object_attributes, ULONG event_type, UCHAR initial_state);
+__declspec(dllimport) NTSTATUS NtWaitForSingleObject(HANDLE handle, UCHAR alertable, int64_t* timeout);
 __declspec(dllimport) NTSTATUS NtQuerySystemTime(int64_t* time);
 __declspec(dllimport) NTSTATUS NtClose(HANDLE handle);
 
@@ -195,8 +200,10 @@ static void build_temp_path(char* out, uint64_t nonce_low32) {
 void mainCRTStartup(void) {
     NTSTATUS st;
     HANDLE dir_handle = 0;
+    HANDLE notify_event = 0;
     HANDLE file_handle = 0;
-    IO_STATUS_BLOCK iosb = {0};
+    IO_STATUS_BLOCK notify_iosb = {0};
+    IO_STATUS_BLOCK file_iosb = {0};
     OBJECT_ATTRIBUTES oa;
     UNICODE_STRING dir_us;
     UNICODE_STRING file_us;
@@ -205,6 +212,7 @@ void mainCRTStartup(void) {
     char file_abuf[256];
     uint8_t notify_buf[1024];
     int64_t now = 0;
+    int64_t wait_timeout_100ns = -10 * 1000 * 1000;
 
     write_str("== syscall_directory_notify_test ==\r\n");
 
@@ -214,7 +222,7 @@ void mainCRTStartup(void) {
         &dir_handle,
         FILE_LIST_DIRECTORY,
         &oa,
-        &iosb,
+        &file_iosb,
         0,
         0,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -229,32 +237,40 @@ void mainCRTStartup(void) {
         terminate_current_process(1);
     }
 
-    iosb.Status = 0;
-    iosb.Information = 0;
+    st = NtCreateEvent(&notify_event, 0, 0, 1, 0);
+    check("NtCreateEvent returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtCreateEvent returns valid handle", notify_event != 0);
+    if (st != STATUS_SUCCESS || notify_event == 0) {
+        terminate_current_process(1);
+    }
+
+    notify_iosb.Status = 0;
+    notify_iosb.Information = 0;
     st = NtNotifyChangeDirectoryFile(
         dir_handle,
+        notify_event,
         0,
         0,
-        0,
-        &iosb,
+        &notify_iosb,
         notify_buf,
         (ULONG)sizeof(notify_buf),
         FILE_NOTIFY_CHANGE_FILE_NAME,
         0
     );
-    check("NtNotifyChangeDirectoryFile(prime) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtNotifyChangeDirectoryFile(prime) returns STATUS_PENDING", st == STATUS_PENDING);
+    check("NtNotifyChangeDirectoryFile(prime) iosb is STATUS_PENDING", (NTSTATUS)notify_iosb.Status == STATUS_PENDING);
 
     (void)NtQuerySystemTime(&now);
     build_temp_path(file_abuf, (uint64_t)now & 0xFFFFffffULL);
     init_unicode(&file_us, file_wbuf, file_abuf);
     init_oa(&oa, &file_us);
-    iosb.Status = 0;
-    iosb.Information = 0;
+    file_iosb.Status = 0;
+    file_iosb.Information = 0;
     st = NtCreateFile(
         &file_handle,
         0x80000000U | 0x40000000U,
         &oa,
-        &iosb,
+        &file_iosb,
         0,
         0,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -268,30 +284,25 @@ void mainCRTStartup(void) {
         (void)NtClose(file_handle);
     }
 
-    iosb.Status = 0;
-    iosb.Information = 0;
-    st = NtNotifyChangeDirectoryFile(
-        dir_handle,
-        0,
-        0,
-        0,
-        &iosb,
-        notify_buf,
-        (ULONG)sizeof(notify_buf),
-        FILE_NOTIFY_CHANGE_FILE_NAME,
-        0
-    );
-    check("NtNotifyChangeDirectoryFile(after create) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
-    check("NtNotifyChangeDirectoryFile(after create) returns non-zero info", iosb.Information >= 12);
-    if (st == STATUS_SUCCESS && iosb.Information >= 12) {
+    st = NtWaitForSingleObject(notify_event, 0, &wait_timeout_100ns);
+    check("NtWaitForSingleObject(notify event) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtNotifyChangeDirectoryFile completion iosb is STATUS_SUCCESS", (NTSTATUS)notify_iosb.Status == STATUS_SUCCESS);
+    check("NtNotifyChangeDirectoryFile completion returns non-zero info", notify_iosb.Information >= 12);
+    if ((NTSTATUS)notify_iosb.Status == STATUS_SUCCESS && notify_iosb.Information >= 12) {
         FILE_NOTIFY_INFORMATION* fni = (FILE_NOTIFY_INFORMATION*)notify_buf;
         check("Notify action is non-zero", fni->Action != 0);
         check("Notify file name contains \"notify_\"",
               unicode_contains_ascii_ci(fni->FileName, fni->FileNameLength, "notify_"));
     }
 
+    wait_timeout_100ns = -1000;
+    st = NtWaitForSingleObject(notify_event, 0, &wait_timeout_100ns);
+    check("Notify event auto-reset after wait (timeout)", st == STATUS_TIMEOUT);
+
     st = NtClose(dir_handle);
     check("NtClose(directory handle) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    st = NtClose(notify_event);
+    check("NtClose(notify event) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
 
     write_str("syscall_directory_notify_test summary: pass=");
     write_u64_hex(g_pass);

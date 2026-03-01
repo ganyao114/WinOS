@@ -54,13 +54,17 @@ pub(crate) fn map_open_flags(access: u32, disposition: u32) -> u64 {
 }
 
 pub(crate) fn file_handle_to_host_fd(file_handle: u64) -> Option<u64> {
+    file_handle_to_host_fd_for_pid(crate::process::current_pid(), file_handle)
+}
+
+pub(crate) fn file_handle_to_host_fd_for_pid(owner_pid: u32, file_handle: u64) -> Option<u64> {
     match file_handle {
         STD_INPUT_HANDLE => Some(0),
         STD_OUTPUT_HANDLE => Some(1),
         STD_ERROR_HANDLE => Some(2),
         _ => {
-            if sync::handle_type(file_handle) == HANDLE_TYPE_FILE {
-                file_host_fd(sync::handle_idx(file_handle))
+            if sync::handle_type_by_owner(file_handle, owner_pid) == HANDLE_TYPE_FILE {
+                file_host_fd(sync::handle_idx_by_owner(file_handle, owner_pid))
             } else {
                 None
             }

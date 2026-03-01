@@ -160,6 +160,7 @@ pub fn terminate_process(pid: u32, exit_status: u32) -> u32 {
         }
     });
 
+    crate::nt::file::cancel_pending_dir_notify_for_pid(pid);
     crate::nt::state::cleanup_process_owned_resources(pid);
 
     let tids = crate::sched::thread_ids_by_pid(pid);
@@ -212,6 +213,7 @@ fn finalize_process_if_no_threads(pid: u32) {
     }
 
     let _ = with_process_mut(pid, |p| p.state = ProcessState::Terminated);
+    crate::nt::file::cancel_pending_dir_notify_for_pid(pid);
     crate::nt::state::cleanup_process_owned_resources(pid);
     crate::sched::sync::process_notify_terminated(pid);
     maybe_free_if_unreferenced(pid);

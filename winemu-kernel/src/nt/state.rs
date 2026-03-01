@@ -598,6 +598,15 @@ pub(crate) fn file_host_fd(idx: u32) -> Option<u64> {
     }
 }
 
+pub(crate) fn file_owner_pid(idx: u32) -> Option<u32> {
+    let ptr = files_store_mut().get_ptr(idx);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { (*ptr).owner_pid })
+    }
+}
+
 pub(crate) fn file_free(idx: u32) {
     let store = files_store_mut();
     let ptr = store.get_ptr(idx);

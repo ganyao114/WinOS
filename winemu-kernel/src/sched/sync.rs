@@ -618,11 +618,30 @@ pub fn handle_idx(h: u64) -> u32 {
     }
 }
 
+pub fn handle_type_by_owner(h: u64, owner_pid: u32) -> u64 {
+    handle_type_for_pid(h, owner_pid)
+}
+
+pub fn handle_idx_by_owner(h: u64, owner_pid: u32) -> u32 {
+    handle_idx_for_pid(h, owner_pid)
+}
+
 fn resolve_handle_idx_by_type(h: u64, expected_type: u64) -> Option<u32> {
     if handle_type(h) != expected_type {
         return None;
     }
     let idx = handle_idx(h);
+    if idx == 0 {
+        return None;
+    }
+    Some(idx)
+}
+
+fn resolve_handle_idx_by_type_for_pid(h: u64, owner_pid: u32, expected_type: u64) -> Option<u32> {
+    if handle_type_for_pid(h, owner_pid) != expected_type {
+        return None;
+    }
+    let idx = handle_idx_for_pid(h, owner_pid);
     if idx == 0 {
         return None;
     }
@@ -1408,6 +1427,13 @@ pub fn event_reset(idx: u32) -> u32 {
 
 pub fn event_set_by_handle(h: u64) -> u32 {
     let Some(idx) = resolve_handle_idx_by_type(h, HANDLE_TYPE_EVENT) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    event_set(idx)
+}
+
+pub fn event_set_by_handle_for_pid(owner_pid: u32, h: u64) -> u32 {
+    let Some(idx) = resolve_handle_idx_by_type_for_pid(h, owner_pid, HANDLE_TYPE_EVENT) else {
         return STATUS_INVALID_HANDLE;
     };
     event_set(idx)

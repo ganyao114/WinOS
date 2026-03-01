@@ -14,6 +14,9 @@
 #define NR_DEVICE_IO_CONTROL_FILE 0x0007
 #define NR_WAIT_SINGLE          0x0004
 #define NR_CLOSE                0x000F
+#define NR_CREATE_EVENT         0x0048
+#define NR_SET_EVENT            0x000E
+#define NR_RESET_EVENT          0x0034
 #define NR_QUERY_ATTRIBUTES_FILE 0x0014
 #define NR_SET_INFORMATION_FILE 0x0027
 #define NR_QUERY_DIRECTORY_FILE 0x004E
@@ -137,6 +140,28 @@ EXPORT NTSTATUS NtWaitForSingleObject(HANDLE handle, UCHAR alertable, int64_t* t
         0,
         0
     );
+}
+
+EXPORT NTSTATUS NtCreateEvent(
+    HANDLE* event_handle, ULONG desired_access, void* object_attributes, ULONG event_type, UCHAR initial_state)
+{
+    return syscall6(
+        NR_CREATE_EVENT,
+        (uint64_t)event_handle,
+        (uint64_t)desired_access,
+        (uint64_t)object_attributes,
+        (uint64_t)event_type,
+        (uint64_t)initial_state,
+        0
+    );
+}
+
+EXPORT NTSTATUS NtSetEvent(HANDLE event_handle, ULONG* previous_state) {
+    return syscall2(NR_SET_EVENT, (uint64_t)event_handle, (uint64_t)previous_state);
+}
+
+EXPORT NTSTATUS NtResetEvent(HANDLE event_handle, ULONG* previous_state) {
+    return syscall2(NR_RESET_EVENT, (uint64_t)event_handle, (uint64_t)previous_state);
 }
 
 EXPORT NTSTATUS NtQueryInformationProcess(

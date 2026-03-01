@@ -144,6 +144,8 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
         save_ctx_for(from, frame);
     }
     loop {
+        file::poll_async_file_completions();
+
         let now = now_ticks();
         sched_lock_acquire();
         set_vcpu_idle_locked(vid, false);
