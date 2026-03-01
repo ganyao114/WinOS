@@ -56,6 +56,8 @@ typedef struct {
 #define FILE_DIRECTORY_FILE 0x00000001U
 #define FILE_SYNCHRONOUS_IO_NONALERT 0x00000020U
 #define FILE_NOTIFY_CHANGE_FILE_NAME 0x00000001U
+#define FILE_READ_DATA 0x00000001U
+#define FILE_WRITE_DATA 0x00000002U
 
 __declspec(dllimport) NTSTATUS NtWriteFile(
     HANDLE file, HANDLE event, void* apc_routine, void* apc_ctx,
@@ -268,7 +270,7 @@ void mainCRTStartup(void) {
     file_iosb.Information = 0;
     st = NtCreateFile(
         &file_handle,
-        0x80000000U | 0x40000000U,
+        FILE_READ_DATA | FILE_WRITE_DATA,
         &oa,
         &file_iosb,
         0,

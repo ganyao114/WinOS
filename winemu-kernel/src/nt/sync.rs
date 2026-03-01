@@ -1,7 +1,8 @@
 use crate::sched::sync::{
     create_event_handle, create_mutex_handle, create_semaphore_handle, event_reset_by_handle,
     event_set_by_handle, mutex_release_by_handle, semaphore_release_by_handle, wait_handle,
-    wait_multiple, EventType, WaitDeadline, STATUS_SUCCESS,
+    wait_multiple, EventType, WaitDeadline, HANDLE_TYPE_EVENT, HANDLE_TYPE_MUTEX,
+    HANDLE_TYPE_SEMAPHORE, STATUS_SUCCESS,
 };
 use winemu_shared::status;
 
@@ -10,6 +11,15 @@ use super::SvcFrame;
 // x0 = EventHandle* (out), x1 = DesiredAccess, x2 = ObjectAttributes*
 // x3 = EventType (0=Notification, 1=Sync), x4 = InitialState
 pub(crate) fn handle_create_event(frame: &mut SvcFrame) {
+    let desired_access = frame.x[1] as u32;
+    let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_EVENT) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+    if (desired_access & !meta.valid_access_mask) != 0 {
+        frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
     let ev_type = if frame.x[3] == 1 {
         EventType::SynchronizationEvent
     } else {
@@ -73,6 +83,15 @@ pub(crate) fn handle_wait_multiple(frame: &mut SvcFrame) {
 // x0 = MutantHandle* (out), x1 = DesiredAccess, x2 = ObjAttr*
 // x3 = InitialOwner (bool)
 pub(crate) fn handle_create_mutex(frame: &mut SvcFrame) {
+    let desired_access = frame.x[1] as u32;
+    let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_MUTEX) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+    if (desired_access & !meta.valid_access_mask) != 0 {
+        frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
     let initial_owner = frame.x[3] != 0;
     match create_mutex_handle(initial_owner) {
         Ok(h) => {
@@ -95,6 +114,15 @@ pub(crate) fn handle_release_mutant_or_set_information_process(frame: &mut SvcFr
 // x0 = SemaphoreHandle* (out), x1 = DesiredAccess, x2 = ObjAttr*
 // x3 = InitialCount, x4 = MaximumCount
 pub(crate) fn handle_create_semaphore(frame: &mut SvcFrame) {
+    let desired_access = frame.x[1] as u32;
+    let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_SEMAPHORE) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+    if (desired_access & !meta.valid_access_mask) != 0 {
+        frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
     let initial = frame.x[3] as i32;
     let maximum = frame.x[4] as i32;
     match create_semaphore_handle(initial, maximum) {

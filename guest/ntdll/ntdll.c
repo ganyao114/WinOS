@@ -15,8 +15,12 @@
 #define NR_WAIT_SINGLE          0x0004
 #define NR_CLOSE                0x000F
 #define NR_CREATE_EVENT         0x0048
+#define NR_CREATE_MUTANT        0x00A9
+#define NR_CREATE_SEMAPHORE     0x00C3
 #define NR_SET_EVENT            0x000E
 #define NR_RESET_EVENT          0x0034
+#define NR_RELEASE_MUTANT       0x001C
+#define NR_RELEASE_SEMAPHORE    0x0033
 #define NR_QUERY_ATTRIBUTES_FILE 0x0014
 #define NR_SET_INFORMATION_FILE 0x0027
 #define NR_QUERY_DIRECTORY_FILE 0x004E
@@ -57,6 +61,7 @@ typedef uint64_t ULONG_PTR;
 typedef void*    HANDLE;
 typedef uint16_t WCHAR;
 typedef uint8_t  UCHAR;
+typedef int32_t  LONG;
 
 #define STATUS_NOT_IMPLEMENTED 0xC0000002U
 #define STATUS_INVALID_PARAMETER 0xC000000DU
@@ -152,6 +157,48 @@ EXPORT NTSTATUS NtCreateEvent(
         (uint64_t)object_attributes,
         (uint64_t)event_type,
         (uint64_t)initial_state,
+        0
+    );
+}
+
+EXPORT NTSTATUS NtCreateMutant(
+    HANDLE* mutant_handle, ULONG desired_access, void* object_attributes, UCHAR initial_owner)
+{
+    return syscall4(
+        NR_CREATE_MUTANT,
+        (uint64_t)mutant_handle,
+        (uint64_t)desired_access,
+        (uint64_t)object_attributes,
+        (uint64_t)initial_owner
+    );
+}
+
+EXPORT NTSTATUS NtReleaseMutant(HANDLE mutant_handle, LONG* previous_count) {
+    return syscall2(NR_RELEASE_MUTANT, (uint64_t)mutant_handle, (uint64_t)previous_count);
+}
+
+EXPORT NTSTATUS NtCreateSemaphore(
+    HANDLE* semaphore_handle, ULONG desired_access, void* object_attributes, LONG initial_count, LONG maximum_count)
+{
+    return syscall6(
+        NR_CREATE_SEMAPHORE,
+        (uint64_t)semaphore_handle,
+        (uint64_t)desired_access,
+        (uint64_t)object_attributes,
+        (uint64_t)(int64_t)initial_count,
+        (uint64_t)(int64_t)maximum_count,
+        0
+    );
+}
+
+EXPORT NTSTATUS NtReleaseSemaphore(
+    HANDLE semaphore_handle, LONG release_count, LONG* previous_count)
+{
+    return syscall4(
+        NR_RELEASE_SEMAPHORE,
+        (uint64_t)semaphore_handle,
+        (uint64_t)(int64_t)release_count,
+        (uint64_t)previous_count,
         0
     );
 }
