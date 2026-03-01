@@ -58,6 +58,7 @@ typedef struct {
 #define STATUS_INFO_LENGTH_MISMATCH 0xC0000004U
 #define STATUS_BUFFER_TOO_SMALL 0xC0000023U
 #define STATUS_NOT_IMPLEMENTED 0xC0000002U
+#define STATUS_ACCESS_DENIED 0xC0000022U
 
 #define PROCESS_DEFAULT_HARD_ERROR_MODE 12U
 #define PROCESS_AFFINITY_MASK 21U
@@ -71,6 +72,8 @@ typedef struct {
 #define TOKEN_ELEVATION_CLASS 20U
 #define TOKEN_VIRTUALIZATION_ENABLED_CLASS 24U
 #define TOKEN_IS_APP_CONTAINER_CLASS 29U
+#define DUPLICATE_CLOSE_SOURCE 0x00000001U
+#define DUPLICATE_SAME_ACCESS 0x00000002U
 
 __declspec(dllimport) NTSTATUS NtWriteFile(
     HANDLE file, HANDLE event, void *apc_routine, void *apc_ctx,
@@ -85,6 +88,10 @@ __declspec(dllimport) NTSTATUS NtSetInformationProcess(
     HANDLE process, ULONG info_class, void *buf, ULONG len);
 __declspec(dllimport) NTSTATUS NtQueryObject(
     HANDLE handle, ULONG object_info_class, void *object_info, ULONG object_info_len, ULONG *ret_len);
+__declspec(dllimport) NTSTATUS NtDuplicateObject(
+    HANDLE source_process, HANDLE source_handle,
+    HANDLE target_process, HANDLE *target_handle,
+    ULONG desired_access, ULONG attributes, ULONG options);
 __declspec(dllimport) NTSTATUS NtClose(HANDLE handle);
 
 static uint32_t g_pass = 0;
@@ -236,6 +243,24 @@ void mainCRTStartup(void) {
     st = NtQueryInformationToken((HANDLE)(ULONG_PTR)0x7fffffffULL, TOKEN_USER_CLASS, user_buf, (ULONG)sizeof(user_buf), &ret_len);
     check("NtQueryInformationToken(invalid handle) returns STATUS_INVALID_HANDLE", st == STATUS_INVALID_HANDLE);
 
+    HANDLE dup = 0;
+    st = NtDuplicateObject(
+        NT_CURRENT_PROCESS, token, NT_CURRENT_PROCESS, &dup,
+        0x80000000U, 0, 0);
+    check("NtDuplicateObject(token, invalid desired access) returns STATUS_ACCESS_DENIED", st == STATUS_ACCESS_DENIED);
+    check("NtDuplicateObject(token, invalid desired access) does not return handle", dup == 0);
+
+    dup = 0;
+    st = NtDuplicateObject(
+        NT_CURRENT_PROCESS, token, NT_CURRENT_PROCESS, &dup,
+        0x80000000U, 0, DUPLICATE_SAME_ACCESS);
+    check("NtDuplicateObject(token, DUPLICATE_SAME_ACCESS) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtDuplicateObject(token, DUPLICATE_SAME_ACCESS) returns non-zero handle", dup != 0);
+    if (dup) {
+        st = NtClose(dup);
+        check("NtClose(duplicate token) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    }
+
     u32 = 0;
     st = NtSetInformationProcess(NT_CURRENT_PROCESS, PROCESS_DEFAULT_HARD_ERROR_MODE, &u32, sizeof(u32));
     check("NtSetInformationProcess(ProcessDefaultHardErrorMode) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
@@ -288,6 +313,17 @@ void mainCRTStartup(void) {
     check("NtQueryObject(ObjectTypeInformation, short) returns STATUS_INFO_LENGTH_MISMATCH", st == STATUS_INFO_LENGTH_MISMATCH);
     check("NtQueryObject(ObjectTypeInformation, short) has non-zero required length", ret_len > 0);
 
+    HANDLE moved = 0;
+    st = NtDuplicateObject(
+        NT_CURRENT_PROCESS, token, NT_CURRENT_PROCESS, &moved,
+        0, 0, DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE);
+    check("NtDuplicateObject(token, DUPLICATE_CLOSE_SOURCE) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtDuplicateObject(token, DUPLICATE_CLOSE_SOURCE) returns non-zero handle", moved != 0);
+
+    st = NtClose(token);
+    check("NtClose(original token after DUPLICATE_CLOSE_SOURCE) returns STATUS_INVALID_HANDLE", st == STATUS_INVALID_HANDLE);
+
+    token = moved;
     st = NtClose(token);
     check("NtClose(token) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
 

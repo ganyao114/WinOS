@@ -72,6 +72,8 @@
 - [x] `NtQueryObject(ObjectTypeInformation)` 改为读取 `kobject` 元数据填充访问与安全字段。
 - [x] `KObjectOps` 增加命名查询入口（`query_name_utf16`），`NtQueryObject(ObjectNameInformation)` 改为按对象类型分发。
 - [x] 首批命名对象接入：`Key` / `Section`。
+- [x] `NtDuplicateObject` 接入 `valid_access_mask` 校验（支持 `DUPLICATE_SAME_ACCESS`）。
+- [x] `NtDuplicateObject` 接入 `DUPLICATE_CLOSE_SOURCE` 语义（复制后关闭源句柄）。
 
 ## 5. 风险与控制
 

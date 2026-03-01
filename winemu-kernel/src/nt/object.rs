@@ -1,7 +1,7 @@
 use core::mem::size_of;
 
 use crate::sched::sync::{
-    close_handle_info, duplicate_handle_between, STATUS_SUCCESS,
+    close_handle_info, close_handle_info_for_pid, duplicate_handle_between, STATUS_SUCCESS,
 };
 use winemu_shared::status;
 
@@ -15,6 +15,11 @@ const OBJECT_INFORMATION_CLASS_TYPE: u32 = 2;
 const OBJECT_BASIC_INFORMATION_SIZE: usize = 56;
 const OBJECT_NAME_INFORMATION_SIZE: usize = 16;
 const OBJECT_TYPE_INFORMATION_SIZE: usize = 104;
+const DUPLICATE_CLOSE_SOURCE: u32 = 0x0000_0001;
+const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
+const DUPLICATE_SAME_ATTRIBUTES: u32 = 0x0000_0004;
+const DUPLICATE_VALID_OPTIONS: u32 =
+    DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS | DUPLICATE_SAME_ATTRIBUTES;
 
 // x0=Handle, x1=ObjectInformationClass, x2=Buffer, x3=Length, x4=*ReturnLength
 pub(crate) fn handle_query_object(frame: &mut SvcFrame) {
@@ -41,11 +46,19 @@ pub(crate) fn handle_query_object(frame: &mut SvcFrame) {
 }
 
 // x0=SourceProcessHandle, x1=SourceHandle, x2=TargetProcessHandle, x3=*TargetHandle
+// x4=DesiredAccess, x5=HandleAttributes, x6=Options
 pub(crate) fn handle_duplicate_object(frame: &mut SvcFrame) {
     let source_process = frame.x[0];
     let src = frame.x[1];
     let target_process = frame.x[2];
     let out_ptr = frame.x[3] as *mut u64;
+    let desired_access = frame.x[4] as u32;
+    let options = frame.x[6] as u32;
+
+    if (options & !DUPLICATE_VALID_OPTIONS) != 0 {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
 
     let Some(source_pid) = crate::process::resolve_process_handle(source_process) else {
         frame.x[0] = status::INVALID_HANDLE as u64;
@@ -56,17 +69,49 @@ pub(crate) fn handle_duplicate_object(frame: &mut SvcFrame) {
         return;
     };
 
+    let Some((src_htype, _src_idx)) = kobject::resolve_handle_target_for_pid(source_pid, src) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+
+    if (options & DUPLICATE_SAME_ACCESS) == 0 {
+        let Some(meta) = kobject::object_type_meta(src_htype) else {
+            frame.x[0] = status::INVALID_HANDLE as u64;
+            return;
+        };
+        if (desired_access & !meta.valid_access_mask) != 0 {
+            close_source_if_requested(options, source_pid, src);
+            frame.x[0] = status::ACCESS_DENIED as u64;
+            return;
+        }
+    }
+
     let dup = match duplicate_handle_between(source_pid, src, target_pid) {
         Ok(v) => v,
         Err(st) => {
+            close_source_if_requested(options, source_pid, src);
             frame.x[0] = st as u64;
             return;
         }
     };
+
     if !out_ptr.is_null() {
         unsafe { out_ptr.write_volatile(dup) };
     }
+    close_source_if_requested(options, source_pid, src);
     frame.x[0] = status::SUCCESS as u64;
+}
+
+fn close_source_if_requested(options: u32, source_pid: u32, source_handle: u64) {
+    if (options & DUPLICATE_CLOSE_SOURCE) == 0 {
+        return;
+    }
+    let Some(info) = close_handle_info_for_pid(source_pid, source_handle) else {
+        return;
+    };
+    if info.destroy_object {
+        let _ = kobject::close_last_ref(info.htype, info.obj_idx);
+    }
 }
 
 pub(crate) fn handle_close(frame: &mut SvcFrame) -> bool {

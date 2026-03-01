@@ -232,6 +232,18 @@ pub(crate) fn resolve_handle_target(handle: u64) -> Option<(u64, u32)> {
     Some((htype, idx))
 }
 
+pub(crate) fn resolve_handle_target_for_pid(owner_pid: u32, handle: u64) -> Option<(u64, u32)> {
+    let htype = sync::handle_type_by_owner(handle, owner_pid);
+    if htype == 0 {
+        return None;
+    }
+    let idx = sync::handle_idx_by_owner(handle, owner_pid);
+    if idx == 0 {
+        return None;
+    }
+    Some((htype, idx))
+}
+
 pub(crate) fn object_ref_count(htype: u64, obj_idx: u32) -> u32 {
     sync::object_ref_count(htype, obj_idx)
 }

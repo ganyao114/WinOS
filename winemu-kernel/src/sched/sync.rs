@@ -707,6 +707,11 @@ pub fn close_handle_info(h: u64) -> Option<HandleCloseInfo> {
     close_handle_slot_for_pid(hid, current_handle_owner_pid())
 }
 
+pub fn close_handle_info_for_pid(owner_pid: u32, h: u64) -> Option<HandleCloseInfo> {
+    let (hid, _htype, _obj_idx, _key) = resolve_user_handle_for_pid(h, owner_pid)?;
+    close_handle_slot_for_pid(hid, owner_pid)
+}
+
 pub fn close_all_handles_for_pid(owner_pid: u32) -> usize {
     if owner_pid == 0 {
         return 0;
