@@ -25,6 +25,7 @@
 #define NR_SET_INFORMATION_FILE 0x0027
 #define NR_QUERY_DIRECTORY_FILE 0x004E
 #define NR_NOTIFY_CHANGE_DIRECTORY_FILE 0x011F
+#define NR_OPEN_KEY            0x0012
 #define NR_QUERY_KEY            0x0013
 #define NR_CREATE_KEY           0x001D
 #define NR_SET_VALUE_KEY        0x003D
@@ -717,6 +718,16 @@ EXPORT NTSTATUS NtCreateThreadEx(
 }
 
 /* ── Registry ────────────────────────────────────────────────── */
+
+EXPORT NTSTATUS NtOpenKey(HANDLE* key_handle, ULONG desired_access, void* object_attributes) {
+    return syscall4(
+        NR_OPEN_KEY,
+        (uint64_t)key_handle,
+        (uint64_t)desired_access,
+        (uint64_t)object_attributes,
+        0
+    );
+}
 
 __attribute__((naked))
 EXPORT NTSTATUS NtCreateKey(

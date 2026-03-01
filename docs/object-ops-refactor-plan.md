@@ -79,6 +79,7 @@
 - [x] `NtCreateProcessEx` / `NtCreateThreadEx` 接入 `valid_access_mask` 校验。
 - [x] `NtCreateFile/NtOpenFile` 与 `NtCreateSection/NtOpenSection` 接入 `valid_access_mask` 校验。
 - [x] `NtCreateEvent/NtCreateMutant/NtCreateSemaphore` 接入 `valid_access_mask` 校验。
+- [x] `NtCreateKey/NtOpenKey` 接入 `valid_access_mask` 校验。
 
 ## 5. 风险与控制
 

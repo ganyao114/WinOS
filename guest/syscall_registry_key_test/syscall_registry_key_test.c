@@ -38,6 +38,7 @@ typedef struct {
 #define STATUS_INVALID_PARAMETER 0xC000000DU
 #define STATUS_BUFFER_TOO_SMALL 0xC0000023U
 #define STATUS_INFO_LENGTH_MISMATCH 0xC0000004U
+#define STATUS_ACCESS_DENIED 0xC0000022U
 
 #define KEY_BASIC_INFORMATION_CLASS 0U
 #define KEY_FULL_INFORMATION_CLASS 2U
@@ -52,6 +53,8 @@ __declspec(dllimport) NTSTATUS NtWriteFile(
     IO_STATUS_BLOCK* iosb, const void* buf, ULONG len, uint64_t* byte_offset, ULONG* key);
 __declspec(dllimport) __attribute__((noreturn))
 void NtTerminateProcess(HANDLE process, NTSTATUS code);
+__declspec(dllimport) NTSTATUS NtOpenKey(
+    HANDLE* key_handle, ULONG desired_access, OBJECT_ATTRIBUTES* object_attributes);
 __declspec(dllimport) NTSTATUS NtCreateKey(
     HANDLE* key_handle, ULONG desired_access, OBJECT_ATTRIBUTES* object_attributes,
     ULONG title_index, UNICODE_STRING* class_name, ULONG create_options, ULONG* disposition);
@@ -166,6 +169,8 @@ void mainCRTStartup(void) {
     NTSTATUS st;
     HANDLE parent_key = 0;
     HANDLE sub_key = 0;
+    HANDLE opened_key = 0;
+    HANDLE denied_key = 0;
     ULONG disp = 0;
     ULONG ret_len = 0;
     uint32_t value = 0x12345678U;
@@ -185,10 +190,23 @@ void mainCRTStartup(void) {
 
     init_unicode(&parent_name, parent_buf, "\\Registry\\Machine\\Software\\WinEmuQueryKeyTest");
     init_oa(&parent_oa, &parent_name, 0);
+    st = NtCreateKey(&denied_key, 0x80000000U, &parent_oa, 0, 0, 0, &disp);
+    check("NtCreateKey(invalid desired access) returns STATUS_ACCESS_DENIED", st == STATUS_ACCESS_DENIED);
+    check("NtCreateKey(invalid desired access) returns no handle", denied_key == 0);
+
     st = NtCreateKey(&parent_key, 0, &parent_oa, 0, 0, 0, &disp);
     check("NtCreateKey(parent) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     check("NtCreateKey(parent) returns non-zero handle", parent_key != 0);
     check("NtCreateKey(parent) disposition is create/opened", disp == 1 || disp == 2);
+
+    st = NtOpenKey(&opened_key, 0, &parent_oa);
+    check("NtOpenKey(valid desired access) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtOpenKey(valid desired access) returns non-zero handle", opened_key != 0);
+
+    denied_key = 0;
+    st = NtOpenKey(&denied_key, 0x80000000U, &parent_oa);
+    check("NtOpenKey(invalid desired access) returns STATUS_ACCESS_DENIED", st == STATUS_ACCESS_DENIED);
+    check("NtOpenKey(invalid desired access) returns no handle", denied_key == 0);
 
     init_unicode(&sub_name, sub_buf, "SubKeyA");
     init_oa(&sub_oa, &sub_name, parent_key);
@@ -264,6 +282,8 @@ void mainCRTStartup(void) {
 
     st = NtClose(sub_key);
     check("NtClose(sub key) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    st = NtClose(opened_key);
+    check("NtClose(opened key) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     st = NtClose(parent_key);
     check("NtClose(parent key) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
 
