@@ -19,6 +19,7 @@ NtQueryVolumeInformationFile = 0x0049
 NtSetInformationFile      = 0x0027
 NtFsControlFile           = 0x0039
 NtQueryDirectoryFile      = 0x004E
+NtNotifyChangeDirectoryFile = 0x011F
 NtAllocateVirtualMemory   = 0x0015
 NtFreeVirtualMemory       = 0x001E
 NtProtectVirtualMemory    = 0x004D

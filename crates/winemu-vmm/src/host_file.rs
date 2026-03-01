@@ -20,6 +20,8 @@ struct HostFile {
     #[allow(dead_code)]
     path: PathBuf,
     dir_cursor: usize,
+    dir_notify_snapshot: Vec<String>,
+    dir_notify_init: bool,
 }
 
 pub struct HostFileTable {
@@ -81,6 +83,8 @@ impl HostFileTable {
                         file,
                         path: path.to_path_buf(),
                         dir_cursor: 0,
+                        dir_notify_snapshot: Vec::new(),
+                        dir_notify_init: false,
                     },
                 );
                 fd
@@ -115,6 +119,8 @@ impl HostFileTable {
                         file,
                         path: host_path,
                         dir_cursor: 0,
+                        dir_notify_snapshot: Vec::new(),
+                        dir_notify_init: false,
                     },
                 );
                 fd
@@ -266,6 +272,110 @@ impl HostFileTable {
             ret |= FLAG_IS_DIR;
         }
         ret
+    }
+
+    fn read_dir_snapshot(path: &std::path::Path, watch_tree: bool) -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        let iter = std::fs::read_dir(path).ok()?;
+        for item in iter {
+            let Ok(entry) = item else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.is_empty() {
+                continue;
+            }
+            out.push(name.clone());
+            if watch_tree && entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let sub = path.join(&name);
+                if let Some(children) = Self::read_dir_snapshot(&sub, true) {
+                    for child in children {
+                        out.push(format!("{}/{}", name, child));
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        Some(out)
+    }
+
+    /// Query one pending directory change and return changed name.
+    ///
+    /// Return value:
+    /// - 0: no change
+    /// - u64::MAX: invalid fd / not a directory / error
+    /// - otherwise: bits[39:32]=action, low32=name_len
+    pub fn notify_dir_change(
+        &self,
+        fd: u64,
+        buf: &mut [u8],
+        watch_tree: bool,
+        _completion_filter: u32,
+    ) -> u64 {
+        if fd <= 2 || buf.is_empty() {
+            return u64::MAX;
+        }
+
+        let mut files = self.files.lock().unwrap();
+        let hf = match files.get_mut(&fd) {
+            Some(v) => v,
+            None => return u64::MAX,
+        };
+
+        match hf.file.metadata() {
+            Ok(meta) if meta.is_dir() => {}
+            _ => return u64::MAX,
+        }
+
+        let Some(current) = Self::read_dir_snapshot(&hf.path, watch_tree) else {
+            return u64::MAX;
+        };
+
+        if !hf.dir_notify_init {
+            hf.dir_notify_snapshot = current;
+            hf.dir_notify_init = true;
+            return 0;
+        }
+
+        let old = &hf.dir_notify_snapshot;
+        if *old == current {
+            return 0;
+        }
+
+        let mut action: u8 = 3; // FILE_ACTION_MODIFIED
+        let mut changed_name = String::from(".");
+
+        let mut oi = 0usize;
+        let mut ci = 0usize;
+        while oi < old.len() && ci < current.len() {
+            if old[oi] == current[ci] {
+                oi += 1;
+                ci += 1;
+                continue;
+            }
+            if old[oi] > current[ci] {
+                action = 1; // FILE_ACTION_ADDED
+                changed_name = current[ci].clone();
+                break;
+            }
+            action = 2; // FILE_ACTION_REMOVED
+            changed_name = old[oi].clone();
+            break;
+        }
+        if oi >= old.len() && ci < current.len() {
+            action = 1;
+            changed_name = current[ci].clone();
+        } else if ci >= current.len() && oi < old.len() {
+            action = 2;
+            changed_name = old[oi].clone();
+        }
+
+        hf.dir_notify_snapshot = current;
+
+        let bytes = changed_name.as_bytes();
+        let copied = bytes.len().min(buf.len());
+        buf[..copied].copy_from_slice(&bytes[..copied]);
+        ((action as u64) << 32) | (copied as u64)
     }
 
     /// Get the raw fd for mmap. Returns None if not found.

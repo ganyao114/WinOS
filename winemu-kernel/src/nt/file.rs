@@ -24,6 +24,10 @@ const FILE_NAMES_INFORMATION_BASE: usize = 12;
 
 const HOST_DIRENT_FLAG_IS_DIR: u64 = 1u64 << 63;
 const HOST_DIRENT_NAME_LEN_MASK: u64 = 0x0000_0000_FFFF_FFFF;
+const HOST_NOTIFY_ACTION_MASK: u64 = 0x0000_00FF_0000_0000;
+const HOST_NOTIFY_ACTION_SHIFT: u64 = 32;
+
+const FILE_NOTIFY_INFORMATION_BASE: usize = 12;
 
 const FILE_FS_SIZE_INFORMATION: u32 = 3;
 const FILE_FS_DEVICE_INFORMATION: u32 = 4;
@@ -161,6 +165,26 @@ fn write_directory_record(info_class: u32, out_ptr: *mut u8, name: &[u8], is_dir
     }
 
     Some(rec_len)
+}
+
+fn write_notify_record(out_ptr: *mut u8, out_len: usize, action: u32, name: &[u8]) -> Result<usize, u32> {
+    let name_utf16_len = name.len().checked_mul(2).ok_or(status::INVALID_PARAMETER)?;
+    let rec_len = align_up_8(
+        FILE_NOTIFY_INFORMATION_BASE
+            .checked_add(name_utf16_len)
+            .ok_or(status::INVALID_PARAMETER)?,
+    );
+    if out_len < rec_len {
+        return Err(status::BUFFER_TOO_SMALL);
+    }
+    unsafe {
+        core::ptr::write_bytes(out_ptr, 0, rec_len);
+        (out_ptr as *mut u32).write_volatile(0); // NextEntryOffset
+        (out_ptr.add(4) as *mut u32).write_volatile(action);
+        (out_ptr.add(8) as *mut u32).write_volatile(name_utf16_len as u32);
+        write_name_utf16(out_ptr.add(FILE_NOTIFY_INFORMATION_BASE), name);
+    }
+    Ok(rec_len)
 }
 
 // x0=*FileHandle, x1=DesiredAccess, x2=ObjectAttributes, x3=*IoStatusBlock
@@ -407,6 +431,72 @@ pub(crate) fn handle_query_directory_file(frame: &mut SvcFrame) {
         write_iosb(iosb_ptr, status::SUCCESS, rec_len as u64);
         frame.x[0] = status::SUCCESS as u64;
         return;
+    }
+}
+
+// x0=FileHandle, x1=Event, x2=ApcRoutine, x3=ApcContext, x4=*IoStatusBlock
+// x5=Buffer, x6=Length, x7=CompletionFilter, stack0=WatchTree
+pub(crate) fn handle_notify_change_directory_file(frame: &mut SvcFrame) {
+    let file_handle = frame.x[0];
+    let iosb_ptr = frame.x[4] as *mut IoStatusBlock;
+    let out_ptr = frame.x[5] as *mut u8;
+    let out_len = frame.x[6] as usize;
+    let completion_filter = frame.x[7] as u32;
+    let watch_tree = unsafe { (frame.sp_el0 as *const u64).read_volatile() != 0 };
+
+    let host_fd = match file_handle_to_host_fd(file_handle) {
+        Some(fd) => fd,
+        None => {
+            write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+            frame.x[0] = status::INVALID_HANDLE as u64;
+            return;
+        }
+    };
+
+    if out_ptr.is_null() || out_len < FILE_NOTIFY_INFORMATION_BASE {
+        write_iosb(iosb_ptr, status::INVALID_PARAMETER, 0);
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+
+    let mut name_buf = [0u8; 512];
+    let packed = hypercall::host_notify_dir(
+        host_fd,
+        name_buf.as_mut_ptr(),
+        name_buf.len(),
+        watch_tree,
+        completion_filter,
+    );
+
+    if packed == u64::MAX {
+        write_iosb(iosb_ptr, status::INVALID_PARAMETER, 0);
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+
+    if packed == 0 {
+        write_iosb(iosb_ptr, status::SUCCESS, 0);
+        frame.x[0] = status::SUCCESS as u64;
+        return;
+    }
+
+    let action = ((packed & HOST_NOTIFY_ACTION_MASK) >> HOST_NOTIFY_ACTION_SHIFT) as u32;
+    let name_len = (packed & HOST_DIRENT_NAME_LEN_MASK) as usize;
+    if action == 0 || name_len == 0 || name_len > name_buf.len() {
+        write_iosb(iosb_ptr, status::SUCCESS, 0);
+        frame.x[0] = status::SUCCESS as u64;
+        return;
+    }
+
+    match write_notify_record(out_ptr, out_len, action, &name_buf[..name_len]) {
+        Ok(written) => {
+            write_iosb(iosb_ptr, status::SUCCESS, written as u64);
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        Err(st) => {
+            write_iosb(iosb_ptr, st, 0);
+            frame.x[0] = st as u64;
+        }
     }
 }
 

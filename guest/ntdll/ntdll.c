@@ -17,6 +17,7 @@
 #define NR_QUERY_ATTRIBUTES_FILE 0x0014
 #define NR_SET_INFORMATION_FILE 0x0027
 #define NR_QUERY_DIRECTORY_FILE 0x004E
+#define NR_NOTIFY_CHANGE_DIRECTORY_FILE 0x011F
 #define NR_QUERY_KEY            0x0013
 #define NR_CREATE_KEY           0x001D
 #define NR_SET_VALUE_KEY        0x003D
@@ -519,6 +520,18 @@ EXPORT NTSTATUS NtQueryDirectoryFile(
         "svc #0\n"
         "ret\n"
         :: "i"(NR_QUERY_DIRECTORY_FILE));
+}
+
+__attribute__((naked))
+EXPORT NTSTATUS NtNotifyChangeDirectoryFile(
+    HANDLE file_handle, HANDLE event, void* apc_routine, void* apc_context,
+    void* io_status_block, void* buffer, ULONG length, ULONG completion_filter, UCHAR watch_tree)
+{
+    asm volatile(
+        "mov x8, %0\n"
+        "svc #0\n"
+        "ret\n"
+        :: "i"(NR_NOTIFY_CHANGE_DIRECTORY_FILE));
 }
 
 __attribute__((naked))

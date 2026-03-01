@@ -46,6 +46,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         sysno::SET_INFORMATION_FILE => file::handle_set_information_file(frame),
         sysno::FS_CONTROL_FILE => file::handle_fs_control_file(frame),
         sysno::QUERY_DIRECTORY_FILE => file::handle_query_directory_file(frame),
+        sysno::NOTIFY_CHANGE_DIRECTORY_FILE => file::handle_notify_change_directory_file(frame),
         sysno::QUERY_SYSTEM_INFORMATION => system::handle_query_system_information(frame),
         sysno::QUERY_SYSTEM_TIME => system::handle_query_system_time(frame),
         sysno::QUERY_PERFORMANCE_COUNTER => system::handle_query_performance_counter(frame),

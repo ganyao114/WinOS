@@ -163,6 +163,13 @@ pub mod nr {
     ///   - u64::MAX: invalid / not a directory
     ///   - 其他: bit63=is_dir, low32=name_len
     pub const HOST_READDIR: u64 = 0x081A;
+    /// 目录变更通知（非阻塞）
+    /// args: [host_fd, dst_gpa, dst_len, watch_tree(0/1), completion_filter, 0]
+    /// 返回:
+    ///   - 0: no change
+    ///   - u64::MAX: invalid / not a directory
+    ///   - 其他: bits[39:32]=action, low32=name_len
+    pub const HOST_NOTIFY_DIR: u64 = 0x081B;
 }
 
 /// NT 超时常量（100ns 单位）

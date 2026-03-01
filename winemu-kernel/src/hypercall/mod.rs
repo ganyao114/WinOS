@@ -147,6 +147,29 @@ pub fn host_readdir(fd: u64, dst: *mut u8, len: usize, restart: bool) -> u64 {
     )
 }
 
+/// HOST_NOTIFY_DIR — 查询目录变更（非阻塞）
+/// 返回:
+/// - 0: no change
+/// - u64::MAX: invalid / not directory
+/// - 其他: bits[39:32]=action, low32=name_len
+pub fn host_notify_dir(
+    fd: u64,
+    dst: *mut u8,
+    len: usize,
+    watch_tree: bool,
+    completion_filter: u32,
+) -> u64 {
+    hypercall6(
+        nr::HOST_NOTIFY_DIR,
+        fd,
+        dst as u64,
+        len as u64,
+        watch_tree as u64,
+        completion_filter as u64,
+        0,
+    )
+}
+
 /// HOST_MMAP — 映射宿主文件到 guest 地址空间
 /// 返回映射基址（失败返回 0）
 pub fn host_mmap(fd: u64, offset: u64, size: u64, prot: u32) -> u64 {
