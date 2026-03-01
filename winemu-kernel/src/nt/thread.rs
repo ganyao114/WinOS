@@ -82,12 +82,23 @@ pub(crate) fn handle_yield(frame: &mut SvcFrame) {
 // stack[0]=StackSize, stack[1]=MaxStackSize, stack[2]=AttributeList
 pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
     let out_ptr = frame.x[0] as *mut u64;
+    let desired_access = frame.x[1] as u32;
     let process_handle = frame.x[3];
     let entry_va = frame.x[4];
     let arg = frame.x[5];
     let create_flags = frame.x[6] as u32;
     let _stack_size_arg = unsafe { (frame.sp_el0 as *const u64).read_volatile() };
     let max_stack_size_arg = unsafe { (frame.sp_el0 as *const u64).add(1).read_volatile() };
+
+    let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_THREAD) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+    if (desired_access & !meta.valid_access_mask) != 0 {
+        frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
+
     let Some(target_pid) = crate::process::resolve_process_handle(process_handle) else {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;

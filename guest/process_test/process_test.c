@@ -25,6 +25,7 @@ typedef struct {
 #define STATUS_SUCCESS 0x00000000U
 #define STATUS_TIMEOUT 0x00000102U
 #define STATUS_INVALID_HANDLE 0xC0000008U
+#define STATUS_ACCESS_DENIED 0xC0000022U
 
 #define STDOUT_HANDLE ((HANDLE)(uint64_t)0xFFFFFFFFFFFFFFF5ULL)
 #define NT_CURRENT_PROCESS ((HANDLE)(uint64_t)-1)
@@ -184,6 +185,7 @@ static inline NTSTATUS nt_duplicate_object(HANDLE source_process, HANDLE source_
 
 static inline NTSTATUS nt_create_thread_ex(
     HANDLE* thread_handle,
+    ULONG access,
     HANDLE process_handle,
     void* start_routine,
     void* argument)
@@ -191,7 +193,7 @@ static inline NTSTATUS nt_create_thread_ex(
     return (NTSTATUS)svc11(
         NR_CREATE_THREAD_EX,
         (uint64_t)thread_handle,
-        0x001FFFFF,
+        (uint64_t)access,
         0,
         (uint64_t)process_handle,
         (uint64_t)start_routine,
@@ -328,6 +330,17 @@ void mainCRTStartup(void) {
     check("Self PID non-zero", self_pbi.UniqueProcessId != 0);
 
     HANDLE child = NULL;
+    HANDLE invalid_access_child = NULL;
+    st = nt_create_process_ex(
+        &invalid_access_child,
+        0x80000000U,
+        NT_CURRENT_PROCESS,
+        0,
+        NULL
+    );
+    check("NtCreateProcessEx(invalid desired access) returns STATUS_ACCESS_DENIED", st == STATUS_ACCESS_DENIED);
+    check("NtCreateProcessEx(invalid desired access) does not return handle", invalid_access_child == NULL);
+
     st = nt_create_process_ex(
         &child,
         0x001FFFFF,
@@ -380,6 +393,7 @@ void mainCRTStartup(void) {
     HANDLE child_thread = NULL;
     st = nt_create_thread_ex(
         &child_thread,
+        0x001FFFFF,
         child,
         (void*)child_thread_entry,
         NULL
@@ -388,6 +402,17 @@ void mainCRTStartup(void) {
         fail_fast("NtCreateThreadEx(child)", st);
     }
     check("NtCreateThreadEx(child) success", st == STATUS_SUCCESS);
+
+    HANDLE invalid_access_thread = NULL;
+    st = nt_create_thread_ex(
+        &invalid_access_thread,
+        0x80000000U,
+        child,
+        (void*)child_thread_entry,
+        NULL
+    );
+    check("NtCreateThreadEx(invalid desired access) returns STATUS_ACCESS_DENIED", st == STATUS_ACCESS_DENIED);
+    check("NtCreateThreadEx(invalid desired access) does not return handle", invalid_access_thread == NULL);
 
     st = nt_wait_single(child_thread);
     check("Wait child thread success", st == STATUS_SUCCESS);

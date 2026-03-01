@@ -85,13 +85,23 @@ pub(crate) fn handle_open_process(frame: &mut SvcFrame) {
 }
 
 // NtCreateProcessEx:
-// x0=*ProcessHandle, x3=ParentProcess, x4=Flags, x5=SectionHandle
+// x0=*ProcessHandle, x1=DesiredAccess, x3=ParentProcess, x4=Flags, x5=SectionHandle
 pub(crate) fn handle_create_process(frame: &mut SvcFrame) {
     crate::hypercall::debug_u64(0xC501_0001);
     let out_ptr = frame.x[0] as *mut u64;
+    let desired_access = frame.x[1] as u32;
     let parent_handle = frame.x[3];
     let flags = frame.x[4] as u32;
     let section_handle = frame.x[5];
+
+    let Some(meta) = super::kobject::object_type_meta(crate::sched::sync::HANDLE_TYPE_PROCESS) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+    if (desired_access & !meta.valid_access_mask) != 0 {
+        frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
 
     match crate::process::create_process(parent_handle, section_handle, flags) {
         Ok(handle) => {
