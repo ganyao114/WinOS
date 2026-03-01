@@ -25,8 +25,6 @@ pub use lock::{sched_lock_acquire, sched_lock_release};
 pub const MAX_VCPUS: usize = 8;
 pub const IDLE_TID: u32 = 0;
 pub const MAX_WAIT_HANDLES: usize = 64;
-const READY_AGING_EPOCH_INTERVAL: u64 = 64;
-const READY_AGING_MAX_PRIORITY: u8 = 15;
 
 pub const WAIT_KIND_NONE: u8 = 0;
 pub const WAIT_KIND_SINGLE: u8 = 1;
@@ -85,7 +83,7 @@ pub struct KThread {
     // 时间片记账（100ns）
     pub slice_remaining_100ns: u64,
     pub last_start_100ns: u64,
-    pub ready_epoch: u64,
+    pub last_vcpu_hint: u8,
 
     // 侵入式链表节点（就绪队列 / 等待队列）
     pub sched_next: u32, // TID of next in ready queue (0 = end)
@@ -120,7 +118,7 @@ impl KThread {
             wait_signaled: 0,
             slice_remaining_100ns: 0,
             last_start_100ns: 0,
-            ready_epoch: 0,
+            last_vcpu_hint: 0,
             sched_next: 0,
             wait_next: 0,
             wait_handles: [0u64; MAX_WAIT_HANDLES],
@@ -231,6 +229,43 @@ impl ReadyQueue {
         tid
     }
 
+    pub fn pop_highest_prefer_vcpu(&mut self, prefer_vcpu: usize) -> u32 {
+        if self.present == 0 {
+            return 0;
+        }
+        let p = 31 - self.present.leading_zeros() as usize;
+        let head = self.heads[p];
+        if head == 0 {
+            return 0;
+        }
+
+        let hint = prefer_vcpu as u8;
+        let mut prev = 0u32;
+        let mut cur = head;
+        while cur != 0 {
+            let cur_hint = with_thread(cur, |t| t.last_vcpu_hint);
+            if cur_hint == hint {
+                let next = with_thread(cur, |t| t.sched_next);
+                if prev == 0 {
+                    self.heads[p] = next;
+                } else {
+                    with_thread_mut(prev, |t| t.sched_next = next);
+                }
+                if next == 0 {
+                    self.tails[p] = prev;
+                }
+                if self.heads[p] == 0 {
+                    self.present &= !(1u32 << p);
+                }
+                return cur;
+            }
+            prev = cur;
+            cur = with_thread(cur, |t| t.sched_next);
+        }
+
+        self.pop_highest()
+    }
+
     pub fn highest_priority(&self) -> Option<u8> {
         if self.present == 0 {
             None
@@ -291,7 +326,6 @@ pub struct Scheduler {
     pending_reschedule_mask: UnsafeCell<u32>,
     reschedule_mask: UnsafeCell<u32>,
     idle_vcpu_mask: UnsafeCell<u32>,
-    epoch: UnsafeCell<u64>,
     // 全局调度锁（可重入，保护 ready queue 和线程状态）
     // 多 vCPU：底层用原子自旋锁
     lock_count: UnsafeCell<u32>,
@@ -308,7 +342,6 @@ pub static SCHED: Scheduler = Scheduler {
     pending_reschedule_mask: UnsafeCell::new(0),
     reschedule_mask: UnsafeCell::new(0),
     idle_vcpu_mask: UnsafeCell::new(0),
-    epoch: UnsafeCell::new(0),
     lock_count: UnsafeCell::new(0),
     lock_owner: UnsafeCell::new(0),
     spinlock: UnsafeCell::new(0),
@@ -427,34 +460,21 @@ pub(crate) fn commit_deferred_scheduling_locked() {
     }
 }
 
-#[inline(always)]
-fn scheduler_epoch_locked() -> u64 {
-    unsafe { *SCHED.epoch.get() }
-}
-
-#[inline(always)]
-fn advance_scheduler_epoch_locked() -> u64 {
-    unsafe {
-        let slot = SCHED.epoch.get();
-        let mut next = (*slot).wrapping_add(1);
-        if next == 0 {
-            next = 1;
-        }
-        *slot = next;
-        next
-    }
-}
-
 fn mark_reschedule_targeted_locked(changed_tid: u32, ready_prio: Option<u8>) {
     let local_vid = vcpu_id().min(MAX_VCPUS - 1);
     mark_vcpu_needs_scheduling_locked(local_vid);
 
     unsafe {
+        let mut idle_target = None;
+        let mut preempt_target = None;
+        let mut preempt_prio = u8::MAX;
         let idle_mask = *SCHED.idle_vcpu_mask.get();
         for vid in 0..MAX_VCPUS {
             let bit = vcpu_bit(vid);
             if (idle_mask & bit) != 0 {
-                mark_vcpu_needs_scheduling_locked(vid);
+                if idle_target.is_none() {
+                    idle_target = Some(vid);
+                }
                 continue;
             }
 
@@ -467,45 +487,18 @@ fn mark_reschedule_targeted_locked(changed_tid: u32, ready_prio: Option<u8>) {
             if let Some(prio) = ready_prio {
                 if running_tid != 0 && thread_exists(running_tid) {
                     let running_prio = with_thread(running_tid, |t| t.priority);
-                    if running_prio < prio {
-                        mark_vcpu_needs_scheduling_locked(vid);
+                    if running_prio < prio && running_prio < preempt_prio {
+                        preempt_prio = running_prio;
+                        preempt_target = Some(vid);
                     }
                 }
             }
         }
-    }
-}
-
-fn apply_ready_aging_locked(epoch: u64) {
-    if epoch == 0 || (epoch % READY_AGING_EPOCH_INTERVAL) != 0 {
-        return;
-    }
-
-    let mut boosts = Vec::new();
-    unsafe {
-        let Some(store) = (&*SCHED.threads.get()).as_ref() else {
-            return;
-        };
-        store.for_each_live_ptr(|tid, ptr| {
-            let t = &*ptr;
-            if t.state != ThreadState::Ready {
-                return;
-            }
-            if t.priority >= READY_AGING_MAX_PRIORITY || t.ready_epoch == 0 {
-                return;
-            }
-            if epoch.wrapping_sub(t.ready_epoch) < READY_AGING_EPOCH_INTERVAL {
-                return;
-            }
-            if boosts.try_reserve(1).is_ok() {
-                boosts.push((tid, (t.priority + 1).min(READY_AGING_MAX_PRIORITY)));
-            }
-        });
-    }
-
-    for (tid, new_prio) in boosts {
-        set_thread_priority_locked(tid, new_prio);
-        with_thread_mut(tid, |t| t.ready_epoch = epoch);
+        if let Some(vid) = idle_target {
+            mark_vcpu_needs_scheduling_locked(vid);
+        } else if let Some(vid) = preempt_target {
+            mark_vcpu_needs_scheduling_locked(vid);
+        }
     }
 }
 
@@ -617,7 +610,6 @@ pub(crate) fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
         return;
     }
 
-    let ready_epoch = scheduler_epoch_locked();
     unsafe {
         if old_state == ThreadState::Ready {
             (*SCHED.ready.get()).remove(tid);
@@ -627,11 +619,6 @@ pub(crate) fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
             t.state = new_state;
             if new_state != ThreadState::Running {
                 t.last_start_100ns = 0;
-            }
-            if new_state == ThreadState::Ready {
-                t.ready_epoch = ready_epoch;
-            } else {
-                t.ready_epoch = 0;
             }
         });
 
@@ -798,8 +785,6 @@ pub fn thread_ids_by_pid(pid: u32) -> Vec<u32> {
 /// 返回 (from_tid, to_tid)；若无需切换则 from == to；to == 0 表示 WFI idle
 pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32) {
     unsafe {
-        let epoch = advance_scheduler_epoch_locked();
-        apply_ready_aging_locked(epoch);
         let vcpu = &mut (*SCHED.vcpus.get())[vcpu_id];
         let mut cur_tid = vcpu.current_tid;
         if cur_tid != 0 && !thread_exists(cur_tid) {
@@ -820,7 +805,7 @@ pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32
             }
         }
 
-        let next_tid = (*SCHED.ready.get()).pop_highest();
+        let next_tid = (*SCHED.ready.get()).pop_highest_prefer_vcpu(vcpu_id);
 
         if next_tid == 0 {
             // No ready threads — if current thread is still Running, keep it
@@ -841,6 +826,7 @@ pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32
                         t.slice_remaining_100ns = quantum_100ns.max(1);
                     }
                     t.last_start_100ns = now_100ns;
+                    t.last_vcpu_hint = vcpu_id as u8;
                 });
                 return (cur_tid, cur_tid);
             }
@@ -856,6 +842,7 @@ pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32
                 t.slice_remaining_100ns = quantum_100ns.max(1);
             }
             t.last_start_100ns = now_100ns;
+            t.last_vcpu_hint = vcpu_id as u8;
         });
         vcpu.current_tid = next_tid;
         set_current_cpu_thread(vcpu_id, next_tid);
@@ -1087,7 +1074,6 @@ pub(crate) fn set_thread_priority_locked(tid: u32, new_priority: u8) {
     with_thread_mut(tid, |t| t.priority = clamped);
     if state == ThreadState::Ready {
         with_thread_mut(tid, |t| unsafe { (*SCHED.ready.get()).push(t) });
-        with_thread_mut(tid, |t| t.ready_epoch = scheduler_epoch_locked());
     }
     let ready_prio = if state == ThreadState::Ready {
         Some(clamped)

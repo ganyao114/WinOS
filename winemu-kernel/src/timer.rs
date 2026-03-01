@@ -144,20 +144,31 @@ impl TimerTaskState {
 
 struct TimerTaskRegistry {
     state: UnsafeCell<Option<TimerTaskState>>,
+    lock: UnsafeCell<u32>,
 }
 
 unsafe impl Sync for TimerTaskRegistry {}
 
 static TIMER_TASKS: TimerTaskRegistry = TimerTaskRegistry {
     state: UnsafeCell::new(None),
+    lock: UnsafeCell::new(0),
 };
 
 #[inline(always)]
-fn require_sched_lock() {
-    assert!(
-        crate::sched::sched_lock_held_by_current_vcpu(),
-        "timer task API requires scheduler lock"
-    );
+fn timer_lock() {
+    crate::arch::spin::lock_word(TIMER_TASKS.lock.get());
+}
+
+#[inline(always)]
+fn timer_unlock() {
+    crate::arch::spin::unlock_word(TIMER_TASKS.lock.get());
+}
+
+fn with_timer_state<R>(f: impl FnOnce(&mut TimerTaskState) -> R) -> R {
+    timer_lock();
+    let out = f(state_mut());
+    timer_unlock();
+    out
 }
 
 fn state_mut() -> &'static mut TimerTaskState {
@@ -238,16 +249,15 @@ fn rebuild_heap_locked(state: &mut TimerTaskState) {
     }
 }
 
-pub fn register_task(
+fn register_task_locked(
+    state: &mut TimerTaskState,
     kind: TimerTaskKind,
     target_id: u32,
     deadline_100ns: u64,
 ) -> Option<TimerTaskHandle> {
-    require_sched_lock();
     if target_id == 0 || deadline_100ns == 0 {
         return None;
     }
-    let state = state_mut();
     let generation = next_generation(state);
     let task_id = tasks_store_mut(state).alloc_with(|_| TimerTaskRecord {
         kind,
@@ -267,16 +277,18 @@ pub fn register_task(
     Some(handle)
 }
 
-pub fn rearm_task(handle: TimerTaskHandle, deadline_100ns: u64) -> Option<TimerTaskHandle> {
-    require_sched_lock();
+fn rearm_task_locked(
+    state: &mut TimerTaskState,
+    handle: TimerTaskHandle,
+    deadline_100ns: u64,
+) -> Option<TimerTaskHandle> {
     if !handle.is_valid() {
         return None;
     }
     if deadline_100ns == 0 {
-        let _ = cancel_task(handle);
+        let _ = cancel_task_locked(state, handle);
         return None;
     }
-    let state = state_mut();
     let generation = next_generation(state);
 
     {
@@ -309,12 +321,10 @@ pub fn rearm_task(handle: TimerTaskHandle, deadline_100ns: u64) -> Option<TimerT
     Some(new_handle)
 }
 
-pub fn cancel_task(handle: TimerTaskHandle) -> bool {
-    require_sched_lock();
+fn cancel_task_locked(state: &mut TimerTaskState, handle: TimerTaskHandle) -> bool {
     if !handle.is_valid() {
         return false;
     }
-    let state = state_mut();
     let store = tasks_store_mut(state);
     let ptr = store.get_ptr(handle.id);
     if ptr.is_null() {
@@ -328,17 +338,16 @@ pub fn cancel_task(handle: TimerTaskHandle) -> bool {
     store.free(handle.id)
 }
 
-pub fn next_deadline_locked() -> u64 {
-    require_sched_lock();
-    let state = state_mut();
+fn next_deadline_locked_inner(state: &mut TimerTaskState) -> u64 {
     rebuild_heap_locked(state);
     prune_heap_locked(state);
     state.heap.peek().map_or(0, |e| e.deadline_100ns)
 }
 
-pub fn pop_expired_task_locked(now_100ns: u64) -> Option<FiredTimerTask> {
-    require_sched_lock();
-    let state = state_mut();
+fn pop_expired_task_locked_inner(
+    state: &mut TimerTaskState,
+    now_100ns: u64,
+) -> Option<FiredTimerTask> {
     rebuild_heap_locked(state);
     loop {
         prune_heap_locked(state);
@@ -369,4 +378,28 @@ pub fn pop_expired_task_locked(now_100ns: u64) -> Option<FiredTimerTask> {
         let _ = tasks_store_mut(state).free(head.task_id);
         return Some(fired);
     }
+}
+
+pub fn register_task(
+    kind: TimerTaskKind,
+    target_id: u32,
+    deadline_100ns: u64,
+) -> Option<TimerTaskHandle> {
+    with_timer_state(|state| register_task_locked(state, kind, target_id, deadline_100ns))
+}
+
+pub fn rearm_task(handle: TimerTaskHandle, deadline_100ns: u64) -> Option<TimerTaskHandle> {
+    with_timer_state(|state| rearm_task_locked(state, handle, deadline_100ns))
+}
+
+pub fn cancel_task(handle: TimerTaskHandle) -> bool {
+    with_timer_state(|state| cancel_task_locked(state, handle))
+}
+
+pub fn next_deadline_locked() -> u64 {
+    with_timer_state(next_deadline_locked_inner)
+}
+
+pub fn pop_expired_task_locked(now_100ns: u64) -> Option<FiredTimerTask> {
+    with_timer_state(|state| pop_expired_task_locked_inner(state, now_100ns))
 }
