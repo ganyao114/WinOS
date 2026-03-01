@@ -2,6 +2,7 @@ pub mod common;
 pub mod constants;
 pub mod dispatch;
 pub mod file;
+pub mod kobject;
 pub mod memory;
 pub mod object;
 pub mod path;

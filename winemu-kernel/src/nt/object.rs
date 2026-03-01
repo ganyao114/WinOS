@@ -1,16 +1,12 @@
 use core::mem::size_of;
 
 use crate::sched::sync::{
-    close_handle_info, destroy_object_by_type, duplicate_handle_between, HANDLE_TYPE_EVENT,
-    HANDLE_TYPE_FILE, HANDLE_TYPE_KEY, HANDLE_TYPE_MUTEX, HANDLE_TYPE_PROCESS, HANDLE_TYPE_SECTION,
-    HANDLE_TYPE_SEMAPHORE, HANDLE_TYPE_THREAD, HANDLE_TYPE_TOKEN, STATUS_SUCCESS,
+    close_handle_info, duplicate_handle_between, STATUS_SUCCESS,
 };
 use winemu_shared::status;
 
 use super::common::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
-use super::file;
-use super::registry;
-use super::section;
+use super::kobject;
 use super::SvcFrame;
 
 const OBJECT_INFORMATION_CLASS_BASIC: u32 = 0;
@@ -90,37 +86,7 @@ pub(crate) fn handle_close(frame: &mut SvcFrame) -> bool {
         return true;
     }
 
-    let htype = info.htype;
-    if htype == HANDLE_TYPE_EVENT
-        || htype == HANDLE_TYPE_MUTEX
-        || htype == HANDLE_TYPE_SEMAPHORE
-        || htype == HANDLE_TYPE_THREAD
-        || htype == HANDLE_TYPE_PROCESS
-        || htype == HANDLE_TYPE_TOKEN
-    {
-        frame.x[0] = destroy_object_by_type(htype, info.obj_idx) as u64;
-        return true;
-    }
-    if htype == HANDLE_TYPE_FILE {
-        file::close_file_idx(info.obj_idx);
-        frame.x[0] = STATUS_SUCCESS as u64;
-        return true;
-    }
-    if htype == HANDLE_TYPE_SECTION {
-        section::close_section_idx(info.obj_idx);
-        frame.x[0] = STATUS_SUCCESS as u64;
-        return true;
-    }
-    if htype == HANDLE_TYPE_KEY {
-        if registry::close_key_idx(info.obj_idx) {
-            frame.x[0] = STATUS_SUCCESS as u64;
-            return true;
-        }
-        frame.x[0] = status::INVALID_HANDLE as u64;
-        return true;
-    }
-
-    frame.x[0] = status::INVALID_HANDLE as u64;
+    frame.x[0] = kobject::close_last_ref(info.htype, info.obj_idx) as u64;
     true
 }
 
@@ -130,11 +96,11 @@ fn query_object_basic(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) 
         return status::INFO_LENGTH_MISMATCH;
     }
 
-    let Some((htype, obj_idx)) = resolve_query_target(handle) else {
+    let Some((htype, obj_idx)) = kobject::resolve_handle_target(handle) else {
         return status::INVALID_HANDLE;
     };
 
-    let refs = crate::sched::sync::object_ref_count(htype, obj_idx).max(1);
+    let refs = kobject::object_ref_count(htype, obj_idx).max(1);
     let mut obi = [0u8; OBJECT_BASIC_INFORMATION_SIZE];
     obi[8..12].copy_from_slice(&refs.to_le_bytes()); // HandleCount
     obi[12..16].copy_from_slice(&refs.to_le_bytes()); // PointerCount
@@ -160,10 +126,10 @@ fn query_object_name(buf: *mut u8, len: usize, ret_len: *mut u32) -> u32 {
 }
 
 fn query_object_type(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -> u32 {
-    let Some((htype, obj_idx)) = resolve_query_target(handle) else {
+    let Some((htype, obj_idx)) = kobject::resolve_handle_target(handle) else {
         return status::INVALID_HANDLE;
     };
-    let Some(type_name_utf16) = object_type_name(htype) else {
+    let Some(type_name_utf16) = kobject::object_type_name(htype) else {
         return status::INVALID_HANDLE;
     };
 
@@ -178,7 +144,7 @@ fn query_object_type(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -
         core::ptr::write_bytes(buf, 0, OBJECT_TYPE_INFORMATION_SIZE);
     }
 
-    let refs = crate::sched::sync::object_ref_count(htype, obj_idx).max(1);
+    let refs = kobject::object_ref_count(htype, obj_idx).max(1);
     let name_ptr = unsafe { buf.add(OBJECT_TYPE_INFORMATION_SIZE) };
     let name_addr = name_ptr as u64;
 
@@ -204,46 +170,6 @@ fn query_object_type(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -
 
     write_ret_len(ret_len, required as u32);
     status::SUCCESS
-}
-
-fn resolve_query_target(handle: u64) -> Option<(u64, u32)> {
-    if let Some(pid) = crate::process::resolve_process_handle(handle) {
-        return Some((HANDLE_TYPE_PROCESS, pid));
-    }
-    let htype = crate::sched::sync::handle_type(handle);
-    if htype == 0 {
-        return None;
-    }
-    let idx = crate::sched::sync::handle_idx(handle);
-    if idx == 0 {
-        return None;
-    }
-    Some((htype, idx))
-}
-
-fn object_type_name(htype: u64) -> Option<&'static [u16]> {
-    const PROCESS: &[u16] = &[80, 114, 111, 99, 101, 115, 115];
-    const THREAD: &[u16] = &[84, 104, 114, 101, 97, 100];
-    const EVENT: &[u16] = &[69, 118, 101, 110, 116];
-    const MUTANT: &[u16] = &[77, 117, 116, 97, 110, 116];
-    const SEMAPHORE: &[u16] = &[83, 101, 109, 97, 112, 104, 111, 114, 101];
-    const FILE: &[u16] = &[70, 105, 108, 101];
-    const SECTION: &[u16] = &[83, 101, 99, 116, 105, 111, 110];
-    const KEY: &[u16] = &[75, 101, 121];
-    const TOKEN: &[u16] = &[84, 111, 107, 101, 110];
-
-    match htype {
-        HANDLE_TYPE_PROCESS => Some(PROCESS),
-        HANDLE_TYPE_THREAD => Some(THREAD),
-        HANDLE_TYPE_EVENT => Some(EVENT),
-        HANDLE_TYPE_MUTEX => Some(MUTANT),
-        HANDLE_TYPE_SEMAPHORE => Some(SEMAPHORE),
-        HANDLE_TYPE_FILE => Some(FILE),
-        HANDLE_TYPE_SECTION => Some(SECTION),
-        HANDLE_TYPE_KEY => Some(KEY),
-        HANDLE_TYPE_TOKEN => Some(TOKEN),
-        _ => None,
-    }
 }
 
 fn write_ret_len(ptr: *mut u32, value: u32) {
