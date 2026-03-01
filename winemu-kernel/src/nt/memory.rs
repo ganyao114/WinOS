@@ -1,7 +1,7 @@
 use winemu_shared::status;
 
 use super::common::{align_up_4k, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE};
-use super::constants::{PAGE_MASK_4K, PAGE_SIZE_4K};
+use super::constants::PAGE_MASK_4K;
 use super::state::{
     vm_commit_private, vm_decommit_private, vm_protect_range, vm_query_region, vm_release_private,
     vm_reserve_private,
@@ -169,16 +169,26 @@ pub(crate) fn handle_query_virtual_memory(frame: &mut SvcFrame) {
     }
     let owner_pid = crate::process::current_pid();
 
-    let (base, size, prot, state, mem_type) = if let Some(q) = vm_query_region(owner_pid, addr) {
-        (q.base, q.size, q.prot, q.state, q.mem_type)
-    } else {
-        (addr & PAGE_MASK_4K, PAGE_SIZE_4K, 0u32, 0u32, 0u32)
+    let (base, alloc_base, alloc_prot, size, prot, state, mem_type) =
+        if let Some(q) = vm_query_region(owner_pid, addr) {
+            (
+                q.base,
+                q.allocation_base,
+                q.allocation_prot,
+                q.size,
+                q.prot,
+                q.state,
+                q.mem_type,
+            )
+        } else {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
     };
 
     let mut mbi = [0u8; 48];
     mbi[0..8].copy_from_slice(&base.to_le_bytes());
-    mbi[8..16].copy_from_slice(&base.to_le_bytes());
-    mbi[16..20].copy_from_slice(&prot.to_le_bytes());
+    mbi[8..16].copy_from_slice(&alloc_base.to_le_bytes());
+    mbi[16..20].copy_from_slice(&alloc_prot.to_le_bytes());
     mbi[24..32].copy_from_slice(&size.to_le_bytes());
     mbi[32..36].copy_from_slice(&state.to_le_bytes());
     mbi[36..40].copy_from_slice(&prot.to_le_bytes());

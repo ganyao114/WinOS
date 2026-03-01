@@ -27,6 +27,7 @@ const NR_DUPLICATE_OBJECT: u64 = 0x003C;
 
 const STATUS_SUCCESS: u64 = 0;
 const STATUS_INVALID_PARAMETER: u64 = 0xC000000D;
+const STATUS_NOT_COMMITTED: u64 = 0xC0000021;
 const PAGE_READWRITE: u64 = 0x04;
 const PAGE_WRITECOPY: u64 = 0x08;
 const PAGE_READONLY: u64 = 0x02;
@@ -36,6 +37,7 @@ const MEM_COMMIT: u64 = 0x1000;
 const MEM_RESERVE: u64 = 0x2000;
 const MEM_DECOMMIT: u64 = 0x4000;
 const MEM_RELEASE: u64 = 0x8000;
+const MEM_FREE: u64 = 0x10000;
 const SEC_COMMIT: u64 = 0x08000000;
 const SEC_IMAGE: u64 = 0x01000000;
 
@@ -208,6 +210,12 @@ fn rd_u32(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(tmp)
 }
 
+fn rd_u64(buf: &[u8], off: usize) -> u64 {
+    let mut tmp = [0u8; 8];
+    tmp.copy_from_slice(&buf[off..off + 8]);
+    u64::from_le_bytes(tmp)
+}
+
 // ════════════════════════════════════════════════════════════════
 // Test 1: NtAllocateVirtualMemory / NtFreeVirtualMemory
 // ════════════════════════════════════════════════════════════════
@@ -245,6 +253,26 @@ unsafe fn test_virtual_memory() {
     check(
         b"Reserved page reports MEM_RESERVE",
         rd_u32(&mbi, 32) as u64 == MEM_RESERVE,
+    );
+
+    // Protect on uncommitted pages must fail.
+    let mut reserve_protect_base = base + 0x3000;
+    let mut reserve_protect_size: u64 = 0x1000;
+    let mut reserve_old_prot: u32 = 0xFFFF_FFFF;
+    let st = svc(
+        NR_PROTECT_VIRTUAL_MEMORY,
+        0xFFFFFFFFFFFFFFFF,
+        &mut reserve_protect_base as *mut u64 as u64,
+        &mut reserve_protect_size as *mut u64 as u64,
+        PAGE_READONLY,
+        &mut reserve_old_prot as *mut u32 as u64,
+        0,
+        0,
+        0,
+    );
+    check(
+        b"NtProtectVirtualMemory on uncommitted page returns NOT_COMMITTED",
+        st == STATUS_NOT_COMMITTED,
     );
 
     // Commit 8KB from reserved region
@@ -286,6 +314,17 @@ unsafe fn test_virtual_memory() {
     check(
         b"Committed page reports MEM_COMMIT",
         rd_u32(&mbi, 32) as u64 == MEM_COMMIT,
+    );
+
+    let mut reserve_mbi = [0u8; 48];
+    let st = nt_query_virtual(base + 0x3000, &mut reserve_mbi);
+    check(
+        b"NtQueryVirtualMemory on uncommitted in-region page returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+    check(
+        b"AllocationBase remains region base for MEM_RESERVE sub-range",
+        rd_u64(&reserve_mbi, 8) == base,
     );
 
     // Protect first page to READONLY
@@ -479,6 +518,21 @@ unsafe fn test_virtual_memory() {
         0,
     );
     check(b"NtFreeVirtualMemory returns SUCCESS", st == STATUS_SUCCESS);
+
+    let mut free_mbi = [0u8; 48];
+    let st = nt_query_virtual(base, &mut free_mbi);
+    check(
+        b"NtQueryVirtualMemory on released address returns SUCCESS",
+        st == STATUS_SUCCESS,
+    );
+    check(
+        b"Released address reports MEM_FREE",
+        rd_u32(&free_mbi, 32) as u64 == MEM_FREE,
+    );
+    check(
+        b"MEM_FREE region has AllocationBase == 0",
+        rd_u64(&free_mbi, 8) == 0,
+    );
 
     // Commit without reserve should fail
     let mut bad_commit_base = base;

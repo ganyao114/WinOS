@@ -176,6 +176,7 @@ pub mod status {
     pub const INVALID_HANDLE: u32 = 0xC000_0008;
     pub const END_OF_FILE: u32 = 0xC000_011B;
     pub const INVALID_PARAMETER: u32 = 0xC000_000D;
+    pub const NOT_COMMITTED: u32 = 0xC000_0021;
     pub const MUTANT_NOT_OWNED: u32 = 0xC000_0046;
     pub const SEMAPHORE_LIMIT_EXCEEDED: u32 = 0xC000_0047;
     pub const NO_MEMORY: u32 = 0xC000_0017;

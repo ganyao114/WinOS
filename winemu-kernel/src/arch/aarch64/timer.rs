@@ -98,7 +98,7 @@ fn sleep_delta_100ns(now_100ns: u64, deadline_100ns: u64, fallback_100ns: u64) -
 
 #[inline(always)]
 fn timer_frequency() -> u64 {
-    let freq = crate::arch::cpu::read_cntfrq_el0();
+    let freq = super::cpu::read_cntfrq_el0();
     if freq == 0 {
         24_000_000
     } else {
@@ -109,22 +109,22 @@ fn timer_frequency() -> u64 {
 #[inline(always)]
 fn arm_vtimer_oneshot_100ns(delta_100ns: u64) {
     let freq = timer_frequency();
-    let now = crate::arch::cpu::read_cntvct_el0();
+    let now = super::cpu::read_cntvct_el0();
     let delta_ticks = (((delta_100ns.max(1) as u128) * (freq as u128)) / 10_000_000u128) as u64;
     let cval = now.saturating_add(delta_ticks.max(1));
     // ENABLE=1, IMASK=0
-    crate::arch::cpu::write_cntv_cval_el0(cval);
-    crate::arch::cpu::write_cntv_ctl_el0(1);
-    crate::arch::cpu::isb();
+    super::cpu::write_cntv_cval_el0(cval);
+    super::cpu::write_cntv_ctl_el0(1);
+    super::cpu::isb();
 }
 
 #[inline(always)]
 fn wait_for_timer_irq() {
     // Mirror HOS-style flow: program one-shot, unmask IRQ, sleep in WFI,
     // then re-mask on return so scheduler critical path keeps explicit IRQ control.
-    crate::arch::cpu::daifclr_irq();
-    crate::arch::cpu::wait_for_interrupt();
-    crate::arch::cpu::daifset_irq();
+    super::cpu::daifclr_irq();
+    super::cpu::wait_for_interrupt();
+    super::cpu::daifset_irq();
 }
 
 #[inline(always)]

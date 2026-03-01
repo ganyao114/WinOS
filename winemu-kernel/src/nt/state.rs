@@ -11,11 +11,13 @@ use winemu_shared::status;
 
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
+const MEM_FREE: u32 = 0x1_0000;
 const MEM_PRIVATE_TYPE: u32 = 0x0002_0000;
 const MEM_MAPPED_TYPE: u32 = 0x0004_0000;
 const MEM_IMAGE_TYPE: u32 = 0x0100_0000;
 const PAGE_NOACCESS: u32 = 0x01;
 const PAGE_WRITECOPY: u32 = 0x08;
+const PAGE_GUARD: u32 = 0x100;
 const PAGE_EXECUTE_READ: u32 = 0x20;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
@@ -63,9 +65,17 @@ pub(crate) struct VmRegion {
 pub(crate) struct VmQueryInfo {
     pub(crate) base: u64,
     pub(crate) size: u64,
+    pub(crate) allocation_base: u64,
+    pub(crate) allocation_prot: u32,
     pub(crate) prot: u32,
     pub(crate) state: u32,
     pub(crate) mem_type: u32,
+}
+
+#[derive(Clone, Copy)]
+struct PhysPageRef {
+    gpa: u64,
+    refs: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -86,6 +96,7 @@ struct NtState {
     sections: UnsafeCell<Option<ObjectStore<GuestSection>>>,
     views: UnsafeCell<Option<ObjectStore<GuestView>>>,
     regions: UnsafeCell<Option<ObjectStore<VmRegion>>>,
+    page_refs: UnsafeCell<Option<ObjectStore<PhysPageRef>>>,
 }
 
 unsafe impl Sync for NtState {}
@@ -95,6 +106,7 @@ static NT_STATE: NtState = NtState {
     sections: UnsafeCell::new(None),
     views: UnsafeCell::new(None),
     regions: UnsafeCell::new(None),
+    page_refs: UnsafeCell::new(None),
 };
 
 fn files_store_mut() -> &'static mut ObjectStore<GuestFile> {
@@ -130,6 +142,16 @@ fn views_store_mut() -> &'static mut ObjectStore<GuestView> {
 fn regions_store_mut() -> &'static mut ObjectStore<VmRegion> {
     unsafe {
         let slot = &mut *NT_STATE.regions.get();
+        if slot.is_none() {
+            *slot = Some(ObjectStore::new());
+        }
+        slot.as_mut().unwrap()
+    }
+}
+
+fn page_refs_store_mut() -> &'static mut ObjectStore<PhysPageRef> {
+    unsafe {
+        let slot = &mut *NT_STATE.page_refs.get();
         if slot.is_none() {
             *slot = Some(ObjectStore::new());
         }
@@ -209,7 +231,8 @@ pub(crate) fn vm_make_guard_page(owner_pid: u32, page_va: u64) -> bool {
     if !vm_range_within_region(&region, page_va, PAGE_SIZE_4K) {
         return false;
     }
-    if !vm_decommit_region_pages(id, page_va, PAGE_SIZE_4K) {
+    let idx = ((page_va - region.base) / PAGE_SIZE_4K) as usize;
+    if idx >= region.page_count {
         return false;
     }
     let ptr = regions_store_mut().get_ptr(id);
@@ -217,12 +240,16 @@ pub(crate) fn vm_make_guard_page(owner_pid: u32, page_va: u64) -> bool {
         return false;
     }
     let region_mut = unsafe { &mut *ptr };
-    let idx = ((page_va - region_mut.base) / PAGE_SIZE_4K) as usize;
-    if idx >= region_mut.page_count {
+    if !vm_region_page_committed(region_mut, idx) {
         return false;
     }
+    // We emulate one-shot PAGE_GUARD in software:
+    // keep the page committed, clear stage-1 mapping to force a fault once,
+    // then clear PAGE_GUARD in the fault path and remap with normal protection.
+    vm_unmap_page_only(region_mut.owner_pid, page_va);
     unsafe {
-        *region_mut.prot_pages.add(idx) = PAGE_NOACCESS;
+        let base_prot = vm_sanitize_nt_prot(*region_mut.prot_pages.add(idx)) & !PAGE_GUARD;
+        *region_mut.prot_pages.add(idx) = base_prot | PAGE_GUARD;
     }
     true
 }
@@ -351,15 +378,44 @@ pub(crate) fn vm_protect_range(
         return Err(status::INVALID_PARAMETER);
     }
 
-    let old = unsafe { *(*ptr).prot_pages.add(start_idx) };
     let region_mut = unsafe { &mut *ptr };
+    let mut old_page_prots = Vec::new();
+    if old_page_prots.try_reserve(page_count).is_err() {
+        return Err(status::NO_MEMORY);
+    }
     for i in 0..page_count {
         let idx = start_idx + i;
+        if !vm_region_page_committed(region_mut, idx) {
+            return Err(status::NOT_COMMITTED);
+        }
+        old_page_prots.push(unsafe { *region_mut.prot_pages.add(idx) });
+    }
+    let old = old_page_prots[0];
+
+    for i in 0..page_count {
+        let idx = start_idx + i;
+        let prev = old_page_prots[i];
+        if prev == prot {
+            continue;
+        }
         unsafe { *region_mut.prot_pages.add(idx) = prot };
         let gpa = unsafe { *region_mut.phys_pages.add(idx) };
         if gpa != 0 {
             let va = region_mut.base + (idx as u64) * PAGE_SIZE_4K;
             if !vm_apply_page_prot(owner_pid, va, prot) {
+                // Roll back all pages already touched in this protect call.
+                for rb in 0..=i {
+                    let rb_idx = start_idx + rb;
+                    let rollback_prot = old_page_prots[rb];
+                    unsafe {
+                        *region_mut.prot_pages.add(rb_idx) = rollback_prot;
+                    }
+                    let rb_gpa = unsafe { *region_mut.phys_pages.add(rb_idx) };
+                    if rb_gpa != 0 {
+                        let rb_va = region_mut.base + (rb_idx as u64) * PAGE_SIZE_4K;
+                        let _ = vm_apply_page_prot(owner_pid, rb_va, rollback_prot);
+                    }
+                }
                 return Err(status::INVALID_PARAMETER);
             }
         }
@@ -371,43 +427,91 @@ pub(crate) fn vm_protect_range(
 }
 
 pub(crate) fn vm_query_region(owner_pid: u32, addr: u64) -> Option<VmQueryInfo> {
-    let (_, region) = vm_find_region(owner_pid, addr)?;
-    let idx = ((addr - region.base) / PAGE_SIZE_4K) as usize;
-    if idx >= region.page_count {
+    let page_addr = addr & !(PAGE_SIZE_4K - 1);
+    if page_addr < crate::process::USER_VA_BASE || page_addr >= crate::process::USER_VA_LIMIT {
         return None;
     }
 
-    let committed = vm_region_page_committed(&region, idx);
-    let prot = unsafe { *region.prot_pages.add(idx) };
-    let state = if committed { MEM_COMMIT } else { MEM_RESERVE };
-
-    let mut start = idx;
-    while start > 0 {
-        let prev = start - 1;
-        let prev_committed = vm_region_page_committed(&region, prev);
-        let prev_prot = unsafe { *region.prot_pages.add(prev) };
-        if prev_committed != committed || prev_prot != prot {
-            break;
+    if let Some((_, region)) = vm_find_region(owner_pid, page_addr) {
+        let idx = ((page_addr - region.base) / PAGE_SIZE_4K) as usize;
+        if idx >= region.page_count {
+            return None;
         }
-        start = prev;
+
+        let committed = vm_region_page_committed(&region, idx);
+        let prot = unsafe { *region.prot_pages.add(idx) };
+        let state = if committed { MEM_COMMIT } else { MEM_RESERVE };
+
+        let mut start = idx;
+        while start > 0 {
+            let prev = start - 1;
+            let prev_committed = vm_region_page_committed(&region, prev);
+            if prev_committed != committed {
+                break;
+            }
+            if committed {
+                let prev_prot = unsafe { *region.prot_pages.add(prev) };
+                if prev_prot != prot {
+                    break;
+                }
+            }
+            start = prev;
+        }
+
+        let mut end = idx + 1;
+        while end < region.page_count {
+            let next_committed = vm_region_page_committed(&region, end);
+            if next_committed != committed {
+                break;
+            }
+            if committed {
+                let next_prot = unsafe { *region.prot_pages.add(end) };
+                if next_prot != prot {
+                    break;
+                }
+            }
+            end += 1;
+        }
+
+        return Some(VmQueryInfo {
+            base: region.base + (start as u64) * PAGE_SIZE_4K,
+            size: ((end - start) as u64) * PAGE_SIZE_4K,
+            allocation_base: region.base,
+            allocation_prot: region.default_prot,
+            prot: if committed { prot } else { 0 },
+            state,
+            mem_type: vm_region_mem_type(&region),
+        });
     }
 
-    let mut end = idx + 1;
-    while end < region.page_count {
-        let next_committed = vm_region_page_committed(&region, end);
-        let next_prot = unsafe { *region.prot_pages.add(end) };
-        if next_committed != committed || next_prot != prot {
-            break;
+    let mut free_start = crate::process::USER_VA_BASE;
+    let mut free_end = crate::process::USER_VA_LIMIT;
+    regions_store_mut().for_each_live_ptr(|_, ptr| unsafe {
+        let r = *ptr;
+        if r.owner_pid != owner_pid {
+            return;
         }
-        end += 1;
+        let r_start = r.base;
+        let r_end = r.base.saturating_add(r.size);
+        if r_end <= page_addr && r_end > free_start {
+            free_start = align_up_4k(r_end);
+        }
+        if r_start > page_addr && r_start < free_end {
+            free_end = r_start;
+        }
+    });
+    if free_end <= free_start || page_addr < free_start || page_addr >= free_end {
+        return None;
     }
 
     Some(VmQueryInfo {
-        base: region.base + (start as u64) * PAGE_SIZE_4K,
-        size: ((end - start) as u64) * PAGE_SIZE_4K,
-        prot: if committed { prot } else { 0 },
-        state,
-        mem_type: vm_region_mem_type(&region),
+        base: free_start,
+        size: free_end - free_start,
+        allocation_base: 0,
+        allocation_prot: 0,
+        prot: 0,
+        state: MEM_FREE,
+        mem_type: 0,
     })
 }
 
@@ -424,24 +528,27 @@ pub(crate) fn vm_handle_page_fault(owner_pid: u32, fault_addr: u64, access: u8) 
         return false;
     }
 
-    let prot = vm_sanitize_nt_prot(unsafe { *region.prot_pages.add(idx) });
-    if access == VM_ACCESS_WRITE && vm_is_copy_on_write_prot(prot) {
-        let ptr = regions_store_mut().get_ptr(id);
-        if ptr.is_null() {
-            return false;
+    let ptr = regions_store_mut().get_ptr(id);
+    if ptr.is_null() {
+        return false;
+    }
+    let region_mut = unsafe { &mut *ptr };
+
+    let mut prot = vm_sanitize_nt_prot(unsafe { *region_mut.prot_pages.add(idx) });
+    if (prot & PAGE_GUARD) != 0 {
+        prot &= !PAGE_GUARD;
+        unsafe {
+            *region_mut.prot_pages.add(idx) = prot;
         }
-        let region_mut = unsafe { &mut *ptr };
+    }
+
+    if access == VM_ACCESS_WRITE && vm_is_copy_on_write_prot(prot) {
         return vm_handle_cow_fault(owner_pid, region_mut, idx, page_va, prot);
     }
     if !vm_access_allowed(prot, access) {
         return false;
     }
 
-    let ptr = regions_store_mut().get_ptr(id);
-    if ptr.is_null() {
-        return false;
-    }
-    let region_mut = unsafe { &mut *ptr };
     let gpa = unsafe { *region_mut.phys_pages.add(idx) };
     if gpa != 0 {
         return crate::process::with_process_mut(owner_pid, |p| {
@@ -471,6 +578,7 @@ pub(crate) fn vm_handle_page_fault(owner_pid: u32, fault_addr: u64, access: u8) 
         return false;
     }
 
+    vm_phys_page_add_ref(new_gpa);
     unsafe {
         *region_mut.phys_pages.add(idx) = new_gpa;
     }
@@ -864,10 +972,17 @@ fn vm_map_new_page(owner_pid: u32, region: &mut VmRegion, idx: usize, va: u64, p
         crate::mm::phys::free_pages(gpa, 1);
         return false;
     }
+    vm_phys_page_add_ref(gpa);
     unsafe {
         *region.phys_pages.add(idx) = gpa;
     }
     true
+}
+
+fn vm_unmap_page_only(owner_pid: u32, va: u64) {
+    let _ = crate::process::with_process_mut(owner_pid, |p| {
+        p.address_space.unmap_user_range(va, PAGE_SIZE_4K)
+    });
 }
 
 fn vm_unmap_free_page(owner_pid: u32, region: &VmRegion, idx: usize, va: u64) {
@@ -878,10 +993,8 @@ fn vm_unmap_free_page(owner_pid: u32, region: &VmRegion, idx: usize, va: u64) {
     if gpa == 0 {
         return;
     }
-    let _ = crate::process::with_process_mut(owner_pid, |p| {
-        p.address_space.unmap_user_range(va, PAGE_SIZE_4K)
-    });
-    crate::mm::phys::free_pages(gpa, 1);
+    vm_unmap_page_only(owner_pid, va);
+    vm_phys_page_release(gpa);
     unsafe {
         *(region.phys_pages.add(idx)) = 0;
     }
@@ -1006,9 +1119,10 @@ fn vm_handle_cow_fault(
         crate::mm::phys::free_pages(new_gpa, 1);
         return false;
     }
+    vm_phys_page_add_ref(new_gpa);
 
     if old_gpa != 0 {
-        crate::mm::phys::free_pages(old_gpa, 1);
+        vm_phys_page_release(old_gpa);
     }
     unsafe {
         *region.phys_pages.add(idx) = new_gpa;
@@ -1058,6 +1172,62 @@ fn vm_fill_section_page(region: &VmRegion, idx: usize, gpa: u64) -> bool {
         }
     }
     true
+}
+
+fn vm_phys_page_add_ref(gpa: u64) {
+    if gpa == 0 {
+        return;
+    }
+    let store = page_refs_store_mut();
+    let mut found = 0u32;
+    store.for_each_live_ptr(|id, ptr| unsafe {
+        if (*ptr).gpa == gpa {
+            found = id;
+        }
+    });
+    if found != 0 {
+        let ptr = store.get_ptr(found);
+        if !ptr.is_null() {
+            unsafe {
+                (*ptr).refs = (*ptr).refs.saturating_add(1);
+            }
+        }
+        return;
+    }
+    let _ = store.alloc_with(|_| PhysPageRef { gpa, refs: 1 });
+}
+
+fn vm_phys_page_release(gpa: u64) {
+    if gpa == 0 {
+        return;
+    }
+    let store = page_refs_store_mut();
+    let mut found = 0u32;
+    let mut refs = 0u32;
+    store.for_each_live_ptr(|id, ptr| unsafe {
+        if (*ptr).gpa == gpa {
+            found = id;
+            refs = (*ptr).refs;
+        }
+    });
+
+    if found == 0 {
+        crate::mm::phys::free_pages(gpa, 1);
+        return;
+    }
+
+    if refs > 1 {
+        let ptr = store.get_ptr(found);
+        if !ptr.is_null() {
+            unsafe {
+                (*ptr).refs = refs - 1;
+            }
+        }
+        return;
+    }
+
+    let _ = store.free(found);
+    crate::mm::phys::free_pages(gpa, 1);
 }
 
 fn vm_alloc_zeroed_array<T>(count: usize) -> Option<*mut T> {
