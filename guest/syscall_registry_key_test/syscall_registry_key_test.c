@@ -37,10 +37,12 @@ typedef struct {
 #define STATUS_INVALID_HANDLE 0xC0000008U
 #define STATUS_INVALID_PARAMETER 0xC000000DU
 #define STATUS_BUFFER_TOO_SMALL 0xC0000023U
+#define STATUS_INFO_LENGTH_MISMATCH 0xC0000004U
 
 #define KEY_BASIC_INFORMATION_CLASS 0U
 #define KEY_FULL_INFORMATION_CLASS 2U
 #define KEY_NAME_INFORMATION_CLASS 3U
+#define OBJECT_NAME_INFORMATION_CLASS 1U
 
 #define REG_DWORD 4U
 #define OBJ_CASE_INSENSITIVE 0x40U
@@ -59,6 +61,8 @@ __declspec(dllimport) NTSTATUS NtSetValueKey(
 __declspec(dllimport) NTSTATUS NtQueryKey(
     HANDLE key_handle, ULONG key_information_class, void* key_information,
     ULONG length, ULONG* result_length);
+__declspec(dllimport) NTSTATUS NtQueryObject(
+    HANDLE handle, ULONG object_info_class, void* object_info, ULONG object_info_len, ULONG* ret_len);
 __declspec(dllimport) NTSTATUS NtClose(HANDLE handle);
 
 static uint32_t g_pass = 0;
@@ -233,6 +237,24 @@ void mainCRTStartup(void) {
         check("KeyFullInformation values >= 1", values >= 1);
         check("KeyFullInformation max value data >= 4", max_value_data >= 4);
     }
+
+    ret_len = 0;
+    st = NtQueryObject(parent_key, OBJECT_NAME_INFORMATION_CLASS, key_info, (ULONG)sizeof(key_info), &ret_len);
+    check("NtQueryObject(key, ObjectNameInformation) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    if (st == STATUS_SUCCESS && ret_len >= 16) {
+        USHORT name_len = *(USHORT*)(key_info + 0);
+        uint64_t name_ptr = *(uint64_t*)(key_info + 8);
+        check("ObjectNameInformation(key) name length is non-zero", name_len != 0);
+        check("ObjectNameInformation(key) buffer pointer is non-zero", name_ptr != 0);
+        check("ObjectNameInformation(key) ends with WinEmuQueryKeyTest",
+              utf16_ends_with_ascii((const WCHAR*)(key_info + 16), (ULONG)name_len, "WinEmuQueryKeyTest"));
+    }
+
+    ret_len = 0;
+    st = NtQueryObject(parent_key, OBJECT_NAME_INFORMATION_CLASS, short_buf, (ULONG)sizeof(short_buf), &ret_len);
+    check("NtQueryObject(ObjectNameInformation, short) returns STATUS_INFO_LENGTH_MISMATCH",
+          st == STATUS_INFO_LENGTH_MISMATCH);
+    check("NtQueryObject(ObjectNameInformation, short) reports required length > 16", ret_len > 16);
 
     st = NtQueryKey((HANDLE)(uint64_t)0x7fffffffULL, KEY_BASIC_INFORMATION_CLASS, key_info, (ULONG)sizeof(key_info), &ret_len);
     check("NtQueryKey(invalid handle) returns STATUS_INVALID_HANDLE", st == STATUS_INVALID_HANDLE);

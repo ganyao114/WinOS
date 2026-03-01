@@ -37,10 +37,12 @@ typedef struct {
 #define STATUS_INVALID_PARAMETER 0xC000000DU
 #define STATUS_OBJECT_NAME_COLLISION 0xC0000035U
 #define STATUS_OBJECT_NAME_NOT_FOUND 0xC0000034U
+#define STATUS_INFO_LENGTH_MISMATCH 0xC0000004U
 
 #define PAGE_READWRITE 0x04U
 #define SEC_COMMIT 0x08000000U
 #define OBJ_CASE_INSENSITIVE 0x40U
+#define OBJECT_NAME_INFORMATION_CLASS 1U
 
 __declspec(dllimport) NTSTATUS NtWriteFile(
     HANDLE file, HANDLE event, void* apc_routine, void* apc_ctx,
@@ -52,6 +54,8 @@ __declspec(dllimport) NTSTATUS NtCreateSection(
     uint64_t* max_size, ULONG page_prot, ULONG alloc_attrs, HANDLE file_handle);
 __declspec(dllimport) NTSTATUS NtOpenSection(
     HANDLE* section_handle, ULONG desired_access, OBJECT_ATTRIBUTES* object_attributes);
+__declspec(dllimport) NTSTATUS NtQueryObject(
+    HANDLE handle, ULONG object_info_class, void* object_info, ULONG object_info_len, ULONG* ret_len);
 __declspec(dllimport) NTSTATUS NtClose(HANDLE handle);
 
 static uint32_t g_pass = 0;
@@ -121,12 +125,46 @@ static void init_oa(OBJECT_ATTRIBUTES* oa, UNICODE_STRING* name, HANDLE root) {
     oa->SecurityQualityOfService = 0;
 }
 
+static WCHAR wchar_lower_ascii(WCHAR ch) {
+    if (ch >= (WCHAR)'A' && ch <= (WCHAR)'Z') {
+        return (WCHAR)(ch + ((WCHAR)'a' - (WCHAR)'A'));
+    }
+    return ch;
+}
+
+static int utf16_ends_with_ascii_ci(const WCHAR* wstr, ULONG wbytes, const char* ascii) {
+    ULONG count = wbytes / 2;
+    ULONG ascii_len = 0;
+    while (ascii[ascii_len]) {
+        ascii_len++;
+    }
+    if (count < ascii_len) {
+        return 0;
+    }
+    ULONG i = 0;
+    ULONG start = count - ascii_len;
+    for (; i < ascii_len; i++) {
+        WCHAR wc = wchar_lower_ascii(wstr[start + i]);
+        char ac = ascii[i];
+        if (ac >= 'A' && ac <= 'Z') {
+            ac = (char)(ac + ('a' - 'A'));
+        }
+        if (wc != (WCHAR)ac) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 void mainCRTStartup(void) {
     NTSTATUS st;
     HANDLE section_a = 0;
     HANDLE section_b = 0;
     HANDLE section_c = 0;
+    ULONG ret_len = 0;
     uint64_t section_size = 0x2000;
+    uint8_t obj_name_info[256];
+    uint8_t short_obj_name_info[8];
     WCHAR named_buf[96];
     WCHAR missing_buf[96];
     UNICODE_STRING named_name;
@@ -146,6 +184,24 @@ void mainCRTStartup(void) {
     st = NtOpenSection(&section_b, 0, &named_oa);
     check("NtOpenSection(existing name) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     check("NtOpenSection(existing name) returns non-zero handle", section_b != 0);
+
+    ret_len = 0;
+    st = NtQueryObject(section_a, OBJECT_NAME_INFORMATION_CLASS, obj_name_info, (ULONG)sizeof(obj_name_info), &ret_len);
+    check("NtQueryObject(section, ObjectNameInformation) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    if (st == STATUS_SUCCESS && ret_len >= 16) {
+        USHORT name_len = *(USHORT*)(obj_name_info + 0);
+        uint64_t name_ptr = *(uint64_t*)(obj_name_info + 8);
+        check("ObjectNameInformation(section) name length is non-zero", name_len != 0);
+        check("ObjectNameInformation(section) buffer pointer is non-zero", name_ptr != 0);
+        check("ObjectNameInformation(section) ends with WinEmuOpenSectionTest",
+              utf16_ends_with_ascii_ci((const WCHAR*)(obj_name_info + 16), (ULONG)name_len, "WinEmuOpenSectionTest"));
+    }
+
+    ret_len = 0;
+    st = NtQueryObject(section_a, OBJECT_NAME_INFORMATION_CLASS, short_obj_name_info, (ULONG)sizeof(short_obj_name_info), &ret_len);
+    check("NtQueryObject(ObjectNameInformation, short) returns STATUS_INFO_LENGTH_MISMATCH",
+          st == STATUS_INFO_LENGTH_MISMATCH);
+    check("NtQueryObject(ObjectNameInformation, short) reports required length > 16", ret_len > 16);
 
     section_c = 0;
     st = NtCreateSection(&section_c, 0, &named_oa, &section_size, PAGE_READWRITE, SEC_COMMIT, 0);

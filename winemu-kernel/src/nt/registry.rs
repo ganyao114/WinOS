@@ -223,6 +223,28 @@ pub(crate) fn close_key_idx(idx: u32) -> bool {
     state.handles.free(idx)
 }
 
+pub(crate) fn key_name_utf16(idx: u32) -> Option<Vec<u16>> {
+    let state = ensure_state();
+    let ptr = state.handles.get_ptr(idx);
+    if ptr.is_null() {
+        return None;
+    }
+    let node = unsafe { &*ptr };
+    let full_name = RegistryKey::get_full_path(node);
+    if full_name.is_empty() {
+        return None;
+    }
+    let mut out = Vec::<u16>::new();
+    let units = full_name.encode_utf16().count();
+    if out.try_reserve(units).is_err() {
+        return None;
+    }
+    for ch in full_name.encode_utf16() {
+        out.push(ch);
+    }
+    Some(out)
+}
+
 pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
     let state = ensure_state();
     let out_ptr = frame.x[0] as *mut u64;

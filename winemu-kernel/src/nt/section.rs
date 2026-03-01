@@ -344,3 +344,33 @@ pub(crate) fn close_section_idx(idx: u32) {
     named_section_remove_by_section(idx);
     section_free(idx);
 }
+
+pub(crate) fn section_name_utf16(section_idx: u32) -> Option<Vec<u16>> {
+    if section_idx == 0 {
+        return None;
+    }
+    named_section_gc_stale();
+    let store = named_sections_mut();
+    let mut out = None;
+    store.for_each_live_ptr(|_id, ptr| unsafe {
+        let entry = &*ptr;
+        if entry.section_idx != section_idx {
+            return;
+        }
+        let len = entry.name_len as usize;
+        if len == 0 || len > MAX_SECTION_NAME {
+            return;
+        }
+        let mut name = Vec::<u16>::new();
+        if name.try_reserve(len).is_err() {
+            return;
+        }
+        let mut i = 0usize;
+        while i < len {
+            name.push(entry.name[i] as u16);
+            i += 1;
+        }
+        out = Some(name);
+    });
+    out
+}

@@ -68,6 +68,11 @@
 
 范围：逐步接入命名对象、安全描述符、访问映射等扩展接口。
 
+- [x] `KObjectOps` 增加对象类型元数据（`valid_access_mask` / `security_required` / `maintain_handle_count`）。
+- [x] `NtQueryObject(ObjectTypeInformation)` 改为读取 `kobject` 元数据填充访问与安全字段。
+- [x] `KObjectOps` 增加命名查询入口（`query_name_utf16`），`NtQueryObject(ObjectNameInformation)` 改为按对象类型分发。
+- [x] 首批命名对象接入：`Key` / `Section`。
+
 ## 5. 风险与控制
 
 - 风险：`Wait` 路径语义微妙，误改容易导致死锁/饥饿。

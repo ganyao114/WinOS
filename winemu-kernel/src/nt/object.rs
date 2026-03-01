@@ -29,7 +29,7 @@ pub(crate) fn handle_query_object(frame: &mut SvcFrame) {
             frame.x[0] = query_object_basic(handle, buf, len, ret_len) as u64;
         }
         OBJECT_INFORMATION_CLASS_NAME => {
-            frame.x[0] = query_object_name(buf, len, ret_len) as u64;
+            frame.x[0] = query_object_name(handle, buf, len, ret_len) as u64;
         }
         OBJECT_INFORMATION_CLASS_TYPE => {
             frame.x[0] = query_object_type(handle, buf, len, ret_len) as u64;
@@ -112,16 +112,44 @@ fn query_object_basic(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) 
     status::SUCCESS
 }
 
-fn query_object_name(buf: *mut u8, len: usize, ret_len: *mut u32) -> u32 {
-    if buf.is_null() || len < OBJECT_NAME_INFORMATION_SIZE {
-        write_ret_len(ret_len, OBJECT_NAME_INFORMATION_SIZE as u32);
+fn query_object_name(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -> u32 {
+    let Some((htype, obj_idx)) = kobject::resolve_handle_target(handle) else {
+        return status::INVALID_HANDLE;
+    };
+    let name_utf16 = kobject::object_name_utf16(htype, obj_idx);
+    let name_len_bytes = name_utf16
+        .as_ref()
+        .map(|n| n.len().saturating_mul(size_of::<u16>()))
+        .unwrap_or(0);
+    let Some(required) = OBJECT_NAME_INFORMATION_SIZE.checked_add(name_len_bytes) else {
+        return status::INVALID_PARAMETER;
+    };
+
+    if buf.is_null() || len < required {
+        write_ret_len(ret_len, required as u32);
         return status::INFO_LENGTH_MISMATCH;
     }
 
     unsafe {
-        core::ptr::write_bytes(buf, 0, OBJECT_NAME_INFORMATION_SIZE);
+        core::ptr::write_bytes(buf, 0, required);
+
+        let uni_len = core::cmp::min(name_len_bytes, u16::MAX as usize) as u16;
+        (buf as *mut u16).write_volatile(uni_len);
+        (buf.add(2) as *mut u16).write_volatile(uni_len);
+
+        if name_len_bytes != 0 {
+            let name_ptr = buf.add(OBJECT_NAME_INFORMATION_SIZE);
+            (buf.add(8) as *mut u64).write_volatile(name_ptr as u64);
+            if let Some(name) = name_utf16.as_ref() {
+                let mut i = 0usize;
+                while i < name.len() {
+                    (name_ptr.add(i * 2) as *mut u16).write_volatile(name[i]);
+                    i += 1;
+                }
+            }
+        }
     }
-    write_ret_len(ret_len, OBJECT_NAME_INFORMATION_SIZE as u32);
+    write_ret_len(ret_len, required as u32);
     status::SUCCESS
 }
 
@@ -148,6 +176,7 @@ fn query_object_type(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -
     let type_stats = kobject::object_type_stats(htype);
     let total_objects = type_stats.object_count.max(1);
     let total_handles = type_stats.handle_count.max(refs);
+    let type_meta = kobject::object_type_meta(htype).unwrap_or_default();
     let name_ptr = unsafe { buf.add(OBJECT_TYPE_INFORMATION_SIZE) };
     let name_addr = name_ptr as u64;
 
@@ -163,7 +192,13 @@ fn query_object_type(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -
         (buf.add(40) as *mut u32).write_volatile(total_objects);
         (buf.add(44) as *mut u32).write_volatile(total_handles);
 
-        (buf.add(84) as *mut u32).write_volatile(0x001F_FFFF);
+        (buf.add(84) as *mut u32).write_volatile(type_meta.valid_access_mask);
+        (buf.add(88) as *mut u8).write_volatile(if type_meta.security_required { 1 } else { 0 });
+        (buf.add(89) as *mut u8).write_volatile(if type_meta.maintain_handle_count {
+            1
+        } else {
+            0
+        });
         (buf.add(90) as *mut u8).write_volatile(htype as u8);
 
         let mut i = 0usize;
