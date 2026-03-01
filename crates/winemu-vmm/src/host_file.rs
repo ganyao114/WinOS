@@ -19,6 +19,7 @@ struct HostFile {
     file: File,
     #[allow(dead_code)]
     path: PathBuf,
+    dir_cursor: usize,
 }
 
 pub struct HostFileTable {
@@ -79,6 +80,7 @@ impl HostFileTable {
                     HostFile {
                         file,
                         path: path.to_path_buf(),
+                        dir_cursor: 0,
                     },
                 );
                 fd
@@ -112,6 +114,7 @@ impl HostFileTable {
                     HostFile {
                         file,
                         path: host_path,
+                        dir_cursor: 0,
                     },
                 );
                 fd
@@ -199,6 +202,70 @@ impl HostFileTable {
             Some(hf) => hf.file.metadata().map(|m| m.len()).unwrap_or(0),
             None => 0,
         }
+    }
+
+    /// Read next directory entry name.
+    ///
+    /// Return value:
+    /// - 0: no more files
+    /// - u64::MAX: invalid fd / not a directory / error
+    /// - otherwise: bit63=is_dir, low32=name_len(bytes copied to `buf`)
+    pub fn readdir(&self, fd: u64, buf: &mut [u8], restart: bool) -> u64 {
+        const FLAG_IS_DIR: u64 = 1u64 << 63;
+
+        if fd <= 2 || buf.is_empty() {
+            return u64::MAX;
+        }
+
+        let mut files = self.files.lock().unwrap();
+        let hf = match files.get_mut(&fd) {
+            Some(v) => v,
+            None => return u64::MAX,
+        };
+
+        match hf.file.metadata() {
+            Ok(meta) if meta.is_dir() => {}
+            _ => return u64::MAX,
+        }
+
+        if restart {
+            hf.dir_cursor = 0;
+        }
+
+        let mut entries: Vec<(String, bool)> = Vec::new();
+        let iter = match std::fs::read_dir(&hf.path) {
+            Ok(v) => v,
+            Err(_) => return u64::MAX,
+        };
+        for item in iter {
+            let Ok(entry) = item else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.is_empty() {
+                continue;
+            }
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            entries.push((name, is_dir));
+        }
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        if hf.dir_cursor >= entries.len() {
+            return 0;
+        }
+
+        let (name, is_dir) = &entries[hf.dir_cursor];
+        hf.dir_cursor += 1;
+
+        let name_bytes = name.as_bytes();
+        let copied = name_bytes.len().min(buf.len());
+        buf[..copied].copy_from_slice(&name_bytes[..copied]);
+
+        let mut ret = copied as u64;
+        if *is_dir {
+            ret |= FLAG_IS_DIR;
+        }
+        ret
     }
 
     /// Get the raw fd for mmap. Returns None if not found.

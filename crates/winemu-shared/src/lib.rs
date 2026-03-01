@@ -156,6 +156,13 @@ pub mod nr {
     /// 查询系统墙钟时间（NT epoch 1601 起的 100ns）
     /// args: [0, 0, 0, 0, 0, 0] → system_time_100ns
     pub const QUERY_SYSTEM_TIME: u64 = 0x0819;
+    /// 枚举目录下一项（按 host 端游标）
+    /// args: [host_fd, dst_gpa, dst_len, restart(0/1), 0, 0]
+    /// 返回:
+    ///   - 0: no more files
+    ///   - u64::MAX: invalid / not a directory
+    ///   - 其他: bit63=is_dir, low32=name_len
+    pub const HOST_READDIR: u64 = 0x081A;
 }
 
 /// NT 超时常量（100ns 单位）

@@ -130,6 +130,23 @@ pub fn host_stat(fd: u64) -> u64 {
     hypercall(nr::HOST_STAT, fd, 0, 0)
 }
 
+/// HOST_READDIR — 读取目录下一项名称
+/// 返回:
+/// - 0: no more files
+/// - u64::MAX: invalid / not directory
+/// - 其他: bit63=is_dir, low32=name_len
+pub fn host_readdir(fd: u64, dst: *mut u8, len: usize, restart: bool) -> u64 {
+    hypercall6(
+        nr::HOST_READDIR,
+        fd,
+        dst as u64,
+        len as u64,
+        restart as u64,
+        0,
+        0,
+    )
+}
+
 /// HOST_MMAP — 映射宿主文件到 guest 地址空间
 /// 返回映射基址（失败返回 0）
 pub fn host_mmap(fd: u64, offset: u64, size: u64, prot: u32) -> u64 {

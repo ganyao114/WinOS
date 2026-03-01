@@ -630,6 +630,27 @@ impl HypercallManager {
                 let size = self.host_files.stat(args[0]);
                 HypercallResult::Sync(size)
             }
+            nr::HOST_READDIR => {
+                // args: [host_fd, dst_gpa, dst_len, restart, 0, 0]
+                let fd = args[0];
+                let dst_gpa = args[1];
+                let len = args[2] as usize;
+                let restart = args[3] != 0;
+                if len == 0 || len > 4096 {
+                    return HypercallResult::Sync(u64::MAX);
+                }
+                let mut buf = vec![0u8; len];
+                let ret = self.host_files.readdir(fd, &mut buf, restart);
+                if ret != 0 && ret != u64::MAX {
+                    let copied = (ret & 0xFFFF_FFFF) as usize;
+                    if copied != 0 {
+                        let copied = copied.min(len);
+                        let mut mem = self.memory.write().unwrap();
+                        mem.write_bytes(winemu_core::addr::Gpa(dst_gpa), &buf[..copied]);
+                    }
+                }
+                HypercallResult::Sync(ret)
+            }
             nr::HOST_MMAP => {
                 // args: [host_fd, offset, size, prot, 0, 0] → gpa (0 on failure)
                 // Simple implementation: read file contents into guest memory
