@@ -116,3 +116,13 @@ pub fn fault_address_read() -> u64 {
 pub fn wait_for_interrupt() {
     wfi();
 }
+
+#[inline(always)]
+pub fn irq_enable() {
+    daifclr_irq();
+}
+
+#[inline(always)]
+pub fn irq_disable() {
+    daifset_irq();
+}

@@ -6,6 +6,8 @@ pub trait CpuBackend {
     fn fault_syndrome_read() -> u64;
     fn fault_address_read() -> u64;
     fn wait_for_interrupt();
+    fn irq_enable();
+    fn irq_disable();
 }
 
 pub trait MmuBackend {

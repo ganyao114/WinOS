@@ -3,6 +3,8 @@ use crate::nt::constants::PAGE_SIZE_4K;
 const PAGE_TABLE_ENTRIES: usize = 512;
 
 const PAGE_MASK_4K: u64 = !(PAGE_SIZE_4K - 1);
+const L1_BLOCK_SIZE: u64 = 1024 * 1024 * 1024;
+const L1_BLOCK_MASK: u64 = !(L1_BLOCK_SIZE - 1);
 const L2_BLOCK_SIZE: u64 = 2 * 1024 * 1024;
 const L2_BLOCK_MASK: u64 = !(L2_BLOCK_SIZE - 1);
 
@@ -49,6 +51,59 @@ impl ProcessAddressSpace {
 
     pub fn ttbr0(&self) -> u64 {
         self.ttbr0
+    }
+
+    pub fn translate_user_va_for_access(&self, va: u64, access: u8) -> Option<u64> {
+        if !is_user_accessible_va(va) {
+            return None;
+        }
+
+        let l0e = unsafe { *self.l0.add(l0_index(va)) };
+        if (l0e & DESC_TYPE_MASK) != DESC_TABLE_OR_PAGE {
+            return None;
+        }
+        let l1 = (l0e & TABLE_ADDR_MASK) as *const u64;
+        if l1.is_null() {
+            return None;
+        }
+
+        let l1e = unsafe { *l1.add(l1_index(va)) };
+        let l1_kind = l1e & DESC_TYPE_MASK;
+        if l1_kind == DESC_INVALID {
+            return None;
+        }
+        if l1_kind == DESC_BLOCK {
+            return translate_from_desc(l1e, va, L1_BLOCK_MASK, L1_BLOCK_SIZE, access);
+        }
+        if l1_kind != DESC_TABLE_OR_PAGE {
+            return None;
+        }
+
+        let l2 = (l1e & TABLE_ADDR_MASK) as *const u64;
+        if l2.is_null() {
+            return None;
+        }
+        let l2e = unsafe { *l2.add(l2_index(va)) };
+        let l2_kind = l2e & DESC_TYPE_MASK;
+        if l2_kind == DESC_INVALID {
+            return None;
+        }
+        if l2_kind == DESC_BLOCK {
+            return translate_from_desc(l2e, va, L2_BLOCK_MASK, L2_BLOCK_SIZE, access);
+        }
+        if l2_kind != DESC_TABLE_OR_PAGE {
+            return None;
+        }
+
+        let l3 = (l2e & TABLE_ADDR_MASK) as *const u64;
+        if l3.is_null() {
+            return None;
+        }
+        let l3e = unsafe { *l3.add(l3_index(va)) };
+        if (l3e & DESC_TYPE_MASK) != DESC_TABLE_OR_PAGE {
+            return None;
+        }
+        translate_from_desc(l3e, va, TABLE_ADDR_MASK, PAGE_SIZE_4K, access)
     }
 
     pub fn map_user_range(&mut self, base: u64, gpa_base: u64, size: u64, prot: u32) -> bool {
@@ -360,6 +415,10 @@ fn is_valid_user_va(va: u64) -> bool {
     va >= USER_VA_BASE && va < USER_VA_LIMIT
 }
 
+fn is_user_accessible_va(va: u64) -> bool {
+    va < USER_VA_LIMIT
+}
+
 fn is_valid_user_range(base: u64, size: u64) -> bool {
     if size == 0 || !is_page_aligned(base) || !is_page_aligned(size) {
         return false;
@@ -381,6 +440,14 @@ fn l3_index(va: u64) -> usize {
     ((va >> 12) & 0x1FF) as usize
 }
 
+fn l0_index(va: u64) -> usize {
+    ((va >> 39) & 0x1FF) as usize
+}
+
+fn l1_index(va: u64) -> usize {
+    ((va >> 30) & 0x1FF) as usize
+}
+
 fn l2_entry_in_user_window(idx: usize) -> bool {
     let start = l2_index(USER_VA_BASE);
     let end = l2_index(USER_VA_LIMIT - 1);
@@ -398,6 +465,27 @@ fn decode_nt_prot(prot: u32) -> (bool, bool, bool) {
         0x40 | 0x80 => (true, false, true), // W^X: downgrade RWX to RX
         _ => (true, true, false),
     }
+}
+
+fn desc_user_perms(desc: u64) -> (bool, bool) {
+    match (desc >> 6) & 0b11 {
+        0b01 => (true, true),
+        0b11 => (true, false),
+        _ => (false, false),
+    }
+}
+
+fn translate_from_desc(desc: u64, va: u64, base_mask: u64, span: u64, access: u8) -> Option<u64> {
+    let (readable, writable) = desc_user_perms(desc);
+    if access == crate::nt::state::VM_ACCESS_READ && !readable {
+        return None;
+    }
+    if access == crate::nt::state::VM_ACCESS_WRITE && !writable {
+        return None;
+    }
+    let base = desc & base_mask;
+    let offset = va & (span - 1);
+    base.checked_add(offset)
 }
 
 fn build_user_pte(pa: u64, prot: u32) -> u64 {

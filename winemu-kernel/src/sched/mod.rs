@@ -44,6 +44,7 @@ pub enum ThreadState {
     Running = 2,
     Waiting = 3,
     Terminated = 4,
+    Suspended = 5,
 }
 
 // ── EL0 寄存器上下文 ──────────────────────────────────────────
@@ -65,6 +66,7 @@ pub struct KThread {
     pub state: ThreadState,
     pub priority: u8, // NT priority 0–31 (31 = highest)
     pub base_priority: u8,
+    pub suspend_count: u8,
     pub tid: u32,
     pub pid: u32,
     pub teb_va: u64,
@@ -100,6 +102,7 @@ impl KThread {
             state: ThreadState::Free,
             priority: 8,
             base_priority: 8,
+            suspend_count: 0,
             tid: 0,
             pid: 0,
             teb_va: 0,
@@ -144,6 +147,7 @@ impl KThread {
         self.state = ThreadState::Free;
         self.priority = priority;
         self.base_priority = priority;
+        self.suspend_count = 0;
         self.tid = tid;
         self.pid = pid;
         self.teb_va = teb_va;
@@ -162,6 +166,7 @@ impl KThread {
         self.state = ThreadState::Running;
         self.priority = 8;
         self.base_priority = 8;
+        self.suspend_count = 0;
         self.tid = tid;
         self.pid = pid;
         self.teb_va = teb_va;
@@ -1103,7 +1108,12 @@ pub fn wake(tid: u32, result: u32) {
         // Resume point for blocked NtWait* should return wake result in x0.
         t.ctx.x[0] = result as u64;
     });
-    set_thread_state_locked(tid, ThreadState::Ready);
+    let suspended = with_thread(tid, |t| t.suspend_count != 0);
+    if suspended {
+        set_thread_state_locked(tid, ThreadState::Suspended);
+    } else {
+        set_thread_state_locked(tid, ThreadState::Ready);
+    }
     sched_lock_release();
 }
 
@@ -1209,7 +1219,12 @@ pub fn check_timeouts(now_ticks: u64) -> bool {
             t.wait_handles.fill(0);
             t.ctx.x[0] = timeout_result as u64;
         });
-        set_thread_state_locked(tid, ThreadState::Ready);
+        let suspended = with_thread(tid, |t| t.suspend_count != 0);
+        if suspended {
+            set_thread_state_locked(tid, ThreadState::Suspended);
+        } else {
+            set_thread_state_locked(tid, ThreadState::Ready);
+        }
         woke_any = true;
     };
 
@@ -1371,6 +1386,77 @@ pub fn resolve_thread_tid_from_handle(thread_handle: u64) -> Option<u32> {
         return None;
     }
     Some(tid)
+}
+
+pub fn suspend_thread_by_tid(tid: u32) -> Result<u32, u32> {
+    if tid == 0 || !thread_exists(tid) {
+        return Err(status::INVALID_HANDLE);
+    }
+
+    sched_lock_acquire();
+    let (state, prev_count) = with_thread(tid, |t| (t.state, t.suspend_count));
+    if state == ThreadState::Free || state == ThreadState::Terminated {
+        sched_lock_release();
+        return Err(status::INVALID_HANDLE);
+    }
+    if prev_count == u8::MAX {
+        sched_lock_release();
+        return Err(status::INVALID_PARAMETER);
+    }
+
+    with_thread_mut(tid, |t| {
+        t.suspend_count = t.suspend_count.saturating_add(1);
+    });
+    if prev_count == 0 {
+        match state {
+            ThreadState::Running | ThreadState::Ready => {
+                set_thread_state_locked(tid, ThreadState::Suspended);
+            }
+            _ => {}
+        }
+    }
+
+    sched_lock_release();
+    Ok(prev_count as u32)
+}
+
+pub fn suspend_thread_by_handle(thread_handle: u64) -> Result<u32, u32> {
+    let Some(tid) = resolve_thread_tid_from_handle(thread_handle) else {
+        return Err(status::INVALID_HANDLE);
+    };
+    suspend_thread_by_tid(tid)
+}
+
+pub fn resume_thread_by_tid(tid: u32) -> Result<u32, u32> {
+    if tid == 0 || !thread_exists(tid) {
+        return Err(status::INVALID_HANDLE);
+    }
+
+    sched_lock_acquire();
+    let (state, prev_count) = with_thread(tid, |t| (t.state, t.suspend_count));
+    if state == ThreadState::Free || state == ThreadState::Terminated {
+        sched_lock_release();
+        return Err(status::INVALID_HANDLE);
+    }
+
+    if prev_count != 0 {
+        with_thread_mut(tid, |t| {
+            t.suspend_count -= 1;
+        });
+        if prev_count == 1 && state == ThreadState::Suspended {
+            set_thread_state_locked(tid, ThreadState::Ready);
+        }
+    }
+
+    sched_lock_release();
+    Ok(prev_count as u32)
+}
+
+pub fn resume_thread_by_handle(thread_handle: u64) -> Result<u32, u32> {
+    let Some(tid) = resolve_thread_tid_from_handle(thread_handle) else {
+        return Err(status::INVALID_HANDLE);
+    };
+    resume_thread_by_tid(tid)
 }
 
 pub fn set_thread_base_priority_by_handle(thread_handle: u64, new_priority: i32) -> u32 {

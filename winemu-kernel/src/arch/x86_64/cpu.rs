@@ -27,3 +27,13 @@ pub fn fault_address_read() -> u64 {
 pub fn wait_for_interrupt() {
     unsupported()
 }
+
+#[inline(always)]
+pub fn irq_enable() {
+    unsupported()
+}
+
+#[inline(always)]
+pub fn irq_disable() {
+    unsupported()
+}

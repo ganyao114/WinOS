@@ -30,6 +30,7 @@
 #define NR_CREATE_KEY           0x001D
 #define NR_SET_VALUE_KEY        0x003D
 #define NR_QUERY_INFORMATION_PROCESS 0x0019
+#define NR_QUERY_INFORMATION_THREAD 0x0025
 #define NR_SET_INFORMATION_PROCESS 0x001C
 #define NR_QUERY_INFORMATION_TOKEN 0x0021
 #define NR_QUERY_OBJECT         0x0017
@@ -54,6 +55,8 @@
 #define NR_MAP_VIEW_OF_SECTION  0x0028
 #define NR_UNMAP_VIEW_OF_SECTION 0x002A
 #define NR_CREATE_THREAD_EX     0x00C1
+#define NR_RESUME_THREAD        0x0052
+#define NR_SUSPEND_THREAD       0x01CC
 #define NR_DELETE_VALUE_KEY     0x006A
 
 typedef uint32_t NTSTATUS;
@@ -715,6 +718,37 @@ EXPORT NTSTATUS NtCreateThreadEx(
         "svc #0\n"
         "ret\n"
         :: "i"(NR_CREATE_THREAD_EX));
+}
+
+EXPORT NTSTATUS NtSuspendThread(HANDLE thread_handle, ULONG* previous_suspend_count) {
+    return syscall2(
+        NR_SUSPEND_THREAD,
+        (uint64_t)thread_handle,
+        (uint64_t)previous_suspend_count
+    );
+}
+
+EXPORT NTSTATUS NtResumeThread(HANDLE thread_handle, ULONG* previous_suspend_count) {
+    return syscall2(
+        NR_RESUME_THREAD,
+        (uint64_t)thread_handle,
+        (uint64_t)previous_suspend_count
+    );
+}
+
+EXPORT NTSTATUS NtQueryInformationThread(
+    HANDLE thread_handle, ULONG thread_information_class, void* thread_information,
+    ULONG thread_information_length, ULONG* return_length)
+{
+    return syscall6(
+        NR_QUERY_INFORMATION_THREAD,
+        (uint64_t)thread_handle,
+        (uint64_t)thread_information_class,
+        (uint64_t)thread_information,
+        (uint64_t)thread_information_length,
+        (uint64_t)return_length,
+        0
+    );
 }
 
 /* ── Registry ────────────────────────────────────────────────── */

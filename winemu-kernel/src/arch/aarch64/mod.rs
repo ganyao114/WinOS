@@ -33,6 +33,16 @@ impl super::contract::CpuBackend for ArchBackend {
     fn wait_for_interrupt() {
         cpu::wait_for_interrupt();
     }
+
+    #[inline(always)]
+    fn irq_enable() {
+        cpu::irq_enable();
+    }
+
+    #[inline(always)]
+    fn irq_disable() {
+        cpu::irq_disable();
+    }
 }
 
 impl super::contract::MmuBackend for ArchBackend {

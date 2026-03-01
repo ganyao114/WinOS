@@ -3,8 +3,8 @@ use crate::sched::sync::{
 };
 use crate::sched::{
     create_user_thread, current_tid, resolve_thread_tid_from_handle,
-    set_thread_base_priority_by_handle, terminate_current_thread, terminate_thread_by_tid,
-    thread_basic_info, CreateThreadError,
+    resume_thread_by_handle, set_thread_base_priority_by_handle, suspend_thread_by_handle,
+    terminate_current_thread, terminate_thread_by_tid, thread_basic_info, CreateThreadError,
 };
 use winemu_shared::status;
 
@@ -136,4 +136,34 @@ pub(crate) fn handle_terminate_thread(frame: &mut SvcFrame) {
     terminate_current_thread();
     thread_notify_terminated(cur);
     frame.x[0] = STATUS_SUCCESS as u64;
+}
+
+// x0=ThreadHandle, x1=*PreviousSuspendCount(opt)
+pub(crate) fn handle_suspend_thread(frame: &mut SvcFrame) {
+    let thread_handle = frame.x[0];
+    let prev_ptr = frame.x[1] as *mut u32;
+    match suspend_thread_by_handle(thread_handle) {
+        Ok(prev) => {
+            if !prev_ptr.is_null() {
+                unsafe { prev_ptr.write_volatile(prev) };
+            }
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        Err(st) => frame.x[0] = st as u64,
+    }
+}
+
+// x0=ThreadHandle, x1=*PreviousSuspendCount(opt)
+pub(crate) fn handle_resume_thread(frame: &mut SvcFrame) {
+    let thread_handle = frame.x[0];
+    let prev_ptr = frame.x[1] as *mut u32;
+    match resume_thread_by_handle(thread_handle) {
+        Ok(prev) => {
+            if !prev_ptr.is_null() {
+                unsafe { prev_ptr.write_volatile(prev) };
+            }
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        Err(st) => frame.x[0] = st as u64,
+    }
 }

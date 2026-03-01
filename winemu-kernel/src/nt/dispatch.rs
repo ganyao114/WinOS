@@ -93,6 +93,8 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         sysno::QUERY_INFORMATION_THREAD => thread::handle_query_information_thread(frame),
         sysno::SET_INFORMATION_THREAD => thread::handle_set_information_thread(frame),
         sysno::CREATE_THREAD_EX => thread::handle_create_thread(frame),
+        sysno::SUSPEND_THREAD => thread::handle_suspend_thread(frame),
+        sysno::RESUME_THREAD => thread::handle_resume_thread(frame),
         sysno::YIELD_EXECUTION => thread::handle_yield(frame),
         sysno::TERMINATE_THREAD => thread::handle_terminate_thread(frame),
 

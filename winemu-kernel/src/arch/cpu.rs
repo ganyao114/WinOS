@@ -24,3 +24,13 @@ pub fn current_fault_address() -> u64 {
 pub fn wait_for_interrupt() {
     <Backend as super::contract::CpuBackend>::wait_for_interrupt();
 }
+
+#[inline(always)]
+pub fn irq_enable() {
+    <Backend as super::contract::CpuBackend>::irq_enable();
+}
+
+#[inline(always)]
+pub fn irq_disable() {
+    <Backend as super::contract::CpuBackend>::irq_disable();
+}

@@ -1,0 +1,233 @@
+#include <stdint.h>
+#include <stddef.h>
+
+typedef uint8_t UCHAR;
+typedef uint32_t NTSTATUS;
+typedef uint32_t ULONG;
+typedef uint64_t ULONG_PTR;
+typedef void* HANDLE;
+
+typedef struct {
+    uint64_t Status;
+    uint64_t Information;
+} IO_STATUS_BLOCK;
+
+#define STDOUT_HANDLE ((HANDLE)(uint64_t)0xFFFFFFFFFFFFFFF5ULL)
+#define NT_CURRENT_PROCESS ((HANDLE)(uint64_t)-1)
+#define NT_CURRENT_THREAD ((HANDLE)(uint64_t)-1)
+
+#define STATUS_SUCCESS 0x00000000U
+#define STATUS_TIMEOUT 0x00000102U
+
+__declspec(dllimport) NTSTATUS NtWriteFile(
+    HANDLE file, HANDLE event, void* apc_routine, void* apc_ctx,
+    IO_STATUS_BLOCK* iosb, const void* buf, ULONG len, uint64_t* byte_offset, ULONG* key);
+__declspec(dllimport) NTSTATUS NtCreateEvent(
+    HANDLE* event_handle, ULONG desired_access, void* object_attributes, ULONG event_type, UCHAR initial_state);
+__declspec(dllimport) NTSTATUS NtSetEvent(HANDLE event_handle, ULONG* previous_state);
+__declspec(dllimport) NTSTATUS NtWaitForSingleObject(HANDLE handle, UCHAR alertable, int64_t* timeout);
+__declspec(dllimport) NTSTATUS NtCreateThreadEx(
+    HANDLE* thread_handle, ULONG access, void* object_attributes, HANDLE process_handle, void* start_routine,
+    void* argument, ULONG create_flags, size_t zero_bits, size_t stack_size, size_t max_stack_size,
+    void* attribute_list);
+__declspec(dllimport) NTSTATUS NtSuspendThread(HANDLE thread_handle, ULONG* previous_suspend_count);
+__declspec(dllimport) NTSTATUS NtResumeThread(HANDLE thread_handle, ULONG* previous_suspend_count);
+__declspec(dllimport) NTSTATUS NtCreateProcessEx(
+    HANDLE* process_handle, ULONG access, void* object_attributes, HANDLE parent_process, ULONG flags,
+    HANDLE section_handle, HANDLE debug_port, HANDLE exception_port, ULONG job_member_level);
+__declspec(dllimport) NTSTATUS NtReadVirtualMemory(
+    HANDLE process, const void* base_address, void* buffer, size_t size, size_t* bytes_read);
+__declspec(dllimport) NTSTATUS NtWriteVirtualMemory(
+    HANDLE process, void* base_address, const void* buffer, size_t size, size_t* bytes_written);
+__declspec(dllimport) __attribute__((noreturn))
+void NtTerminateThread(HANDLE thread, NTSTATUS exit_code);
+__declspec(dllimport) NTSTATUS NtTerminateProcess(HANDLE process, NTSTATUS exit_code);
+__declspec(dllimport) NTSTATUS NtClose(HANDLE handle);
+
+static uint32_t g_pass = 0;
+static uint32_t g_fail = 0;
+static volatile uint32_t g_worker_ran = 0;
+static volatile uint64_t g_child_marker = 0;
+static volatile uint64_t g_vm_readback = 0;
+static volatile uint64_t g_vm_write_value = 0xAABBCCDDEEFF0011ULL;
+static volatile uint64_t g_vm_bytes_done = 0;
+
+static void write_str(const char* s) {
+    IO_STATUS_BLOCK iosb = {0};
+    ULONG len = 0;
+    while (s[len]) {
+        len++;
+    }
+    (void)NtWriteFile(STDOUT_HANDLE, 0, 0, 0, &iosb, s, len, 0, 0);
+}
+
+static void check(const char* name, int ok) {
+    if (ok) {
+        g_pass++;
+        write_str("[PASS] ");
+    } else {
+        g_fail++;
+        write_str("[FAIL] ");
+    }
+    write_str(name);
+    write_str("\r\n");
+}
+
+static __attribute__((noreturn)) void terminate_current_process(uint32_t code) {
+    NtTerminateProcess(NT_CURRENT_PROCESS, code);
+    for (;;) {
+        __asm__ volatile("wfi" ::: "memory");
+    }
+}
+
+static __attribute__((noreturn)) void worker_thread(void* arg) {
+    HANDLE evt = (HANDLE)arg;
+    NTSTATUS st = NtWaitForSingleObject(evt, 0, 0);
+    if (st == STATUS_SUCCESS) {
+        g_worker_ran = 1;
+    }
+    NtTerminateThread(NT_CURRENT_THREAD, st);
+    for (;;) {
+        __asm__ volatile("wfi" ::: "memory");
+    }
+}
+
+static __attribute__((noreturn)) void child_marker_thread(void* arg) {
+    g_child_marker = (uint64_t)arg;
+    NtTerminateThread(NT_CURRENT_THREAD, STATUS_SUCCESS);
+    for (;;) {
+        __asm__ volatile("wfi" ::: "memory");
+    }
+}
+
+void mainCRTStartup(void) {
+    NTSTATUS st;
+
+    write_str("== syscall_thread_vm_test ==\r\n");
+
+    // ---- Suspend/Resume thread ----
+    HANDLE evt = 0;
+    HANDLE th = 0;
+    ULONG prev = 0;
+    int64_t timeout_100ms = -1000000; // relative 100ms in 100ns units
+
+    st = NtCreateEvent(&evt, 0, 0, 1, 0);
+    check("NtCreateEvent returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtCreateEvent returns handle", evt != 0);
+
+    st = NtCreateThreadEx(
+        &th,
+        0x001FFFFF,
+        0,
+        NT_CURRENT_PROCESS,
+        (void*)worker_thread,
+        (void*)evt,
+        0,
+        0,
+        0x10000,
+        0x10000,
+        0
+    );
+    check("NtCreateThreadEx(current process) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtCreateThreadEx(current process) returns handle", th != 0);
+
+    prev = 0xFFFFffffU;
+    st = NtSuspendThread(th, &prev);
+    check("NtSuspendThread returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtSuspendThread previous count is 0", prev == 0);
+
+    st = NtSetEvent(evt, 0);
+    check("NtSetEvent returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+
+    st = NtWaitForSingleObject(th, 0, &timeout_100ms);
+    check("Suspended thread wait returns STATUS_TIMEOUT", st == STATUS_TIMEOUT);
+
+    prev = 0xFFFFffffU;
+    st = NtResumeThread(th, &prev);
+    check("NtResumeThread returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtResumeThread previous count is 1", prev == 1);
+
+    st = NtWaitForSingleObject(th, 0, 0);
+    check("Resumed thread wait returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("Worker thread executed after resume", g_worker_ran == 1);
+
+    st = NtClose(th);
+    check("NtClose(thread) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    st = NtClose(evt);
+    check("NtClose(event) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+
+    // ---- Cross-process Read/WriteVirtualMemory ----
+    HANDLE child = 0;
+    HANDLE child_thread = 0;
+    uint64_t expected_child_value = 0x1122334455667788ULL;
+    st = NtCreateProcessEx(&child, 0x001FFFFF, 0, NT_CURRENT_PROCESS, 0, 0, 0, 0, 0);
+    check("NtCreateProcessEx returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtCreateProcessEx returns handle", child != 0);
+
+    st = NtCreateThreadEx(
+        &child_thread,
+        0x001FFFFF,
+        0,
+        child,
+        (void*)child_marker_thread,
+        (void*)(uintptr_t)expected_child_value,
+        0,
+        0,
+        0x10000,
+        0x10000,
+        0
+    );
+    check("NtCreateThreadEx(child process) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtCreateThreadEx(child process) returns handle", child_thread != 0);
+
+    st = NtWaitForSingleObject(child_thread, 0, 0);
+    check("NtWaitForSingleObject(child thread) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+
+    g_vm_bytes_done = 0;
+    g_vm_readback = 0;
+    st = NtReadVirtualMemory(
+        child,
+        (const void*)&g_child_marker,
+        (void*)&g_vm_readback,
+        sizeof(g_vm_readback),
+        (size_t*)&g_vm_bytes_done
+    );
+    check("NtReadVirtualMemory(child marker) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtReadVirtualMemory(child marker) returns full length", g_vm_bytes_done == sizeof(g_vm_readback));
+    check("NtReadVirtualMemory(child marker) reads expected value", g_vm_readback == expected_child_value);
+
+    g_vm_bytes_done = 0;
+    st = NtWriteVirtualMemory(
+        child,
+        (void*)&g_child_marker,
+        (const void*)&g_vm_write_value,
+        sizeof(g_vm_write_value),
+        (size_t*)&g_vm_bytes_done
+    );
+    check("NtWriteVirtualMemory(child marker) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtWriteVirtualMemory(child marker) returns full length", g_vm_bytes_done == sizeof(g_vm_write_value));
+
+    g_vm_bytes_done = 0;
+    g_vm_readback = 0;
+    st = NtReadVirtualMemory(
+        child,
+        (const void*)&g_child_marker,
+        (void*)&g_vm_readback,
+        sizeof(g_vm_readback),
+        (size_t*)&g_vm_bytes_done
+    );
+    check("NtReadVirtualMemory(child marker, re-read) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtReadVirtualMemory(child marker, re-read) returns full length", g_vm_bytes_done == sizeof(g_vm_readback));
+    check("NtWriteVirtualMemory(child marker) takes effect", g_vm_readback == g_vm_write_value);
+
+    st = NtClose(child_thread);
+    check("NtClose(child thread) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+
+    st = NtTerminateProcess(child, STATUS_SUCCESS);
+    check("NtTerminateProcess(child) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    st = NtClose(child);
+    check("NtClose(child process) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+
+    write_str("syscall_thread_vm_test summary complete\r\n");
+    terminate_current_process(g_fail == 0 ? 0 : 1);
+}
