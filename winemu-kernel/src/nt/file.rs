@@ -375,6 +375,18 @@ pub(crate) fn handle_create_file(frame: &mut SvcFrame) {
     let iosb_ptr = frame.x[3] as *mut IoStatusBlock;
     let disposition = frame.x[7] as u32;
     let mut path_buf = [0u8; 512];
+
+    let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_FILE) else {
+        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+    if (access & !meta.valid_access_mask) != 0 {
+        write_iosb(iosb_ptr, status::ACCESS_DENIED, 0);
+        frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
+
     let path_len = read_oa_path(oa_ptr, &mut path_buf);
     if path_len == 0 {
         write_iosb(iosb_ptr, status::OBJECT_NAME_NOT_FOUND, 0);

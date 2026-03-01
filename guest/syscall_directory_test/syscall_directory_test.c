@@ -45,6 +45,7 @@ typedef struct {
 #define STATUS_INVALID_PARAMETER 0xC000000DU
 #define STATUS_NO_MORE_FILES 0x80000006U
 #define STATUS_INFO_LENGTH_MISMATCH 0xC0000004U
+#define STATUS_ACCESS_DENIED 0xC0000022U
 
 #define OBJ_CASE_INSENSITIVE 0x40U
 
@@ -211,6 +212,25 @@ void mainCRTStartup(void) {
     if (st != STATUS_SUCCESS || dir_handle == 0) {
         terminate_current_process(1);
     }
+
+    HANDLE invalid_dir_handle = 0;
+    iosb.Status = 0;
+    iosb.Information = 0;
+    st = NtCreateFile(
+        &invalid_dir_handle,
+        0x80000000U,
+        &oa,
+        &iosb,
+        0,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        0,
+        0
+    );
+    check("NtCreateFile(invalid desired access) returns STATUS_ACCESS_DENIED", st == STATUS_ACCESS_DENIED);
+    check("NtCreateFile(invalid desired access) returns no handle", invalid_dir_handle == 0);
 
     ret_len = 0;
     st = NtQueryObject(

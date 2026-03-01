@@ -133,11 +133,22 @@ fn named_section_remove_by_section(section_idx: u32) {
 // x0=*SectionHandle, x3=*MaximumSize, x4=Protection, x6=FileHandle
 pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
     let out_ptr = frame.x[0] as *mut u64;
+    let desired_access = frame.x[1] as u32;
     let oa_ptr = frame.x[2];
     let max_size_ptr = frame.x[3] as *const u64;
     let prot = frame.x[4] as u32;
     let alloc_attrs = frame.x[5] as u32;
     let file_handle = frame.x[6];
+
+    let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_SECTION) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+    if (desired_access & !meta.valid_access_mask) != 0 {
+        frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
+
     let mut section_name = [0u8; MAX_SECTION_NAME];
     let section_name_len = section_name_from_oa(oa_ptr, &mut section_name);
     named_section_gc_stale();
@@ -198,7 +209,18 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
 // x0=*SectionHandle, x1=DesiredAccess, x2=ObjectAttributes
 pub(crate) fn handle_open_section(frame: &mut SvcFrame) {
     let out_ptr = frame.x[0] as *mut u64;
+    let desired_access = frame.x[1] as u32;
     let oa_ptr = frame.x[2];
+
+    let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_SECTION) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+    if (desired_access & !meta.valid_access_mask) != 0 {
+        frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
+
     let mut section_name = [0u8; MAX_SECTION_NAME];
     let section_name_len = section_name_from_oa(oa_ptr, &mut section_name);
     if section_name_len == 0 {

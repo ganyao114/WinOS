@@ -77,6 +77,7 @@
 - [x] `NtDuplicateObject` 接入 `DUPLICATE_CLOSE_SOURCE` 语义（复制后关闭源句柄）。
 - [x] `NtOpenProcess` / `NtOpenProcessToken` 接入 `valid_access_mask` 校验。
 - [x] `NtCreateProcessEx` / `NtCreateThreadEx` 接入 `valid_access_mask` 校验。
+- [x] `NtCreateFile/NtOpenFile` 与 `NtCreateSection/NtOpenSection` 接入 `valid_access_mask` 校验。
 
 ## 5. 风险与控制
 

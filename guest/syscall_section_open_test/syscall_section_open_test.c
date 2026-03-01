@@ -38,6 +38,7 @@ typedef struct {
 #define STATUS_OBJECT_NAME_COLLISION 0xC0000035U
 #define STATUS_OBJECT_NAME_NOT_FOUND 0xC0000034U
 #define STATUS_INFO_LENGTH_MISMATCH 0xC0000004U
+#define STATUS_ACCESS_DENIED 0xC0000022U
 
 #define PAGE_READWRITE 0x04U
 #define SEC_COMMIT 0x08000000U
@@ -181,9 +182,19 @@ void mainCRTStartup(void) {
     check("NtCreateSection(named) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     check("NtCreateSection(named) returns non-zero handle", section_a != 0);
 
+    section_c = 0;
+    st = NtCreateSection(&section_c, 0x80000000U, &named_oa, &section_size, PAGE_READWRITE, SEC_COMMIT, 0);
+    check("NtCreateSection(invalid desired access) returns STATUS_ACCESS_DENIED", st == STATUS_ACCESS_DENIED);
+    check("NtCreateSection(invalid desired access) returns no handle", section_c == 0);
+
     st = NtOpenSection(&section_b, 0, &named_oa);
     check("NtOpenSection(existing name) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     check("NtOpenSection(existing name) returns non-zero handle", section_b != 0);
+
+    section_c = 0;
+    st = NtOpenSection(&section_c, 0x80000000U, &named_oa);
+    check("NtOpenSection(invalid desired access) returns STATUS_ACCESS_DENIED", st == STATUS_ACCESS_DENIED);
+    check("NtOpenSection(invalid desired access) returns no handle", section_c == 0);
 
     ret_len = 0;
     st = NtQueryObject(section_a, OBJECT_NAME_INFORMATION_CLASS, obj_name_info, (ULONG)sizeof(obj_name_info), &ret_len);
