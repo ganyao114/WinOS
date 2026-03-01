@@ -25,7 +25,8 @@ global_asm!(
     ".balign 16",
     ".global __svc_stack_bottom",
     "__svc_stack_bottom:",
-    ".space 16384",
+    // 64 KiB: process creation and VM clone paths can consume >16 KiB stack.
+    ".space 65536",
     ".global __svc_stack_top",
     "__svc_stack_top:",
 );
