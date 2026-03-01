@@ -2,6 +2,7 @@ mod address_space;
 mod handle;
 mod lifecycle;
 mod query;
+mod set;
 
 use crate::kobj::ObjectStore;
 use core::cell::UnsafeCell;
@@ -13,6 +14,7 @@ pub use lifecycle::{
     terminate_process,
 };
 pub use query::query_information_process;
+pub use set::set_information_process;
 
 pub(crate) use address_space::{ProcessAddressSpace, USER_VA_BASE, USER_VA_LIMIT};
 

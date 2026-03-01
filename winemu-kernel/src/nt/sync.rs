@@ -83,8 +83,12 @@ pub(crate) fn handle_create_mutex(frame: &mut SvcFrame) {
     }
 }
 
-// x0 = MutantHandle, x1 = PreviousCount* (optional)
-pub(crate) fn handle_release_mutant(frame: &mut SvcFrame) {
+// `NtReleaseMutant` and `NtSetInformationProcess` share nr in current ABI profile.
+pub(crate) fn handle_release_mutant_or_set_information_process(frame: &mut SvcFrame) {
+    if super::process::should_dispatch_set_information_process(frame) {
+        super::process::handle_set_information_process(frame);
+        return;
+    }
     frame.x[0] = mutex_release_by_handle(frame.x[0]) as u64;
 }
 

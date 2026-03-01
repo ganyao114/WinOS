@@ -21,6 +21,29 @@ pub(crate) fn handle_query_information_process(frame: &mut SvcFrame) {
             as u64;
 }
 
+pub(crate) fn should_dispatch_set_information_process(frame: &SvcFrame) -> bool {
+    // `NtReleaseMutant(handle, previous_count*)` uses a mutex handle in x0.
+    // `NtSetInformationProcess(handle, class, info, len)` uses a process handle in x0.
+    if crate::process::resolve_process_handle(frame.x[0]).is_none() {
+        return false;
+    }
+    if frame.x[2] != 0 || frame.x[3] != 0 {
+        return true;
+    }
+    (frame.x[1] as u32) <= 0x0200
+}
+
+// x0=ProcessHandle, x1=ProcessInformationClass, x2=ProcessInformation, x3=ProcessInformationLength
+pub(crate) fn handle_set_information_process(frame: &mut SvcFrame) {
+    let process_handle = frame.x[0];
+    let info_class = frame.x[1] as u32;
+    let info = frame.x[2] as *const u8;
+    let info_len = frame.x[3] as usize;
+
+    frame.x[0] =
+        crate::process::set_information_process(process_handle, info_class, info, info_len) as u64;
+}
+
 // NtOpenProcess:
 // x0=*ProcessHandle, x1=DesiredAccess, x2=ObjectAttributes, x3=ClientId
 pub(crate) fn handle_open_process(frame: &mut SvcFrame) {

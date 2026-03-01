@@ -98,7 +98,11 @@ pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> R
 
     let _ = with_process_mut(pid, |p| p.state = ProcessState::Running);
 
-    let Some(handle) = crate::sched::sync::make_new_handle(crate::sched::sync::HANDLE_TYPE_PROCESS, pid)
+    let Some(handle) = crate::sched::sync::make_new_handle_for_pid(
+        parent_pid,
+        crate::sched::sync::HANDLE_TYPE_PROCESS,
+        pid,
+    )
     else {
         crate::hypercall::debug_u64(0xC502_E007);
         let _ = free_process(pid);

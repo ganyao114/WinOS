@@ -415,6 +415,7 @@ pub const HANDLE_TYPE_FILE: u64 = 5;
 pub const HANDLE_TYPE_SECTION: u64 = 6;
 pub const HANDLE_TYPE_KEY: u64 = 7;
 pub const HANDLE_TYPE_PROCESS: u64 = 8;
+pub const HANDLE_TYPE_TOKEN: u64 = 9;
 
 #[derive(Clone, Copy)]
 struct HandleEntry {
@@ -1567,6 +1568,7 @@ pub fn destroy_object_by_type(htype: u64, obj_idx: u32) -> u32 {
             crate::process::last_handle_closed(obj_idx);
             STATUS_SUCCESS
         }
+        HANDLE_TYPE_TOKEN => STATUS_SUCCESS,
         _ => STATUS_INVALID_HANDLE,
     }
 }

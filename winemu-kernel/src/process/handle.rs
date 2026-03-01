@@ -8,7 +8,9 @@ pub fn current_pid() -> u32 {
     let tid = crate::sched::current_tid();
     if tid != 0 {
         if let Some(pid) = crate::sched::thread_pid(tid) {
-            return pid;
+            if pid != 0 {
+                return pid;
+            }
         }
     }
     let vid = crate::sched::vcpu_id().min(crate::sched::MAX_VCPUS - 1);

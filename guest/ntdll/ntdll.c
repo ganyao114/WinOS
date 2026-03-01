@@ -12,8 +12,11 @@
 #define NR_WAIT_SINGLE          0x0004
 #define NR_CLOSE                0x000F
 #define NR_QUERY_INFORMATION_PROCESS 0x0019
+#define NR_SET_INFORMATION_PROCESS 0x001C
+#define NR_QUERY_INFORMATION_TOKEN 0x0021
 #define NR_QUERY_OBJECT         0x0017
 #define NR_OPEN_PROCESS         0x0026
+#define NR_OPEN_PROCESS_TOKEN   0x0131
 #define NR_DUPLICATE_OBJECT     0x003C
 #define NR_YIELD_EXECUTION      0x0046
 #define NR_QUERY_PERFORMANCE_COUNTER 0x0031
@@ -137,6 +140,18 @@ EXPORT NTSTATUS NtQueryInformationProcess(
     );
 }
 
+EXPORT NTSTATUS NtSetInformationProcess(
+    HANDLE process, ULONG info_class, void* buf, ULONG len)
+{
+    return syscall4(
+        NR_SET_INFORMATION_PROCESS,
+        (uint64_t)process,
+        (uint64_t)info_class,
+        (uint64_t)buf,
+        (uint64_t)len
+    );
+}
+
 EXPORT NTSTATUS NtOpenProcess(
     HANDLE* process_handle, ULONG desired_access, void* object_attributes, void* client_id)
 {
@@ -146,6 +161,32 @@ EXPORT NTSTATUS NtOpenProcess(
         (uint64_t)desired_access,
         (uint64_t)object_attributes,
         (uint64_t)client_id
+    );
+}
+
+EXPORT NTSTATUS NtOpenProcessToken(
+    HANDLE process_handle, ULONG desired_access, HANDLE* token_handle)
+{
+    return syscall4(
+        NR_OPEN_PROCESS_TOKEN,
+        (uint64_t)process_handle,
+        (uint64_t)desired_access,
+        (uint64_t)token_handle,
+        0
+    );
+}
+
+EXPORT NTSTATUS NtQueryInformationToken(
+    HANDLE token, ULONG info_class, void* token_info, ULONG token_info_len, ULONG* ret_len)
+{
+    return syscall6(
+        NR_QUERY_INFORMATION_TOKEN,
+        (uint64_t)token,
+        (uint64_t)info_class,
+        (uint64_t)token_info,
+        (uint64_t)token_info_len,
+        (uint64_t)ret_len,
+        0
     );
 }
 

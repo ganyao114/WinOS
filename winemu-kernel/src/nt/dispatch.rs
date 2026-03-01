@@ -17,7 +17,7 @@ use super::constants::{
     SVC_TAG_TABLE_SHIFT,
 };
 use super::sysno;
-use super::{file, memory, object, process, registry, section, sync, system, thread, SvcFrame};
+use super::{file, memory, object, process, registry, section, sync, system, thread, token, SvcFrame};
 
 #[no_mangle]
 pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
@@ -52,7 +52,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         sysno::WAIT_SINGLE => sync::handle_wait_single(frame),
         sysno::WAIT_MULTIPLE => sync::handle_wait_multiple(frame),
         sysno::CREATE_MUTEX => sync::handle_create_mutex(frame),
-        sysno::RELEASE_MUTANT => sync::handle_release_mutant(frame),
+        sysno::RELEASE_MUTANT => sync::handle_release_mutant_or_set_information_process(frame),
         sysno::CREATE_SEMAPHORE => sync::handle_create_semaphore(frame),
         sysno::RELEASE_SEMAPHORE => sync::handle_release_semaphore(frame),
 
@@ -80,6 +80,8 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         sysno::OPEN_PROCESS => process::handle_open_process(frame),
         sysno::CREATE_PROCESS_EX => process::handle_create_process(frame),
         sysno::TERMINATE_PROCESS => process::handle_terminate_process(frame),
+        sysno::OPEN_PROCESS_TOKEN => token::handle_open_process_token(frame),
+        sysno::QUERY_INFORMATION_TOKEN => token::handle_query_information_token(frame),
 
         sysno::QUERY_INFORMATION_THREAD => thread::handle_query_information_thread(frame),
         sysno::SET_INFORMATION_THREAD => thread::handle_set_information_thread(frame),
@@ -131,6 +133,9 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
     let vid = vcpu_id();
     let quantum_100ns = timer::DEFAULT_TIMESLICE_100NS;
     let mut from = current_tid();
+    if from != 0 {
+        save_ctx_for(from, frame);
+    }
     loop {
         let now = now_ticks();
         sched_lock_acquire();
