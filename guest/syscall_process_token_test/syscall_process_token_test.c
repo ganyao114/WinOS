@@ -261,6 +261,13 @@ void mainCRTStartup(void) {
         check("NtClose(duplicate token) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     }
 
+    dup = 0;
+    st = NtDuplicateObject(
+        NT_CURRENT_PROCESS, token, NT_CURRENT_PROCESS, &dup,
+        0, 0, 0x80000000U);
+    check("NtDuplicateObject(token, invalid options) returns STATUS_INVALID_PARAMETER", st == STATUS_INVALID_PARAMETER);
+    check("NtDuplicateObject(token, invalid options) does not return handle", dup == 0);
+
     u32 = 0;
     st = NtSetInformationProcess(NT_CURRENT_PROCESS, PROCESS_DEFAULT_HARD_ERROR_MODE, &u32, sizeof(u32));
     check("NtSetInformationProcess(ProcessDefaultHardErrorMode) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
