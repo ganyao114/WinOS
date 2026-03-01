@@ -15,8 +15,8 @@ use super::{
     boost_thread_priority_locked, clear_wait_deadline_locked, current_tid, sched_lock_acquire,
     sched_lock_release, set_thread_priority_locked, set_thread_state_locked,
     set_wait_deadline_locked, thread_exists, wake, with_thread, with_thread_mut, ThreadState,
-    MAX_WAIT_HANDLES, WAIT_KIND_DELAY, WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY, WAIT_KIND_NONE,
-    WAIT_KIND_SINGLE,
+    thread_count, MAX_WAIT_HANDLES, WAIT_KIND_DELAY, WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY,
+    WAIT_KIND_NONE, WAIT_KIND_SINGLE,
 };
 
 // ── NTSTATUS 常量 ─────────────────────────────────────────────
@@ -764,7 +764,35 @@ pub fn object_type_stats(htype: u64) -> ObjectTypeStats {
         }
         i += 1;
     }
+    let live_objects = backing_object_count(htype);
+    if live_objects > stats.object_count {
+        stats.object_count = live_objects;
+    }
     stats
+}
+
+fn backing_store_live_count<T>(slot: &UnsafeCell<Option<ObjectStore<T>>>) -> u32 {
+    unsafe {
+        let Some(store) = (&*slot.get()).as_ref() else {
+            return 0;
+        };
+        let mut count = 0u32;
+        store.for_each_live_id(|_| {
+            count = count.saturating_add(1);
+        });
+        count
+    }
+}
+
+fn backing_object_count(htype: u64) -> u32 {
+    match htype {
+        HANDLE_TYPE_EVENT => backing_store_live_count(&SYNC_STATE.events),
+        HANDLE_TYPE_MUTEX => backing_store_live_count(&SYNC_STATE.mutexes),
+        HANDLE_TYPE_SEMAPHORE => backing_store_live_count(&SYNC_STATE.semaphores),
+        HANDLE_TYPE_THREAD => thread_count(),
+        HANDLE_TYPE_PROCESS => crate::process::process_count(),
+        _ => 0,
+    }
 }
 
 fn recompute_owned_mutex_priority_locked(owner_tid: u32) {

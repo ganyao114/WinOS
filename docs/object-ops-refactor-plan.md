@@ -62,6 +62,7 @@
 - [x] 在 `sync` 层新增统一统计结构 `ObjectTypeStats` 与 `object_type_stats(htype)`。
 - [x] 在 `nt/kobject.rs` 暴露统一统计入口，供上层 syscall 查询使用。
 - [x] `NtQueryObject(ObjectTypeInformation)` 接入统一统计（对象总数/句柄总数/高水位字段）。
+- [x] `ObjectTypeStats.object_count` 融合 backing store live 数（event/mutex/semaphore/thread/process）。
 
 ### Phase D（可选）
 

@@ -188,3 +188,16 @@ pub(crate) fn for_each_process(mut f: impl FnMut(u32, &KProcess)) {
         });
     }
 }
+
+pub(crate) fn process_count() -> u32 {
+    unsafe {
+        let Some(store) = (&*PROCESS_RUNTIME.processes.get()).as_ref() else {
+            return 0;
+        };
+        let mut count = 0u32;
+        store.for_each_live_id(|_| {
+            count = count.saturating_add(1);
+        });
+        count
+    }
+}

@@ -435,6 +435,19 @@ pub fn thread_exists(tid: u32) -> bool {
     }
 }
 
+pub fn thread_count() -> u32 {
+    unsafe {
+        let Some(store) = (&*SCHED.threads.get()).as_ref() else {
+            return 0;
+        };
+        let mut count = 0u32;
+        store.for_each_live_id(|_| {
+            count = count.saturating_add(1);
+        });
+        count
+    }
+}
+
 pub fn with_thread<R>(tid: u32, f: impl FnOnce(&KThread) -> R) -> R {
     let ptr = thread_ptr(tid);
     unsafe { f(&*ptr) }
