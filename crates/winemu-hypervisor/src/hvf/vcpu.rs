@@ -62,7 +62,7 @@ impl HvfVcpu {
             use_vtimer_exit: std::env::var("WINEMU_HVF_VTIMER_EXIT")
                 .ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
+                .unwrap_or(true),
         };
         vcpu.init_el1()?;
         Ok(vcpu)
@@ -161,7 +161,9 @@ impl HvfVcpu {
             if !self.use_vtimer_exit {
                 return Ok(VmExit::Wfi);
             }
-            self.vtimer.on_vtimer_activated(self.id)?;
+            let pstate = self.get_reg(ffi::HV_REG_CPSR).unwrap_or(0);
+            let running_el0 = ((pstate >> 2) & 0x3) == 0;
+            self.vtimer.on_vtimer_activated(self.id, running_el0)?;
             return Ok(VmExit::Timer);
         }
         if exit.reason == ffi::HV_EXIT_REASON_CANCELED {
