@@ -40,6 +40,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         sysno::READ_FILE => file::handle_read_file(frame),
         sysno::WRITE_FILE => file::handle_write_file(frame),
         sysno::QUERY_INFORMATION_FILE => file::handle_query_information_file(frame),
+        sysno::QUERY_VOLUME_INFORMATION_FILE => file::handle_query_volume_information_file(frame),
         sysno::SET_INFORMATION_FILE => file::handle_set_information_file(frame),
         sysno::QUERY_DIRECTORY_FILE => file::handle_query_directory_file(frame),
         sysno::QUERY_SYSTEM_INFORMATION => system::handle_query_system_information(frame),
@@ -58,6 +59,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
 
         sysno::OPEN_KEY => registry::handle_open_key(frame),
         sysno::CREATE_KEY => registry::handle_create_key(frame),
+        sysno::QUERY_KEY => registry::handle_query_key(frame),
         sysno::QUERY_VALUE_KEY => registry::handle_query_value_key(frame),
         sysno::SET_VALUE_KEY => registry::handle_set_value_key(frame),
         sysno::DELETE_KEY => registry::handle_delete_key(frame),
@@ -73,6 +75,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         sysno::WRITE_VIRTUAL_MEMORY => memory::handle_write_virtual_memory(frame),
 
         sysno::CREATE_SECTION => section::handle_create_section(frame),
+        sysno::OPEN_SECTION => section::handle_open_section(frame),
         sysno::MAP_VIEW_OF_SECTION => section::handle_map_view_of_section(frame),
         sysno::UNMAP_VIEW_OF_SECTION => section::handle_unmap_view_of_section(frame),
 

@@ -13,6 +13,12 @@ use super::SvcFrame;
 const MAX_PATH: usize = 256;
 const MAX_NAME_BYTES: usize = 256;
 const MAX_VALUE_NAME_UTF16: usize = 256;
+const KEY_INFORMATION_BASIC: u32 = 0;
+const KEY_INFORMATION_FULL: u32 = 2;
+const KEY_INFORMATION_NAME: u32 = 3;
+const KEY_BASIC_INFORMATION_SIZE: usize = 16;
+const KEY_FULL_INFORMATION_SIZE: usize = 44;
+const KEY_NAME_INFORMATION_SIZE: usize = 4;
 
 struct RegistryState {
     root: KeyNode,
@@ -170,6 +176,24 @@ fn encode_utf16_bytes(s: &str, out: &mut [u8]) -> usize {
         w += 2;
     }
     w
+}
+
+fn utf16_bytes(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::<u8>::new();
+    let units = s.encode_utf16().count();
+    if out.try_reserve(units.saturating_mul(2)).is_err() {
+        return None;
+    }
+    for ch in s.encode_utf16() {
+        let b = ch.to_le_bytes();
+        out.push(b[0]);
+        out.push(b[1]);
+    }
+    Some(out)
+}
+
+fn utf16_byte_len(s: &str) -> usize {
+    s.encode_utf16().count().saturating_mul(2)
 }
 
 fn write_ret_len(ptr: u64, len: usize) {
@@ -419,6 +443,127 @@ pub(crate) fn handle_query_value_key(frame: &mut SvcFrame) {
             _ => {
                 frame.x[0] = status::INVALID_PARAMETER as u64;
             }
+        }
+    }
+}
+
+pub(crate) fn handle_query_key(frame: &mut SvcFrame) {
+    let state = ensure_state();
+    let handle = frame.x[0];
+    let info_class = frame.x[1] as u32;
+    let out_ptr = frame.x[2] as *mut u8;
+    let out_len = frame.x[3] as usize;
+    let ret_len_ptr = frame.x[4];
+
+    let Some(node) = key_node_from_handle(state, handle) else {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+
+    match info_class {
+        KEY_INFORMATION_BASIC => {
+            let name = node.borrow().name.clone();
+            let Some(name_w) = utf16_bytes(&name) else {
+                frame.x[0] = status::NO_MEMORY as u64;
+                return;
+            };
+            let need = KEY_BASIC_INFORMATION_SIZE + name_w.len();
+            write_ret_len(ret_len_ptr, need);
+            if out_ptr.is_null() || out_len < need {
+                frame.x[0] = status::BUFFER_TOO_SMALL as u64;
+                return;
+            }
+
+            unsafe {
+                (out_ptr as *mut u64).write_volatile(0);
+                (out_ptr.add(8) as *mut u32).write_volatile(0);
+                (out_ptr.add(12) as *mut u32).write_volatile(name_w.len() as u32);
+                if !name_w.is_empty() {
+                    core::ptr::copy_nonoverlapping(
+                        name_w.as_ptr(),
+                        out_ptr.add(KEY_BASIC_INFORMATION_SIZE),
+                        name_w.len(),
+                    );
+                }
+            }
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        KEY_INFORMATION_NAME => {
+            let full_name = RegistryKey::get_full_path(&node);
+            let Some(name_w) = utf16_bytes(&full_name) else {
+                frame.x[0] = status::NO_MEMORY as u64;
+                return;
+            };
+            let need = KEY_NAME_INFORMATION_SIZE + name_w.len();
+            write_ret_len(ret_len_ptr, need);
+            if out_ptr.is_null() || out_len < need {
+                frame.x[0] = status::BUFFER_TOO_SMALL as u64;
+                return;
+            }
+
+            unsafe {
+                (out_ptr as *mut u32).write_volatile(name_w.len() as u32);
+                if !name_w.is_empty() {
+                    core::ptr::copy_nonoverlapping(
+                        name_w.as_ptr(),
+                        out_ptr.add(KEY_NAME_INFORMATION_SIZE),
+                        name_w.len(),
+                    );
+                }
+            }
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        KEY_INFORMATION_FULL => {
+            let (subkeys, max_name_len, values, max_value_name_len, max_value_data_len) = {
+                let guard = node.borrow();
+                let subkeys = guard.subkeys().len() as u32;
+                let values = guard.values().len() as u32;
+
+                let mut max_name_len = 0usize;
+                for name in guard.subkeys().keys() {
+                    max_name_len = core::cmp::max(max_name_len, utf16_byte_len(name));
+                }
+
+                let mut max_value_name_len = 0usize;
+                let mut max_value_data_len = 0usize;
+                for value in guard.values().values() {
+                    max_value_name_len =
+                        core::cmp::max(max_value_name_len, utf16_byte_len(&value.name));
+                    max_value_data_len =
+                        core::cmp::max(max_value_data_len, value.raw_bytes().len());
+                }
+
+                (
+                    subkeys,
+                    max_name_len as u32,
+                    values,
+                    max_value_name_len as u32,
+                    max_value_data_len as u32,
+                )
+            };
+
+            write_ret_len(ret_len_ptr, KEY_FULL_INFORMATION_SIZE);
+            if out_ptr.is_null() || out_len < KEY_FULL_INFORMATION_SIZE {
+                frame.x[0] = status::BUFFER_TOO_SMALL as u64;
+                return;
+            }
+
+            unsafe {
+                (out_ptr as *mut u64).write_volatile(0);
+                (out_ptr.add(8) as *mut u32).write_volatile(0);
+                (out_ptr.add(12) as *mut u32).write_volatile(KEY_FULL_INFORMATION_SIZE as u32);
+                (out_ptr.add(16) as *mut u32).write_volatile(0);
+                (out_ptr.add(20) as *mut u32).write_volatile(subkeys);
+                (out_ptr.add(24) as *mut u32).write_volatile(max_name_len);
+                (out_ptr.add(28) as *mut u32).write_volatile(0);
+                (out_ptr.add(32) as *mut u32).write_volatile(values);
+                (out_ptr.add(36) as *mut u32).write_volatile(max_value_name_len);
+                (out_ptr.add(40) as *mut u32).write_volatile(max_value_data_len);
+            }
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        _ => {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
         }
     }
 }

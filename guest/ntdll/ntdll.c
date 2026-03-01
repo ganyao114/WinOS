@@ -11,6 +11,9 @@
 #define NR_WRITE_FILE           0x0008
 #define NR_WAIT_SINGLE          0x0004
 #define NR_CLOSE                0x000F
+#define NR_QUERY_KEY            0x0013
+#define NR_CREATE_KEY           0x001D
+#define NR_SET_VALUE_KEY        0x003D
 #define NR_QUERY_INFORMATION_PROCESS 0x0019
 #define NR_SET_INFORMATION_PROCESS 0x001C
 #define NR_QUERY_INFORMATION_TOKEN 0x0021
@@ -28,7 +31,9 @@
 #define NR_WRITE_VIRTUAL_MEM    0x003A
 #define NR_READ_VIRTUAL_MEM     0x003F
 #define NR_QUERY_SYSTEM_TIME    0x005A
+#define NR_QUERY_VOLUME_INFORMATION_FILE 0x0049
 #define NR_CREATE_SECTION       0x004A
+#define NR_OPEN_SECTION         0x0037
 #define NR_CREATE_PROCESS_EX    0x004B
 #define NR_MAP_VIEW_OF_SECTION  0x0028
 #define NR_UNMAP_VIEW_OF_SECTION 0x002A
@@ -454,6 +459,20 @@ EXPORT NTSTATUS NtWriteFile(
     return (NTSTATUS)x0;
 }
 
+EXPORT NTSTATUS NtQueryVolumeInformationFile(
+    HANDLE file_handle, void* io_status_block, void* fs_information, ULONG length, ULONG fs_information_class)
+{
+    return syscall6(
+        NR_QUERY_VOLUME_INFORMATION_FILE,
+        (uint64_t)file_handle,
+        (uint64_t)io_status_block,
+        (uint64_t)fs_information,
+        (uint64_t)length,
+        (uint64_t)fs_information_class,
+        0
+    );
+}
+
 /* ── Section ─────────────────────────────────────────────────── */
 
 EXPORT NTSTATUS NtCreateSection(
@@ -470,6 +489,16 @@ EXPORT NTSTATUS NtCreateSection(
     register uint64_t x6 asm("x6") = (uint64_t)file;
     asm volatile("svc #0" : "+r"(x0) : "r"(x8),"r"(x1),"r"(x2),"r"(x3),"r"(x4),"r"(x5),"r"(x6) : "memory");
     return (NTSTATUS)x0;
+}
+
+EXPORT NTSTATUS NtOpenSection(void** section_handle, ULONG desired_access, void* object_attributes) {
+    return syscall4(
+        NR_OPEN_SECTION,
+        (uint64_t)section_handle,
+        (uint64_t)desired_access,
+        (uint64_t)object_attributes,
+        0
+    );
 }
 
 /* NtMapViewOfSection has 10 args. On ARM64 Windows ABI, args 9-10 go on the
@@ -507,6 +536,48 @@ EXPORT NTSTATUS NtCreateThreadEx(
 }
 
 /* ── Registry ────────────────────────────────────────────────── */
+
+__attribute__((naked))
+EXPORT NTSTATUS NtCreateKey(
+    HANDLE* key_handle, ULONG desired_access, void* object_attributes,
+    ULONG title_index, void* class_name, ULONG create_options, ULONG* disposition)
+{
+    asm volatile(
+        "mov x8, %0\n"
+        "svc #0\n"
+        "ret\n"
+        :: "i"(NR_CREATE_KEY));
+}
+
+EXPORT NTSTATUS NtSetValueKey(
+    HANDLE key_handle, void* value_name, ULONG title_index,
+    ULONG type, const void* data, ULONG data_size)
+{
+    return syscall6(
+        NR_SET_VALUE_KEY,
+        (uint64_t)key_handle,
+        (uint64_t)value_name,
+        (uint64_t)title_index,
+        (uint64_t)type,
+        (uint64_t)data,
+        (uint64_t)data_size
+    );
+}
+
+EXPORT NTSTATUS NtQueryKey(
+    HANDLE key_handle, ULONG key_information_class, void* key_information,
+    ULONG length, ULONG* result_length)
+{
+    return syscall6(
+        NR_QUERY_KEY,
+        (uint64_t)key_handle,
+        (uint64_t)key_information_class,
+        (uint64_t)key_information,
+        (uint64_t)length,
+        (uint64_t)result_length,
+        0
+    );
+}
 
 EXPORT NTSTATUS NtDeleteValueKey(HANDLE key_handle, void* value_name) {
     return syscall2(NR_DELETE_VALUE_KEY, (uint64_t)key_handle, (uint64_t)value_name);

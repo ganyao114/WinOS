@@ -1,8 +1,11 @@
+use crate::kobj::ObjectStore;
+use crate::rust_alloc::vec::Vec;
 use crate::sched::sync::{self, make_new_handle, HANDLE_TYPE_FILE, HANDLE_TYPE_SECTION};
 use winemu_shared::status;
 
 use super::common::align_up_4k;
 use super::constants::PAGE_SIZE_4K;
+use super::path::read_oa_path;
 use super::state::{
     file_host_fd, section_alloc, section_free, section_get, view_alloc, view_free,
     vm_alloc_region_typed, vm_free_region, vm_set_section_backing,
@@ -12,14 +15,137 @@ use crate::mm::vaspace::VmaType;
 
 const SEC_IMAGE: u32 = 0x0100_0000;
 const PAGE_EXECUTE_READ: u32 = 0x20;
+const MAX_SECTION_NAME: usize = 256;
+
+#[derive(Clone, Copy)]
+struct NamedSection {
+    section_idx: u32,
+    name_len: u16,
+    name: [u8; MAX_SECTION_NAME],
+}
+
+static mut NAMED_SECTIONS: Option<ObjectStore<NamedSection>> = None;
+
+fn named_sections_mut() -> &'static mut ObjectStore<NamedSection> {
+    unsafe {
+        if NAMED_SECTIONS.is_none() {
+            NAMED_SECTIONS = Some(ObjectStore::new());
+        }
+        NAMED_SECTIONS.as_mut().unwrap()
+    }
+}
+
+fn ascii_lower(b: u8) -> u8 {
+    if b >= b'A' && b <= b'Z' {
+        b + 32
+    } else {
+        b
+    }
+}
+
+fn section_name_from_oa(oa_ptr: u64, out: &mut [u8; MAX_SECTION_NAME]) -> usize {
+    if oa_ptr == 0 {
+        return 0;
+    }
+    let len = read_oa_path(oa_ptr, out);
+    if len == 0 {
+        return 0;
+    }
+    for b in out.iter_mut().take(len) {
+        *b = ascii_lower(*b);
+    }
+    len
+}
+
+fn named_section_eq(lhs: &[u8], rhs: &[u8]) -> bool {
+    if lhs.len() != rhs.len() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < lhs.len() {
+        if lhs[i] != rhs[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn named_section_gc_stale() {
+    let store = named_sections_mut();
+    let mut stale = Vec::<u32>::new();
+    store.for_each_live_ptr(|id, ptr| unsafe {
+        if section_get((*ptr).section_idx).is_none() {
+            let _ = stale.try_reserve(1);
+            stale.push(id);
+        }
+    });
+    for id in stale {
+        let _ = store.free(id);
+    }
+}
+
+fn named_section_find(name: &[u8]) -> Option<u32> {
+    let store = named_sections_mut();
+    let mut found = None;
+    store.for_each_live_ptr(|_, ptr| unsafe {
+        let entry = &*ptr;
+        let len = entry.name_len as usize;
+        if len == 0 || len > MAX_SECTION_NAME {
+            return;
+        }
+        if named_section_eq(name, &entry.name[..len]) {
+            found = Some(entry.section_idx);
+        }
+    });
+    found
+}
+
+fn named_section_insert(name: &[u8], section_idx: u32) -> bool {
+    if name.is_empty() || name.len() > MAX_SECTION_NAME {
+        return false;
+    }
+    let mut name_buf = [0u8; MAX_SECTION_NAME];
+    name_buf[..name.len()].copy_from_slice(name);
+    named_sections_mut()
+        .alloc_with(|_| NamedSection {
+            section_idx,
+            name_len: name.len() as u16,
+            name: name_buf,
+        })
+        .is_some()
+}
+
+fn named_section_remove_by_section(section_idx: u32) {
+    let store = named_sections_mut();
+    let mut remove_ids = Vec::<u32>::new();
+    store.for_each_live_ptr(|id, ptr| unsafe {
+        if (*ptr).section_idx == section_idx {
+            let _ = remove_ids.try_reserve(1);
+            remove_ids.push(id);
+        }
+    });
+    for id in remove_ids {
+        let _ = store.free(id);
+    }
+}
 
 // x0=*SectionHandle, x3=*MaximumSize, x4=Protection, x6=FileHandle
 pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
     let out_ptr = frame.x[0] as *mut u64;
+    let oa_ptr = frame.x[2];
     let max_size_ptr = frame.x[3] as *const u64;
     let prot = frame.x[4] as u32;
     let alloc_attrs = frame.x[5] as u32;
     let file_handle = frame.x[6];
+    let mut section_name = [0u8; MAX_SECTION_NAME];
+    let section_name_len = section_name_from_oa(oa_ptr, &mut section_name);
+    named_section_gc_stale();
+    if section_name_len != 0 && named_section_find(&section_name[..section_name_len]).is_some() {
+        frame.x[0] = status::OBJECT_NAME_COLLISION as u64;
+        return;
+    }
+
     let size = if max_size_ptr.is_null() {
         PAGE_SIZE_4K
     } else {
@@ -52,8 +178,46 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
             return;
         }
     };
-    let Some(handle) = make_new_handle(HANDLE_TYPE_SECTION, idx) else {
+    if section_name_len != 0 && !named_section_insert(&section_name[..section_name_len], idx) {
         section_free(idx);
+        frame.x[0] = status::NO_MEMORY as u64;
+        return;
+    }
+    let Some(handle) = make_new_handle(HANDLE_TYPE_SECTION, idx) else {
+        named_section_remove_by_section(idx);
+        section_free(idx);
+        frame.x[0] = status::NO_MEMORY as u64;
+        return;
+    };
+    if !out_ptr.is_null() {
+        unsafe { out_ptr.write_volatile(handle) };
+    }
+    frame.x[0] = status::SUCCESS as u64;
+}
+
+// x0=*SectionHandle, x1=DesiredAccess, x2=ObjectAttributes
+pub(crate) fn handle_open_section(frame: &mut SvcFrame) {
+    let out_ptr = frame.x[0] as *mut u64;
+    let oa_ptr = frame.x[2];
+    let mut section_name = [0u8; MAX_SECTION_NAME];
+    let section_name_len = section_name_from_oa(oa_ptr, &mut section_name);
+    if section_name_len == 0 {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+
+    named_section_gc_stale();
+    let Some(section_idx) = named_section_find(&section_name[..section_name_len]) else {
+        frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
+        return;
+    };
+    if section_get(section_idx).is_none() {
+        named_section_remove_by_section(section_idx);
+        frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
+        return;
+    }
+
+    let Some(handle) = make_new_handle(HANDLE_TYPE_SECTION, section_idx) else {
         frame.x[0] = status::NO_MEMORY as u64;
         return;
     };
@@ -177,5 +341,6 @@ pub(crate) fn handle_unmap_view_of_section(frame: &mut SvcFrame) {
 }
 
 pub(crate) fn close_section_idx(idx: u32) {
+    named_section_remove_by_section(idx);
     section_free(idx);
 }

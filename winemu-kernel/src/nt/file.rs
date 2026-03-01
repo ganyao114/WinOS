@@ -7,6 +7,18 @@ use super::path::read_oa_path;
 use super::state::{file_alloc, file_free};
 use super::SvcFrame;
 
+const FILE_FS_SIZE_INFORMATION: u32 = 3;
+const FILE_FS_DEVICE_INFORMATION: u32 = 4;
+const FILE_FS_ATTRIBUTE_INFORMATION: u32 = 5;
+const FILE_FS_SIZE_INFORMATION_SIZE: usize = 24;
+const FILE_FS_DEVICE_INFORMATION_SIZE: usize = 8;
+const FILE_FS_ATTRIBUTE_INFORMATION_SIZE: usize = 12;
+
+const FILE_DEVICE_DISK: u32 = 0x0000_0007;
+const FILE_CASE_SENSITIVE_SEARCH: u32 = 0x0000_0001;
+const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
+const FILE_UNICODE_ON_DISK: u32 = 0x0000_0004;
+
 // x0=*FileHandle, x1=DesiredAccess, x2=ObjectAttributes, x3=*IoStatusBlock
 // x7=CreateDisposition
 pub(crate) fn handle_create_file(frame: &mut SvcFrame) {
@@ -173,6 +185,93 @@ pub(crate) fn handle_query_directory_file(frame: &mut SvcFrame) {
     let iosb_ptr = frame.x[4] as *mut IoStatusBlock;
     write_iosb(iosb_ptr, status::NO_MORE_FILES, 0);
     frame.x[0] = status::NO_MORE_FILES as u64;
+}
+
+// x0=FileHandle, x1=*IoStatusBlock, x2=FsInformation, x3=Length, x4=FsInformationClass
+pub(crate) fn handle_query_volume_information_file(frame: &mut SvcFrame) {
+    let file_handle = frame.x[0];
+    let iosb_ptr = frame.x[1] as *mut IoStatusBlock;
+    let out_ptr = frame.x[2] as *mut u8;
+    let out_len = frame.x[3] as usize;
+    let info_class = frame.x[4] as u32;
+
+    let host_fd = match file_handle_to_host_fd(file_handle) {
+        Some(fd) => fd,
+        None => {
+            write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+            frame.x[0] = status::INVALID_HANDLE as u64;
+            return;
+        }
+    };
+
+    unsafe {
+        match info_class {
+            FILE_FS_DEVICE_INFORMATION => {
+                if out_ptr.is_null() || out_len < FILE_FS_DEVICE_INFORMATION_SIZE {
+                    write_iosb(iosb_ptr, status::INFO_LENGTH_MISMATCH, 0);
+                    frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
+                    return;
+                }
+                (out_ptr as *mut u32).write_volatile(FILE_DEVICE_DISK);
+                (out_ptr.add(4) as *mut u32).write_volatile(0);
+                write_iosb(iosb_ptr, status::SUCCESS, FILE_FS_DEVICE_INFORMATION_SIZE as u64);
+                frame.x[0] = status::SUCCESS as u64;
+            }
+            FILE_FS_ATTRIBUTE_INFORMATION => {
+                const FS_NAME: &[u8] = b"WinEmuFS";
+                let fs_name_bytes = FS_NAME.len() * 2;
+                let need = FILE_FS_ATTRIBUTE_INFORMATION_SIZE + fs_name_bytes;
+                if out_ptr.is_null() || out_len < need {
+                    write_iosb(iosb_ptr, status::INFO_LENGTH_MISMATCH, 0);
+                    frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
+                    return;
+                }
+                (out_ptr as *mut u32).write_volatile(
+                    FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK,
+                );
+                (out_ptr.add(4) as *mut u32).write_volatile(255);
+                (out_ptr.add(8) as *mut u32).write_volatile(fs_name_bytes as u32);
+
+                let mut i = 0usize;
+                while i < FS_NAME.len() {
+                    let ch = FS_NAME[i] as u16;
+                    (out_ptr.add(FILE_FS_ATTRIBUTE_INFORMATION_SIZE + i * 2) as *mut u16)
+                        .write_volatile(ch);
+                    i += 1;
+                }
+                write_iosb(iosb_ptr, status::SUCCESS, need as u64);
+                frame.x[0] = status::SUCCESS as u64;
+            }
+            FILE_FS_SIZE_INFORMATION => {
+                if out_ptr.is_null() || out_len < FILE_FS_SIZE_INFORMATION_SIZE {
+                    write_iosb(iosb_ptr, status::INFO_LENGTH_MISMATCH, 0);
+                    frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
+                    return;
+                }
+                let bytes_per_sector: u64 = 4096;
+                let sectors_per_alloc: u64 = 1;
+                let file_bytes = if host_fd <= 2 {
+                    0
+                } else {
+                    hypercall::host_stat(host_fd)
+                };
+                let total_bytes = core::cmp::max(file_bytes, 64 * 1024 * 1024);
+                let total_units = core::cmp::max(total_bytes / bytes_per_sector, 1);
+                let avail_units = total_units / 2;
+
+                (out_ptr as *mut u64).write_volatile(total_units);
+                (out_ptr.add(8) as *mut u64).write_volatile(avail_units);
+                (out_ptr.add(16) as *mut u32).write_volatile(sectors_per_alloc as u32);
+                (out_ptr.add(20) as *mut u32).write_volatile(bytes_per_sector as u32);
+                write_iosb(iosb_ptr, status::SUCCESS, FILE_FS_SIZE_INFORMATION_SIZE as u64);
+                frame.x[0] = status::SUCCESS as u64;
+            }
+            _ => {
+                write_iosb(iosb_ptr, status::INVALID_PARAMETER, 0);
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+            }
+        }
+    }
 }
 
 pub(crate) fn close_file_idx(idx: u32) {
