@@ -379,40 +379,40 @@ unsafe fn apply_imports(
                 _ => (dll_name, iref, false),
             };
             let Some(addr) = resolve(resolved_dll, resolved_iref) else {
-                hypercall::debug_print("ldr: unresolved import ");
-                hypercall::debug_print(dll_name);
-                hypercall::debug_print("!");
+                crate::log::debug_print("ldr: unresolved import ");
+                crate::log::debug_print(dll_name);
+                crate::log::debug_print("!");
                 match iref {
                     ImportRef::Name(fn_name) => {
-                        hypercall::debug_print(fn_name);
+                        crate::log::debug_print(fn_name);
                     }
                     ImportRef::Ordinal(ord) => {
-                        hypercall::debug_print("#");
-                        hypercall::debug_u64(ord as u64);
+                        crate::log::debug_print("#");
+                        crate::log::debug_u64(ord as u64);
                     }
                 }
                 if remapped {
-                    hypercall::debug_print(" via ");
-                    hypercall::debug_print(resolved_dll);
+                    crate::log::debug_print(" via ");
+                    crate::log::debug_print(resolved_dll);
                 }
-                hypercall::debug_print("\n");
+                crate::log::debug_print("\n");
                 return Err(LdrError::BadImport);
             };
             if let ImportRef::Name(fn_name) = iref {
                 if fn_name == "RtlOpenCrossProcessEmulatorWorkConnection" {
-                    hypercall::debug_print("ldr: import ");
-                    hypercall::debug_print(dll_name);
-                    hypercall::debug_print("!");
-                    hypercall::debug_print(fn_name);
+                    crate::log::debug_print("ldr: import ");
+                    crate::log::debug_print(dll_name);
+                    crate::log::debug_print("!");
+                    crate::log::debug_print(fn_name);
                     if remapped {
-                        hypercall::debug_print(" => ");
-                        hypercall::debug_print(resolved_dll);
+                        crate::log::debug_print(" => ");
+                        crate::log::debug_print(resolved_dll);
                     }
-                    hypercall::debug_print(" -> ");
-                    hypercall::debug_u64(addr);
-                    hypercall::debug_print(" slot=");
-                    hypercall::debug_u64((base as u64).saturating_add(iat_rva as u64 + (slot as u64) * 8));
-                    hypercall::debug_print("\n");
+                    crate::log::debug_print(" -> ");
+                    crate::log::debug_u64(addr);
+                    crate::log::debug_print(" slot=");
+                    crate::log::debug_u64((base as u64).saturating_add(iat_rva as u64 + (slot as u64) * 8));
+                    crate::log::debug_print("\n");
                 }
                 if dll_name.eq_ignore_ascii_case("kernel32.dll")
                     && (fn_name == "GetProcessHeap"
@@ -439,17 +439,17 @@ unsafe fn apply_imports(
                         || fn_name == "LeaveCriticalSection"
                         || fn_name == "RaiseException")
                 {
-                    hypercall::debug_print("ldr: import ");
-                    hypercall::debug_print(dll_name);
-                    hypercall::debug_print("!");
-                    hypercall::debug_print(fn_name);
+                    crate::log::debug_print("ldr: import ");
+                    crate::log::debug_print(dll_name);
+                    crate::log::debug_print("!");
+                    crate::log::debug_print(fn_name);
                     if remapped {
-                        hypercall::debug_print(" => ");
-                        hypercall::debug_print(resolved_dll);
+                        crate::log::debug_print(" => ");
+                        crate::log::debug_print(resolved_dll);
                     }
-                    hypercall::debug_print(" -> ");
-                    hypercall::debug_u64(addr);
-                    hypercall::debug_print("\n");
+                    crate::log::debug_print(" -> ");
+                    crate::log::debug_u64(addr);
+                    crate::log::debug_print("\n");
                 }
             }
             pe::wu64(base.add(iat_rva + slot * 8), addr);

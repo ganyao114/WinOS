@@ -82,26 +82,26 @@ fn trace_cpp_exception_type_name(pid: u32, throw_info: u64, image_base: u64) {
     if throw_info == 0 {
         return;
     }
-    crate::hypercall::debug_print("nt: cpp throw_info=");
-    crate::hypercall::debug_u64(throw_info);
-    crate::hypercall::debug_print(" image_base=");
-    crate::hypercall::debug_u64(image_base);
-    crate::hypercall::debug_print("\n");
+    crate::log::debug_print("nt: cpp throw_info=");
+    crate::log::debug_u64(throw_info);
+    crate::log::debug_print(" image_base=");
+    crate::log::debug_u64(image_base);
+    crate::log::debug_print("\n");
 
     // Try MSVC ThrowInfo -> CatchableTypeArray -> TypeDescriptor chain.
     if image_base != 0 {
         let cta_rva = read_user_u32(pid, throw_info.saturating_add(0x0c)).unwrap_or(0);
         let cta = image_rel_or_abs(image_base, cta_rva);
-        crate::hypercall::debug_print("nt: cpp cta_rva=");
-        crate::hypercall::debug_u64(cta_rva as u64);
-        crate::hypercall::debug_print(" cta=");
-        crate::hypercall::debug_u64(cta);
-        crate::hypercall::debug_print("\n");
+        crate::log::debug_print("nt: cpp cta_rva=");
+        crate::log::debug_u64(cta_rva as u64);
+        crate::log::debug_print(" cta=");
+        crate::log::debug_u64(cta);
+        crate::log::debug_print("\n");
         if cta != 0 {
             let count = read_user_u32(pid, cta).unwrap_or(0);
-            crate::hypercall::debug_print("nt: cpp catchable_count=");
-            crate::hypercall::debug_u64(count as u64);
-            crate::hypercall::debug_print("\n");
+            crate::log::debug_print("nt: cpp catchable_count=");
+            crate::log::debug_u64(count as u64);
+            crate::log::debug_print("\n");
             if (1..=32).contains(&count) {
                 for i in 0..count {
                     let ct_rva = read_user_u32(pid, cta.saturating_add(4 + (i as u64) * 4)).unwrap_or(0);
@@ -111,11 +111,11 @@ fn trace_cpp_exception_type_name(pid: u32, throw_info: u64, image_base: u64) {
                     }
                     let td_rva = read_user_u32(pid, ct.saturating_add(4)).unwrap_or(0);
                     let td = image_rel_or_abs(image_base, td_rva);
-                    crate::hypercall::debug_print("nt: cpp ct=");
-                    crate::hypercall::debug_u64(ct);
-                    crate::hypercall::debug_print(" td=");
-                    crate::hypercall::debug_u64(td);
-                    crate::hypercall::debug_print("\n");
+                    crate::log::debug_print("nt: cpp ct=");
+                    crate::log::debug_u64(ct);
+                    crate::log::debug_print(" td=");
+                    crate::log::debug_u64(td);
+                    crate::log::debug_print("\n");
                     if td == 0 {
                         continue;
                     }
@@ -130,9 +130,9 @@ fn trace_cpp_exception_type_name(pid: u32, throw_info: u64, image_base: u64) {
                             continue;
                         }
                         if let Ok(name) = core::str::from_utf8(&buf[..len]) {
-                            crate::hypercall::debug_print("nt: cpp exception type=");
-                            crate::hypercall::debug_print(name);
-                            crate::hypercall::debug_print("\n");
+                            crate::log::debug_print("nt: cpp exception type=");
+                            crate::log::debug_print(name);
+                            crate::log::debug_print("\n");
                             return;
                         }
                     }
@@ -157,13 +157,13 @@ fn trace_cpp_exception_type_name(pid: u32, throw_info: u64, image_base: u64) {
             continue;
         }
         if let Ok(name) = core::str::from_utf8(&buf[..len]) {
-            crate::hypercall::debug_print("nt: cpp exception type=");
-            crate::hypercall::debug_print(name);
-            crate::hypercall::debug_print("\n");
+            crate::log::debug_print("nt: cpp exception type=");
+            crate::log::debug_print(name);
+            crate::log::debug_print("\n");
             return;
         }
     }
-    crate::hypercall::debug_print("nt: cpp exception type=<unresolved>\n");
+    crate::log::debug_print("nt: cpp exception type=<unresolved>\n");
 }
 
 // x0=ProcessHandle, x1=ProcessInformationClass, x2=Buffer, x3=BufferLength, x4=*ReturnLength
@@ -245,7 +245,7 @@ pub(crate) fn handle_open_process(frame: &mut SvcFrame) {
 // NtCreateProcessEx:
 // x0=*ProcessHandle, x1=DesiredAccess, x3=ParentProcess, x4=Flags, x5=SectionHandle
 pub(crate) fn handle_create_process(frame: &mut SvcFrame) {
-    crate::hypercall::debug_u64(0xC501_0001);
+    crate::log::debug_u64(0xC501_0001);
     let out_ptr = frame.x[0] as *mut u64;
     let desired_access = frame.x[1] as u32;
     let parent_handle = frame.x[3];
@@ -263,14 +263,14 @@ pub(crate) fn handle_create_process(frame: &mut SvcFrame) {
 
     match crate::process::create_process(parent_handle, section_handle, flags) {
         Ok(handle) => {
-            crate::hypercall::debug_u64(0xC501_0002);
+            crate::log::debug_u64(0xC501_0002);
             if !out_ptr.is_null() {
                 unsafe { out_ptr.write_volatile(handle) };
             }
             frame.x[0] = status::SUCCESS as u64;
         }
         Err(st) => {
-            crate::hypercall::debug_u64(0xC501_1000 | st as u64);
+            crate::log::debug_u64(0xC501_1000 | st as u64);
             frame.x[0] = st as u64;
         }
     }
@@ -284,34 +284,34 @@ pub(crate) fn handle_terminate_process(frame: &mut SvcFrame) {
     let dbg3 = frame.x[3];
     let dbg4 = frame.x[4];
     let dbg5 = frame.x[5];
-    crate::hypercall::debug_print("nt: NtTerminateProcess enter h=");
-    crate::hypercall::debug_u64(process_handle);
-    crate::hypercall::debug_print(" status=");
-    crate::hypercall::debug_u64(exit_status as u64);
-    crate::hypercall::debug_print(" d2=");
-    crate::hypercall::debug_u64(dbg2);
-    crate::hypercall::debug_print(" d3=");
-    crate::hypercall::debug_u64(dbg3);
-    crate::hypercall::debug_print(" d4=");
-    crate::hypercall::debug_u64(dbg4);
-    crate::hypercall::debug_print(" d5=");
-    crate::hypercall::debug_u64(dbg5);
-    crate::hypercall::debug_print(" elr=");
-    crate::hypercall::debug_u64(frame.elr);
-    crate::hypercall::debug_print(" fp=");
-    crate::hypercall::debug_u64(frame.x[29]);
-    crate::hypercall::debug_print(" lr=");
-    crate::hypercall::debug_u64(frame.x[30]);
-    crate::hypercall::debug_print("\n");
+    crate::log::debug_print("nt: NtTerminateProcess enter h=");
+    crate::log::debug_u64(process_handle);
+    crate::log::debug_print(" status=");
+    crate::log::debug_u64(exit_status as u64);
+    crate::log::debug_print(" d2=");
+    crate::log::debug_u64(dbg2);
+    crate::log::debug_print(" d3=");
+    crate::log::debug_u64(dbg3);
+    crate::log::debug_print(" d4=");
+    crate::log::debug_u64(dbg4);
+    crate::log::debug_print(" d5=");
+    crate::log::debug_u64(dbg5);
+    crate::log::debug_print(" elr=");
+    crate::log::debug_u64(frame.elr);
+    crate::log::debug_print(" fp=");
+    crate::log::debug_u64(frame.x[29]);
+    crate::log::debug_print(" lr=");
+    crate::log::debug_u64(frame.x[30]);
+    crate::log::debug_print("\n");
 
     let Some(pid) = crate::process::resolve_process_handle(process_handle) else {
-        crate::hypercall::debug_print("nt: NtTerminateProcess invalid handle\n");
+        crate::log::debug_print("nt: NtTerminateProcess invalid handle\n");
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     };
-    crate::hypercall::debug_print("nt: NtTerminateProcess pid=");
-    crate::hypercall::debug_u64(pid as u64);
-    crate::hypercall::debug_print("\n");
+    crate::log::debug_print("nt: NtTerminateProcess pid=");
+    crate::log::debug_u64(pid as u64);
+    crate::log::debug_print("\n");
     if exit_status == CPP_EH_EXCEPTION_CODE {
         trace_cpp_exception_type_name(pid, dbg2, dbg3);
     }

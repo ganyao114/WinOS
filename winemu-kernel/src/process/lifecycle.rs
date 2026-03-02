@@ -55,18 +55,18 @@ pub fn init_boot_process(image_base: u64, peb_va: u64) -> bool {
 }
 
 pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> Result<u64, u32> {
-    crate::hypercall::debug_u64(0xC502_0001);
+    crate::log::debug_u64(0xC502_0001);
     let Some(parent_pid) = super::resolve_process_handle(parent_handle) else {
-        crate::hypercall::debug_u64(0xC502_E001);
+        crate::log::debug_u64(0xC502_E001);
         return Err(status::INVALID_HANDLE);
     };
-    crate::hypercall::debug_u64(0xC502_0002);
+    crate::log::debug_u64(0xC502_0002);
 
     if section_handle != 0
         && crate::sched::sync::handle_type(section_handle)
             != crate::sched::sync::HANDLE_TYPE_SECTION
     {
-        crate::hypercall::debug_u64(0xC502_E002);
+        crate::log::debug_u64(0xC502_E002);
         return Err(status::INVALID_HANDLE);
     }
 
@@ -74,31 +74,31 @@ pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> R
         let child_as = ProcessAddressSpace::clone_from(&parent.address_space);
         (parent.state, parent.image_base, parent.peb_va, child_as)
     }) else {
-        crate::hypercall::debug_u64(0xC502_E003);
+        crate::log::debug_u64(0xC502_E003);
         return Err(status::INVALID_HANDLE);
     };
-    crate::hypercall::debug_u64(0xC502_0003);
+    crate::log::debug_u64(0xC502_0003);
 
     if state == ProcessState::Terminated || state == ProcessState::Terminating {
-        crate::hypercall::debug_u64(0xC502_E004);
+        crate::log::debug_u64(0xC502_E004);
         return Err(status::INVALID_HANDLE);
     }
 
     let Some(address_space) = child_as else {
-        crate::hypercall::debug_u64(0xC502_E005);
+        crate::log::debug_u64(0xC502_E005);
         return Err(status::NO_MEMORY);
     };
-    crate::hypercall::debug_u64(0xC502_0004);
+    crate::log::debug_u64(0xC502_0004);
 
     let Some(pid) = alloc_process(parent_pid, image_base, peb_va, address_space) else {
-        crate::hypercall::debug_u64(0xC502_E006);
+        crate::log::debug_u64(0xC502_E006);
         return Err(status::NO_MEMORY);
     };
-    crate::hypercall::debug_u64(0xC502_0005);
+    crate::log::debug_u64(0xC502_0005);
 
     let _ = with_process_mut(pid, |p| p.state = ProcessState::Running);
     if !crate::nt::state::vm_clone_external_mappings(parent_pid, pid) {
-        crate::hypercall::debug_u64(0xC502_E008);
+        crate::log::debug_u64(0xC502_E008);
         let _ = free_process(pid);
         return Err(status::NO_MEMORY);
     }
@@ -109,11 +109,11 @@ pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> R
         pid,
     )
     else {
-        crate::hypercall::debug_u64(0xC502_E007);
+        crate::log::debug_u64(0xC502_E007);
         let _ = free_process(pid);
         return Err(status::NO_MEMORY);
     };
-    crate::hypercall::debug_u64(0xC502_0006);
+    crate::log::debug_u64(0xC502_0006);
 
     Ok(handle)
 }

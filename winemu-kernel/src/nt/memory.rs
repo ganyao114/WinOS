@@ -151,23 +151,23 @@ fn trace_avm_success(
         read_user_u64(owner_pid, base_ptr as *const u64).unwrap_or(0)
     };
     let readback_size = read_user_u64(owner_pid, size_ptr as *const u64).unwrap_or(0);
-    crate::hypercall::debug_print("nt: avm ok pid=");
-    crate::hypercall::debug_u64(owner_pid as u64);
-    crate::hypercall::debug_print(" bp=");
-    crate::hypercall::debug_u64(base_ptr as u64);
-    crate::hypercall::debug_print(" sp=");
-    crate::hypercall::debug_u64(size_ptr as u64);
-    crate::hypercall::debug_print(" base=");
-    crate::hypercall::debug_u64(base);
-    crate::hypercall::debug_print(" size=");
-    crate::hypercall::debug_u64(size);
-    crate::hypercall::debug_print(" req=");
-    crate::hypercall::debug_u64(req_size);
-    crate::hypercall::debug_print(" rb_base=");
-    crate::hypercall::debug_u64(readback_base);
-    crate::hypercall::debug_print(" rb_size=");
-    crate::hypercall::debug_u64(readback_size);
-    crate::hypercall::debug_print("\n");
+    crate::log::debug_print("nt: avm ok pid=");
+    crate::log::debug_u64(owner_pid as u64);
+    crate::log::debug_print(" bp=");
+    crate::log::debug_u64(base_ptr as u64);
+    crate::log::debug_print(" sp=");
+    crate::log::debug_u64(size_ptr as u64);
+    crate::log::debug_print(" base=");
+    crate::log::debug_u64(base);
+    crate::log::debug_print(" size=");
+    crate::log::debug_u64(size);
+    crate::log::debug_print(" req=");
+    crate::log::debug_u64(req_size);
+    crate::log::debug_print(" rb_base=");
+    crate::log::debug_u64(readback_base);
+    crate::log::debug_print(" rb_size=");
+    crate::log::debug_u64(readback_size);
+    crate::log::debug_print("\n");
 }
 
 // x1=*BaseAddress, x3=*RegionSize, x5=Protect
@@ -180,18 +180,18 @@ pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
         return;
     }
     if size_ptr.is_null() {
-        crate::hypercall::debug_u64(0xE215_E001);
+        crate::log::debug_u64(0xE215_E001);
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
 
     let Some(req_size) = read_user_u64(owner_pid, size_ptr as *const u64) else {
-        crate::hypercall::debug_u64(0xE215_E005);
+        crate::log::debug_u64(0xE215_E005);
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     };
     if req_size == 0 {
-        crate::hypercall::debug_u64(0xE215_E002);
+        crate::log::debug_u64(0xE215_E002);
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
@@ -200,7 +200,7 @@ pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
     let size = align_up_4k(req_size);
     let req_base = if !base_ptr.is_null() {
         let Some(v) = read_user_u64(owner_pid, base_ptr as *const u64) else {
-            crate::hypercall::debug_u64(0xE215_E006);
+            crate::log::debug_u64(0xE215_E006);
             frame.x[0] = status::INVALID_PARAMETER as u64;
             return;
         };
@@ -212,7 +212,7 @@ pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
     let reserve = (alloc_type & MEM_RESERVE) != 0;
     let commit = (alloc_type & MEM_COMMIT) != 0;
     if !reserve && !commit {
-        crate::hypercall::debug_u64(0xE215_E003);
+        crate::log::debug_u64(0xE215_E003);
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
@@ -221,7 +221,7 @@ pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
         let base = match vm_reserve_private(owner_pid, req_base, size, prot) {
             Ok(v) => v,
             Err(st) => {
-                crate::hypercall::debug_u64(0xE215_0000 | st as u64);
+                crate::log::debug_u64(0xE215_0000 | st as u64);
                 frame.x[0] = st as u64;
                 return;
             }
@@ -229,25 +229,25 @@ pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
         if commit {
             let st = vm_commit_private(owner_pid, base, size, prot);
             if st != status::SUCCESS {
-                crate::hypercall::debug_u64(0xE215_1000 | st as u64);
+                crate::log::debug_u64(0xE215_1000 | st as u64);
                 let _ = vm_release_private(owner_pid, base);
                 frame.x[0] = st as u64;
                 return;
             }
         }
         if !base_ptr.is_null() && !write_user_u64(owner_pid, base_ptr, base) {
-            crate::hypercall::debug_u64(0xE215_E007);
+            crate::log::debug_u64(0xE215_E007);
             frame.x[0] = status::INVALID_PARAMETER as u64;
             return;
         }
         if !write_user_u64(owner_pid, size_ptr, size) {
-            crate::hypercall::debug_u64(0xE215_E008);
+            crate::log::debug_u64(0xE215_E008);
             frame.x[0] = status::INVALID_PARAMETER as u64;
             return;
         }
         if base < USER_VA_BASE || base >= USER_VA_LIMIT {
-            crate::hypercall::debug_u64(0xE215_E00B);
-            crate::hypercall::debug_u64(base);
+            crate::log::debug_u64(0xE215_E00B);
+            crate::log::debug_u64(base);
         }
         trace_avm_success(owner_pid, base_ptr, size_ptr, base, size, req_size);
         frame.x[0] = status::SUCCESS as u64;
@@ -255,37 +255,37 @@ pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
     }
 
     if req_base == 0 {
-        crate::hypercall::debug_u64(0xE215_E004);
-        crate::hypercall::debug_print("nt: avm invalid commit-only null base alloc_type=");
-        crate::hypercall::debug_u64(alloc_type as u64);
-        crate::hypercall::debug_print(" prot=");
-        crate::hypercall::debug_u64(prot as u64);
-        crate::hypercall::debug_print(" req=");
-        crate::hypercall::debug_u64(req_size);
-        crate::hypercall::debug_print("\n");
+        crate::log::debug_u64(0xE215_E004);
+        crate::log::debug_print("nt: avm invalid commit-only null base alloc_type=");
+        crate::log::debug_u64(alloc_type as u64);
+        crate::log::debug_print(" prot=");
+        crate::log::debug_u64(prot as u64);
+        crate::log::debug_print(" req=");
+        crate::log::debug_u64(req_size);
+        crate::log::debug_print("\n");
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
 
     let st = vm_commit_private(owner_pid, req_base, size, prot);
     if st != status::SUCCESS {
-        crate::hypercall::debug_u64(0xE215_2000 | st as u64);
+        crate::log::debug_u64(0xE215_2000 | st as u64);
         frame.x[0] = st as u64;
         return;
     }
     if !base_ptr.is_null() && !write_user_u64(owner_pid, base_ptr, req_base) {
-        crate::hypercall::debug_u64(0xE215_E009);
+        crate::log::debug_u64(0xE215_E009);
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
     if !write_user_u64(owner_pid, size_ptr, size) {
-        crate::hypercall::debug_u64(0xE215_E00A);
+        crate::log::debug_u64(0xE215_E00A);
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
     if req_base < USER_VA_BASE || req_base >= USER_VA_LIMIT {
-        crate::hypercall::debug_u64(0xE215_E00C);
-        crate::hypercall::debug_u64(req_base);
+        crate::log::debug_u64(0xE215_E00C);
+        crate::log::debug_u64(req_base);
     }
     trace_avm_success(owner_pid, base_ptr, size_ptr, req_base, size, req_size);
     frame.x[0] = status::SUCCESS as u64;

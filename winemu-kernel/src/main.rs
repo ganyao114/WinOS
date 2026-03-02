@@ -91,57 +91,57 @@ pub extern "C" fn el0_page_fault(far: u64, esr: u64, elr: u64, frame_ptr: u64) -
         }
     }
 
-    hypercall::debug_print("PAGE_FAULT_UNRESOLVED: ");
-    hypercall::debug_u64(far);
-    hypercall::debug_print(" ESR=");
-    hypercall::debug_u64(esr);
-    hypercall::debug_print(" ELR=");
-    hypercall::debug_u64(elr);
+    crate::log::debug_print("PAGE_FAULT_UNRESOLVED: ");
+    crate::log::debug_u64(far);
+    crate::log::debug_print(" ESR=");
+    crate::log::debug_u64(esr);
+    crate::log::debug_print(" ELR=");
+    crate::log::debug_u64(elr);
     let owner_pid = crate::process::current_pid();
-    hypercall::debug_print(" PID=");
-    hypercall::debug_u64(owner_pid as u64);
-        hypercall::debug_print(" TID=");
-        hypercall::debug_u64(crate::sched::current_tid() as u64);
+    crate::log::debug_print(" PID=");
+    crate::log::debug_u64(owner_pid as u64);
+        crate::log::debug_print(" TID=");
+        crate::log::debug_u64(crate::sched::current_tid() as u64);
         let cur_tid = crate::sched::current_tid();
         if cur_tid != 0 && crate::sched::thread_exists(cur_tid) {
             crate::sched::with_thread(cur_tid, |t| {
-                hypercall::debug_print(" LastTrapSP=");
-                hypercall::debug_u64(t.ctx.sp);
-                hypercall::debug_print(" LastTrapPC=");
-                hypercall::debug_u64(t.ctx.pc);
+                crate::log::debug_print(" LastTrapSP=");
+                crate::log::debug_u64(t.ctx.sp);
+                crate::log::debug_print(" LastTrapPC=");
+                crate::log::debug_u64(t.ctx.pc);
             });
         } else {
-            hypercall::debug_print(" LastTrapCtx=none");
+            crate::log::debug_print(" LastTrapCtx=none");
         }
         if owner_pid != 0 {
             if let Some(info) = crate::nt::state::vm_query_region(owner_pid, far) {
-                hypercall::debug_print(" Q.base=");
-            hypercall::debug_u64(info.base);
-            hypercall::debug_print(" Q.size=");
-            hypercall::debug_u64(info.size);
-            hypercall::debug_print(" Q.alloc_base=");
-            hypercall::debug_u64(info.allocation_base);
-            hypercall::debug_print(" Q.alloc_prot=");
-            hypercall::debug_u64(info.allocation_prot as u64);
-            hypercall::debug_print(" Q.prot=");
-            hypercall::debug_u64(info.prot as u64);
-            hypercall::debug_print(" Q.state=");
-            hypercall::debug_u64(info.state as u64);
-            hypercall::debug_print(" Q.type=");
-            hypercall::debug_u64(info.mem_type as u64);
+                crate::log::debug_print(" Q.base=");
+            crate::log::debug_u64(info.base);
+            crate::log::debug_print(" Q.size=");
+            crate::log::debug_u64(info.size);
+            crate::log::debug_print(" Q.alloc_base=");
+            crate::log::debug_u64(info.allocation_base);
+            crate::log::debug_print(" Q.alloc_prot=");
+            crate::log::debug_u64(info.allocation_prot as u64);
+            crate::log::debug_print(" Q.prot=");
+            crate::log::debug_u64(info.prot as u64);
+            crate::log::debug_print(" Q.state=");
+            crate::log::debug_u64(info.state as u64);
+            crate::log::debug_print(" Q.type=");
+            crate::log::debug_u64(info.mem_type as u64);
         } else {
-            hypercall::debug_print(" Q.none");
+            crate::log::debug_print(" Q.none");
             if let Some((any_owner, any_base, any_size, any_kind)) =
                 crate::nt::state::vm_debug_find_region_any(far)
             {
-                hypercall::debug_print(" AQ.owner=");
-                hypercall::debug_u64(any_owner as u64);
-                hypercall::debug_print(" AQ.base=");
-                hypercall::debug_u64(any_base);
-                hypercall::debug_print(" AQ.size=");
-                hypercall::debug_u64(any_size);
-                hypercall::debug_print(" AQ.kind=");
-                hypercall::debug_u64(any_kind as u64);
+                crate::log::debug_print(" AQ.owner=");
+                crate::log::debug_u64(any_owner as u64);
+                crate::log::debug_print(" AQ.base=");
+                crate::log::debug_u64(any_base);
+                crate::log::debug_print(" AQ.size=");
+                crate::log::debug_u64(any_size);
+                crate::log::debug_print(" AQ.kind=");
+                crate::log::debug_u64(any_kind as u64);
             }
         }
     }
@@ -157,92 +157,92 @@ pub extern "C" fn el0_page_fault(far: u64, esr: u64, elr: u64, frame_ptr: u64) -
         let x30 = unsafe { frame.add(30).read_volatile() };
         // __el0_da frame saves SP_EL0 at +0x108 (index 33).
         let sp_el0 = unsafe { frame.add(33).read_volatile() };
-        hypercall::debug_print(" X0=");
-        hypercall::debug_u64(x0);
-        hypercall::debug_print(" X1=");
-        hypercall::debug_u64(x1);
-        hypercall::debug_print(" X2=");
-        hypercall::debug_u64(x2);
-        hypercall::debug_print(" X3=");
-        hypercall::debug_u64(x3);
-        hypercall::debug_print(" X4=");
-        hypercall::debug_u64(x4);
-        hypercall::debug_print(" X18=");
-        hypercall::debug_u64(x18);
-        hypercall::debug_print(" SP=");
-        hypercall::debug_u64(sp_el0);
-        hypercall::debug_print(" X29=");
-        hypercall::debug_u64(x29);
-        hypercall::debug_print(" X30=");
-        hypercall::debug_u64(x30);
+        crate::log::debug_print(" X0=");
+        crate::log::debug_u64(x0);
+        crate::log::debug_print(" X1=");
+        crate::log::debug_u64(x1);
+        crate::log::debug_print(" X2=");
+        crate::log::debug_u64(x2);
+        crate::log::debug_print(" X3=");
+        crate::log::debug_u64(x3);
+        crate::log::debug_print(" X4=");
+        crate::log::debug_u64(x4);
+        crate::log::debug_print(" X18=");
+        crate::log::debug_u64(x18);
+        crate::log::debug_print(" SP=");
+        crate::log::debug_u64(sp_el0);
+        crate::log::debug_print(" X29=");
+        crate::log::debug_u64(x29);
+        crate::log::debug_print(" X30=");
+        crate::log::debug_u64(x30);
         if owner_pid != 0 && x18 >= crate::process::USER_VA_BASE {
             if let Some(stack_base) =
                 read_user_u64_debug(owner_pid, x18.saturating_add(winemu_shared::teb::STACK_BASE as u64))
             {
-                hypercall::debug_print(" TEB.StackBase=");
-                hypercall::debug_u64(stack_base);
+                crate::log::debug_print(" TEB.StackBase=");
+                crate::log::debug_u64(stack_base);
             }
             if let Some(stack_limit) =
                 read_user_u64_debug(owner_pid, x18.saturating_add(winemu_shared::teb::STACK_LIMIT as u64))
             {
-                hypercall::debug_print(" TEB.StackLimit=");
-                hypercall::debug_u64(stack_limit);
+                crate::log::debug_print(" TEB.StackLimit=");
+                crate::log::debug_u64(stack_limit);
             }
         }
         if owner_pid != 0 && elr >= crate::process::USER_VA_BASE {
             if let Some(v) = read_user_u32_debug(owner_pid, elr.saturating_sub(8)) {
-                hypercall::debug_print(" I-8=");
-                hypercall::debug_u64(v as u64);
+                crate::log::debug_print(" I-8=");
+                crate::log::debug_u64(v as u64);
             }
             if let Some(v) = read_user_u32_debug(owner_pid, elr.saturating_sub(4)) {
-                hypercall::debug_print(" I-4=");
-                hypercall::debug_u64(v as u64);
+                crate::log::debug_print(" I-4=");
+                crate::log::debug_u64(v as u64);
             }
             if let Some(v) = read_user_u32_debug(owner_pid, elr) {
-                hypercall::debug_print(" I0=");
-                hypercall::debug_u64(v as u64);
+                crate::log::debug_print(" I0=");
+                crate::log::debug_u64(v as u64);
             }
             if let Some(v) = read_user_u32_debug(owner_pid, elr.saturating_add(4)) {
-                hypercall::debug_print(" I+4=");
-                hypercall::debug_u64(v as u64);
+                crate::log::debug_print(" I+4=");
+                crate::log::debug_u64(v as u64);
             }
         }
         if x29 != 0 && owner_pid != 0 {
             let fp1 = read_user_u64_debug(owner_pid, x29);
             let lr0 = read_user_u64_debug(owner_pid, x29.saturating_add(8));
             if let Some(lr0) = lr0 {
-                hypercall::debug_print(" LR0=");
-                hypercall::debug_u64(lr0);
+                crate::log::debug_print(" LR0=");
+                crate::log::debug_u64(lr0);
             }
             if let Some(fp1) = fp1 {
                 if fp1 != 0 {
                     if let Some(lr1) = read_user_u64_debug(owner_pid, fp1.saturating_add(8)) {
-                        hypercall::debug_print(" LR1=");
-                        hypercall::debug_u64(lr1);
+                        crate::log::debug_print(" LR1=");
+                        crate::log::debug_u64(lr1);
                     }
                 }
             }
         }
         if owner_pid != 0 && sp_el0 >= crate::process::USER_VA_BASE {
             if let Some(v) = read_user_u64_debug(owner_pid, sp_el0.saturating_add(0x48)) {
-                hypercall::debug_print(" SP+48=");
-                hypercall::debug_u64(v);
+                crate::log::debug_print(" SP+48=");
+                crate::log::debug_u64(v);
             }
             if let Some(v) = read_user_u64_debug(owner_pid, sp_el0.saturating_add(0x108)) {
-                hypercall::debug_print(" SP+108=");
-                hypercall::debug_u64(v);
+                crate::log::debug_print(" SP+108=");
+                crate::log::debug_u64(v);
             }
             if let Some(v) = read_user_u64_debug(owner_pid, sp_el0.saturating_add(0x1e8)) {
-                hypercall::debug_print(" SP+1E8=");
-                hypercall::debug_u64(v);
+                crate::log::debug_print(" SP+1E8=");
+                crate::log::debug_u64(v);
             }
             if let Some(v) = read_user_u64_debug(owner_pid, sp_el0.saturating_add(0x208)) {
-                hypercall::debug_print(" SP+208=");
-                hypercall::debug_u64(v);
+                crate::log::debug_print(" SP+208=");
+                crate::log::debug_u64(v);
             }
         }
     }
-    hypercall::debug_print("\n");
+    crate::log::debug_print("\n");
     hypercall::process_exit(0xFF)
 }
 
@@ -255,25 +255,25 @@ pub extern "C" fn el1_sync_fault(far: u64, esr: u64, elr: u64) -> ! {
     let insn = unsafe { (elr as *const u32).read_volatile() as u64 };
     let insn_p1 = unsafe { (elr.wrapping_add(4) as *const u32).read_volatile() as u64 };
     let insn_p2 = unsafe { (elr.wrapping_add(8) as *const u32).read_volatile() as u64 };
-    hypercall::debug_print("KERNEL_FAULT: FAR=");
-    hypercall::debug_u64(far);
-    hypercall::debug_print(" ESR=");
-    hypercall::debug_u64(esr);
-    hypercall::debug_print(" ELR=");
-    hypercall::debug_u64(elr);
-    hypercall::debug_print(" INSN=");
-    hypercall::debug_u64(insn);
-    hypercall::debug_print(" WIN=");
-    hypercall::debug_u64(insn_m2);
-    hypercall::debug_print(",");
-    hypercall::debug_u64(insn_m1);
-    hypercall::debug_print(",");
-    hypercall::debug_u64(insn);
-    hypercall::debug_print(",");
-    hypercall::debug_u64(insn_p1);
-    hypercall::debug_print(",");
-    hypercall::debug_u64(insn_p2);
-    hypercall::debug_print("\n");
+    crate::log::debug_print("KERNEL_FAULT: FAR=");
+    crate::log::debug_u64(far);
+    crate::log::debug_print(" ESR=");
+    crate::log::debug_u64(esr);
+    crate::log::debug_print(" ELR=");
+    crate::log::debug_u64(elr);
+    crate::log::debug_print(" INSN=");
+    crate::log::debug_u64(insn);
+    crate::log::debug_print(" WIN=");
+    crate::log::debug_u64(insn_m2);
+    crate::log::debug_print(",");
+    crate::log::debug_u64(insn_m1);
+    crate::log::debug_print(",");
+    crate::log::debug_u64(insn);
+    crate::log::debug_print(",");
+    crate::log::debug_u64(insn_p1);
+    crate::log::debug_print(",");
+    crate::log::debug_u64(insn_p2);
+    crate::log::debug_print("\n");
     loop { core::hint::spin_loop(); }
 }
 
@@ -331,9 +331,9 @@ pub extern "C" fn kernel_main() -> ! {
     {
         let mut buf = [0u8; 32];
         let s = fmt_u64_hex(&mut buf, exe_size);
-        hypercall::debug_print("kernel: exe_size=0x");
-        hypercall::debug_print(s);
-        hypercall::debug_print("\n");
+        crate::log::debug_print("kernel: exe_size=0x");
+        crate::log::debug_print(s);
+        crate::log::debug_print("\n");
     }
 
     // 读取 PE 可选头栈参数：reserve/commit
@@ -429,16 +429,16 @@ fn fmt_u64_hex<'a>(buf: &'a mut [u8; 32], val: u64) -> &'a str {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    hypercall::debug_print("KERNEL_PANIC");
+    crate::log::debug_print("KERNEL_PANIC");
     if let Some(loc) = info.location() {
-        hypercall::debug_print(" at ");
-        hypercall::debug_print(loc.file());
-        hypercall::debug_print(":");
+        crate::log::debug_print(" at ");
+        crate::log::debug_print(loc.file());
+        crate::log::debug_print(":");
         let mut buf = [0u8; 32];
         let s = fmt_u64_dec(&mut buf, loc.line() as u64);
-        hypercall::debug_print(s);
+        crate::log::debug_print(s);
     }
-    hypercall::debug_print("\n");
+    crate::log::debug_print("\n");
     loop { core::hint::spin_loop(); }
 }
 

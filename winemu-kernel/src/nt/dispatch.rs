@@ -31,7 +31,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
     let tag = frame.x8_orig;
     let nr = (tag & SVC_TAG_NR_MASK) as u16;
     let table = ((tag >> SVC_TAG_TABLE_SHIFT) & SVC_TAG_TABLE_MASK) as u8;
-    hypercall::debug_u64(0xE200_0000 | ((table as u64) << 12) | nr as u64);
+    crate::log::debug_u64(0xE200_0000 | ((table as u64) << 12) | nr as u64);
 
     if table != 0 {
         forward_to_vmm(frame, nr, table);
@@ -251,10 +251,10 @@ pub extern "C" fn timer_irq_dispatch(frame: &mut SvcFrame) {
 pub extern "C" fn el1_fault_dispatch(frame: &mut SvcFrame) {
     let esr = crate::arch::cpu::current_fault_syndrome();
     let far = crate::arch::cpu::current_fault_address();
-    hypercall::debug_u64(EL1_FAULT_ESR_TAG | esr);
-    hypercall::debug_u64(EL1_FAULT_FAR_TAG | far);
-    hypercall::debug_u64(EL1_FAULT_ELR_TAG | frame.elr);
-    hypercall::debug_u64(EL1_FAULT_SPSR_TAG | frame.spsr);
+    crate::log::debug_u64(EL1_FAULT_ESR_TAG | esr);
+    crate::log::debug_u64(EL1_FAULT_FAR_TAG | far);
+    crate::log::debug_u64(EL1_FAULT_ELR_TAG | frame.elr);
+    crate::log::debug_u64(EL1_FAULT_SPSR_TAG | frame.spsr);
     hypercall::process_exit(0xE1);
 }
 
@@ -262,10 +262,10 @@ pub extern "C" fn el1_fault_dispatch(frame: &mut SvcFrame) {
 pub extern "C" fn el0_fault_dispatch(frame: &mut SvcFrame) {
     let esr = crate::arch::cpu::current_fault_syndrome();
     let far = crate::arch::cpu::current_fault_address();
-    hypercall::debug_u64(EL0_FAULT_ESR_TAG | esr);
-    hypercall::debug_u64(EL0_FAULT_FAR_TAG | far);
-    hypercall::debug_u64(EL0_FAULT_ELR_TAG | frame.elr);
-    hypercall::debug_u64(EL0_FAULT_SPSR_TAG | frame.spsr);
+    crate::log::debug_u64(EL0_FAULT_ESR_TAG | esr);
+    crate::log::debug_u64(EL0_FAULT_FAR_TAG | far);
+    crate::log::debug_u64(EL0_FAULT_ELR_TAG | frame.elr);
+    crate::log::debug_u64(EL0_FAULT_SPSR_TAG | frame.spsr);
     hypercall::process_exit(0xFF);
 }
 

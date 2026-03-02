@@ -137,6 +137,32 @@ pub fn log(level: LogLevel, msg: &str) {
     logf(level, format_args!("{}", msg));
 }
 
+/// Compatibility shim for legacy incremental debug logging call sites.
+/// Emits only when `Debug` level is enabled.
+pub fn debug_print(msg: &str) {
+    if log_enabled(LogLevel::Debug) {
+        crate::hypercall::debug_print(msg);
+    }
+}
+
+/// Compatibility shim for legacy incremental debug logging call sites.
+/// Emits a single `0x...` token only when `Debug` level is enabled.
+pub fn debug_u64(val: u64) {
+    if !log_enabled(LogLevel::Debug) {
+        return;
+    }
+    let hex = b"0123456789abcdef";
+    let mut buf = [0u8; 18]; // "0x" + 16 hex digits
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16usize {
+        let shift = (15 - i) * 4;
+        buf[2 + i] = hex[((val >> shift) & 0xF) as usize];
+    }
+    let s = unsafe { core::str::from_utf8_unchecked(&buf) };
+    crate::hypercall::debug_print(s);
+}
+
 #[macro_export]
 macro_rules! klog {
     ($level:expr, $($arg:tt)*) => {{

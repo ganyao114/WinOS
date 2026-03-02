@@ -119,13 +119,13 @@ pub(crate) fn alloc_process(
     peb_va: u64,
     address_space: ProcessAddressSpace,
 ) -> Option<u32> {
-    crate::hypercall::debug_u64(0xC503_0001);
+    crate::log::debug_u64(0xC503_0001);
     let create_time = crate::hypercall::query_mono_time_100ns();
-    crate::hypercall::debug_u64(0xC503_0002);
+    crate::log::debug_u64(0xC503_0002);
     let store = process_store_mut();
-    crate::hypercall::debug_u64(0xC503_0003);
+    crate::log::debug_u64(0xC503_0003);
     let (pid, ptr) = store.alloc_slot_with_id()?;
-    crate::hypercall::debug_u64(0xC503_0004);
+    crate::log::debug_u64(0xC503_0004);
     unsafe {
         ptr.write(KProcess::new(
             pid,
@@ -136,7 +136,7 @@ pub(crate) fn alloc_process(
             create_time,
         ));
     }
-    crate::hypercall::debug_u64(0xC503_0005);
+    crate::log::debug_u64(0xC503_0005);
     Some(pid)
 }
 

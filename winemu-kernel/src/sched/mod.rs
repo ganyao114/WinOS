@@ -719,11 +719,11 @@ pub(crate) fn sched_lock_held_by_current_vcpu() -> bool {
 }
 
 pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
-    crate::hypercall::debug_u64(0xD101_0001);
-    crate::hypercall::debug_u64(tid as u64);
-    crate::hypercall::debug_u64(deadline);
+    crate::log::debug_u64(0xD101_0001);
+    crate::log::debug_u64(tid as u64);
+    crate::log::debug_u64(deadline);
     if tid == 0 || !thread_exists(tid) {
-        crate::hypercall::debug_u64(0xD101_E001);
+        crate::log::debug_u64(0xD101_E001);
         return false;
     }
     let old_handle = with_thread_mut(tid, |t| {
@@ -740,7 +740,7 @@ pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
         if old_handle.is_valid() {
             let _ = timer::cancel_task(old_handle);
         }
-        crate::hypercall::debug_u64(0xD101_0002);
+        crate::log::debug_u64(0xD101_0002);
         return true;
     }
 
@@ -750,9 +750,9 @@ pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
                 t.wait_timer_task_id = handle.id;
                 t.wait_timer_generation = handle.generation;
             });
-            crate::hypercall::debug_u64(0xD101_0003);
-            crate::hypercall::debug_u64(handle.id as u64);
-            crate::hypercall::debug_u64(handle.generation as u64);
+            crate::log::debug_u64(0xD101_0003);
+            crate::log::debug_u64(handle.id as u64);
+            crate::log::debug_u64(handle.generation as u64);
             return true;
         }
         let _ = timer::cancel_task(old_handle);
@@ -763,9 +763,9 @@ pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
             t.wait_timer_task_id = handle.id;
             t.wait_timer_generation = handle.generation;
         });
-        crate::hypercall::debug_u64(0xD101_0004);
-        crate::hypercall::debug_u64(handle.id as u64);
-        crate::hypercall::debug_u64(handle.generation as u64);
+        crate::log::debug_u64(0xD101_0004);
+        crate::log::debug_u64(handle.id as u64);
+        crate::log::debug_u64(handle.generation as u64);
         return true;
     }
 
@@ -774,7 +774,7 @@ pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
         t.wait_timer_task_id = 0;
         t.wait_timer_generation = 0;
     });
-    crate::hypercall::debug_u64(0xD101_E002);
+    crate::log::debug_u64(0xD101_E002);
     false
 }
 
