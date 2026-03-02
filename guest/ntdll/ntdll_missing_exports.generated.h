@@ -33,17 +33,17 @@ WINEMU_STUB_RET0(EtwUnregisterTraceGuids)
 WINEMU_STUB_NT(LdrAccessResource)
 WINEMU_STUB_NT(LdrAddDllDirectory)
 WINEMU_STUB_NT(LdrAddRefDll)
-WINEMU_STUB_NT(LdrDisableThreadCalloutsForDll)
+/* LdrDisableThreadCalloutsForDll is implemented in src/loader.c */
 WINEMU_STUB_NT(LdrFindResourceDirectory_U)
 WINEMU_STUB_NT(LdrFindResource_U)
 WINEMU_STUB_NT(LdrGetDllDirectory)
 WINEMU_STUB_NT(LdrGetDllFullName)
-WINEMU_STUB_NT(LdrGetDllHandle)
-WINEMU_STUB_NT(LdrGetDllHandleEx)
+/* LdrGetDllHandle is implemented in src/loader.c */
+/* LdrGetDllHandleEx is implemented in src/loader.c */
 WINEMU_STUB_NT(LdrGetDllPath)
-WINEMU_STUB_NT(LdrGetProcedureAddress)
+/* LdrGetProcedureAddress is implemented in src/loader.c */
 WINEMU_STUB_NT(LdrLoadDll)
-WINEMU_STUB_NT(LdrQueryImageFileExecutionOptions)
+/* LdrQueryImageFileExecutionOptions is implemented in src/loader.c */
 WINEMU_STUB_NT(LdrRemoveDllDirectory)
 WINEMU_STUB_NT(LdrResolveDelayLoadedAPI)
 WINEMU_STUB_NT(LdrSetDefaultDllDirectories)
@@ -221,7 +221,7 @@ WINEMU_STUB_RET0(RtlExpandEnvironmentStrings_U)
 WINEMU_STUB_RET0(RtlFindActivationContextSectionGuid)
 WINEMU_STUB_RET0(RtlFindActivationContextSectionString)
 WINEMU_STUB_RET0(RtlFindClearBitsAndSet)
-WINEMU_STUB_RET0(RtlFindExportedRoutineByName)
+/* RtlFindExportedRoutineByName is implemented in src/loader.c */
 WINEMU_STUB_RET0(RtlFindMessage)
 WINEMU_STUB_RET0(RtlFirstFreeAce)
 WINEMU_STUB_RET0(RtlFormatMessage)

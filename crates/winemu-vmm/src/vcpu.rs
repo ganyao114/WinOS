@@ -141,8 +141,6 @@ pub fn vcpu_thread(
             VmExit::Hypercall { nr, args } => {
                 if nr == winemu_shared::nr::NT_SYSCALL {
                     let regs = vcpu.regs().unwrap();
-                    log::debug!("NT_SYSCALL hvc: x0={:#x} x8={:#x} x9={:#x} x10={:#x} x11={:#x} x12={:#x} x30={:#x} pc={:#x} sp={:#x}",
-                        regs.x[0], regs.x[8], regs.x[9], regs.x[10], regs.x[11], regs.x[12], regs.x[30], regs.pc, regs.sp);
                     let syscall_nr = regs.x[9];
                     let table_nr = regs.x[10];
                     // x11 = orig_x0: SVC handler does `mov x11, x0` before hvc

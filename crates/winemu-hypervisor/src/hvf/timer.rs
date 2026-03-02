@@ -50,8 +50,12 @@ impl HvfVTimer {
 
         if self.waiting_guest_clear {
             let cntv_ctl = get_sys_reg(vcpu, ffi::HV_SYS_REG_CNTV_CTL_EL0)?;
+            let enabled = (cntv_ctl & 0x1) != 0;
             let fired = (cntv_ctl & 0x4) != 0;
-            if fired {
+            // Guest EOI contract: IRQ entry writes CNTV_CTL_EL0=0.
+            // Treat "disabled" as an acknowledged tick, otherwise we can keep
+            // IRQ pending forever when ISTATUS stays set in HVF.
+            if enabled && fired {
                 return set_vtimer_mask(vcpu, true);
             }
 

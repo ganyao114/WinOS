@@ -16,6 +16,7 @@ pub mod system;
 pub mod sysno;
 pub mod thread;
 pub mod token;
+pub mod win32k;
 
 #[repr(C)]
 pub struct SvcFrame {

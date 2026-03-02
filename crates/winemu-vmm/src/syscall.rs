@@ -87,8 +87,20 @@ impl SyscallTable {
                 if let Some((name, val)) = line.split_once('=') {
                     let name = name.trim();
                     let val = val.trim().trim_start_matches("0x");
-                    if let Ok(nr) = u32::from_str_radix(val, 16) {
-                        tables[cur_table].insert(nr, name.to_string());
+                    if let Ok(raw_nr) = u32::from_str_radix(val, 16) {
+                        // Accept both forms:
+                        // 1) Plain per-table numbers (e.g. 0x0127 under [win32k])
+                        // 2) Wine-encoded numbers with table bits in [13:12] (e.g. 0x1127)
+                        let mut table_idx = cur_table;
+                        let mut nr = raw_nr;
+                        if raw_nr >= 0x1000 {
+                            let enc_table = ((raw_nr >> 12) & 0x3) as usize;
+                            if enc_table < tables.len() {
+                                table_idx = enc_table;
+                                nr = raw_nr & 0x0fff;
+                            }
+                        }
+                        tables[table_idx].insert(nr, name.to_string());
                     }
                 }
             }

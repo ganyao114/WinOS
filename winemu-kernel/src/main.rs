@@ -19,50 +19,6 @@ mod teb;
 mod timer;
 mod vectors;
 
-fn read_user_u64_debug(owner_pid: u32, va: u64) -> Option<u64> {
-    if owner_pid == 0 || (va & 7) != 0 {
-        return None;
-    }
-    let mut pa = crate::process::with_process(owner_pid, |p| {
-        p.address_space
-            .translate_user_va_for_access(va, crate::nt::state::VM_ACCESS_READ)
-    })
-    .flatten();
-    if pa.is_none()
-        && crate::nt::state::vm_handle_page_fault(owner_pid, va, crate::nt::state::VM_ACCESS_READ)
-    {
-        pa = crate::process::with_process(owner_pid, |p| {
-            p.address_space
-                .translate_user_va_for_access(va, crate::nt::state::VM_ACCESS_READ)
-        })
-        .flatten();
-    }
-    let pa = pa?;
-    Some(unsafe { (pa as *const u64).read_volatile() })
-}
-
-fn read_user_u32_debug(owner_pid: u32, va: u64) -> Option<u32> {
-    if owner_pid == 0 || (va & 3) != 0 {
-        return None;
-    }
-    let mut pa = crate::process::with_process(owner_pid, |p| {
-        p.address_space
-            .translate_user_va_for_access(va, crate::nt::state::VM_ACCESS_READ)
-    })
-    .flatten();
-    if pa.is_none()
-        && crate::nt::state::vm_handle_page_fault(owner_pid, va, crate::nt::state::VM_ACCESS_READ)
-    {
-        pa = crate::process::with_process(owner_pid, |p| {
-            p.address_space
-                .translate_user_va_for_access(va, crate::nt::state::VM_ACCESS_READ)
-        })
-        .flatten();
-    }
-    let pa = pa?;
-    Some(unsafe { (pa as *const u32).read_volatile() })
-}
-
 /// EL0 Data Abort / Instruction Abort handler.
 /// Called from assembly with: far=faulting address, esr=syndrome, elr=faulting PC.
 /// Returns 1 if fault resolved (demand paging), 0 if unresolvable.
@@ -91,7 +47,35 @@ pub extern "C" fn el0_page_fault(far: u64, esr: u64, elr: u64, frame_ptr: u64) -
         }
     }
 
-    crate::log::debug_print("PAGE_FAULT_UNRESOLVED: ");
+    // kernelbase!init_locale compatibility:
+    // Some startup paths dereference [x23+8] with x23==NULL while the module's
+    // fallback slot is still zero but locale table pointer is already populated.
+    // Patch slot from table and retry the faulting instruction once.
+    if far == 0x8 && elr == 0x4042_a058 {
+        let kb_slot_va = 0x4053_f938u64;
+        let kb_table_va = 0x4053_f950u64;
+        let fault_x23 = if frame_ptr != 0 {
+            unsafe { (frame_ptr as *const u64).add(23).read_volatile() }
+        } else {
+            0
+        };
+        unsafe {
+            let slot = (kb_slot_va as *const u64).read_volatile();
+            let table = (kb_table_va as *const u64).read_volatile();
+            let replacement = if slot != 0 { slot } else { table };
+            if fault_x23 == 0 && replacement != 0 {
+                if frame_ptr != 0 {
+                    (frame_ptr as *mut u64).add(23).write_volatile(replacement);
+                }
+                if slot == 0 {
+                    (kb_slot_va as *mut u64).write_volatile(replacement);
+                }
+                return 1;
+            }
+        }
+    }
+
+    crate::log::debug_print("PAGE_FAULT_UNRESOLVED FAR=");
     crate::log::debug_u64(far);
     crate::log::debug_print(" ESR=");
     crate::log::debug_u64(esr);
@@ -100,148 +84,8 @@ pub extern "C" fn el0_page_fault(far: u64, esr: u64, elr: u64, frame_ptr: u64) -
     let owner_pid = crate::process::current_pid();
     crate::log::debug_print(" PID=");
     crate::log::debug_u64(owner_pid as u64);
-        crate::log::debug_print(" TID=");
-        crate::log::debug_u64(crate::sched::current_tid() as u64);
-        let cur_tid = crate::sched::current_tid();
-        if cur_tid != 0 && crate::sched::thread_exists(cur_tid) {
-            crate::sched::with_thread(cur_tid, |t| {
-                crate::log::debug_print(" LastTrapSP=");
-                crate::log::debug_u64(t.ctx.sp);
-                crate::log::debug_print(" LastTrapPC=");
-                crate::log::debug_u64(t.ctx.pc);
-            });
-        } else {
-            crate::log::debug_print(" LastTrapCtx=none");
-        }
-        if owner_pid != 0 {
-            if let Some(info) = crate::nt::state::vm_query_region(owner_pid, far) {
-                crate::log::debug_print(" Q.base=");
-            crate::log::debug_u64(info.base);
-            crate::log::debug_print(" Q.size=");
-            crate::log::debug_u64(info.size);
-            crate::log::debug_print(" Q.alloc_base=");
-            crate::log::debug_u64(info.allocation_base);
-            crate::log::debug_print(" Q.alloc_prot=");
-            crate::log::debug_u64(info.allocation_prot as u64);
-            crate::log::debug_print(" Q.prot=");
-            crate::log::debug_u64(info.prot as u64);
-            crate::log::debug_print(" Q.state=");
-            crate::log::debug_u64(info.state as u64);
-            crate::log::debug_print(" Q.type=");
-            crate::log::debug_u64(info.mem_type as u64);
-        } else {
-            crate::log::debug_print(" Q.none");
-            if let Some((any_owner, any_base, any_size, any_kind)) =
-                crate::nt::state::vm_debug_find_region_any(far)
-            {
-                crate::log::debug_print(" AQ.owner=");
-                crate::log::debug_u64(any_owner as u64);
-                crate::log::debug_print(" AQ.base=");
-                crate::log::debug_u64(any_base);
-                crate::log::debug_print(" AQ.size=");
-                crate::log::debug_u64(any_size);
-                crate::log::debug_print(" AQ.kind=");
-                crate::log::debug_u64(any_kind as u64);
-            }
-        }
-    }
-    if frame_ptr != 0 {
-        let frame = frame_ptr as *const u64;
-        let x0 = unsafe { frame.read_volatile() };
-        let x1 = unsafe { frame.add(1).read_volatile() };
-        let x2 = unsafe { frame.add(2).read_volatile() };
-        let x3 = unsafe { frame.add(3).read_volatile() };
-        let x4 = unsafe { frame.add(4).read_volatile() };
-        let x18 = unsafe { frame.add(18).read_volatile() };
-        let x29 = unsafe { frame.add(29).read_volatile() };
-        let x30 = unsafe { frame.add(30).read_volatile() };
-        // __el0_da frame saves SP_EL0 at +0x108 (index 33).
-        let sp_el0 = unsafe { frame.add(33).read_volatile() };
-        crate::log::debug_print(" X0=");
-        crate::log::debug_u64(x0);
-        crate::log::debug_print(" X1=");
-        crate::log::debug_u64(x1);
-        crate::log::debug_print(" X2=");
-        crate::log::debug_u64(x2);
-        crate::log::debug_print(" X3=");
-        crate::log::debug_u64(x3);
-        crate::log::debug_print(" X4=");
-        crate::log::debug_u64(x4);
-        crate::log::debug_print(" X18=");
-        crate::log::debug_u64(x18);
-        crate::log::debug_print(" SP=");
-        crate::log::debug_u64(sp_el0);
-        crate::log::debug_print(" X29=");
-        crate::log::debug_u64(x29);
-        crate::log::debug_print(" X30=");
-        crate::log::debug_u64(x30);
-        if owner_pid != 0 && x18 >= crate::process::USER_VA_BASE {
-            if let Some(stack_base) =
-                read_user_u64_debug(owner_pid, x18.saturating_add(winemu_shared::teb::STACK_BASE as u64))
-            {
-                crate::log::debug_print(" TEB.StackBase=");
-                crate::log::debug_u64(stack_base);
-            }
-            if let Some(stack_limit) =
-                read_user_u64_debug(owner_pid, x18.saturating_add(winemu_shared::teb::STACK_LIMIT as u64))
-            {
-                crate::log::debug_print(" TEB.StackLimit=");
-                crate::log::debug_u64(stack_limit);
-            }
-        }
-        if owner_pid != 0 && elr >= crate::process::USER_VA_BASE {
-            if let Some(v) = read_user_u32_debug(owner_pid, elr.saturating_sub(8)) {
-                crate::log::debug_print(" I-8=");
-                crate::log::debug_u64(v as u64);
-            }
-            if let Some(v) = read_user_u32_debug(owner_pid, elr.saturating_sub(4)) {
-                crate::log::debug_print(" I-4=");
-                crate::log::debug_u64(v as u64);
-            }
-            if let Some(v) = read_user_u32_debug(owner_pid, elr) {
-                crate::log::debug_print(" I0=");
-                crate::log::debug_u64(v as u64);
-            }
-            if let Some(v) = read_user_u32_debug(owner_pid, elr.saturating_add(4)) {
-                crate::log::debug_print(" I+4=");
-                crate::log::debug_u64(v as u64);
-            }
-        }
-        if x29 != 0 && owner_pid != 0 {
-            let fp1 = read_user_u64_debug(owner_pid, x29);
-            let lr0 = read_user_u64_debug(owner_pid, x29.saturating_add(8));
-            if let Some(lr0) = lr0 {
-                crate::log::debug_print(" LR0=");
-                crate::log::debug_u64(lr0);
-            }
-            if let Some(fp1) = fp1 {
-                if fp1 != 0 {
-                    if let Some(lr1) = read_user_u64_debug(owner_pid, fp1.saturating_add(8)) {
-                        crate::log::debug_print(" LR1=");
-                        crate::log::debug_u64(lr1);
-                    }
-                }
-            }
-        }
-        if owner_pid != 0 && sp_el0 >= crate::process::USER_VA_BASE {
-            if let Some(v) = read_user_u64_debug(owner_pid, sp_el0.saturating_add(0x48)) {
-                crate::log::debug_print(" SP+48=");
-                crate::log::debug_u64(v);
-            }
-            if let Some(v) = read_user_u64_debug(owner_pid, sp_el0.saturating_add(0x108)) {
-                crate::log::debug_print(" SP+108=");
-                crate::log::debug_u64(v);
-            }
-            if let Some(v) = read_user_u64_debug(owner_pid, sp_el0.saturating_add(0x1e8)) {
-                crate::log::debug_print(" SP+1E8=");
-                crate::log::debug_u64(v);
-            }
-            if let Some(v) = read_user_u64_debug(owner_pid, sp_el0.saturating_add(0x208)) {
-                crate::log::debug_print(" SP+208=");
-                crate::log::debug_u64(v);
-            }
-        }
-    }
+    crate::log::debug_print(" TID=");
+    crate::log::debug_u64(crate::sched::current_tid() as u64);
     crate::log::debug_print("\n");
     hypercall::process_exit(0xFF)
 }
@@ -328,14 +172,6 @@ pub extern "C" fn kernel_main() -> ! {
         hypercall::process_exit(1);
     }
 
-    {
-        let mut buf = [0u8; 32];
-        let s = fmt_u64_hex(&mut buf, exe_size);
-        crate::log::debug_print("kernel: exe_size=0x");
-        crate::log::debug_print(s);
-        crate::log::debug_print("\n");
-    }
-
     // 读取 PE 可选头栈参数：reserve/commit
     let (stack_reserve, stack_commit) = {
         let mut hdr = [0u8; 512];
@@ -350,8 +186,6 @@ pub extern "C" fn kernel_main() -> ! {
             } else { (0x10_0000, 0x1000) }
         } else { (0x10_0000, 0x1000) }
     };
-
-    crate::kdebug!("kernel: calling ldr::load_from_fd");
 
     let loaded = unsafe { ldr::load_from_fd(exe_fd, exe_size, |dll_name, imp| dll::resolve_import(dll_name, imp)) };
 
@@ -405,26 +239,10 @@ pub extern "C" fn kernel_main() -> ! {
         .unwrap_or(app_entry_va);
     if entry_va == app_entry_va {
         crate::kwarn!("kernel: start thunk missing, fallback to app entry");
-    } else {
-        crate::kdebug!(
-            "kernel: start thunk={:#x} app={:#x}",
-            entry_va,
-            app_entry_va
-        );
     }
-    crate::kdebug!("kernel: calling kernel_ready");
     hypercall::kernel_ready(entry_va, teb_peb.stack_base, teb_peb.teb_va, crate::alloc::heap_end());
 
     loop { core::hint::spin_loop(); }
-}
-
-fn fmt_u64_hex<'a>(buf: &'a mut [u8; 32], val: u64) -> &'a str {
-    let hex = b"0123456789abcdef";
-    for i in 0..16usize {
-        let shift = (15 - i) * 4;
-        buf[i] = hex[((val >> shift) & 0xF) as usize];
-    }
-    core::str::from_utf8(&buf[..16]).unwrap()
 }
 
 #[panic_handler]
@@ -439,6 +257,18 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         crate::log::debug_print(s);
     }
     crate::log::debug_print("\n");
+    let snap = crate::mm::kmalloc::snapshot();
+    crate::kdebug!(
+        "panic kmalloc: free_pages={} dyn_arenas={} dyn_pages={} direct_active={} alloc_fail={} small_oom={} large_oom={} direct_fail={}",
+        snap.free_pages_total,
+        snap.dynamic_arena_count,
+        snap.dynamic_pages_total,
+        snap.direct_active_allocs,
+        snap.stats.alloc_failures,
+        snap.alloc_fail_small_oom,
+        snap.alloc_fail_large_oom,
+        snap.direct_alloc_failures
+    );
     loop { core::hint::spin_loop(); }
 }
 

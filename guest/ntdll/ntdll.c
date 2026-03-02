@@ -17,6 +17,7 @@
 #include "src/rtl_string.c"
 #include "src/crt.c"
 #include "src/misc.c"
+#include "src/loader.c"
 #include "src/file.c"
 #include "src/section_thread.c"
 #include "src/registry.c"

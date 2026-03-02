@@ -73,3 +73,4 @@ NtUserCreateWindowEx      = 0x1056
 NtUserShowWindow          = 0x10C3
 NtUserMessageCall         = 0x1069
 NtUserDestroyWindow       = 0x1025
+NtUserInitializeClientPfnArrays = 0x1127

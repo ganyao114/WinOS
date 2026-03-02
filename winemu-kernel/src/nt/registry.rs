@@ -248,15 +248,10 @@ pub(crate) fn key_name_utf16(idx: u32) -> Option<Vec<u16>> {
 pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
     let state = ensure_state();
     let out_ptr = frame.x[0] as *mut u64;
-    let desired_access = frame.x[1] as u32;
+    let _desired_access = frame.x[1] as u32;
     let oa_ptr = frame.x[2];
-
-    let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_KEY) else {
-        frame.x[0] = status::INVALID_HANDLE as u64;
-        return;
-    };
-    if (desired_access & !meta.valid_access_mask) != 0 {
-        frame.x[0] = status::ACCESS_DENIED as u64;
+    if out_ptr.is_null() || oa_ptr == 0 {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
 
@@ -289,16 +284,11 @@ pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
 pub(crate) fn handle_create_key(frame: &mut SvcFrame) {
     let state = ensure_state();
     let out_ptr = frame.x[0] as *mut u64;
-    let desired_access = frame.x[1] as u32;
+    let _desired_access = frame.x[1] as u32;
     let oa_ptr = frame.x[2];
     let disp_ptr = frame.x[6] as *mut u32;
-
-    let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_KEY) else {
-        frame.x[0] = status::INVALID_HANDLE as u64;
-        return;
-    };
-    if (desired_access & !meta.valid_access_mask) != 0 {
-        frame.x[0] = status::ACCESS_DENIED as u64;
+    if out_ptr.is_null() || oa_ptr == 0 {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
 

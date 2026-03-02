@@ -18,7 +18,10 @@ use super::constants::{
     SVC_TAG_TABLE_SHIFT,
 };
 use super::sysno;
-use super::{file, memory, object, process, registry, section, sync, system, thread, token, SvcFrame};
+use super::{
+    file, memory, object, process, registry, section, sync, system, thread, token, win32k,
+    SvcFrame,
+};
 
 static SYSCALL_ERR_TRACE_BUDGET: AtomicU32 = AtomicU32::new(512);
 
@@ -34,7 +37,22 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
     crate::log::debug_u64(0xE200_0000 | ((table as u64) << 12) | nr as u64);
 
     if table != 0 {
+        if table == 1 {
+            match nr {
+                0x127 => {
+                    // NtUserInitializeClientPfnArrays
+                    win32k::handle_user_initialize_client_pfn_arrays(frame);
+                    schedule_from_trap(frame, true);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Non-NT tables still need normal trap-exit scheduling so timer slice /
+        // deadline programming remains consistent on this path.
         forward_to_vmm(frame, nr, table);
+        schedule_from_trap(frame, true);
         return;
     }
 

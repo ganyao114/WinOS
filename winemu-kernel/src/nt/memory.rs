@@ -1,5 +1,4 @@
 use winemu_shared::status;
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::common::{align_up_4k, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE};
 use super::constants::PAGE_MASK_4K;
@@ -13,7 +12,6 @@ const PAGE_SIZE_4K: u64 = 0x1000;
 const USER_ACCESS_BASE: u64 = crate::process::USER_ACCESS_BASE;
 const USER_VA_BASE: u64 = crate::process::USER_VA_BASE;
 const USER_VA_LIMIT: u64 = crate::process::USER_VA_LIMIT;
-static AVM_TRACE_BUDGET: AtomicU32 = AtomicU32::new(64);
 
 fn ensure_user_range_access(pid: u32, addr: u64, size: usize, access: u8) -> bool {
     if pid == 0 {
@@ -127,49 +125,6 @@ fn write_user_u64(pid: u32, user_ptr: *mut u64, value: u64) -> bool {
     )
 }
 
-fn trace_avm_success(
-    owner_pid: u32,
-    base_ptr: *mut u64,
-    size_ptr: *mut u64,
-    base: u64,
-    size: u64,
-    req_size: u64,
-) {
-    let remain = AVM_TRACE_BUDGET.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-        if v == 0 {
-            None
-        } else {
-            Some(v - 1)
-        }
-    });
-    if remain.is_err() {
-        return;
-    }
-    let readback_base = if base_ptr.is_null() {
-        0
-    } else {
-        read_user_u64(owner_pid, base_ptr as *const u64).unwrap_or(0)
-    };
-    let readback_size = read_user_u64(owner_pid, size_ptr as *const u64).unwrap_or(0);
-    crate::log::debug_print("nt: avm ok pid=");
-    crate::log::debug_u64(owner_pid as u64);
-    crate::log::debug_print(" bp=");
-    crate::log::debug_u64(base_ptr as u64);
-    crate::log::debug_print(" sp=");
-    crate::log::debug_u64(size_ptr as u64);
-    crate::log::debug_print(" base=");
-    crate::log::debug_u64(base);
-    crate::log::debug_print(" size=");
-    crate::log::debug_u64(size);
-    crate::log::debug_print(" req=");
-    crate::log::debug_u64(req_size);
-    crate::log::debug_print(" rb_base=");
-    crate::log::debug_u64(readback_base);
-    crate::log::debug_print(" rb_size=");
-    crate::log::debug_u64(readback_size);
-    crate::log::debug_print("\n");
-}
-
 // x1=*BaseAddress, x3=*RegionSize, x5=Protect
 pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
     let base_ptr = frame.x[1] as *mut u64;
@@ -209,12 +164,19 @@ pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
         0
     };
 
-    let reserve = (alloc_type & MEM_RESERVE) != 0;
+    let mut reserve = (alloc_type & MEM_RESERVE) != 0;
     let commit = (alloc_type & MEM_COMMIT) != 0;
     if !reserve && !commit {
         crate::log::debug_u64(0xE215_E003);
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
+    }
+
+    // Runtime compatibility: some userspace paths request MEM_COMMIT with
+    // *BaseAddress == NULL. Real NT rejects this, but many higher layers assume
+    // "allocate fresh committed region" behavior. Treat it as RESERVE|COMMIT.
+    if !reserve && commit && req_base == 0 {
+        reserve = true;
     }
 
     if reserve {
@@ -249,20 +211,12 @@ pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
             crate::log::debug_u64(0xE215_E00B);
             crate::log::debug_u64(base);
         }
-        trace_avm_success(owner_pid, base_ptr, size_ptr, base, size, req_size);
         frame.x[0] = status::SUCCESS as u64;
         return;
     }
 
     if req_base == 0 {
         crate::log::debug_u64(0xE215_E004);
-        crate::log::debug_print("nt: avm invalid commit-only null base alloc_type=");
-        crate::log::debug_u64(alloc_type as u64);
-        crate::log::debug_print(" prot=");
-        crate::log::debug_u64(prot as u64);
-        crate::log::debug_print(" req=");
-        crate::log::debug_u64(req_size);
-        crate::log::debug_print("\n");
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
@@ -287,7 +241,6 @@ pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
         crate::log::debug_u64(0xE215_E00C);
         crate::log::debug_u64(req_base);
     }
-    trace_avm_success(owner_pid, base_ptr, size_ptr, req_base, size, req_size);
     frame.x[0] = status::SUCCESS as u64;
 }
 
@@ -311,7 +264,8 @@ pub(crate) fn handle_free_virtual_memory(frame: &mut SvcFrame) {
                     return;
                 }
             }
-            frame.x[0] = vm_release_private(owner_pid, base) as u64;
+            let st = vm_release_private(owner_pid, base);
+            frame.x[0] = st as u64;
         }
         MEM_DECOMMIT => {
             if size_ptr.is_null() {
@@ -323,7 +277,8 @@ pub(crate) fn handle_free_virtual_memory(frame: &mut SvcFrame) {
                 frame.x[0] = status::INVALID_PARAMETER as u64;
                 return;
             }
-            frame.x[0] = vm_decommit_private(owner_pid, base, size) as u64;
+            let st = vm_decommit_private(owner_pid, base, size);
+            frame.x[0] = st as u64;
         }
         _ => {
             frame.x[0] = status::INVALID_PARAMETER as u64;

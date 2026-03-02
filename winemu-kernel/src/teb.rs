@@ -282,14 +282,17 @@ pub fn init(
     let cmd_va  = write_utf16(upp_buf, &mut str_off, cmdline, upp_va);
     let cmd_len = (cmdline.len() * 2) as u16;
 
-    // Minimal environment block: empty multi-string (L"\0\0").
+    // Minimal environment block. Wine/kernelbase locale bootstrap expects
+    // WINEUSERLOCALE/WINEUNIXCP to be queryable at process start.
     let env_va = upp_va + str_off as u64;
-    if str_off + 4 <= upp_buf.len() {
+    for key_value in ["WINEUSERLOCALE=en_US", "WINEUNIXCP=65001"] {
+        let _ = write_utf16(upp_buf, &mut str_off, key_value, upp_va);
+    }
+    // Multi-SZ terminator (extra trailing NUL).
+    if str_off + 2 <= upp_buf.len() {
         upp_buf[str_off] = 0;
         upp_buf[str_off + 1] = 0;
-        upp_buf[str_off + 2] = 0;
-        upp_buf[str_off + 3] = 0;
-        str_off += 4;
+        str_off += 2;
     }
 
     // 固定字段

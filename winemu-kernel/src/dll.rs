@@ -202,12 +202,6 @@ fn load_mapped_dll(fd: u64, file_size: u64, dll_name: &str) -> Result<ldr::Loade
     if !remember_loaded(dll_name, loaded.base, loaded.size as u32, entry) {
         return Err(ldr::LdrError::BadImport);
     }
-    crate::kdebug!(
-        "dll: loaded {} base={:#x} size={:#x}",
-        dll_name,
-        loaded.base,
-        loaded.size
-    );
     let owner_pid = crate::process::current_pid();
     if owner_pid != 0 {
         if !crate::nt::state::vm_track_existing_file_mapping(
@@ -236,10 +230,57 @@ fn load_mapped_dll(fd: u64, file_size: u64, dll_name: &str) -> Result<ldr::Loade
 }
 
 fn apply_runtime_compat_bootstrap(dll_name: &str, base: u64, size: u64) {
+    if dll_name.eq_ignore_ascii_case("win32u.dll") {
+        const WIN32U_SYSCALL_SLOT_NATIVE: u64 = 0x43060;
+        const WIN32U_SYSCALL_SLOT_ARM64EC: u64 = 0x43068;
+        const WIN32U_UNIX_SLOT_NATIVE: u64 = 0x43058;
+        const WIN32U_UNIX_SLOT_ARM64EC: u64 = 0x43048;
+
+        let export_target = |name: &str| {
+            resolve_import("ntdll.dll", ImportRef::Name(name))
+                .map(|ptr| unsafe { (ptr as *const u64).read_volatile() })
+                .unwrap_or(0)
+        };
+        let syscall_value = {
+            let value = export_target("__winemu_syscall_dispatcher");
+            if value != 0 {
+                value
+            } else {
+                export_target("__wine_syscall_dispatcher")
+            }
+        };
+        let unix_value = export_target("__wine_unix_call_dispatcher");
+
+        let patch_slot = |slot_off: u64, value: u64| {
+            if value == 0 {
+                return;
+            }
+            let slot_va = base.saturating_add(slot_off);
+            if slot_va < base || slot_va.saturating_add(8) > base.saturating_add(size) {
+                return;
+            }
+            unsafe {
+                let cur = (slot_va as *const u64).read_volatile();
+                if cur == 0 {
+                    (slot_va as *mut u64).write_volatile(value);
+                }
+            }
+        };
+
+        patch_slot(WIN32U_SYSCALL_SLOT_NATIVE, syscall_value);
+        patch_slot(WIN32U_SYSCALL_SLOT_ARM64EC, syscall_value);
+        patch_slot(WIN32U_UNIX_SLOT_NATIVE, unix_value);
+        patch_slot(WIN32U_UNIX_SLOT_ARM64EC, unix_value);
+    }
+
     if dll_name.eq_ignore_ascii_case("kernelbase.dll") {
         // Some ARM64X builds read this import via an alternate .rdata slot
         // (base + 0xE47C0) instead of the primary FirstThunk slot.
         const ALT_IAT_RTL_OPEN_CROSS: u64 = 0xE47C0;
+        // Locale pointers used by kernelbase locale bootstrap paths.
+        const KB_LOCALE_FALLBACK_PTR: u64 = 0x13F938;
+        const KB_LOCALE_RUNTIME_PTR: u64 = 0x13F948;
+        const KB_LOCALE_TABLE_PTR: u64 = 0x13F950;
         let slot_va = base.saturating_add(ALT_IAT_RTL_OPEN_CROSS);
         if slot_va >= base && slot_va.saturating_add(8) <= base.saturating_add(size) {
             if let Some(addr) =
@@ -247,6 +288,44 @@ fn apply_runtime_compat_bootstrap(dll_name: &str, base: u64, size: u64) {
             {
                 unsafe {
                     (slot_va as *mut u64).write_volatile(addr);
+                }
+            }
+        }
+
+        // Some startup paths hit init_locale before this fallback pointer gets
+        // initialized by user-mode runtime, which leads to NULL dereference.
+        let fallback_va = base.saturating_add(KB_LOCALE_FALLBACK_PTR);
+        let runtime_va = base.saturating_add(KB_LOCALE_RUNTIME_PTR);
+        let table_va = base.saturating_add(KB_LOCALE_TABLE_PTR);
+        if fallback_va >= base
+            && fallback_va.saturating_add(8) <= base.saturating_add(size)
+            && runtime_va >= base
+            && runtime_va.saturating_add(8) <= base.saturating_add(size)
+            && table_va >= base
+            && table_va.saturating_add(8) <= base.saturating_add(size)
+        {
+            unsafe {
+                let fallback = (fallback_va as *const u64).read_volatile();
+                let runtime = (runtime_va as *const u64).read_volatile();
+                let table = (table_va as *const u64).read_volatile();
+                let mut patched = fallback;
+                if patched == 0 {
+                    patched = if runtime != 0 {
+                        runtime
+                    } else if table != 0 {
+                        table
+                    } else {
+                        kernelbase_locale_stub_ptr()
+                    };
+                    if patched != 0 {
+                        (fallback_va as *mut u64).write_volatile(patched);
+                    }
+                }
+                if runtime == 0 && patched != 0 {
+                    (runtime_va as *mut u64).write_volatile(patched);
+                }
+                if table == 0 && patched != 0 {
+                    (table_va as *mut u64).write_volatile(patched);
                 }
             }
         }
@@ -277,6 +356,22 @@ fn apply_runtime_compat_bootstrap(dll_name: &str, base: u64, size: u64) {
         unsafe {
             (dbg_flags_va as *mut u8).write_volatile(0);
         }
+    }
+}
+
+fn kernelbase_locale_stub_ptr() -> u64 {
+    static mut LOCALE_STUB_PTR: u64 = 0;
+    unsafe {
+        if LOCALE_STUB_PTR != 0 {
+            return LOCALE_STUB_PTR;
+        }
+        let Some(ptr) = crate::alloc::alloc_zeroed(0x40, 16) else {
+            return 0;
+        };
+        // kernelbase!init_locale reads u16 at [stub + 8]
+        (ptr.add(8) as *mut u16).write_volatile(0x0c00);
+        LOCALE_STUB_PTR = ptr as u64;
+        LOCALE_STUB_PTR
     }
 }
 

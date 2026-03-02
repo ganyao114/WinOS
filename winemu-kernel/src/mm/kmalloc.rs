@@ -7,7 +7,7 @@ const NONE_I16: i16 = -1;
 const NONE_U16: u16 = u16::MAX;
 
 const MAX_PAGES: usize = 1024; // 4 MiB / 4 KiB
-const MAX_ARENAS: usize = 8;
+const MAX_ARENAS: usize = 32;
 const MAX_ORDER: usize = 10; // 2^10 pages = 1024 pages
 const NUM_ORDERS: usize = MAX_ORDER + 1;
 const DYNAMIC_MIN_ARENA_PAGES: usize = 64; // 256 KiB
@@ -15,7 +15,7 @@ const DYNAMIC_MAX_ARENA_PAGES: usize = MAX_PAGES;
 const DYNAMIC_LOW_WATER_PAGES: usize = DYNAMIC_MIN_ARENA_PAGES * 8; // 2 MiB
 const DYNAMIC_HIGH_WATER_PAGES: usize = DYNAMIC_MIN_ARENA_PAGES * 16; // 4 MiB
 const RECLAIM_CHECK_INTERVAL_FREE_OPS: u32 = 64;
-const MAX_DIRECT_ALLOCS: usize = 64;
+const MAX_DIRECT_ALLOCS: usize = 1024;
 const MAX_PENDING_PHYS_FREES: usize = MAX_ARENAS + MAX_DIRECT_ALLOCS;
 
 const SLAB_MIN_SHIFT: usize = 3; // 8 bytes

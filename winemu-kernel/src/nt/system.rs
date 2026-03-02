@@ -110,13 +110,14 @@ pub(crate) fn handle_query_system_information(frame: &mut SvcFrame) {
     let buf_len = frame.x[2] as usize;
     let ret_len = frame.x[3] as *mut u32;
 
-    frame.x[0] = match info_class {
+    let st = match info_class {
         SYSTEM_INFO_CLASS_BASIC => query_system_basic_information(buf, buf_len, ret_len),
         SYSTEM_INFO_CLASS_TIME_OF_DAY => {
             query_system_time_of_day_information(buf, buf_len, ret_len)
         }
         _ => status::INVALID_PARAMETER,
-    } as u64;
+    };
+    frame.x[0] = st as u64;
 }
 
 pub(crate) fn handle_query_system_time(frame: &mut SvcFrame) {

@@ -6,10 +6,62 @@
 #define LDR_ENTRY_IN_INIT_ORDER_LINK_OFF 0x20
 #define LDR_ENTRY_DLL_BASE_OFF           0x30
 #define LDR_ENTRY_ENTRY_POINT_OFF        0x38
+#define LDR_ENTRY_BASE_DLL_NAME_OFF      0x58
 #define DLL_PROCESS_ATTACH               1
+#define KB_LOCALE_FALLBACK_PTR_OFF       0x13f938
 
 typedef int (*DLL_ENTRY_FN)(HANDLE, ULONG, void*);
 typedef void (*EXE_ENTRY_FN)(void);
+
+static uint16_t g_kernelbase_locale_fallback[16];
+static int g_kernelbase_locale_fallback_ready = 0;
+
+static void winemu_init_kernelbase_locale_fallback(void) {
+    if (g_kernelbase_locale_fallback_ready) return;
+    for (size_t i = 0; i < (sizeof(g_kernelbase_locale_fallback) / sizeof(g_kernelbase_locale_fallback[0])); i++) {
+        g_kernelbase_locale_fallback[i] = 0;
+    }
+    /* init_locale reads *(u16*)(ptr + 8). */
+    g_kernelbase_locale_fallback[4] = 0x0c00;
+    g_kernelbase_locale_fallback_ready = 1;
+}
+
+static int winemu_ascii_tolower(int ch) {
+    if (ch >= 'A' && ch <= 'Z') return ch + ('a' - 'A');
+    return ch;
+}
+
+static int winemu_us_name_equals_ascii_ci(uint64_t us_ptr, const char* ascii) {
+    if (!us_ptr || !ascii) return 0;
+    uint16_t name_len = *(uint16_t*)(uintptr_t)us_ptr;
+    uint64_t buf = *(uint64_t*)(uintptr_t)(us_ptr + 8);
+    if (!buf) return 0;
+
+    size_t ascii_len = 0;
+    while (ascii[ascii_len]) ascii_len++;
+    if (name_len != (uint16_t)(ascii_len * 2)) return 0;
+
+    for (size_t i = 0; i < ascii_len; i++) {
+        uint16_t wc = *(uint16_t*)(uintptr_t)(buf + i * 2);
+        int a = winemu_ascii_tolower((int)ascii[i]);
+        int b = winemu_ascii_tolower((int)(wc & 0xff));
+        if (a != b || (wc >> 8) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void winemu_patch_kernelbase_locale_fallback(uint64_t dll_base, uint64_t entry_ptr) {
+    if (!winemu_us_name_equals_ascii_ci(entry_ptr + LDR_ENTRY_BASE_DLL_NAME_OFF, "kernelbase.dll")) {
+        return;
+    }
+    winemu_init_kernelbase_locale_fallback();
+    uint64_t* fallback_slot = (uint64_t*)(uintptr_t)(dll_base + KB_LOCALE_FALLBACK_PTR_OFF);
+    if (*fallback_slot == 0) {
+        *fallback_slot = (uint64_t)(uintptr_t)g_kernelbase_locale_fallback;
+    }
+}
 
 static void winemu_call_process_attach(uint8_t* peb) {
     if (!peb) return;
@@ -28,6 +80,9 @@ static void winemu_call_process_attach(uint8_t* peb) {
         uint64_t entry = link - LDR_ENTRY_IN_INIT_ORDER_LINK_OFF;
         uint64_t dll_base = *(uint64_t*)(uintptr_t)(entry + LDR_ENTRY_DLL_BASE_OFF);
         uint64_t ep = *(uint64_t*)(uintptr_t)(entry + LDR_ENTRY_ENTRY_POINT_OFF);
+        if (dll_base) {
+            winemu_patch_kernelbase_locale_fallback(dll_base, entry);
+        }
         if (ep && dll_base && dll_base != image_base) {
             DLL_ENTRY_FN dll_main = (DLL_ENTRY_FN)(uintptr_t)ep;
             (void)dll_main((HANDLE)(uintptr_t)dll_base, DLL_PROCESS_ATTACH, NULL);
@@ -122,4 +177,3 @@ EXPORT NTSTATUS RtlOpenCrossProcessEmulatorWorkConnection(
     *out_connection = (void*)g_emu_work_conn;
     return STATUS_SUCCESS;
 }
-
