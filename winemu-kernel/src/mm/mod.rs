@@ -55,11 +55,13 @@ unsafe fn setup_kernel_mapping() {
     let l1_desc = (l2_addr & !0xfffu64) | 0b11; // next-level table descriptor
     (*core::ptr::addr_of_mut!(L1_TABLE)).0[1] = l1_desc;
 
+    let user_l2_start = ((crate::process::USER_VA_BASE - 0x4000_0000u64) >> 21) as usize;
+    let guard_l2_idx = user_l2_start.saturating_sub(1);
     for i in 0..512usize {
         let block_addr = 0x4000_0000u64 + ((i as u64) << 21); // 2MB per L2 entry
         // [1:0]=01 block, AttrIdx=0, SH=inner-shareable, AF=1
         let mut desc = block_addr | (1 << 10) | (0b11 << 8) | 0b01;
-        if i != 0 {
+        if i != 0 && i != guard_l2_idx {
             desc |= 0b01 << 6; // AP=01: EL0+EL1 RW
         }
         (*core::ptr::addr_of_mut!(L2_TABLE)).0[i] = desc;

@@ -116,34 +116,23 @@ impl<T> ObjectStore<T> {
     }
 
     fn alloc_id(&mut self) -> Option<u32> {
-        crate::hypercall::debug_u64(0xC510_0001);
         if let Some(id) = self.free_ids.pop() {
-            crate::hypercall::debug_u64(0xC510_0002);
             return Some(id);
         }
         let id = self.slots.len() as u32;
-        crate::hypercall::debug_u64(0xC510_0003);
         if self.slots.try_reserve(1).is_err() {
-            crate::hypercall::debug_u64(0xC510_E001);
             return None;
         }
-        crate::hypercall::debug_u64(0xC510_0004);
         self.slots.push(null_mut());
-        crate::hypercall::debug_u64(0xC510_0005);
         Some(id)
     }
 
     pub fn alloc_slot_with_id(&mut self) -> Option<(u32, *mut T)> {
-        crate::hypercall::debug_u64(0xC511_0001);
         let id = self.alloc_id()?;
-        crate::hypercall::debug_u64(0xC511_0002);
         let Some(ptr) = self.pool.alloc_slot() else {
-            crate::hypercall::debug_u64(0xC511_E001);
             return None;
         };
-        crate::hypercall::debug_u64(0xC511_0003);
         self.slots[id as usize] = ptr;
-        crate::hypercall::debug_u64(0xC511_0004);
         Some((id, ptr))
     }
 

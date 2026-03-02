@@ -3,7 +3,8 @@
 //       Wine dlls/ntdll/unix/virtual.c init_teb / init_peb
 
 use crate::mm::vaspace::VmaType;
-use crate::nt::state::{vm_alloc_region_typed, vm_free_region};
+use crate::nt::constants::PAGE_SIZE_4K;
+use crate::nt::state::{vm_alloc_region_typed, vm_free_region, vm_make_guard_page};
 use winemu_shared::{peb, teb};
 
 /// 已初始化的 TEB/PEB 描述符
@@ -134,14 +135,45 @@ fn list_insert_tail(
     // head.Blink = entry
     wu64(head_buf, head_list_off + 8, entry_ptr);
 
-    // old_blink.Flink = entry  (需要直接写内存，因为 old_blink 可能是 head 本身)
+    // old_blink.Flink = entry
     if blink_ptr == head_ptr {
-        // 链表只有头节点，old_blink 就是 head
         wu64(head_buf, head_list_off, entry_ptr);
+    } else {
+        unsafe {
+            (blink_ptr as *mut u64).write_volatile(entry_ptr);
+        }
     }
-    // 注意：若链表已有多个节点，old_blink 是另一个 entry，
-    // 那个 entry 的内存我们无法在这里修改（已写入 guest 内存）。
-    // Phase 2 只插入一个模块，所以这里够用。
+}
+
+fn init_ldr_entry(
+    entry_buf: &mut [u8],
+    entry_va: u64,
+    dll_base: u64,
+    size_of_image: u32,
+    entry_point: u64,
+    full_name: &str,
+    base_name: &str,
+) {
+    wu64(entry_buf, ldr_entry::DLL_BASE, dll_base);
+    wu64(entry_buf, ldr_entry::ENTRY_POINT, entry_point);
+    wu32(entry_buf, ldr_entry::SIZE_OF_IMAGE, size_of_image);
+    wu32(entry_buf, ldr_entry::FLAGS, 0x0004);
+    wu16(entry_buf, ldr_entry::LOAD_COUNT, 0xFFFF);
+
+    let name_data_off = 0x100usize;
+    let mut full_off = name_data_off;
+    let full_va = write_utf16(entry_buf, &mut full_off, full_name, entry_va);
+    let full_len = (full_name.len() * 2) as u16;
+    wu16(entry_buf, ldr_entry::FULL_DLL_NAME, full_len);
+    wu16(entry_buf, ldr_entry::FULL_DLL_NAME + 2, full_len + 2);
+    wu64(entry_buf, ldr_entry::FULL_DLL_NAME + 8, full_va);
+
+    let mut base_off = full_off;
+    let base_va = write_utf16(entry_buf, &mut base_off, base_name, entry_va);
+    let base_len = (base_name.len() * 2) as u16;
+    wu16(entry_buf, ldr_entry::BASE_DLL_NAME, base_len);
+    wu16(entry_buf, ldr_entry::BASE_DLL_NAME + 2, base_len + 2);
+    wu64(entry_buf, ldr_entry::BASE_DLL_NAME + 8, base_va);
 }
 
 pub fn init(
@@ -149,13 +181,19 @@ pub fn init(
     pid: u32,
     tid: u32,
     stack_reserve: u64,
+    stack_commit: u64,
     image_path: &str,
     cmdline: &str,
 ) -> Option<TebPeb> {
     let stack_size = align_up(stack_reserve.max(0x10_0000), 0x10000) as usize;
-    let mut allocated = [0u64; 6];
+    let max_commit = (stack_size as u64).saturating_sub(PAGE_SIZE_4K);
+    let mut commit_size = align_up(stack_commit.max(PAGE_SIZE_4K), PAGE_SIZE_4K);
+    if commit_size > max_commit {
+        commit_size = max_commit.max(PAGE_SIZE_4K);
+    }
+    let mut allocated = [0u64; 128];
     let mut allocated_count = 0usize;
-    let stack_limit = match alloc_user_region(
+    let stack_reserve_base = match alloc_user_region(
         pid,
         stack_size,
         VmaType::ThreadStack,
@@ -165,11 +203,35 @@ pub fn init(
         Some(v) => v,
         None => return None,
     };
-    let stack_base = stack_limit + stack_size as u64;
+    let stack_base = stack_reserve_base + stack_size as u64;
+    let mut stack_limit = stack_base.saturating_sub(commit_size);
+    if stack_limit <= stack_reserve_base {
+        stack_limit = stack_reserve_base.saturating_add(PAGE_SIZE_4K);
+    }
+    let guard_page = stack_limit.saturating_sub(PAGE_SIZE_4K);
+    if guard_page < stack_reserve_base || !vm_make_guard_page(pid, guard_page) {
+        free_user_regions(pid, &allocated, allocated_count);
+        return None;
+    }
 
     let peb_va = match alloc_user_region(
         pid,
         peb::SIZE,
+        VmaType::Private,
+        &mut allocated,
+        &mut allocated_count,
+    ) {
+        Some(v) => v,
+        None => {
+            free_user_regions(pid, &allocated, allocated_count);
+            return None;
+        }
+    };
+
+    // Dedicated mapped page as default ProcessHeap anchor for user-mode runtime.
+    let process_heap_va = match alloc_user_region(
+        pid,
+        0x1000,
         VmaType::Private,
         &mut allocated,
         &mut allocated_count,
@@ -220,6 +282,16 @@ pub fn init(
     let cmd_va  = write_utf16(upp_buf, &mut str_off, cmdline, upp_va);
     let cmd_len = (cmdline.len() * 2) as u16;
 
+    // Minimal environment block: empty multi-string (L"\0\0").
+    let env_va = upp_va + str_off as u64;
+    if str_off + 4 <= upp_buf.len() {
+        upp_buf[str_off] = 0;
+        upp_buf[str_off + 1] = 0;
+        upp_buf[str_off + 2] = 0;
+        upp_buf[str_off + 3] = 0;
+        str_off += 4;
+    }
+
     // 固定字段
     wu32(upp_buf, upp::MAXIMUM_LENGTH, upp::SIZE as u32);
     wu32(upp_buf, upp::LENGTH,         upp::SIZE as u32);
@@ -234,11 +306,13 @@ pub fn init(
     wu16(upp_buf, upp::COMMAND_LINE,     cmd_len);
     wu16(upp_buf, upp::COMMAND_LINE + 2, cmd_len + 2);
     wu64(upp_buf, upp::COMMAND_LINE + 8, cmd_va);
+    wu64(upp_buf, upp::ENVIRONMENT,      env_va);
 
     // ── PEB ──────────────────────────────────────────────────
     let peb_buf = unsafe { core::slice::from_raw_parts_mut(peb_va as *mut u8, peb::SIZE) };
     wu64(peb_buf, peb::IMAGE_BASE_ADDRESS,  image_base);
     wu64(peb_buf, peb::PROCESS_PARAMETERS,  upp_va);
+    wu64(peb_buf, peb::PROCESS_HEAP,        process_heap_va);
     wu32(peb_buf, peb::OS_MAJOR_VERSION,    10);
     wu32(peb_buf, peb::OS_MINOR_VERSION,    0);
     wu32(peb_buf, peb::OS_BUILD_NUMBER,     19045);
@@ -283,31 +357,10 @@ pub fn init(
     };
     let entry_buf = unsafe { core::slice::from_raw_parts_mut(entry_va as *mut u8, ldr_entry::SIZE) };
 
-    wu64(entry_buf, ldr_entry::DLL_BASE,      image_base);
-    wu64(entry_buf, ldr_entry::ENTRY_POINT,   0); // filled later if needed
-    wu32(entry_buf, ldr_entry::SIZE_OF_IMAGE, 0); // unknown here, 0 is safe
-    wu32(entry_buf, ldr_entry::FLAGS,         0x0004); // LDRP_ENTRY_PROCESSED
-    wu16(entry_buf, ldr_entry::LOAD_COUNT,    0xFFFF); // pinned
-
-    // FullDllName = image_path as UTF-16
-    let name_data_off = 0x100usize;
-    let mut full_off = name_data_off;
-    let full_va = write_utf16(entry_buf, &mut full_off, image_path, entry_va);
-    let full_len = (image_path.len() * 2) as u16;
-    wu16(entry_buf, ldr_entry::FULL_DLL_NAME,     full_len);
-    wu16(entry_buf, ldr_entry::FULL_DLL_NAME + 2, full_len + 2);
-    wu64(entry_buf, ldr_entry::FULL_DLL_NAME + 8, full_va);
-
-    // BaseDllName = last component
     let base_name = image_path.rfind('\\')
         .map(|i| &image_path[i+1..])
         .unwrap_or(image_path);
-    let mut base_off = name_data_off + (image_path.len() + 1) * 2;
-    let base_va2 = write_utf16(entry_buf, &mut base_off, base_name, entry_va);
-    let base_len = (base_name.len() * 2) as u16;
-    wu16(entry_buf, ldr_entry::BASE_DLL_NAME,     base_len);
-    wu16(entry_buf, ldr_entry::BASE_DLL_NAME + 2, base_len + 2);
-    wu64(entry_buf, ldr_entry::BASE_DLL_NAME + 8, base_va2);
+    init_ldr_entry(entry_buf, entry_va, image_base, 0, 0, image_path, base_name);
 
     // 插入三个链表
     list_insert_tail(ldr_buf, ldr_va, ldr_data::IN_LOAD_ORDER,
@@ -316,6 +369,60 @@ pub fn init(
                      entry_buf, entry_va, ldr_entry::IN_MEMORY_ORDER);
     list_insert_tail(ldr_buf, ldr_va, ldr_data::IN_INIT_ORDER,
                      entry_buf, entry_va, ldr_entry::IN_INIT_ORDER);
+
+    // ── LDR_DATA_TABLE_ENTRY for preloaded DLLs ─────────────
+    crate::dll::for_each_loaded(|dll_name, dll_base, dll_size, dll_entry| {
+        if dll_base == 0 || dll_base == image_base {
+            return;
+        }
+
+        let Some(dll_entry_va) = alloc_user_region(
+            pid,
+            ldr_entry::SIZE,
+            VmaType::Private,
+            &mut allocated,
+            &mut allocated_count,
+        ) else {
+            return;
+        };
+        let dll_entry_buf = unsafe {
+            core::slice::from_raw_parts_mut(dll_entry_va as *mut u8, ldr_entry::SIZE)
+        };
+        init_ldr_entry(
+            dll_entry_buf,
+            dll_entry_va,
+            dll_base,
+            dll_size,
+            dll_entry,
+            dll_name,
+            dll_name,
+        );
+
+        list_insert_tail(
+            ldr_buf,
+            ldr_va,
+            ldr_data::IN_LOAD_ORDER,
+            dll_entry_buf,
+            dll_entry_va,
+            ldr_entry::IN_LOAD_ORDER,
+        );
+        list_insert_tail(
+            ldr_buf,
+            ldr_va,
+            ldr_data::IN_MEMORY_ORDER,
+            dll_entry_buf,
+            dll_entry_va,
+            ldr_entry::IN_MEMORY_ORDER,
+        );
+        list_insert_tail(
+            ldr_buf,
+            ldr_va,
+            ldr_data::IN_INIT_ORDER,
+            dll_entry_buf,
+            dll_entry_va,
+            ldr_entry::IN_INIT_ORDER,
+        );
+    });
 
     // PEB.Ldr = ldr_va
     wu64(peb_buf, peb::LDR, ldr_va);
@@ -340,7 +447,7 @@ pub fn init(
     Some(TebPeb { teb_va, peb_va, stack_base, stack_limit })
 }
 
-fn free_user_regions(pid: u32, regions: &[u64; 6], count: usize) {
+fn free_user_regions(pid: u32, regions: &[u64], count: usize) {
     for i in 0..count.min(regions.len()) {
         let base = regions[i];
         if base != 0 {
@@ -353,7 +460,7 @@ fn alloc_user_region(
     pid: u32,
     size: usize,
     vma_type: VmaType,
-    regions: &mut [u64; 6],
+    regions: &mut [u64],
     count: &mut usize,
 ) -> Option<u64> {
     let base = vm_alloc_region_typed(pid, 0, size as u64, 0x04, vma_type)?;

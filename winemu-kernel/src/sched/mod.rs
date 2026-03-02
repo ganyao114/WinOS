@@ -9,14 +9,15 @@ pub mod sync;
 use crate::kobj::ObjectStore;
 use crate::mm::vaspace::VmaType;
 use crate::nt::constants::{
-    DEFAULT_THREAD_STACK_RESERVE, PAGE_SIZE_4K, PSEUDO_CURRENT_THREAD, PSEUDO_CURRENT_THREAD_ALT,
-    THREAD_BASIC_INFORMATION_SIZE, THREAD_STACK_ALIGN,
+    DEFAULT_THREAD_STACK_COMMIT, DEFAULT_THREAD_STACK_RESERVE, PAGE_SIZE_4K, PSEUDO_CURRENT_THREAD,
+    PSEUDO_CURRENT_THREAD_ALT, THREAD_BASIC_INFORMATION_SIZE, THREAD_STACK_ALIGN,
 };
 use crate::nt::state::{vm_alloc_region_typed, vm_free_region, vm_make_guard_page};
 use crate::timer::{self, TimerTaskHandle, TimerTaskKind};
 use crate::rust_alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use winemu_shared::status;
+use winemu_shared::teb as teb_layout;
 
 pub use lock::{sched_lock_acquire, sched_lock_release};
 
@@ -883,11 +884,31 @@ fn normalize_stack_size(max_stack_size_arg: u64) -> u64 {
     }
 }
 
+#[inline(always)]
+fn normalize_stack_commit_size(stack_size_arg: u64, stack_reserve: u64) -> u64 {
+    let requested = if stack_size_arg == 0 {
+        DEFAULT_THREAD_STACK_COMMIT
+    } else {
+        (stack_size_arg + (PAGE_SIZE_4K - 1)) & !(PAGE_SIZE_4K - 1)
+    };
+    let max_commit = stack_reserve.saturating_sub(PAGE_SIZE_4K);
+    if max_commit == 0 {
+        return PAGE_SIZE_4K;
+    }
+    requested.max(PAGE_SIZE_4K).min(max_commit)
+}
+
+#[inline(always)]
+unsafe fn write_teb_u64(teb_va: u64, offset: usize, value: u64) {
+    ((teb_va + offset as u64) as *mut u64).write_volatile(value);
+}
+
 #[inline(never)]
 pub fn create_user_thread(
     pid: u32,
     entry_va: u64,
     arg: u64,
+    stack_size_arg: u64,
     max_stack_size_arg: u64,
     priority: u8,
 ) -> Result<u32, CreateThreadError> {
@@ -895,14 +916,10 @@ pub fn create_user_thread(
         return Err(CreateThreadError::InvalidParameter);
     }
 
-    let usable_stack_size = normalize_stack_size(max_stack_size_arg);
-    let stack_size = usable_stack_size.saturating_add(PAGE_SIZE_4K);
+    let stack_size = normalize_stack_size(max_stack_size_arg);
+    let stack_commit = normalize_stack_commit_size(stack_size_arg, stack_size);
     let stack_base = vm_alloc_region_typed(pid, 0, stack_size, 0x04, VmaType::ThreadStack)
         .ok_or(CreateThreadError::NoMemory)?;
-    if !vm_make_guard_page(pid, stack_base) {
-        let _ = vm_free_region(pid, stack_base);
-        return Err(CreateThreadError::NoMemory);
-    }
     let teb_va =
         vm_alloc_region_typed(pid, 0, PAGE_SIZE_4K, 0x04, VmaType::Private).map_or(0, |v| v);
     if teb_va == 0 {
@@ -910,6 +927,27 @@ pub fn create_user_thread(
         return Err(CreateThreadError::NoMemory);
     }
     let stack_top = stack_base + stack_size;
+    let mut stack_limit = stack_top.saturating_sub(stack_commit);
+    if stack_limit <= stack_base {
+        stack_limit = stack_base.saturating_add(PAGE_SIZE_4K);
+    }
+    let guard_page = stack_limit.saturating_sub(PAGE_SIZE_4K);
+    if guard_page < stack_base || !vm_make_guard_page(pid, guard_page) {
+        let _ = vm_free_region(pid, stack_base);
+        let _ = vm_free_region(pid, teb_va);
+        return Err(CreateThreadError::NoMemory);
+    }
+
+    let peb_va = crate::process::with_process(pid, |p| p.peb_va).unwrap_or(0);
+    unsafe {
+        core::ptr::write_bytes(teb_va as *mut u8, 0, PAGE_SIZE_4K as usize);
+        write_teb_u64(teb_va, teb_layout::EXCEPTION_LIST, u64::MAX);
+        write_teb_u64(teb_va, teb_layout::STACK_BASE, stack_top);
+        write_teb_u64(teb_va, teb_layout::STACK_LIMIT, stack_limit);
+        write_teb_u64(teb_va, teb_layout::SELF, teb_va);
+        write_teb_u64(teb_va, teb_layout::PEB, peb_va);
+        write_teb_u64(teb_va, teb_layout::CLIENT_ID, pid as u64);
+    }
 
     let tid = spawn(
         pid, entry_va, stack_top, arg, teb_va, stack_base, stack_size, priority,
@@ -918,6 +956,9 @@ pub fn create_user_thread(
         let _ = vm_free_region(pid, stack_base);
         let _ = vm_free_region(pid, teb_va);
         return Err(CreateThreadError::NoMemory);
+    }
+    unsafe {
+        write_teb_u64(teb_va, teb_layout::CLIENT_ID + 8, tid as u64);
     }
     crate::process::on_thread_created(pid, tid);
     Ok(tid)

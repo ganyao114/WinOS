@@ -294,7 +294,8 @@ WINEMU_STUB_RET0(RtlNewSecurityObjectWithMultipleInheritance)
 WINEMU_STUB_RET0(RtlNormalizeProcessParams)
 WINEMU_STUB_RET0(RtlNormalizeString)
 WINEMU_STUB_RET0(RtlOemStringToUnicodeString)
-WINEMU_STUB_RET0(RtlOpenCrossProcessEmulatorWorkConnection)
+/* Implemented in ntdll.c for kernelbase locale bootstrap. */
+/* WINEMU_STUB_RET0(RtlOpenCrossProcessEmulatorWorkConnection) */
 WINEMU_STUB_RET0(RtlOpenCurrentUser)
 WINEMU_STUB_RET0(RtlProcessFlsData)
 WINEMU_STUB_RET0(RtlQueryActivationContextApplicationSettings)
@@ -410,16 +411,16 @@ WINEMU_STUB_RET0(TpWaitForTimer)
 WINEMU_STUB_RET0(TpWaitForWait)
 WINEMU_STUB_RET0(TpWaitForWork)
 WINEMU_STUB_RET0(VerSetConditionMask)
-WINEMU_STUB_RET0(__wine_dbg_get_channel_flags)
-WINEMU_STUB_RET0(__wine_dbg_header)
-WINEMU_STUB_RET0(__wine_dbg_output)
-WINEMU_STUB_RET0(__wine_dbg_strdup)
+/* __wine_dbg_get_channel_flags is implemented in ntdll.c */
+/* __wine_dbg_header is implemented in ntdll.c */
+/* __wine_dbg_output is implemented in ntdll.c */
+/* __wine_dbg_strdup is implemented in ntdll.c */
 WINEMU_STUB_RET0(_local_unwind)
-WINEMU_STUB_RET0(_setjmpex)
+/* _setjmpex is implemented in ntdll.c */
 WINEMU_STUB_RET0(_vsnprintf)
 WINEMU_STUB_RET0(_vsnwprintf)
 WINEMU_STUB_RET0(islower)
-WINEMU_STUB_RET0(longjmp)
+/* longjmp is implemented in ntdll.c */
 WINEMU_STUB_RET0(memchr)
 WINEMU_STUB_RET0(strpbrk)
 WINEMU_STUB_RET0(wine_get_host_version)

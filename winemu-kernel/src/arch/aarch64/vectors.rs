@@ -88,7 +88,14 @@ global_asm!(
     "b.ne 92f",
     "b __el0_da",
     "92:",
-    "b __el1_sync",                 // unknown exception — print ESR/FAR/ELR
+    // Some user-mode probes trap as EC=0x00/0x18 on this platform
+    // configuration. Keep this compat path for those EC values only; all
+    // other unknown sync traps are treated as fatal and routed to diagnostics.
+    "cmp x9, #0x18",
+    "b.eq __el0_undef_skip",
+    "cmp x9, #0x00",
+    "b.eq __el0_undef_skip",
+    "b __el0_undef",
     ".balign 128",
 
     // ── Slot 9: Lower EL AArch64 IRQ ────────────────────────
@@ -132,6 +139,9 @@ global_asm!(
     // Build SvcFrame on SVC stack and call guest EL1 dispatcher.
     // x9 was saved into tpidrro_el0 by Slot 8 dispatch above.
     "__el0_svc:",
+    // Preserve user x16/x17 before borrowing them as scratch.
+    "mov x9, x17",
+    "mov x17, x16",
     "ldr x16, =__svc_stack_top",
     "mov sp, x16",
     "sub sp, sp, #0x120",
@@ -144,7 +154,8 @@ global_asm!(
     "stp x10, x11, [sp, #0x050]",
     "stp x12, x13, [sp, #0x060]",
     "stp x14, x15, [sp, #0x070]",
-    "stp x16, x17, [sp, #0x080]",
+    "str x17,      [sp, #0x080]",
+    "str x9,       [sp, #0x088]",
     "stp x18, x19, [sp, #0x090]",
     "stp x20, x21, [sp, #0x0a0]",
     "stp x22, x23, [sp, #0x0b0]",
@@ -201,6 +212,9 @@ global_asm!(
     // x9 was already saved to tpidrro_el0 by Slot 8 dispatch above.
     // Preserve full EL0 register context so demand-paging retries are transparent.
     "__el0_da:",
+    // Preserve user x16/x17 before borrowing them as scratch.
+    "mov x9, x17",
+    "mov x17, x16",
     "ldr x16, =__svc_stack_top",
     "mov sp, x16",
     "sub sp, sp, #0x110",
@@ -213,7 +227,8 @@ global_asm!(
     "stp x10, x11, [sp, #0x050]",
     "stp x12, x13, [sp, #0x060]",
     "stp x14, x15, [sp, #0x070]",
-    "stp x16, x17, [sp, #0x080]",
+    "str x17,      [sp, #0x080]",
+    "str x9,       [sp, #0x088]",
     "stp x18, x19, [sp, #0x090]",
     "stp x20, x21, [sp, #0x0a0]",
     "stp x22, x23, [sp, #0x0b0]",
@@ -226,16 +241,20 @@ global_asm!(
     "str x16, [sp, #0x0f8]",
     "mrs x16, spsr_el1",
     "str x16, [sp, #0x100]",
+    "mrs x16, sp_el0",
+    "str x16, [sp, #0x108]",
     "mrs x16, tpidrro_el0",
     "str x16, [sp, #0x048]",
     // Args for Rust handler: (far, esr, elr)
     "mrs x0, far_el1",
     "mrs x1, esr_el1",
     "ldr x2, [sp, #0x0f8]",
+    "mov x3, sp",
     "bl el0_page_fault",
-    // x0 == 0 => unresolved fault, stay halted for debug.
+    // x0 == 0 => unresolved EL0 fault. For now, skip one A64 instruction.
     "cbz x0, 90f",
     // Restore ELR/SPSR
+    "95:",
     "ldr x16, [sp, #0x0f8]",
     "msr elr_el1, x16",
     "ldr x16, [sp, #0x100]",
@@ -259,7 +278,31 @@ global_asm!(
     "ldr x30,      [sp, #0x0f0]",
     "add sp, sp, #0x110",
     "1: eret",
-    "90: b .",                      // unresolved fault — hang
+    "90:",
+    "ldr x16, [sp, #0x0f8]",
+    "add x16, x16, #4",
+    "str x16, [sp, #0x0f8]",
+    "b 95b",
+
+    // ── Unknown sync from EL0 (fatal) ─────────────────────────
+    "__el0_undef:",
+    "ldr x16, =__svc_stack_top",
+    "mov sp, x16",
+    "mrs x0, far_el1",
+    "mrs x1, esr_el1",
+    "mrs x2, elr_el1",
+    "mov x3, xzr",
+    "bl el0_page_fault",
+    "b .",
+
+    // ── EC=0x00 compat skip path ──────────────────────────────
+    "__el0_undef_skip:",
+    "mrs x16, elr_el1",
+    "add x16, x16, #4",
+    "msr elr_el1, x16",
+    // restore user x9 saved by Slot 8 dispatch path
+    "mrs x9, tpidrro_el0",
+    "eret",
 );
 
 extern "C" {

@@ -33,6 +33,7 @@ pub struct LoadedImage {
 
 // ── 导入引用 ─────────────────────────────────────────────────
 
+#[derive(Clone, Copy)]
 pub enum ImportRef<'a> {
     Name(&'a str),
     Ordinal(u16),
@@ -177,6 +178,132 @@ pub unsafe fn load(
     })
 }
 
+/// Load PE image into memory (with relocations) but do not resolve IAT yet.
+pub unsafe fn load_from_fd_unlinked(fd: u64, file_size: u64) -> LdrResult<LoadedImage> {
+    const HDR_BUF_SIZE: usize = 4096;
+    let hdr_buf = alloc::alloc_zeroed(HDR_BUF_SIZE, 16).ok_or(LdrError::AllocFailed)?;
+    let read_len = HDR_BUF_SIZE.min(file_size as usize);
+    let got = hypercall::host_read(fd, hdr_buf, read_len, 0);
+    if got == 0 {
+        hypercall::debug_print("ldr: failed to read PE headers\n");
+        return Err(LdrError::IoError);
+    }
+    let hdr_slice = core::slice::from_raw_parts(hdr_buf as *const u8, got);
+    let hdrs = PeHeaders::from_slice(hdr_slice)?;
+    hypercall::debug_print("ldr: parsed PE headers\n");
+
+    if hdrs.machine != pe::MACHINE_ARM64 {
+        return Err(LdrError::NotArm64);
+    }
+
+    let buf = alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096).ok_or(LdrError::AllocFailed)?;
+    hypercall::debug_print("ldr: alloc ok\n");
+    let load_base = buf as u64;
+
+    let hdr_copy = (hdrs.size_of_headers as usize).min(got);
+    core::ptr::copy_nonoverlapping(hdr_buf as *const u8, buf, hdr_copy);
+
+    for sec in hdrs.sections() {
+        if sec.raw_size > 0 && sec.raw_off > 0 {
+            let dst = buf.add(sec.vaddr as usize);
+            let read_size = (sec.raw_size as usize).min(sec.vsize as usize);
+            let n = hypercall::host_read(fd, dst, read_size, sec.raw_off as u64);
+            if n == 0 && read_size > 0 {
+                hypercall::debug_print("ldr: section read failed\n");
+                return Err(LdrError::IoError);
+            }
+        }
+    }
+
+    let delta = load_base.wrapping_sub(hdrs.image_base) as i64;
+    if delta != 0 {
+        if let Some(dir) = hdrs.data_dir(pe::DIR_BASERELOC) {
+            if dir.is_present() {
+                apply_relocations(buf, dir.rva as usize, dir.size as usize, delta)?;
+            }
+        }
+    }
+
+    Ok(LoadedImage {
+        base: load_base,
+        size: hdrs.size_of_image as usize,
+        entry_rva: hdrs.entry_rva,
+    })
+}
+
+/// Load PE image into memory (with relocations) but do not resolve IAT yet.
+pub unsafe fn load_unlinked(image: &[u8]) -> LdrResult<LoadedImage> {
+    let hdrs = PeHeaders::from_slice(image)?;
+    crate::hypercall::debug_print("ldr: parsed PE headers\n");
+
+    if hdrs.machine != pe::MACHINE_ARM64 {
+        return Err(LdrError::NotArm64);
+    }
+
+    let buf = alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096).ok_or(LdrError::AllocFailed)?;
+    crate::hypercall::debug_print("ldr: alloc ok\n");
+    let load_base = buf as u64;
+
+    let hdr_copy = (hdrs.size_of_headers as usize).min(image.len());
+    if hdr_copy > 0 {
+        core::ptr::copy_nonoverlapping(image.as_ptr(), buf, hdr_copy);
+    }
+
+    for sec in hdrs.sections() {
+        if sec.raw_size > 0 {
+            let src_off = sec.raw_off as usize;
+            let dst_off = sec.vaddr as usize;
+            let copy_len = (sec.raw_size as usize).min(sec.vsize as usize);
+            if src_off + copy_len <= image.len() {
+                core::ptr::copy_nonoverlapping(image.as_ptr().add(src_off), buf.add(dst_off), copy_len);
+            }
+        }
+    }
+
+    let delta = load_base.wrapping_sub(hdrs.image_base) as i64;
+    if delta != 0 {
+        if let Some(dir) = hdrs.data_dir(pe::DIR_BASERELOC) {
+            if dir.is_present() {
+                apply_relocations(buf, dir.rva as usize, dir.size as usize, delta)?;
+            }
+        }
+    }
+
+    Ok(LoadedImage {
+        base: load_base,
+        size: hdrs.size_of_image as usize,
+        entry_rva: hdrs.entry_rva,
+    })
+}
+
+/// Resolve and patch import table for an already loaded image.
+pub unsafe fn link_imports(
+    image_base: u64,
+    resolve_import: impl Fn(&str, ImportRef) -> Option<u64>,
+) -> LdrResult<()> {
+    let Some((import_rva, import_size)) = read_import_dir(image_base as *const u8) else {
+        return Ok(());
+    };
+    if import_rva == 0 || import_size == 0 {
+        return Ok(());
+    }
+    apply_imports(image_base as *mut u8, import_rva, &resolve_import)
+}
+
+unsafe fn read_import_dir(image: *const u8) -> Option<(usize, usize)> {
+    if pe::ru16(image) != pe::MZ_MAGIC {
+        return None;
+    }
+    let lfanew = pe::ru32(image.add(60)) as usize;
+    if pe::ru32(image.add(lfanew)) != pe::PE_MAGIC {
+        return None;
+    }
+    let oh = image.add(lfanew + 24);
+    let import_rva = pe::ru32(oh.add(112 + pe::DIR_IMPORT * 8)) as usize;
+    let import_size = pe::ru32(oh.add(112 + pe::DIR_IMPORT * 8 + 4)) as usize;
+    Some((import_rva, import_size))
+}
+
 // ── 重定位 ───────────────────────────────────────────────────
 
 unsafe fn apply_relocations(
@@ -242,13 +369,117 @@ unsafe fn apply_imports(
                 let ibn = (thunk & 0x7FFF_FFFF_FFFF_FFFF) as usize;
                 ImportRef::Name(cstr(base.add(ibn + 2)))
             };
-            let addr = resolve(dll_name, iref).ok_or(LdrError::BadImport)?;
+            let (resolved_dll, resolved_iref, remapped) = match iref {
+                ImportRef::Name(fn_name)
+                    if dll_name.eq_ignore_ascii_case("kernel32.dll")
+                        && should_remap_kernel32_to_ntdll(fn_name) =>
+                {
+                    ("ntdll.dll", ImportRef::Name(fn_name), true)
+                }
+                _ => (dll_name, iref, false),
+            };
+            let Some(addr) = resolve(resolved_dll, resolved_iref) else {
+                hypercall::debug_print("ldr: unresolved import ");
+                hypercall::debug_print(dll_name);
+                hypercall::debug_print("!");
+                match iref {
+                    ImportRef::Name(fn_name) => {
+                        hypercall::debug_print(fn_name);
+                    }
+                    ImportRef::Ordinal(ord) => {
+                        hypercall::debug_print("#");
+                        hypercall::debug_u64(ord as u64);
+                    }
+                }
+                if remapped {
+                    hypercall::debug_print(" via ");
+                    hypercall::debug_print(resolved_dll);
+                }
+                hypercall::debug_print("\n");
+                return Err(LdrError::BadImport);
+            };
+            if let ImportRef::Name(fn_name) = iref {
+                if fn_name == "RtlOpenCrossProcessEmulatorWorkConnection" {
+                    hypercall::debug_print("ldr: import ");
+                    hypercall::debug_print(dll_name);
+                    hypercall::debug_print("!");
+                    hypercall::debug_print(fn_name);
+                    if remapped {
+                        hypercall::debug_print(" => ");
+                        hypercall::debug_print(resolved_dll);
+                    }
+                    hypercall::debug_print(" -> ");
+                    hypercall::debug_u64(addr);
+                    hypercall::debug_print(" slot=");
+                    hypercall::debug_u64((base as u64).saturating_add(iat_rva as u64 + (slot as u64) * 8));
+                    hypercall::debug_print("\n");
+                }
+                if dll_name.eq_ignore_ascii_case("kernel32.dll")
+                    && (fn_name == "GetProcessHeap"
+                        || fn_name == "HeapAlloc"
+                        || fn_name == "HeapFree"
+                        || fn_name == "HeapReAlloc"
+                        || fn_name == "GlobalAlloc"
+                        || fn_name == "GlobalReAlloc"
+                        || fn_name == "GlobalFree"
+                        || fn_name == "GlobalLock"
+                        || fn_name == "GlobalUnlock"
+                        || fn_name == "GlobalHandle"
+                        || fn_name == "GlobalSize"
+                        || fn_name == "GlobalFlags"
+                        || fn_name == "LocalAlloc"
+                        || fn_name == "LocalReAlloc"
+                        || fn_name == "LocalFree"
+                        || fn_name == "LocalLock"
+                        || fn_name == "LocalUnlock"
+                        || fn_name == "LocalHandle"
+                        || fn_name == "LocalSize"
+                        || fn_name == "LocalFlags"
+                        || fn_name == "EnterCriticalSection"
+                        || fn_name == "LeaveCriticalSection"
+                        || fn_name == "RaiseException")
+                {
+                    hypercall::debug_print("ldr: import ");
+                    hypercall::debug_print(dll_name);
+                    hypercall::debug_print("!");
+                    hypercall::debug_print(fn_name);
+                    if remapped {
+                        hypercall::debug_print(" => ");
+                        hypercall::debug_print(resolved_dll);
+                    }
+                    hypercall::debug_print(" -> ");
+                    hypercall::debug_u64(addr);
+                    hypercall::debug_print("\n");
+                }
+            }
             pe::wu64(base.add(iat_rva + slot * 8), addr);
             slot += 1;
         }
         desc_off += ID_SIZE;
     }
     Ok(())
+}
+
+fn should_remap_kernel32_to_ntdll(fn_name: &str) -> bool {
+    matches!(
+        fn_name,
+        "GlobalAlloc"
+            | "GlobalReAlloc"
+            | "GlobalFree"
+            | "GlobalLock"
+            | "GlobalUnlock"
+            | "GlobalHandle"
+            | "GlobalSize"
+            | "GlobalFlags"
+            | "LocalAlloc"
+            | "LocalReAlloc"
+            | "LocalFree"
+            | "LocalLock"
+            | "LocalUnlock"
+            | "LocalHandle"
+            | "LocalSize"
+            | "LocalFlags"
+    )
 }
 
 unsafe fn cstr<'a>(p: *const u8) -> &'a str {

@@ -13,6 +13,7 @@ const DESC_INVALID: u64 = 0b00;
 const DESC_BLOCK: u64 = 0b01;
 const DESC_TABLE_OR_PAGE: u64 = 0b11;
 const TABLE_ADDR_MASK: u64 = !0xFFF;
+const DESC_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 const AP_EL1_RW: u64 = 0b00 << 6;
 const AP_EL0_RW: u64 = 0b01 << 6;
@@ -416,7 +417,7 @@ fn is_valid_user_va(va: u64) -> bool {
 }
 
 fn is_user_accessible_va(va: u64) -> bool {
-    va < USER_VA_LIMIT
+    va >= USER_VA_BASE && va < USER_VA_LIMIT
 }
 
 fn is_valid_user_range(base: u64, size: u64) -> bool {
@@ -483,7 +484,9 @@ fn translate_from_desc(desc: u64, va: u64, base_mask: u64, span: u64, access: u8
     if access == crate::nt::state::VM_ACCESS_WRITE && !writable {
         return None;
     }
-    let base = desc & base_mask;
+    // Strip descriptor attribute bits (e.g. UXN/PXN/AP/AF) and keep only
+    // the physical address field relevant to this level.
+    let base = desc & base_mask & DESC_ADDR_MASK;
     let offset = va & (span - 1);
     base.checked_add(offset)
 }

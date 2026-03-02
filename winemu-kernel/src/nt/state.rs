@@ -204,6 +204,20 @@ pub(crate) fn vm_find_region(owner_pid: u32, base_or_addr: u64) -> Option<(u32, 
     found
 }
 
+pub(crate) fn vm_debug_find_region_any(addr: u64) -> Option<(u32, u64, u64, u8)> {
+    let mut out = None;
+    regions_store_mut().for_each_live_ptr(|_, ptr| unsafe {
+        if out.is_some() {
+            return;
+        }
+        let r = *ptr;
+        if addr >= r.base && addr < r.base.saturating_add(r.size) {
+            out = Some((r.owner_pid, r.base, r.size, r.kind));
+        }
+    });
+    out
+}
+
 pub(crate) fn vm_set_region_prot(id: u32, prot: u32) -> bool {
     let ptr = regions_store_mut().get_ptr(id);
     if ptr.is_null() {
@@ -519,6 +533,38 @@ pub(crate) fn vm_query_region(owner_pid: u32, addr: u64) -> Option<VmQueryInfo> 
     })
 }
 
+fn vm_update_current_thread_stack_limit(owner_pid: u32, new_limit: u64) {
+    let tid = crate::sched::current_tid();
+    if tid == 0 || !crate::sched::thread_exists(tid) {
+        return;
+    }
+    let teb_va = crate::sched::with_thread(tid, |t| if t.pid == owner_pid { t.teb_va } else { 0 });
+    if teb_va == 0 {
+        return;
+    }
+    unsafe {
+        ((teb_va + winemu_shared::teb::STACK_LIMIT as u64) as *mut u64).write_volatile(new_limit);
+    }
+}
+
+fn vm_on_thread_stack_guard_hit(owner_pid: u32, region: &mut VmRegion, idx: usize, page_va: u64) {
+    vm_update_current_thread_stack_limit(owner_pid, page_va);
+    if idx == 0 {
+        return;
+    }
+    let next_idx = idx - 1;
+    if !vm_region_page_committed(region, next_idx) {
+        return;
+    }
+    let next_va = region.base + (next_idx as u64) * PAGE_SIZE_4K;
+    let next_prot = vm_sanitize_nt_prot(unsafe { *region.prot_pages.add(next_idx) }) & !PAGE_GUARD;
+    unsafe {
+        *region.prot_pages.add(next_idx) = next_prot | PAGE_GUARD;
+    }
+    // Force a one-shot fault when stack grows into the next page.
+    vm_unmap_page_only(owner_pid, next_va);
+}
+
 pub(crate) fn vm_handle_page_fault(owner_pid: u32, fault_addr: u64, access: u8) -> bool {
     let page_va = fault_addr & !(PAGE_SIZE_4K - 1);
     let Some((id, region)) = vm_find_region(owner_pid, page_va) else {
@@ -539,6 +585,7 @@ pub(crate) fn vm_handle_page_fault(owner_pid: u32, fault_addr: u64, access: u8) 
     let region_mut = unsafe { &mut *ptr };
 
     let mut prot = vm_sanitize_nt_prot(unsafe { *region_mut.prot_pages.add(idx) });
+    let had_guard = (prot & PAGE_GUARD) != 0;
     if (prot & PAGE_GUARD) != 0 {
         prot &= !PAGE_GUARD;
         unsafe {
@@ -555,11 +602,15 @@ pub(crate) fn vm_handle_page_fault(owner_pid: u32, fault_addr: u64, access: u8) 
 
     let gpa = unsafe { *region_mut.phys_pages.add(idx) };
     if gpa != 0 {
-        return crate::process::with_process_mut(owner_pid, |p| {
+        let mapped = crate::process::with_process_mut(owner_pid, |p| {
             p.address_space
                 .map_user_range(page_va, gpa, PAGE_SIZE_4K, prot)
         })
         .unwrap_or(false);
+        if mapped && had_guard && region_mut.kind == VM_KIND_THREAD_STACK {
+            vm_on_thread_stack_guard_hit(owner_pid, region_mut, idx, page_va);
+        }
+        return mapped;
     }
 
     let Some(new_gpa) = crate::mm::phys::alloc_pages(1) else {
@@ -585,6 +636,9 @@ pub(crate) fn vm_handle_page_fault(owner_pid: u32, fault_addr: u64, access: u8) 
     vm_phys_page_add_ref(new_gpa);
     unsafe {
         *region_mut.phys_pages.add(idx) = new_gpa;
+    }
+    if had_guard && region_mut.kind == VM_KIND_THREAD_STACK {
+        vm_on_thread_stack_guard_hit(owner_pid, region_mut, idx, page_va);
     }
     true
 }

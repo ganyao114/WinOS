@@ -533,6 +533,10 @@ typedef struct {
 #define WINEMU_HEAP_HDR_MAGIC 0x5748454150484452ULL
 #define WINEMU_HEAP_HDR_SIZE  ((size_t)sizeof(WINEMU_HEAP_HDR))
 
+static uint64_t g_heap_alloc_fail_count = 0;
+static uint64_t g_heap_last_fail_size = 0;
+static uint32_t g_heap_last_fail_status = STATUS_SUCCESS;
+
 static size_t align_up(size_t v, size_t a) {
     return (v + (a - 1)) & ~(a - 1);
 }
@@ -606,7 +610,12 @@ EXPORT void* RtlAllocateHeap(HANDLE heap, ULONG flags, size_t size) {
     size_t sz = total;
     NTSTATUS st = NtAllocateVirtualMemory(
         (HANDLE)(uint64_t)-1, &raw, 0, &sz, 0x3000, 4);
-    if (st != 0 || !raw) return NULL;
+    if (st != 0 || !raw) {
+        g_heap_alloc_fail_count++;
+        g_heap_last_fail_size = total;
+        g_heap_last_fail_status = (uint32_t)st;
+        return NULL;
+    }
 
     WINEMU_HEAP_HDR* hdr = (WINEMU_HEAP_HDR*)raw;
     hdr->magic = WINEMU_HEAP_HDR_MAGIC;
@@ -661,6 +670,238 @@ EXPORT int RtlValidateHeap(HANDLE heap, ULONG flags, const void* ptr) {
     return hdr->magic == WINEMU_HEAP_HDR_MAGIC ? 1 : 0;
 }
 
+/* ── Global/Local memory APIs ─────────────────────────────────── */
+
+typedef struct {
+    uint64_t magic;
+    uint32_t flags;
+    uint32_t lock_count;
+    size_t size;
+    void* data_base;
+    void* user_ptr;
+} WINEMU_GMEM_HDR;
+
+#define WINEMU_GMEM_MAGIC 0x57474D454D484452ULL
+#define WINEMU_GMEM_PREFIX_SIZE ((size_t)sizeof(void*))
+
+#define GMEM_FIXED     0x0000U
+#define GMEM_MOVEABLE  0x0002U
+#define GMEM_ZEROINIT  0x0040U
+#define GMEM_MODIFY    0x0080U
+
+static void gmem_zero(void* ptr, size_t n) {
+    uint8_t* p = (uint8_t*)ptr;
+    for (size_t i = 0; i < n; i++) {
+        p[i] = 0;
+    }
+}
+
+static int gmem_valid_hdr(const WINEMU_GMEM_HDR* hdr) {
+    return hdr
+        && hdr->magic == WINEMU_GMEM_MAGIC
+        && hdr->data_base
+        && hdr->user_ptr
+        && (hdr->user_ptr == (void*)((uint8_t*)hdr->data_base + WINEMU_GMEM_PREFIX_SIZE));
+}
+
+static WINEMU_GMEM_HDR* gmem_hdr_from_handle(const void* handle) {
+    const WINEMU_GMEM_HDR* hdr = (const WINEMU_GMEM_HDR*)handle;
+    return gmem_valid_hdr(hdr) ? (WINEMU_GMEM_HDR*)hdr : NULL;
+}
+
+static WINEMU_GMEM_HDR* gmem_hdr_from_ptr(const void* ptr) {
+    if (!ptr) return NULL;
+    const uint8_t* p = (const uint8_t*)ptr;
+    if ((uintptr_t)p < WINEMU_GMEM_PREFIX_SIZE) return NULL;
+    WINEMU_GMEM_HDR* hdr = *(WINEMU_GMEM_HDR**)(p - WINEMU_GMEM_PREFIX_SIZE);
+    if (!gmem_valid_hdr(hdr)) return NULL;
+    if (hdr->user_ptr != ptr) return NULL;
+    return hdr;
+}
+
+static WINEMU_GMEM_HDR* gmem_resolve(const void* mem, int* from_handle) {
+    WINEMU_GMEM_HDR* hdr = gmem_hdr_from_handle(mem);
+    if (hdr) {
+        if (from_handle) *from_handle = 1;
+        return hdr;
+    }
+    hdr = gmem_hdr_from_ptr(mem);
+    if (hdr) {
+        if (from_handle) *from_handle = 0;
+        return hdr;
+    }
+    return NULL;
+}
+
+static int gmem_is_moveable(const WINEMU_GMEM_HDR* hdr) {
+    return (hdr->flags & GMEM_MOVEABLE) != 0;
+}
+
+static int gmem_alloc_data(WINEMU_GMEM_HDR* hdr, size_t size, int zero_init) {
+    size_t need = align_up(size ? size : 1, 16);
+    size_t total = align_up(need + WINEMU_GMEM_PREFIX_SIZE, 16);
+    void* data_base = RtlAllocateHeap(NULL, 0, total);
+    if (!data_base) {
+        return 0;
+    }
+    *(WINEMU_GMEM_HDR**)data_base = hdr;
+    void* user = (void*)((uint8_t*)data_base + WINEMU_GMEM_PREFIX_SIZE);
+    if (zero_init && need) {
+        gmem_zero(user, need);
+    }
+    hdr->data_base = data_base;
+    hdr->user_ptr = user;
+    hdr->size = size;
+    return 1;
+}
+
+static HANDLE gmem_handle_for(const WINEMU_GMEM_HDR* hdr) {
+    if (gmem_is_moveable(hdr)) {
+        return (HANDLE)hdr;
+    }
+    return (HANDLE)hdr->user_ptr;
+}
+
+EXPORT HANDLE GlobalAlloc(ULONG flags, size_t bytes) {
+    WINEMU_GMEM_HDR* hdr = (WINEMU_GMEM_HDR*)RtlAllocateHeap(NULL, 0, sizeof(WINEMU_GMEM_HDR));
+    if (!hdr) return NULL;
+
+    hdr->magic = WINEMU_GMEM_MAGIC;
+    hdr->flags = flags;
+    hdr->lock_count = 0;
+    hdr->size = 0;
+    hdr->data_base = NULL;
+    hdr->user_ptr = NULL;
+    if (!gmem_alloc_data(hdr, bytes, (flags & GMEM_ZEROINIT) != 0)) {
+        (void)RtlFreeHeap(NULL, 0, hdr);
+        return NULL;
+    }
+    return gmem_handle_for(hdr);
+}
+
+EXPORT HANDLE GlobalFree(HANDLE mem) {
+    if (!mem) return NULL;
+    WINEMU_GMEM_HDR* hdr = gmem_resolve(mem, NULL);
+    if (!hdr) return mem;
+    void* data_base = hdr->data_base;
+    hdr->magic = 0;
+    hdr->data_base = NULL;
+    hdr->user_ptr = NULL;
+    if (data_base) {
+        (void)RtlFreeHeap(NULL, 0, data_base);
+    }
+    (void)RtlFreeHeap(NULL, 0, hdr);
+    return NULL;
+}
+
+EXPORT HANDLE GlobalHandle(const void* mem) {
+    WINEMU_GMEM_HDR* hdr = gmem_resolve(mem, NULL);
+    if (!hdr) return NULL;
+    return gmem_handle_for(hdr);
+}
+
+EXPORT void* GlobalLock(HANDLE mem) {
+    WINEMU_GMEM_HDR* hdr = gmem_resolve(mem, NULL);
+    if (!hdr) return NULL;
+    if (gmem_is_moveable(hdr) && hdr->lock_count != 0xFFFFFFFFU) {
+        hdr->lock_count++;
+    }
+    return hdr->user_ptr;
+}
+
+EXPORT int GlobalUnlock(HANDLE mem) {
+    WINEMU_GMEM_HDR* hdr = gmem_resolve(mem, NULL);
+    if (!hdr) return 0;
+    if (!gmem_is_moveable(hdr)) return 1;
+    if (hdr->lock_count == 0) return 0;
+    hdr->lock_count--;
+    return hdr->lock_count != 0 ? 1 : 0;
+}
+
+EXPORT size_t GlobalSize(HANDLE mem) {
+    WINEMU_GMEM_HDR* hdr = gmem_resolve(mem, NULL);
+    if (!hdr) return 0;
+    return hdr->size;
+}
+
+EXPORT ULONG GlobalFlags(HANDLE mem) {
+    WINEMU_GMEM_HDR* hdr = gmem_resolve(mem, NULL);
+    if (!hdr) return 0xFFFFU;
+    ULONG out = 0;
+    if (gmem_is_moveable(hdr)) out |= GMEM_MOVEABLE;
+    out |= (hdr->lock_count & 0xFFU);
+    return out;
+}
+
+EXPORT HANDLE GlobalReAlloc(HANDLE mem, size_t bytes, ULONG flags) {
+    if (!mem) {
+        return GlobalAlloc(flags, bytes);
+    }
+    int from_handle = 0;
+    WINEMU_GMEM_HDR* hdr = gmem_resolve(mem, &from_handle);
+    if (!hdr) return NULL;
+
+    if (flags & GMEM_MODIFY) {
+        if (flags & GMEM_MOVEABLE) {
+            hdr->flags |= GMEM_MOVEABLE;
+        } else {
+            hdr->flags &= ~GMEM_MOVEABLE;
+        }
+        return gmem_handle_for(hdr);
+    }
+
+    size_t old_size = hdr->size;
+    size_t need = align_up(bytes ? bytes : 1, 16);
+    size_t total = align_up(need + WINEMU_GMEM_PREFIX_SIZE, 16);
+    void* new_data = RtlReAllocateHeap(NULL, 0, hdr->data_base, total);
+    if (!new_data) return NULL;
+
+    *(WINEMU_GMEM_HDR**)new_data = hdr;
+    hdr->data_base = new_data;
+    hdr->user_ptr = (void*)((uint8_t*)new_data + WINEMU_GMEM_PREFIX_SIZE);
+    hdr->size = bytes;
+    if ((flags & GMEM_ZEROINIT) && bytes > old_size) {
+        gmem_zero((uint8_t*)hdr->user_ptr + old_size, bytes - old_size);
+    }
+
+    if (!from_handle && !gmem_is_moveable(hdr)) {
+        return (HANDLE)hdr->user_ptr;
+    }
+    return gmem_handle_for(hdr);
+}
+
+EXPORT HANDLE LocalAlloc(ULONG flags, size_t bytes) {
+    return GlobalAlloc(flags, bytes);
+}
+
+EXPORT HANDLE LocalReAlloc(HANDLE mem, size_t bytes, ULONG flags) {
+    return GlobalReAlloc(mem, bytes, flags);
+}
+
+EXPORT HANDLE LocalFree(HANDLE mem) {
+    return GlobalFree(mem);
+}
+
+EXPORT void* LocalLock(HANDLE mem) {
+    return GlobalLock(mem);
+}
+
+EXPORT int LocalUnlock(HANDLE mem) {
+    return GlobalUnlock(mem);
+}
+
+EXPORT HANDLE LocalHandle(const void* mem) {
+    return GlobalHandle(mem);
+}
+
+EXPORT size_t LocalSize(HANDLE mem) {
+    return GlobalSize(mem);
+}
+
+EXPORT ULONG LocalFlags(HANDLE mem) {
+    return GlobalFlags(mem);
+}
+
 /* ── Critical Section ────────────────────────────────────────── */
 
 typedef struct {
@@ -672,9 +913,55 @@ typedef struct {
     uint64_t spin_count;
 } RTL_CRITICAL_SECTION;
 
+typedef struct {
+    uint64_t owner_cs;
+    uint8_t storage[0x40];
+} CS_DEBUG_SLOT;
+
+#define CS_DEBUG_SLOTS 256
+static CS_DEBUG_SLOT g_cs_debug_slots[CS_DEBUG_SLOTS];
+static uint32_t g_cs_debug_next;
+
+static void cs_debug_zero(uint8_t* buf, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        buf[i] = 0;
+    }
+}
+
+static uint64_t cs_debug_info_acquire(RTL_CRITICAL_SECTION* cs) {
+    uint64_t key = (uint64_t)(uintptr_t)cs;
+    for (uint32_t i = 0; i < CS_DEBUG_SLOTS; i++) {
+        if (g_cs_debug_slots[i].owner_cs == key) {
+            return (uint64_t)(uintptr_t)g_cs_debug_slots[i].storage;
+        }
+    }
+    for (uint32_t i = 0; i < CS_DEBUG_SLOTS; i++) {
+        if (g_cs_debug_slots[i].owner_cs == 0) {
+            g_cs_debug_slots[i].owner_cs = key;
+            cs_debug_zero(g_cs_debug_slots[i].storage, sizeof(g_cs_debug_slots[i].storage));
+            return (uint64_t)(uintptr_t)g_cs_debug_slots[i].storage;
+        }
+    }
+    uint32_t idx = g_cs_debug_next++ % CS_DEBUG_SLOTS;
+    g_cs_debug_slots[idx].owner_cs = key;
+    cs_debug_zero(g_cs_debug_slots[idx].storage, sizeof(g_cs_debug_slots[idx].storage));
+    return (uint64_t)(uintptr_t)g_cs_debug_slots[idx].storage;
+}
+
+static void cs_debug_info_release(RTL_CRITICAL_SECTION* cs) {
+    uint64_t key = (uint64_t)(uintptr_t)cs;
+    for (uint32_t i = 0; i < CS_DEBUG_SLOTS; i++) {
+        if (g_cs_debug_slots[i].owner_cs == key) {
+            g_cs_debug_slots[i].owner_cs = 0;
+            cs_debug_zero(g_cs_debug_slots[i].storage, sizeof(g_cs_debug_slots[i].storage));
+            return;
+        }
+    }
+}
+
 EXPORT NTSTATUS RtlInitializeCriticalSection(RTL_CRITICAL_SECTION* cs) {
     if (!cs) return STATUS_INVALID_PARAMETER;
-    cs->debug_info   = 0;
+    cs->debug_info   = cs_debug_info_acquire(cs);
     cs->lock_count   = -1;
     cs->recursion    = 0;
     cs->owner_thread = 0;
@@ -694,7 +981,12 @@ EXPORT NTSTATUS RtlInitializeCriticalSectionEx(RTL_CRITICAL_SECTION* cs, ULONG s
     return RtlInitializeCriticalSectionAndSpinCount(cs, spin);
 }
 
-EXPORT NTSTATUS RtlDeleteCriticalSection(RTL_CRITICAL_SECTION* cs) { (void)cs; return 0; }
+EXPORT NTSTATUS RtlDeleteCriticalSection(RTL_CRITICAL_SECTION* cs) {
+    if (!cs) return STATUS_INVALID_PARAMETER;
+    cs_debug_info_release(cs);
+    cs->debug_info = 0;
+    return 0;
+}
 
 EXPORT NTSTATUS RtlEnterCriticalSection(RTL_CRITICAL_SECTION* cs) {
     cs->lock_count++;
@@ -745,6 +1037,35 @@ EXPORT int RtlTryAcquireSRWLockShared(void* lock) {
     return 1;
 }
 
+typedef struct {
+    unsigned char flags;
+    char name[15];
+} WINE_DEBUG_CHANNEL;
+
+EXPORT unsigned char __wine_dbg_get_channel_flags(WINE_DEBUG_CHANNEL* channel) {
+    if (!channel) return 0;
+    channel->flags = 0;
+    return 0;
+}
+
+EXPORT int __wine_dbg_header(int cls, WINE_DEBUG_CHANNEL* channel, const char* function) {
+    (void)cls;
+    (void)function;
+    if (channel) channel->flags = 0;
+    return -1;
+}
+
+EXPORT int __wine_dbg_output(const char* str) {
+    if (!str) return 0;
+    int n = 0;
+    while (str[n]) n++;
+    return n;
+}
+
+EXPORT const char* __wine_dbg_strdup(const char* str) {
+    return str ? str : "";
+}
+
 /* ── String helpers ──────────────────────────────────────────── */
 
 typedef struct { uint16_t Length, MaximumLength; uint32_t _pad; WCHAR* Buffer; } UNICODE_STRING;
@@ -770,8 +1091,29 @@ EXPORT void RtlInitAnsiString(ANSI_STRING* dest, const UCHAR* src) {
 
 /* ── Basic CRT exports required by kernelbase/kernel32 ─────── */
 
+__attribute__((naked))
 EXPORT ULONG_PTR __chkstk(void) {
-    return 0;
+    asm volatile(
+        // Windows arm64 ABI: allocation size is passed in x15 in 16-byte units.
+        // Probe one page at a time from current SP downward so guard growth and
+        // stack overflow behavior are fault-driven and deterministic.
+        "mov x9, sp\n\t"
+        "lsl x10, x15, #4\n\t"
+        "cbz x10, 2f\n\t"
+        "1:\n\t"
+        "cmp x10, #0x1000\n\t"
+        "b.lo 3f\n\t"
+        "sub x9, x9, #0x1000\n\t"
+        "ldr x11, [x9]\n\t"
+        "sub x10, x10, #0x1000\n\t"
+        "cbnz x10, 1b\n\t"
+        "b 2f\n\t"
+        "3:\n\t"
+        "sub x9, x9, x10\n\t"
+        "ldr x11, [x9]\n\t"
+        "2:\n\t"
+        "mov x0, x15\n\t"
+        "ret\n\t");
 }
 
 EXPORT void* memset(void* dst, int c, size_t n) {
@@ -1589,13 +1931,97 @@ EXPORT NTSTATUS RtlWow64SetThreadContext(HANDLE thread, const void* ctx) {
     return STATUS_NOT_IMPLEMENTED;
 }
 
+__attribute__((naked))
 EXPORT ULONG_PTR __chkstk_arm64ec(void) {
-    return 0;
+    asm volatile(
+        "b __chkstk\n\t");
+}
+
+typedef struct {
+    uint64_t frame;
+    uint64_t reserved;
+    uint64_t x19;
+    uint64_t x20;
+    uint64_t x21;
+    uint64_t x22;
+    uint64_t x23;
+    uint64_t x24;
+    uint64_t x25;
+    uint64_t x26;
+    uint64_t x27;
+    uint64_t x28;
+    uint64_t fp;
+    uint64_t lr;
+    uint64_t sp;
+    uint32_t fpcr;
+    uint32_t fpsr;
+    double d[8];
+} WINEMU_JUMP_BUFFER_ARM64;
+
+__attribute__((naked))
+EXPORT int _setjmpex(void* env, void* frame) {
+    asm volatile(
+        "cbz x0, 2f\n\t"
+        "str x1, [x0, #0x00]\n\t"
+        "str xzr, [x0, #0x08]\n\t"
+        "stp x19, x20, [x0, #0x10]\n\t"
+        "stp x21, x22, [x0, #0x20]\n\t"
+        "stp x23, x24, [x0, #0x30]\n\t"
+        "stp x25, x26, [x0, #0x40]\n\t"
+        "stp x27, x28, [x0, #0x50]\n\t"
+        "stp x29, x30, [x0, #0x60]\n\t"
+        "mov x2, sp\n\t"
+        "str x2, [x0, #0x70]\n\t"
+        "mrs x2, fpcr\n\t"
+        "str w2, [x0, #0x78]\n\t"
+        "mrs x2, fpsr\n\t"
+        "str w2, [x0, #0x7c]\n\t"
+        "stp d8, d9, [x0, #0x80]\n\t"
+        "stp d10, d11, [x0, #0x90]\n\t"
+        "stp d12, d13, [x0, #0xa0]\n\t"
+        "stp d14, d15, [x0, #0xb0]\n\t"
+        "2:\n\t"
+        "mov w0, #0\n\t"
+        "ret\n\t");
 }
 
 EXPORT int _setjmp(void* env) {
-    (void)env;
-    return 0;
+    return _setjmpex(env, NULL);
+}
+
+__attribute__((naked))
+EXPORT void longjmp(void* env, int value) {
+    asm volatile(
+        "cbz x0, 3f\n\t"
+        "mov x16, x0\n\t"
+        "mov w0, w1\n\t"
+        "cbnz w0, 1f\n\t"
+        "mov w0, #1\n\t"
+        "1:\n\t"
+        "ldp x19, x20, [x16, #0x10]\n\t"
+        "ldp x21, x22, [x16, #0x20]\n\t"
+        "ldp x23, x24, [x16, #0x30]\n\t"
+        "ldp x25, x26, [x16, #0x40]\n\t"
+        "ldp x27, x28, [x16, #0x50]\n\t"
+        "ldp x29, x30, [x16, #0x60]\n\t"
+        "ldr x2, [x16, #0x70]\n\t"
+        "ldr w3, [x16, #0x78]\n\t"
+        "msr fpcr, x3\n\t"
+        "ldr w3, [x16, #0x7c]\n\t"
+        "msr fpsr, x3\n\t"
+        "ldp d8, d9, [x16, #0x80]\n\t"
+        "ldp d10, d11, [x16, #0x90]\n\t"
+        "ldp d12, d13, [x16, #0xa0]\n\t"
+        "ldp d14, d15, [x16, #0xb0]\n\t"
+        "mov sp, x2\n\t"
+        "ret\n\t"
+        "3:\n\t"
+        "mov x8, %0\n\t"
+        "mov x0, #-1\n\t"
+        "mov x1, #0\n\t"
+        "svc #0\n\t"
+        "b .\n\t"
+        :: "i"(NR_TERMINATE_PROCESS));
 }
 
 EXPORT void RtlSetLastWin32Error(ULONG code) {
@@ -2642,6 +3068,16 @@ static NTSTATUS virtual_unwind(ULONG type, DISPATCHER_CONTEXT_ARM64* dispatch, A
     if (st != STATUS_SUCCESS) {
         return st;
     }
+    {
+        uint8_t* teb = (uint8_t*)NtCurrentTeb();
+        if (teb) {
+            uint64_t stack_base = *(uint64_t*)(teb + 0x08);
+            uint64_t stack_limit = *(uint64_t*)(teb + 0x10);
+            if (context->Sp < stack_limit || context->Sp >= stack_base) {
+                context->Sp = stack_limit;
+            }
+        }
+    }
     dispatch->LanguageHandler = handler;
     dispatch->HandlerData = handler_data;
     dispatch->EstablisherFrame = frame;
@@ -2732,6 +3168,25 @@ static void winemu_restore_context(ARM64_NT_CONTEXT* context) {
 
 EXPORT void RtlRestoreContext(ARM64_NT_CONTEXT* context, EXCEPTION_RECORD64* rec) {
     (void)rec;
+    if (context) {
+        uint8_t* teb = (uint8_t*)NtCurrentTeb();
+        if (teb) {
+            uint64_t stack_base = *(uint64_t*)(teb + 0x08);
+            uint64_t stack_limit = *(uint64_t*)(teb + 0x10);
+            uint64_t target_sp = context->Sp;
+            if (target_sp < stack_limit || target_sp >= stack_base || (target_sp & 0x0fU)) {
+                uint64_t current_sp = 0;
+                asm volatile("mov %0, sp" : "=r"(current_sp));
+                if (current_sp >= stack_limit && current_sp < stack_base) {
+                    context->Sp = current_sp & ~0x0fULL;
+                } else {
+                    uint64_t safe_sp = (stack_base >= 0x100) ? (stack_base - 0x100) : stack_limit;
+                    if (safe_sp < stack_limit) safe_sp = stack_limit;
+                    context->Sp = safe_sp & ~0x0fULL;
+                }
+            }
+        }
+    }
     winemu_restore_context(context);
 }
 
@@ -2754,6 +3209,9 @@ static int is_valid_teb_frame(uint64_t frame) {
 static uint64_t g_dispatch_handler_count = 0;
 static uint64_t g_dispatch_last_result = 0;
 static uint64_t g_dispatch_last_handler = 0;
+static uint64_t g_dispatch_first_unwound_pc = 0;
+static uint64_t g_dispatch_second_unwound_pc = 0;
+static uint64_t g_dispatch_third_unwound_pc = 0;
 
 static NTSTATUS dispatch_exception(EXCEPTION_RECORD64* rec, ARM64_NT_CONTEXT* orig_context) {
     ARM64_NT_CONTEXT context = *orig_context;
@@ -2765,12 +3223,19 @@ static NTSTATUS dispatch_exception(EXCEPTION_RECORD64* rec, ARM64_NT_CONTEXT* or
     uint64_t handler_count = 0;
     uint64_t last_result = 0;
     uint64_t last_handler = 0;
+    uint64_t first_unwound_pc = 0;
+    uint64_t second_unwound_pc = 0;
+    uint64_t third_unwound_pc = 0;
+    uint64_t unwind_step = 0;
     uint8_t* teb = (uint8_t*)NtCurrentTeb();
 
 #define FINISH_DISPATCH(st) do { \
     g_dispatch_handler_count = handler_count; \
     g_dispatch_last_result = last_result; \
     g_dispatch_last_handler = last_handler; \
+    g_dispatch_first_unwound_pc = first_unwound_pc; \
+    g_dispatch_second_unwound_pc = second_unwound_pc; \
+    g_dispatch_third_unwound_pc = third_unwound_pc; \
     *orig_context = context; \
     return (st); \
 } while (0)
@@ -2789,6 +3254,16 @@ static NTSTATUS dispatch_exception(EXCEPTION_RECORD64* rec, ARM64_NT_CONTEXT* or
         NTSTATUS status = virtual_unwind(UNW_FLAG_EHANDLER, &dispatch, &context);
         if (status != STATUS_SUCCESS) {
             FINISH_DISPATCH(status);
+        }
+        unwind_step++;
+        if (!first_unwound_pc && context.Pc) {
+            first_unwound_pc = context.Pc;
+        }
+        if (unwind_step == 2 && !second_unwound_pc && context.Pc) {
+            second_unwound_pc = context.Pc;
+        }
+        if (unwind_step == 3 && !third_unwound_pc && context.Pc) {
+            third_unwound_pc = context.Pc;
         }
         if (!dispatch.EstablisherFrame) break;
 
@@ -2979,14 +3454,31 @@ void winemu_raise_exception_dispatch(EXCEPTION_RECORD64* record, ARM64_NT_CONTEX
     }
     uint64_t dispatch_diag = ((g_dispatch_handler_count & 0xFFFFULL) << 48)
         | ((g_dispatch_last_result & 0xFFULL) << 40)
+        | ((g_heap_alloc_fail_count & 0xFFULL) << 32)
         | (uint64_t)(uint32_t)dispatch_status;
+    uint64_t diag4 = exaddr;
+    if (g_heap_last_fail_size) {
+        diag4 = g_heap_last_fail_size;
+    }
+    if (g_dispatch_last_handler) {
+        diag4 = g_dispatch_last_handler;
+    }
+    if (g_dispatch_first_unwound_pc) {
+        diag4 = g_dispatch_first_unwound_pc;
+    }
+    if (g_dispatch_second_unwound_pc) {
+        diag4 = g_dispatch_second_unwound_pc;
+    }
+    if (g_dispatch_third_unwound_pc) {
+        diag4 = g_dispatch_third_unwound_pc;
+    }
     (void)syscall6(
         NR_TERMINATE_PROCESS,
         (uint64_t)(HANDLE)(uint64_t)-1,
         (uint64_t)(NTSTATUS)code,
         info2,
         info3,
-        g_dispatch_last_handler ? g_dispatch_last_handler : exaddr,
+        diag4,
         dispatch_diag
     );
     for (;;) {}
@@ -3018,6 +3510,131 @@ EXPORT void RtlRaiseException(EXCEPTION_RECORD64* record) {
         "bl winemu_raise_exception_dispatch\n\t"
         "brk #1\n\t"
     );
+}
+
+/* ── User thread bootstrap ───────────────────────────────────── */
+
+#define PEB_IMAGE_BASE_OFF               0x10
+#define PEB_LDR_OFF                      0x18
+#define LDR_IN_INIT_ORDER_LIST_OFF       0x30
+#define LDR_ENTRY_IN_INIT_ORDER_LINK_OFF 0x20
+#define LDR_ENTRY_DLL_BASE_OFF           0x30
+#define LDR_ENTRY_ENTRY_POINT_OFF        0x38
+#define DLL_PROCESS_ATTACH               1
+
+typedef int (*DLL_ENTRY_FN)(HANDLE, ULONG, void*);
+typedef void (*EXE_ENTRY_FN)(void);
+
+static void winemu_call_process_attach(uint8_t* peb) {
+    if (!peb) return;
+
+    uint64_t image_base = *(uint64_t*)(peb + PEB_IMAGE_BASE_OFF);
+    uint64_t ldr = *(uint64_t*)(peb + PEB_LDR_OFF);
+    if (!ldr) return;
+
+    uint64_t head = ldr + LDR_IN_INIT_ORDER_LIST_OFF;
+    uint64_t link = *(uint64_t*)(uintptr_t)head;
+    for (unsigned i = 0; i < 2048 && link && link != head; i++) {
+        uint64_t next = *(uint64_t*)(uintptr_t)link;
+        if (link < LDR_ENTRY_IN_INIT_ORDER_LINK_OFF) {
+            break;
+        }
+        uint64_t entry = link - LDR_ENTRY_IN_INIT_ORDER_LINK_OFF;
+        uint64_t dll_base = *(uint64_t*)(uintptr_t)(entry + LDR_ENTRY_DLL_BASE_OFF);
+        uint64_t ep = *(uint64_t*)(uintptr_t)(entry + LDR_ENTRY_ENTRY_POINT_OFF);
+        if (ep && dll_base && dll_base != image_base) {
+            DLL_ENTRY_FN dll_main = (DLL_ENTRY_FN)(uintptr_t)ep;
+            (void)dll_main((HANDLE)(uintptr_t)dll_base, DLL_PROCESS_ATTACH, NULL);
+        }
+        link = next;
+    }
+}
+
+static uint64_t winemu_query_main_entry(uint8_t* peb) {
+    if (!peb) return 0;
+    uint8_t* image = *(uint8_t**)(peb + PEB_IMAGE_BASE_OFF);
+    IMAGE_NT_HEADERS64* nt = image_nt_headers(image);
+    if (!nt) return 0;
+    uint32_t entry_rva = nt->OptionalHeader.AddressOfEntryPoint;
+    if (!entry_rva) return 0;
+    return (uint64_t)(uintptr_t)(image + entry_rva);
+}
+
+EXPORT __attribute__((noreturn))
+void RtlUserThreadStart(void* start, void* peb_arg) {
+    (void)start;
+    uint8_t* peb = (uint8_t*)peb_arg;
+    if (!peb) {
+        peb = (uint8_t*)RtlGetCurrentPeb();
+    }
+
+    winemu_call_process_attach(peb);
+
+    uint64_t main_entry = winemu_query_main_entry(peb);
+    if (main_entry) {
+        EXE_ENTRY_FN exe_entry = (EXE_ENTRY_FN)(uintptr_t)main_entry;
+        exe_entry();
+    }
+
+    RtlExitUserProcess(0);
+}
+
+/* Kernelbase locale/bootstrap expects this entry to return an opaque
+ * connection blob with a few offset tables already wired. */
+static uint8_t g_emu_work_conn[0x2000];
+static int g_emu_work_conn_ready = 0;
+
+static void wu32_raw(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xff);
+    p[1] = (uint8_t)((v >> 8) & 0xff);
+    p[2] = (uint8_t)((v >> 16) & 0xff);
+    p[3] = (uint8_t)((v >> 24) & 0xff);
+}
+
+static void winemu_init_emu_work_conn(void) {
+    if (g_emu_work_conn_ready) return;
+
+    for (size_t i = 0; i < sizeof(g_emu_work_conn); i++) {
+        g_emu_work_conn[i] = 0;
+    }
+
+    /* Top-level offsets used by kernelbase!init_locale */
+    wu32_raw(&g_emu_work_conn[0x10], 0x0100);
+    wu32_raw(&g_emu_work_conn[0x14], 0x0400);
+    wu32_raw(&g_emu_work_conn[0x18], 0x0800);
+
+    /* Secondary tables read by init_locale */
+    wu32_raw(&g_emu_work_conn[0x0100 + 0x2c], 0x0000);
+    wu32_raw(&g_emu_work_conn[0x0100 + 0x30], 0x0000);
+    wu32_raw(&g_emu_work_conn[0x0100 + 0x40], 0x0000);
+
+    wu32_raw(&g_emu_work_conn[0x0800 + 0x0c], 0x0000);
+    wu32_raw(&g_emu_work_conn[0x0800 + 0x10], 0x0000);
+    wu32_raw(&g_emu_work_conn[0x0800 + 0x14], 0x0000);
+    wu32_raw(&g_emu_work_conn[0x0800 + 0x18], 0x0000);
+
+    /* Root offsets reused later in the same routine. */
+    wu32_raw(&g_emu_work_conn[0x00], 0x0c00);
+    wu32_raw(&g_emu_work_conn[0x04], 0x0c20);
+    wu32_raw(&g_emu_work_conn[0x08], 0x0c40);
+    wu32_raw(&g_emu_work_conn[0x0c], 0x0c60);
+
+    g_emu_work_conn_ready = 1;
+}
+
+EXPORT NTSTATUS RtlOpenCrossProcessEmulatorWorkConnection(
+    void** out_connection,
+    void* locale_name,
+    void* scratch
+) {
+    (void)locale_name;
+    (void)scratch;
+    if (!out_connection) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    winemu_init_emu_work_conn();
+    *out_connection = (void*)g_emu_work_conn;
+    return STATUS_SUCCESS;
 }
 
 #include "ntdll_missing_exports.generated.h"

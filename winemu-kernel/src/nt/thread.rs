@@ -87,7 +87,7 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
     let entry_va = frame.x[4];
     let arg = frame.x[5];
     let create_flags = frame.x[6] as u32;
-    let _stack_size_arg = unsafe { (frame.sp_el0 as *const u64).read_volatile() };
+    let stack_size_arg = unsafe { (frame.sp_el0 as *const u64).read_volatile() };
     let max_stack_size_arg = unsafe { (frame.sp_el0 as *const u64).add(1).read_volatile() };
 
     let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_THREAD) else {
@@ -107,7 +107,7 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     }
-    let tid = match create_user_thread(target_pid, entry_va, arg, max_stack_size_arg, 8) {
+    let tid = match create_user_thread(target_pid, entry_va, arg, stack_size_arg, max_stack_size_arg, 8) {
         Ok(tid) => tid,
         Err(CreateThreadError::InvalidParameter) => {
             frame.x[0] = status::INVALID_PARAMETER as u64;

@@ -4,6 +4,7 @@ use super::with_process;
 
 const PROCESS_BASIC_INFORMATION_SIZE: usize = 48;
 const PROCESS_IMAGE_FILE_NAME_SIZE: usize = 16;
+const PROCESS_WOW64_INFORMATION_SIZE: usize = 8;
 
 pub fn query_information_process(
     process_handle: u64,
@@ -13,14 +14,39 @@ pub fn query_information_process(
     ret_len: *mut u32,
 ) -> u32 {
     let Some(pid) = super::resolve_process_handle(process_handle) else {
+        crate::hypercall::debug_print("nt: qip invalid handle=");
+        crate::hypercall::debug_u64(process_handle);
+        crate::hypercall::debug_print(" class=");
+        crate::hypercall::debug_u64(info_class as u64);
+        crate::hypercall::debug_print("\n");
         return status::INVALID_HANDLE;
     };
 
     match info_class {
         0 => query_basic(pid, buf, buf_len, ret_len),
+        26 => query_wow64_information(buf, buf_len, ret_len),
         27 => query_image_file_name(buf, buf_len, ret_len),
-        _ => status::INVALID_PARAMETER,
+        _ => {
+            crate::hypercall::debug_print("nt: qip unsupported class=");
+            crate::hypercall::debug_u64(info_class as u64);
+            crate::hypercall::debug_print(" pid=");
+            crate::hypercall::debug_u64(pid as u64);
+            crate::hypercall::debug_print("\n");
+            status::INVALID_PARAMETER
+        }
     }
+}
+
+fn query_wow64_information(buf: *mut u8, buf_len: usize, ret_len: *mut u32) -> u32 {
+    if buf.is_null() || buf_len < PROCESS_WOW64_INFORMATION_SIZE {
+        write_ret_len(ret_len, PROCESS_WOW64_INFORMATION_SIZE as u32);
+        return status::INFO_LENGTH_MISMATCH;
+    }
+    unsafe {
+        (buf as *mut u64).write_volatile(0);
+    }
+    write_ret_len(ret_len, PROCESS_WOW64_INFORMATION_SIZE as u32);
+    status::SUCCESS
 }
 
 fn query_basic(pid: u32, buf: *mut u8, buf_len: usize, ret_len: *mut u32) -> u32 {

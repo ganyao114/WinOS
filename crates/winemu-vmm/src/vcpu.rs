@@ -230,6 +230,8 @@ pub fn vcpu_thread(
                     log::warn!("vcpu{} unhandled vmexit: {:?}", vcpu_id, exit);
                 }
                 let _ = vcpu.advance_pc(4);
+                let ctx = save_ctx(&mut *vcpu);
+                sched.save_ctx(tid, ctx);
             }
         }
     }

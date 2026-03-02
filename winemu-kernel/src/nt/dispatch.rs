@@ -3,6 +3,7 @@
 // 若需要线程切换，直接修改 SvcFrame 中的寄存器，ERET 后进入新线程。
 
 use crate::hypercall;
+use core::sync::atomic::{AtomicU32, Ordering};
 use crate::sched::{
     charge_current_runtime_locked, check_timeouts, consume_pending_reschedule_locked,
     current_slice_remaining_100ns, current_tid, next_wait_deadline_locked, now_ticks,
@@ -19,6 +20,8 @@ use super::constants::{
 use super::sysno;
 use super::{file, memory, object, process, registry, section, sync, system, thread, token, SvcFrame};
 
+static SYSCALL_ERR_TRACE_BUDGET: AtomicU32 = AtomicU32::new(512);
+
 #[no_mangle]
 pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
     if current_tid() == 0 {
@@ -28,6 +31,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
     let tag = frame.x8_orig;
     let nr = (tag & SVC_TAG_NR_MASK) as u16;
     let table = ((tag >> SVC_TAG_TABLE_SHIFT) & SVC_TAG_TABLE_MASK) as u8;
+    hypercall::debug_u64(0xE200_0000 | ((table as u64) << 12) | nr as u64);
 
     if table != 0 {
         forward_to_vmm(frame, nr, table);
@@ -109,7 +113,37 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         _ => forward_to_vmm(frame, nr, table),
     }
 
+    trace_syscall_error(nr, table, frame);
     schedule_from_trap(frame, true);
+}
+
+fn trace_syscall_error(nr: u16, table: u8, frame: &SvcFrame) {
+    if table != 0 {
+        return;
+    }
+    let status = frame.x[0] as u32;
+    if status < 0xC000_0000 {
+        return;
+    }
+    let remain = SYSCALL_ERR_TRACE_BUDGET.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        if v == 0 {
+            None
+        } else {
+            Some(v - 1)
+        }
+    });
+    if remain.is_err() {
+        return;
+    }
+    hypercall::debug_print("nt: syscall error nr=");
+    hypercall::debug_u64(nr as u64);
+    hypercall::debug_print(" st=");
+    hypercall::debug_u64(status as u64);
+    hypercall::debug_print(" elr=");
+    hypercall::debug_u64(frame.elr);
+    hypercall::debug_print(" lr=");
+    hypercall::debug_u64(frame.x[30]);
+    hypercall::debug_print("\n");
 }
 
 fn save_ctx_for(tid: u32, frame: &SvcFrame) {
@@ -195,7 +229,9 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
             sched_lock_release();
 
             if crate::sched::all_threads_done() {
-                hypercall::process_exit(0);
+                let code = crate::process::process_exit_status(crate::process::current_pid())
+                    .unwrap_or(0);
+                hypercall::process_exit(code);
             }
             timer::idle_wait_until_deadline_100ns(now, next_deadline);
             continue;

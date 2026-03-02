@@ -134,14 +134,16 @@ pub(crate) fn handle_query_system_time(frame: &mut SvcFrame) {
 pub(crate) fn handle_query_performance_counter(frame: &mut SvcFrame) {
     let counter_ptr = frame.x[0] as *mut i64;
     let freq_ptr = frame.x[1] as *mut i64;
-    if counter_ptr.is_null() {
+    if counter_ptr.is_null() && freq_ptr.is_null() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
 
     let counter = crate::hypercall::query_mono_time_100ns() as i64;
     unsafe {
-        counter_ptr.write_volatile(counter);
+        if !counter_ptr.is_null() {
+            counter_ptr.write_volatile(counter);
+        }
         if !freq_ptr.is_null() {
             freq_ptr.write_volatile(PERF_COUNTER_FREQUENCY_100NS as i64);
         }
