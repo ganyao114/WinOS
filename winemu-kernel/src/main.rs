@@ -10,6 +10,7 @@ mod dll;
 mod hypercall;
 mod kobj;
 mod ldr;
+mod log;
 mod mm;
 mod nt;
 mod process;
@@ -286,11 +287,11 @@ fn register_process_boot_file_mappings(owner_pid: u32, exe_base: u64, exe_size: 
         exe_size,
         crate::nt::state::VM_FILE_MAPPING_DEFAULT_PROT,
     ) {
-        hypercall::debug_print("kernel: track exe file mapping failed base=");
-        hypercall::debug_u64(exe_base);
-        hypercall::debug_print(" size=");
-        hypercall::debug_u64(exe_size);
-        hypercall::debug_print("\n");
+        crate::kwarn!(
+            "kernel: track exe file mapping failed base={:#x} size={:#x}",
+            exe_base,
+            exe_size
+        );
     }
     dll::for_each_loaded(|_name, base, size, _entry| {
         if base == 0 || size == 0 {
@@ -302,28 +303,28 @@ fn register_process_boot_file_mappings(owner_pid: u32, exe_base: u64, exe_size: 
             size as u64,
             crate::nt::state::VM_FILE_MAPPING_DEFAULT_PROT,
         ) {
-            hypercall::debug_print("kernel: track dll file mapping failed base=");
-            hypercall::debug_u64(base);
-            hypercall::debug_print(" size=");
-            hypercall::debug_u64(size as u64);
-            hypercall::debug_print("\n");
+            crate::kwarn!(
+                "kernel: track dll file mapping failed base={:#x} size={:#x}",
+                base,
+                size
+            );
         }
     });
 }
 
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
-    hypercall::debug_print("kernel_main: start\n");
+    crate::kinfo!("kernel_main: start");
     // Install vectors early so MMU-init faults can be diagnosed.
     vectors::install();
     mm::init();
-    hypercall::debug_print("kernel_main: mmu ok\n");
+    crate::kinfo!("kernel_main: mmu ok");
     alloc::init();
 
     // ── 1. 通过 host fd 加载 EXE ─────────────────────────────
     let (exe_fd, exe_size) = hypercall::query_exe_info();
     if exe_fd == u64::MAX || exe_size == 0 {
-        hypercall::debug_print("kernel: query_exe_info failed\n");
+        crate::kerror!("kernel: query_exe_info failed");
         hypercall::process_exit(1);
     }
 
@@ -350,7 +351,7 @@ pub extern "C" fn kernel_main() -> ! {
         } else { (0x10_0000, 0x1000) }
     };
 
-    hypercall::debug_print("kernel: calling ldr::load_from_fd\n");
+    crate::kdebug!("kernel: calling ldr::load_from_fd");
 
     let loaded = unsafe { ldr::load_from_fd(exe_fd, exe_size, |dll_name, imp| dll::resolve_import(dll_name, imp)) };
 
@@ -360,19 +361,19 @@ pub extern "C" fn kernel_main() -> ! {
     let loaded = match loaded {
         Ok(img) => img,
         Err(_) => {
-            hypercall::debug_print("kernel: PE load failed\n");
+            crate::kerror!("kernel: PE load failed");
             hypercall::process_exit(1);
         }
     };
 
     // ── 3. 先建立 boot process，再在其地址空间初始化 TEB / PEB / 栈 ──
     if !process::init_boot_process(loaded.base, 0) {
-        hypercall::debug_print("kernel: boot process init failed\n");
+        crate::kerror!("kernel: boot process init failed");
         hypercall::process_exit(1);
     }
     let boot_pid = process::boot_pid();
     if boot_pid == 0 {
-        hypercall::debug_print("kernel: boot pid invalid\n");
+        crate::kerror!("kernel: boot pid invalid");
         hypercall::process_exit(1);
     }
     register_process_boot_file_mappings(boot_pid, loaded.base, loaded.size as u64);
@@ -388,13 +389,13 @@ pub extern "C" fn kernel_main() -> ! {
     ) {
         Some(t) => t,
         None => {
-            hypercall::debug_print("kernel: teb init failed\n");
+            crate::kerror!("kernel: teb init failed");
             hypercall::process_exit(1);
         }
     };
 
     if !process::init_boot_process(loaded.base, teb_peb.peb_va) {
-        hypercall::debug_print("kernel: boot process update failed\n");
+        crate::kerror!("kernel: boot process update failed");
         hypercall::process_exit(1);
     }
 
@@ -403,15 +404,15 @@ pub extern "C" fn kernel_main() -> ! {
     let entry_va = dll::resolve_import("ntdll.dll", ldr::ImportRef::Name("RtlUserThreadStart"))
         .unwrap_or(app_entry_va);
     if entry_va == app_entry_va {
-        hypercall::debug_print("kernel: start thunk missing, fallback to app entry\n");
+        crate::kwarn!("kernel: start thunk missing, fallback to app entry");
     } else {
-        hypercall::debug_print("kernel: start thunk=");
-        hypercall::debug_u64(entry_va);
-        hypercall::debug_print(" app=");
-        hypercall::debug_u64(app_entry_va);
-        hypercall::debug_print("\n");
+        crate::kdebug!(
+            "kernel: start thunk={:#x} app={:#x}",
+            entry_va,
+            app_entry_va
+        );
     }
-    hypercall::debug_print("kernel: calling kernel_ready\n");
+    crate::kdebug!("kernel: calling kernel_ready");
     hypercall::kernel_ready(entry_va, teb_peb.stack_base, teb_peb.teb_va, crate::alloc::heap_end());
 
     loop { core::hint::spin_loop(); }

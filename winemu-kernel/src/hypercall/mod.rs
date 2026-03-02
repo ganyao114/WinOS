@@ -1,5 +1,7 @@
 use winemu_shared::nr;
 
+pub use crate::log::{logf, LogLevel};
+
 /// 6 引数 hypercall（HVC #0）
 /// x0 = nr, x1-x6 = args, 返回值在 x0
 #[inline(always)]

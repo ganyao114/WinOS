@@ -55,14 +55,14 @@ pub unsafe fn load_from_fd(
     let read_len = HDR_BUF_SIZE.min(file_size as usize);
     let got = hypercall::host_read(fd, hdr_buf, read_len, 0);
     if got == 0 {
-        hypercall::debug_print("ldr: failed to read PE headers\n");
+        crate::kerror!("ldr: failed to read PE headers");
         return Err(LdrError::IoError);
     }
     let hdr_slice = core::slice::from_raw_parts(hdr_buf as *const u8, got);
 
     // 2. 解析 PE 头
     let hdrs = PeHeaders::from_slice(hdr_slice)?;
-    hypercall::debug_print("ldr: parsed PE headers from fd\n");
+    crate::kdebug!("ldr: parsed PE headers from fd");
 
     if hdrs.machine != pe::MACHINE_ARM64 {
         return Err(LdrError::NotArm64);
@@ -84,7 +84,7 @@ pub unsafe fn load_from_fd(
             let read_size = (sec.raw_size as usize).min(sec.vsize as usize);
             let n = hypercall::host_read(fd, dst, read_size, sec.raw_off as u64);
             if n == 0 && read_size > 0 {
-                hypercall::debug_print("ldr: section read failed\n");
+                crate::kerror!("ldr: section read failed");
                 return Err(LdrError::IoError);
             }
         }
@@ -121,7 +121,7 @@ pub unsafe fn load(
     resolve_import: impl Fn(&str, ImportRef) -> Option<u64>,
 ) -> LdrResult<LoadedImage> {
     let hdrs = PeHeaders::from_slice(image)?;
-    crate::hypercall::debug_print("ldr: parsed PE headers\n");
+    crate::kdebug!("ldr: parsed PE headers");
 
     if hdrs.machine != pe::MACHINE_ARM64 {
         return Err(LdrError::NotArm64);
@@ -129,7 +129,7 @@ pub unsafe fn load(
 
     let buf = alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096)
         .ok_or(LdrError::AllocFailed)?;
-    crate::hypercall::debug_print("ldr: alloc ok\n");
+    crate::kdebug!("ldr: alloc ok");
     let load_base = buf as u64;
 
     // 先复制 PE headers（导出解析依赖 DOS/NT 头）
@@ -185,19 +185,19 @@ pub unsafe fn load_from_fd_unlinked(fd: u64, file_size: u64) -> LdrResult<Loaded
     let read_len = HDR_BUF_SIZE.min(file_size as usize);
     let got = hypercall::host_read(fd, hdr_buf, read_len, 0);
     if got == 0 {
-        hypercall::debug_print("ldr: failed to read PE headers\n");
+        crate::kerror!("ldr: failed to read PE headers");
         return Err(LdrError::IoError);
     }
     let hdr_slice = core::slice::from_raw_parts(hdr_buf as *const u8, got);
     let hdrs = PeHeaders::from_slice(hdr_slice)?;
-    hypercall::debug_print("ldr: parsed PE headers\n");
+    crate::kdebug!("ldr: parsed PE headers");
 
     if hdrs.machine != pe::MACHINE_ARM64 {
         return Err(LdrError::NotArm64);
     }
 
     let buf = alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096).ok_or(LdrError::AllocFailed)?;
-    hypercall::debug_print("ldr: alloc ok\n");
+    crate::kdebug!("ldr: alloc ok");
     let load_base = buf as u64;
 
     let hdr_copy = (hdrs.size_of_headers as usize).min(got);
@@ -209,7 +209,7 @@ pub unsafe fn load_from_fd_unlinked(fd: u64, file_size: u64) -> LdrResult<Loaded
             let read_size = (sec.raw_size as usize).min(sec.vsize as usize);
             let n = hypercall::host_read(fd, dst, read_size, sec.raw_off as u64);
             if n == 0 && read_size > 0 {
-                hypercall::debug_print("ldr: section read failed\n");
+                crate::kerror!("ldr: section read failed");
                 return Err(LdrError::IoError);
             }
         }
@@ -234,14 +234,14 @@ pub unsafe fn load_from_fd_unlinked(fd: u64, file_size: u64) -> LdrResult<Loaded
 /// Load PE image into memory (with relocations) but do not resolve IAT yet.
 pub unsafe fn load_unlinked(image: &[u8]) -> LdrResult<LoadedImage> {
     let hdrs = PeHeaders::from_slice(image)?;
-    crate::hypercall::debug_print("ldr: parsed PE headers\n");
+    crate::kdebug!("ldr: parsed PE headers");
 
     if hdrs.machine != pe::MACHINE_ARM64 {
         return Err(LdrError::NotArm64);
     }
 
     let buf = alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096).ok_or(LdrError::AllocFailed)?;
-    crate::hypercall::debug_print("ldr: alloc ok\n");
+    crate::kdebug!("ldr: alloc ok");
     let load_base = buf as u64;
 
     let hdr_copy = (hdrs.size_of_headers as usize).min(image.len());

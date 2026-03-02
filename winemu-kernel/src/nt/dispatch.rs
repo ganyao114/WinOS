@@ -135,15 +135,13 @@ fn trace_syscall_error(nr: u16, table: u8, frame: &SvcFrame) {
     if remain.is_err() {
         return;
     }
-    hypercall::debug_print("nt: syscall error nr=");
-    hypercall::debug_u64(nr as u64);
-    hypercall::debug_print(" st=");
-    hypercall::debug_u64(status as u64);
-    hypercall::debug_print(" elr=");
-    hypercall::debug_u64(frame.elr);
-    hypercall::debug_print(" lr=");
-    hypercall::debug_u64(frame.x[30]);
-    hypercall::debug_print("\n");
+    crate::kerror!(
+        "nt: syscall error nr={:#x} st={:#x} elr={:#x} lr={:#x}",
+        nr,
+        status,
+        frame.elr,
+        frame.x[30]
+    );
 }
 
 fn save_ctx_for(tid: u32, frame: &SvcFrame) {

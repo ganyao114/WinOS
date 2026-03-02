@@ -14,11 +14,11 @@ pub fn query_information_process(
     ret_len: *mut u32,
 ) -> u32 {
     let Some(pid) = super::resolve_process_handle(process_handle) else {
-        crate::hypercall::debug_print("nt: qip invalid handle=");
-        crate::hypercall::debug_u64(process_handle);
-        crate::hypercall::debug_print(" class=");
-        crate::hypercall::debug_u64(info_class as u64);
-        crate::hypercall::debug_print("\n");
+        crate::kwarn!(
+            "nt: qip invalid handle={:#x} class={:#x}",
+            process_handle,
+            info_class
+        );
         return status::INVALID_HANDLE;
     };
 
@@ -27,11 +27,11 @@ pub fn query_information_process(
         26 => query_wow64_information(buf, buf_len, ret_len),
         27 => query_image_file_name(buf, buf_len, ret_len),
         _ => {
-            crate::hypercall::debug_print("nt: qip unsupported class=");
-            crate::hypercall::debug_u64(info_class as u64);
-            crate::hypercall::debug_print(" pid=");
-            crate::hypercall::debug_u64(pid as u64);
-            crate::hypercall::debug_print("\n");
+            crate::kwarn!(
+                "nt: qip unsupported class={:#x} pid={:#x}",
+                info_class,
+                pid
+            );
             status::INVALID_PARAMETER
         }
     }

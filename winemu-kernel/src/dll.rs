@@ -202,13 +202,12 @@ fn load_mapped_dll(fd: u64, file_size: u64, dll_name: &str) -> Result<ldr::Loade
     if !remember_loaded(dll_name, loaded.base, loaded.size as u32, entry) {
         return Err(ldr::LdrError::BadImport);
     }
-    hypercall::debug_print("dll: loaded ");
-    hypercall::debug_print(dll_name);
-    hypercall::debug_print(" base=");
-    hypercall::debug_u64(loaded.base);
-    hypercall::debug_print(" size=");
-    hypercall::debug_u64(loaded.size as u64);
-    hypercall::debug_print("\n");
+    crate::kdebug!(
+        "dll: loaded {} base={:#x} size={:#x}",
+        dll_name,
+        loaded.base,
+        loaded.size
+    );
     let owner_pid = crate::process::current_pid();
     if owner_pid != 0 {
         if !crate::nt::state::vm_track_existing_file_mapping(
@@ -217,11 +216,11 @@ fn load_mapped_dll(fd: u64, file_size: u64, dll_name: &str) -> Result<ldr::Loade
             loaded.size as u64,
             crate::nt::state::VM_FILE_MAPPING_DEFAULT_PROT,
         ) {
-            hypercall::debug_print("dll: vm_track_existing_file_mapping failed base=");
-            hypercall::debug_u64(loaded.base);
-            hypercall::debug_print(" size=");
-            hypercall::debug_u64(loaded.size as u64);
-            hypercall::debug_print("\n");
+            crate::kwarn!(
+                "dll: vm_track_existing_file_mapping failed base={:#x} size={:#x}",
+                loaded.base,
+                loaded.size
+            );
         }
     }
 
