@@ -117,7 +117,7 @@
 
 执行方式：
 
-1. `make -C guest`
+1. `make -C guest && make -C tests/guest`
 2. `./scripts/build-kernel-bin.sh`
 3. `cargo build`
 4. `codesign --entitlements entitlements.plist -s - target/debug/winemu`
@@ -128,12 +128,12 @@
 - `tests/thread_test`
 - `tests/registry_test`
 - `tests/hello_win`
-- `guest/process_test`
+- `tests/guest/process_test`
 
 ## 8. 最近进展
 
 1. 已完成 Phase 1：  
    `NtQuerySystemInformation/NtQuerySystemTime/NtQueryPerformanceCounter/NtDelayExecution`
-2. 已新增并通过：`guest/syscall_sysinfo_test`
-3. 已开始 Phase 2：实现 `NtOpenProcess` 与 `NtQueryObject(ObjectBasicInformation)`，并新增/扩展 `guest/open_process_test`
+2. 已新增并通过：`tests/guest/syscall_sysinfo_test`
+3. 已开始 Phase 2：实现 `NtOpenProcess` 与 `NtQueryObject(ObjectBasicInformation)`，并新增/扩展 `tests/guest/open_process_test`
 4. 回归通过：`tests/full_test`、`tests/thread_test`、`tests/registry_test`、`tests/hello_win`

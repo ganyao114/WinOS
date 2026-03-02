@@ -1,0 +1,164 @@
+/* ── Critical Section ────────────────────────────────────────── */
+
+typedef struct {
+    uint64_t debug_info;
+    int32_t  lock_count;
+    int32_t  recursion;
+    uint64_t owner_thread;
+    uint64_t lock_sem;
+    uint64_t spin_count;
+} RTL_CRITICAL_SECTION;
+
+typedef struct {
+    uint64_t owner_cs;
+    uint8_t storage[0x40];
+} CS_DEBUG_SLOT;
+
+#define CS_DEBUG_SLOTS 256
+static CS_DEBUG_SLOT g_cs_debug_slots[CS_DEBUG_SLOTS];
+static uint32_t g_cs_debug_next;
+
+static void cs_debug_zero(uint8_t* buf, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        buf[i] = 0;
+    }
+}
+
+static uint64_t cs_debug_info_acquire(RTL_CRITICAL_SECTION* cs) {
+    uint64_t key = (uint64_t)(uintptr_t)cs;
+    for (uint32_t i = 0; i < CS_DEBUG_SLOTS; i++) {
+        if (g_cs_debug_slots[i].owner_cs == key) {
+            return (uint64_t)(uintptr_t)g_cs_debug_slots[i].storage;
+        }
+    }
+    for (uint32_t i = 0; i < CS_DEBUG_SLOTS; i++) {
+        if (g_cs_debug_slots[i].owner_cs == 0) {
+            g_cs_debug_slots[i].owner_cs = key;
+            cs_debug_zero(g_cs_debug_slots[i].storage, sizeof(g_cs_debug_slots[i].storage));
+            return (uint64_t)(uintptr_t)g_cs_debug_slots[i].storage;
+        }
+    }
+    uint32_t idx = g_cs_debug_next++ % CS_DEBUG_SLOTS;
+    g_cs_debug_slots[idx].owner_cs = key;
+    cs_debug_zero(g_cs_debug_slots[idx].storage, sizeof(g_cs_debug_slots[idx].storage));
+    return (uint64_t)(uintptr_t)g_cs_debug_slots[idx].storage;
+}
+
+static void cs_debug_info_release(RTL_CRITICAL_SECTION* cs) {
+    uint64_t key = (uint64_t)(uintptr_t)cs;
+    for (uint32_t i = 0; i < CS_DEBUG_SLOTS; i++) {
+        if (g_cs_debug_slots[i].owner_cs == key) {
+            g_cs_debug_slots[i].owner_cs = 0;
+            cs_debug_zero(g_cs_debug_slots[i].storage, sizeof(g_cs_debug_slots[i].storage));
+            return;
+        }
+    }
+}
+
+EXPORT NTSTATUS RtlInitializeCriticalSection(RTL_CRITICAL_SECTION* cs) {
+    if (!cs) return STATUS_INVALID_PARAMETER;
+    cs->debug_info   = cs_debug_info_acquire(cs);
+    cs->lock_count   = -1;
+    cs->recursion    = 0;
+    cs->owner_thread = 0;
+    cs->lock_sem     = 0;
+    cs->spin_count   = 0;
+    return 0;
+}
+
+EXPORT NTSTATUS RtlInitializeCriticalSectionAndSpinCount(RTL_CRITICAL_SECTION* cs, ULONG spin) {
+    NTSTATUS r = RtlInitializeCriticalSection(cs);
+    if (r == 0) cs->spin_count = spin;
+    return r;
+}
+
+EXPORT NTSTATUS RtlInitializeCriticalSectionEx(RTL_CRITICAL_SECTION* cs, ULONG spin, ULONG flags) {
+    (void)flags;
+    return RtlInitializeCriticalSectionAndSpinCount(cs, spin);
+}
+
+EXPORT NTSTATUS RtlDeleteCriticalSection(RTL_CRITICAL_SECTION* cs) {
+    if (!cs) return STATUS_INVALID_PARAMETER;
+    cs_debug_info_release(cs);
+    cs->debug_info = 0;
+    return 0;
+}
+
+EXPORT NTSTATUS RtlEnterCriticalSection(RTL_CRITICAL_SECTION* cs) {
+    cs->lock_count++;
+    cs->recursion++;
+    return 0;
+}
+
+EXPORT NTSTATUS RtlLeaveCriticalSection(RTL_CRITICAL_SECTION* cs) {
+    cs->lock_count--;
+    cs->recursion--;
+    return 0;
+}
+
+EXPORT int RtlTryEnterCriticalSection(RTL_CRITICAL_SECTION* cs) {
+    RtlEnterCriticalSection(cs);
+    return 1;
+}
+
+EXPORT void RtlInitializeSRWLock(void* lock) {
+    if (lock) {
+        *(volatile uint64_t*)lock = 0;
+    }
+}
+
+EXPORT void RtlAcquireSRWLockExclusive(void* lock) {
+    (void)lock;
+}
+
+EXPORT void RtlAcquireSRWLockShared(void* lock) {
+    (void)lock;
+}
+
+EXPORT void RtlReleaseSRWLockExclusive(void* lock) {
+    (void)lock;
+}
+
+EXPORT void RtlReleaseSRWLockShared(void* lock) {
+    (void)lock;
+}
+
+EXPORT int RtlTryAcquireSRWLockExclusive(void* lock) {
+    (void)lock;
+    return 1;
+}
+
+EXPORT int RtlTryAcquireSRWLockShared(void* lock) {
+    (void)lock;
+    return 1;
+}
+
+typedef struct {
+    unsigned char flags;
+    char name[15];
+} WINE_DEBUG_CHANNEL;
+
+EXPORT unsigned char __wine_dbg_get_channel_flags(WINE_DEBUG_CHANNEL* channel) {
+    if (!channel) return 0;
+    channel->flags = 0;
+    return 0;
+}
+
+EXPORT int __wine_dbg_header(int cls, WINE_DEBUG_CHANNEL* channel, const char* function) {
+    (void)cls;
+    (void)function;
+    if (channel) channel->flags = 0;
+    return -1;
+}
+
+EXPORT int __wine_dbg_output(const char* str) {
+    if (!str) return 0;
+    int n = 0;
+    while (str[n]) n++;
+    return n;
+}
+
+EXPORT const char* __wine_dbg_strdup(const char* str) {
+    return str ? str : "";
+}
+

@@ -1,7 +1,22 @@
 include common.mk
 
 DLLS := ntdll
-EXES := hello_win open_process_test process_test syscall_sysinfo_test syscall_process_token_test syscall_registry_key_test syscall_file_volume_test syscall_file_control_test syscall_directory_test syscall_directory_notify_test syscall_sync_test syscall_thread_vm_test syscall_section_open_test vm_rw_test
+TEST_EXE_DIR := ../tests/guest
+EXES := \
+	$(TEST_EXE_DIR)/hello_win \
+	$(TEST_EXE_DIR)/open_process_test \
+	$(TEST_EXE_DIR)/process_test \
+	$(TEST_EXE_DIR)/syscall_sysinfo_test \
+	$(TEST_EXE_DIR)/syscall_process_token_test \
+	$(TEST_EXE_DIR)/syscall_registry_key_test \
+	$(TEST_EXE_DIR)/syscall_file_volume_test \
+	$(TEST_EXE_DIR)/syscall_file_control_test \
+	$(TEST_EXE_DIR)/syscall_directory_test \
+	$(TEST_EXE_DIR)/syscall_directory_notify_test \
+	$(TEST_EXE_DIR)/syscall_sync_test \
+	$(TEST_EXE_DIR)/syscall_thread_vm_test \
+	$(TEST_EXE_DIR)/syscall_section_open_test \
+	$(TEST_EXE_DIR)/vm_rw_test
 
 .PHONY: all clean $(DLLS) $(EXES)
 
