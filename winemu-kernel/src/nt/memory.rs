@@ -10,6 +10,7 @@ use super::state::{
 use super::SvcFrame;
 
 const PAGE_SIZE_4K: u64 = 0x1000;
+const USER_ACCESS_BASE: u64 = crate::process::USER_ACCESS_BASE;
 const USER_VA_BASE: u64 = crate::process::USER_VA_BASE;
 const USER_VA_LIMIT: u64 = crate::process::USER_VA_LIMIT;
 static AVM_TRACE_BUDGET: AtomicU32 = AtomicU32::new(64);
@@ -27,11 +28,19 @@ fn ensure_user_range_access(pid: u32, addr: u64, size: usize, access: u8) -> boo
     let mut page = addr & PAGE_MASK_4K;
     let end_page = end_addr & PAGE_MASK_4K;
     loop {
-        if page < USER_VA_BASE || page >= USER_VA_LIMIT {
+        if page < USER_ACCESS_BASE || page >= USER_VA_LIMIT {
             // Disallow non-user pointers from user syscall buffers.
             return false;
         }
-        if !super::state::vm_handle_page_fault(pid, page, access) {
+        if page >= USER_VA_BASE {
+            // Managed private/user window: demand-map on access.
+            if !super::state::vm_handle_page_fault(pid, page, access) {
+                return false;
+            }
+        }
+        // Regardless of region kind (managed window or shared image mapping),
+        // require user-accessible PTE permissions for this access type.
+        if translate_user_va(pid, page, access).is_none() {
             return false;
         }
         if page == end_page {

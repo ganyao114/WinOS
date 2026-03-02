@@ -16,7 +16,7 @@ pub use lifecycle::{
 pub use query::query_information_process;
 pub use set::set_information_process;
 
-pub(crate) use address_space::{ProcessAddressSpace, USER_VA_BASE, USER_VA_LIMIT};
+pub(crate) use address_space::{ProcessAddressSpace, USER_ACCESS_BASE, USER_VA_BASE, USER_VA_LIMIT};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]

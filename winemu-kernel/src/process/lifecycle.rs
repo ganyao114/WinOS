@@ -97,6 +97,11 @@ pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> R
     crate::hypercall::debug_u64(0xC502_0005);
 
     let _ = with_process_mut(pid, |p| p.state = ProcessState::Running);
+    if !crate::nt::state::vm_clone_external_mappings(parent_pid, pid) {
+        crate::hypercall::debug_u64(0xC502_E008);
+        let _ = free_process(pid);
+        return Err(status::NO_MEMORY);
+    }
 
     let Some(handle) = crate::sched::sync::make_new_handle_for_pid(
         parent_pid,

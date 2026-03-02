@@ -179,7 +179,7 @@ fn open_dll_file(dll_name: &str) -> u64 {
 }
 
 fn load_mapped_dll(fd: u64, file_size: u64, dll_name: &str) -> Result<ldr::LoadedImage, ldr::LdrError> {
-    let map_base = hypercall::host_mmap(fd, 0, file_size, 0x02);
+    let map_base = hypercall::host_mmap_untracked(fd, 0, file_size, 0x02);
     let loaded = if map_base == 0 || map_base < GUEST_RAM_BASE {
         if map_base != 0 {
             let _ = hypercall::host_munmap(map_base, file_size);
@@ -209,6 +209,21 @@ fn load_mapped_dll(fd: u64, file_size: u64, dll_name: &str) -> Result<ldr::Loade
     hypercall::debug_print(" size=");
     hypercall::debug_u64(loaded.size as u64);
     hypercall::debug_print("\n");
+    let owner_pid = crate::process::current_pid();
+    if owner_pid != 0 {
+        if !crate::nt::state::vm_track_existing_file_mapping(
+            owner_pid,
+            loaded.base,
+            loaded.size as u64,
+            crate::nt::state::VM_FILE_MAPPING_DEFAULT_PROT,
+        ) {
+            hypercall::debug_print("dll: vm_track_existing_file_mapping failed base=");
+            hypercall::debug_u64(loaded.base);
+            hypercall::debug_print(" size=");
+            hypercall::debug_u64(loaded.size as u64);
+            hypercall::debug_print("\n");
+        }
+    }
 
     let linked = unsafe { ldr::link_imports(loaded.base, |dep_name, dep_imp| resolve_import(dep_name, dep_imp)) };
     if linked.is_err() {

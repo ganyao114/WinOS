@@ -276,6 +276,41 @@ pub extern "C" fn el1_sync_fault(far: u64, esr: u64, elr: u64) -> ! {
     loop { core::hint::spin_loop(); }
 }
 
+fn register_process_boot_file_mappings(owner_pid: u32, exe_base: u64, exe_size: u64) {
+    if owner_pid == 0 {
+        return;
+    }
+    if !crate::nt::state::vm_track_existing_file_mapping(
+        owner_pid,
+        exe_base,
+        exe_size,
+        crate::nt::state::VM_FILE_MAPPING_DEFAULT_PROT,
+    ) {
+        hypercall::debug_print("kernel: track exe file mapping failed base=");
+        hypercall::debug_u64(exe_base);
+        hypercall::debug_print(" size=");
+        hypercall::debug_u64(exe_size);
+        hypercall::debug_print("\n");
+    }
+    dll::for_each_loaded(|_name, base, size, _entry| {
+        if base == 0 || size == 0 {
+            return;
+        }
+        if !crate::nt::state::vm_track_existing_file_mapping(
+            owner_pid,
+            base,
+            size as u64,
+            crate::nt::state::VM_FILE_MAPPING_DEFAULT_PROT,
+        ) {
+            hypercall::debug_print("kernel: track dll file mapping failed base=");
+            hypercall::debug_u64(base);
+            hypercall::debug_print(" size=");
+            hypercall::debug_u64(size as u64);
+            hypercall::debug_print("\n");
+        }
+    });
+}
+
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
     hypercall::debug_print("kernel_main: start\n");
@@ -340,6 +375,7 @@ pub extern "C" fn kernel_main() -> ! {
         hypercall::debug_print("kernel: boot pid invalid\n");
         hypercall::process_exit(1);
     }
+    register_process_boot_file_mappings(boot_pid, loaded.base, loaded.size as u64);
 
     let teb_peb = match teb::init(
         loaded.base,

@@ -27,6 +27,7 @@ const PTE_PXN: u64 = 1 << 53;
 
 pub const USER_VA_BASE: u64 = 0x7000_0000;
 pub const USER_VA_LIMIT: u64 = 0x8000_0000;
+pub const USER_ACCESS_BASE: u64 = 0x4000_0000;
 
 pub struct ProcessAddressSpace {
     ttbr0: u64,
@@ -417,7 +418,7 @@ fn is_valid_user_va(va: u64) -> bool {
 }
 
 fn is_user_accessible_va(va: u64) -> bool {
-    va >= USER_VA_BASE && va < USER_VA_LIMIT
+    va >= USER_ACCESS_BASE && va < USER_VA_LIMIT
 }
 
 fn is_valid_user_range(base: u64, size: u64) -> bool {

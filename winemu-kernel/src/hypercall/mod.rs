@@ -170,10 +170,39 @@ pub fn host_notify_dir(
     )
 }
 
-/// HOST_MMAP — 映射宿主文件到 guest 地址空间
-/// 返回映射基址（失败返回 0）
-pub fn host_mmap(fd: u64, offset: u64, size: u64, prot: u32) -> u64 {
+/// Raw HOST_MMAP primitive. Keep internal so callers must choose explicit
+/// tracked/untracked mapping semantics.
+fn host_mmap_raw(fd: u64, offset: u64, size: u64, prot: u32) -> u64 {
     hypercall6(nr::HOST_MMAP, fd, offset, size, prot as u64, 0, 0)
+}
+
+/// HOST_MMAP (untracked) — for transient in-kernel file source mappings.
+/// Caller is responsible for lifetime and HOST_MUNMAP.
+pub fn host_mmap_untracked(fd: u64, offset: u64, size: u64, prot: u32) -> u64 {
+    host_mmap_raw(fd, offset, size, prot)
+}
+
+/// HOST_MMAP (tracked) — map host file and register the VA range into
+/// current process VM metadata as an external file mapping.
+///
+/// Returns mapped base on success; returns 0 if mapping or tracking fails.
+/// On tracking failure the just-created host mapping is rolled back.
+pub fn host_mmap_tracked(fd: u64, offset: u64, size: u64, map_prot: u32, vm_prot: u32) -> u64 {
+    let base = host_mmap_raw(fd, offset, size, map_prot);
+    if base == 0 {
+        return 0;
+    }
+    let owner_pid = crate::process::current_pid();
+    if owner_pid == 0 {
+        let _ = host_munmap(base, size);
+        return 0;
+    }
+    if crate::nt::state::vm_track_existing_file_mapping(owner_pid, base, size, vm_prot) {
+        base
+    } else {
+        let _ = host_munmap(base, size);
+        0
+    }
 }
 
 /// HOST_MUNMAP — 解除映射

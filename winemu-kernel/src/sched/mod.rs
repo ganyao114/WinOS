@@ -12,7 +12,9 @@ use crate::nt::constants::{
     DEFAULT_THREAD_STACK_COMMIT, DEFAULT_THREAD_STACK_RESERVE, PAGE_SIZE_4K, PSEUDO_CURRENT_THREAD,
     PSEUDO_CURRENT_THREAD_ALT, THREAD_BASIC_INFORMATION_SIZE, THREAD_STACK_ALIGN,
 };
-use crate::nt::state::{vm_alloc_region_typed, vm_free_region, vm_make_guard_page};
+use crate::nt::state::{
+    vm_alloc_region_typed, vm_free_region, vm_handle_page_fault, vm_make_guard_page, VM_ACCESS_WRITE,
+};
 use crate::timer::{self, TimerTaskHandle, TimerTaskKind};
 use crate::rust_alloc::vec::Vec;
 use core::cell::UnsafeCell;
@@ -899,8 +901,69 @@ fn normalize_stack_commit_size(stack_size_arg: u64, stack_reserve: u64) -> u64 {
 }
 
 #[inline(always)]
-unsafe fn write_teb_u64(teb_va: u64, offset: usize, value: u64) {
-    ((teb_va + offset as u64) as *mut u64).write_volatile(value);
+fn write_process_user_bytes(pid: u32, user_va: u64, src: *const u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let mut done = 0usize;
+    while done < len {
+        let cur_va = user_va.saturating_add(done as u64);
+        let page = cur_va & !(PAGE_SIZE_4K - 1);
+        if !vm_handle_page_fault(pid, page, VM_ACCESS_WRITE) {
+            return false;
+        }
+        let Some(dst_pa) = crate::process::with_process(pid, |p| {
+            p.address_space
+                .translate_user_va_for_access(cur_va, VM_ACCESS_WRITE)
+        })
+        .flatten()
+        else {
+            return false;
+        };
+        let page_off = (cur_va as usize) & ((PAGE_SIZE_4K as usize) - 1);
+        let chunk = core::cmp::min(len - done, (PAGE_SIZE_4K as usize) - page_off);
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.add(done), dst_pa as *mut u8, chunk);
+        }
+        done += chunk;
+    }
+    true
+}
+
+#[inline(always)]
+fn zero_process_user_bytes(pid: u32, user_va: u64, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let mut done = 0usize;
+    while done < len {
+        let cur_va = user_va.saturating_add(done as u64);
+        let page = cur_va & !(PAGE_SIZE_4K - 1);
+        if !vm_handle_page_fault(pid, page, VM_ACCESS_WRITE) {
+            return false;
+        }
+        let Some(dst_pa) = crate::process::with_process(pid, |p| {
+            p.address_space
+                .translate_user_va_for_access(cur_va, VM_ACCESS_WRITE)
+        })
+        .flatten()
+        else {
+            return false;
+        };
+        let page_off = (cur_va as usize) & ((PAGE_SIZE_4K as usize) - 1);
+        let chunk = core::cmp::min(len - done, (PAGE_SIZE_4K as usize) - page_off);
+        unsafe {
+            core::ptr::write_bytes(dst_pa as *mut u8, 0, chunk);
+        }
+        done += chunk;
+    }
+    true
+}
+
+#[inline(always)]
+fn write_teb_u64(pid: u32, teb_va: u64, offset: usize, value: u64) -> bool {
+    let bytes = value.to_le_bytes();
+    write_process_user_bytes(pid, teb_va + offset as u64, bytes.as_ptr(), bytes.len())
 }
 
 #[inline(never)]
@@ -939,14 +1002,17 @@ pub fn create_user_thread(
     }
 
     let peb_va = crate::process::with_process(pid, |p| p.peb_va).unwrap_or(0);
-    unsafe {
-        core::ptr::write_bytes(teb_va as *mut u8, 0, PAGE_SIZE_4K as usize);
-        write_teb_u64(teb_va, teb_layout::EXCEPTION_LIST, u64::MAX);
-        write_teb_u64(teb_va, teb_layout::STACK_BASE, stack_top);
-        write_teb_u64(teb_va, teb_layout::STACK_LIMIT, stack_limit);
-        write_teb_u64(teb_va, teb_layout::SELF, teb_va);
-        write_teb_u64(teb_va, teb_layout::PEB, peb_va);
-        write_teb_u64(teb_va, teb_layout::CLIENT_ID, pid as u64);
+    if !zero_process_user_bytes(pid, teb_va, PAGE_SIZE_4K as usize)
+        || !write_teb_u64(pid, teb_va, teb_layout::EXCEPTION_LIST, u64::MAX)
+        || !write_teb_u64(pid, teb_va, teb_layout::STACK_BASE, stack_top)
+        || !write_teb_u64(pid, teb_va, teb_layout::STACK_LIMIT, stack_limit)
+        || !write_teb_u64(pid, teb_va, teb_layout::SELF, teb_va)
+        || !write_teb_u64(pid, teb_va, teb_layout::PEB, peb_va)
+        || !write_teb_u64(pid, teb_va, teb_layout::CLIENT_ID, pid as u64)
+    {
+        let _ = vm_free_region(pid, stack_base);
+        let _ = vm_free_region(pid, teb_va);
+        return Err(CreateThreadError::NoMemory);
     }
 
     let tid = spawn(
@@ -957,8 +1023,9 @@ pub fn create_user_thread(
         let _ = vm_free_region(pid, teb_va);
         return Err(CreateThreadError::NoMemory);
     }
-    unsafe {
-        write_teb_u64(teb_va, teb_layout::CLIENT_ID + 8, tid as u64);
+    if !write_teb_u64(pid, teb_va, teb_layout::CLIENT_ID + 8, tid as u64) {
+        let _ = terminate_thread_by_tid(tid);
+        return Err(CreateThreadError::NoMemory);
     }
     crate::process::on_thread_created(pid, tid);
     Ok(tid)

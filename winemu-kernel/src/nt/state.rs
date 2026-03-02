@@ -30,6 +30,7 @@ const VM_KIND_OTHER: u8 = 4;
 pub(crate) const VM_ACCESS_READ: u8 = 1;
 pub(crate) const VM_ACCESS_WRITE: u8 = 2;
 pub(crate) const VM_ACCESS_EXEC: u8 = 3;
+pub(crate) const VM_FILE_MAPPING_DEFAULT_PROT: u32 = PAGE_EXECUTE_READ;
 
 #[derive(Clone, Copy)]
 pub(crate) struct GuestSection {
@@ -59,6 +60,7 @@ pub(crate) struct VmRegion {
     pub(crate) section_view_size: u64,
     pub(crate) section_file_backed: bool,
     pub(crate) section_is_image: bool,
+    pub(crate) owns_phys_pages: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -299,6 +301,94 @@ pub(crate) fn vm_set_section_backing(
     true
 }
 
+pub(crate) fn vm_track_existing_file_mapping(
+    owner_pid: u32,
+    base: u64,
+    size: u64,
+    prot: u32,
+) -> bool {
+    if owner_pid == 0 {
+        return false;
+    }
+    let size = align_up_4k(size.max(PAGE_SIZE_4K));
+    if !vm_range_access_valid(base, size) {
+        return false;
+    }
+
+    if let Some((id, existing)) = vm_find_region_by_base(owner_pid, base) {
+        if !existing.owns_phys_pages && existing.size == size {
+            let ptr = regions_store_mut().get_ptr(id);
+            if !ptr.is_null() {
+                let region = unsafe { &mut *ptr };
+                let sanitized = vm_sanitize_nt_prot(prot);
+                region.default_prot = sanitized;
+                for i in 0..region.page_count {
+                    unsafe { *region.prot_pages.add(i) = sanitized };
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+    if vm_region_overlaps(owner_pid, base, size) {
+        return false;
+    }
+
+    let prot = vm_sanitize_nt_prot(prot);
+    let Some(id) = vm_create_region(owner_pid, base, size, prot, VM_KIND_SECTION) else {
+        return false;
+    };
+    let ptr = regions_store_mut().get_ptr(id);
+    if ptr.is_null() {
+        let _ = vm_release_region_by_id(id);
+        return false;
+    }
+    let region = unsafe { &mut *ptr };
+    region.default_prot = prot;
+    region.section_is_image = false;
+    region.section_file_backed = false;
+    region.section_file_fd = 0;
+    region.section_file_offset = 0;
+    region.section_view_size = size;
+    region.owns_phys_pages = false;
+
+    for i in 0..region.page_count {
+        let page_va = base + (i as u64) * PAGE_SIZE_4K;
+        let Some(gpa) = vm_translate_user_va(owner_pid, page_va, VM_ACCESS_READ) else {
+            let _ = vm_release_region_by_id(id);
+            return false;
+        };
+        unsafe {
+            *region.phys_pages.add(i) = gpa & !(PAGE_SIZE_4K - 1);
+            *region.prot_pages.add(i) = prot;
+        }
+        vm_set_region_page_committed(region, i, true);
+    }
+    true
+}
+
+pub(crate) fn vm_clone_external_mappings(src_pid: u32, dst_pid: u32) -> bool {
+    if src_pid == 0 || dst_pid == 0 {
+        return false;
+    }
+    let mut mappings = Vec::<(u64, u64, u32)>::new();
+    regions_store_mut().for_each_live_ptr(|_, ptr| unsafe {
+        let r = *ptr;
+        if r.owner_pid != src_pid || r.owns_phys_pages {
+            return;
+        }
+        if mappings.try_reserve(1).is_ok() {
+            mappings.push((r.base, r.size, r.default_prot));
+        }
+    });
+    for (base, size, prot) in mappings {
+        if !vm_track_existing_file_mapping(dst_pid, base, size, prot) {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn vm_free_region(owner_pid: u32, base: u64) -> bool {
     let Some((id, _)) = vm_find_region_by_base(owner_pid, base) else {
         return false;
@@ -446,7 +536,7 @@ pub(crate) fn vm_protect_range(
 
 pub(crate) fn vm_query_region(owner_pid: u32, addr: u64) -> Option<VmQueryInfo> {
     let page_addr = addr & !(PAGE_SIZE_4K - 1);
-    if page_addr < crate::process::USER_VA_BASE || page_addr >= crate::process::USER_VA_LIMIT {
+    if page_addr < crate::process::USER_ACCESS_BASE || page_addr >= crate::process::USER_VA_LIMIT {
         return None;
     }
 
@@ -500,6 +590,12 @@ pub(crate) fn vm_query_region(owner_pid: u32, addr: u64) -> Option<VmQueryInfo> 
             state,
             mem_type: vm_region_mem_type(&region),
         });
+    }
+
+    // Below USER_VA_BASE we only expose explicitly tracked file mappings.
+    // Do not synthesize MEM_FREE gaps there.
+    if page_addr < crate::process::USER_VA_BASE {
+        return None;
     }
 
     let mut free_start = crate::process::USER_VA_BASE;
@@ -889,6 +985,24 @@ fn vm_range_valid(base: u64, size: u64) -> bool {
     end <= crate::process::USER_VA_LIMIT
 }
 
+fn vm_range_access_valid(base: u64, size: u64) -> bool {
+    if size == 0 || (base & (PAGE_SIZE_4K - 1)) != 0 || (size & (PAGE_SIZE_4K - 1)) != 0 {
+        return false;
+    }
+    if base < crate::process::USER_ACCESS_BASE || base >= crate::process::USER_VA_LIMIT {
+        return false;
+    }
+    let Some(end) = base.checked_add(size) else {
+        return false;
+    };
+    end <= crate::process::USER_VA_LIMIT
+}
+
+fn vm_translate_user_va(owner_pid: u32, va: u64, access: u8) -> Option<u64> {
+    crate::process::with_process(owner_pid, |p| p.address_space.translate_user_va_for_access(va, access))
+        .flatten()
+}
+
 fn vm_kind_from_vma_type(vma_type: VmaType) -> u8 {
     match vma_type {
         VmaType::Private => VM_KIND_PRIVATE,
@@ -955,6 +1069,7 @@ fn vm_create_region(owner_pid: u32, base: u64, size: u64, prot: u32, kind: u8) -
         section_view_size: 0,
         section_file_backed: false,
         section_is_image: false,
+        owns_phys_pages: true,
     });
 
     if id.is_none() {
@@ -1093,7 +1208,9 @@ fn vm_unmap_free_page(owner_pid: u32, region: &VmRegion, idx: usize, va: u64) {
         return;
     }
     vm_unmap_page_only(owner_pid, va);
-    vm_phys_page_release(gpa);
+    if region.owns_phys_pages {
+        vm_phys_page_release(gpa);
+    }
     unsafe {
         *(region.phys_pages.add(idx)) = 0;
     }
