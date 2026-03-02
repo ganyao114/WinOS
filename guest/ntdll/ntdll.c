@@ -644,6 +644,23 @@ EXPORT void* RtlReAllocateHeap(HANDLE heap, ULONG flags, void* ptr, size_t size)
     return newp;
 }
 
+EXPORT size_t RtlSizeHeap(HANDLE heap, ULONG flags, const void* ptr) {
+    (void)heap; (void)flags;
+    if (!ptr) return (size_t)-1;
+    const WINEMU_HEAP_HDR* hdr =
+        (const WINEMU_HEAP_HDR*)((const uint8_t*)ptr - WINEMU_HEAP_HDR_SIZE);
+    if (hdr->magic != WINEMU_HEAP_HDR_MAGIC) return (size_t)-1;
+    return (size_t)hdr->size;
+}
+
+EXPORT int RtlValidateHeap(HANDLE heap, ULONG flags, const void* ptr) {
+    (void)heap; (void)flags;
+    if (!ptr) return 1;
+    const WINEMU_HEAP_HDR* hdr =
+        (const WINEMU_HEAP_HDR*)((const uint8_t*)ptr - WINEMU_HEAP_HDR_SIZE);
+    return hdr->magic == WINEMU_HEAP_HDR_MAGIC ? 1 : 0;
+}
+
 /* ── Critical Section ────────────────────────────────────────── */
 
 typedef struct {
@@ -2734,6 +2751,10 @@ static int is_valid_teb_frame(uint64_t frame) {
     return 1;
 }
 
+static uint64_t g_dispatch_handler_count = 0;
+static uint64_t g_dispatch_last_result = 0;
+static uint64_t g_dispatch_last_handler = 0;
+
 static NTSTATUS dispatch_exception(EXCEPTION_RECORD64* rec, ARM64_NT_CONTEXT* orig_context) {
     ARM64_NT_CONTEXT context = *orig_context;
     DISPATCHER_CONTEXT_ARM64 dispatch;
@@ -2741,7 +2762,19 @@ static NTSTATUS dispatch_exception(EXCEPTION_RECORD64* rec, ARM64_NT_CONTEXT* or
     EXCEPTION_REGISTRATION_RECORD64* teb_frame = NULL;
     uint64_t prev_sp = context.Sp;
     uint64_t prev_pc = context.Pc;
+    uint64_t handler_count = 0;
+    uint64_t last_result = 0;
+    uint64_t last_handler = 0;
     uint8_t* teb = (uint8_t*)NtCurrentTeb();
+
+#define FINISH_DISPATCH(st) do { \
+    g_dispatch_handler_count = handler_count; \
+    g_dispatch_last_result = last_result; \
+    g_dispatch_last_handler = last_handler; \
+    *orig_context = context; \
+    return (st); \
+} while (0)
+
     if (teb) {
         teb_frame = (EXCEPTION_REGISTRATION_RECORD64*)(uintptr_t)(*(uint64_t*)(teb + 0x00));
     }
@@ -2755,59 +2788,58 @@ static NTSTATUS dispatch_exception(EXCEPTION_RECORD64* rec, ARM64_NT_CONTEXT* or
 
         NTSTATUS status = virtual_unwind(UNW_FLAG_EHANDLER, &dispatch, &context);
         if (status != STATUS_SUCCESS) {
-            *orig_context = context;
-            return status;
+            FINISH_DISPATCH(status);
         }
         if (!dispatch.EstablisherFrame) break;
 
         if (dispatch.LanguageHandler) {
+            handler_count++;
+            last_handler = (uint64_t)(uintptr_t)dispatch.LanguageHandler;
             EXCEPTION_DISPOSITION res = dispatch.LanguageHandler(
                 rec,
                 (void*)(uintptr_t)dispatch.EstablisherFrame,
-                orig_context,
+                &context,
                 &dispatch
             );
+            last_result = (uint64_t)res;
             rec->ExceptionFlags &= EXCEPTION_NONCONTINUABLE;
 
             if (res == ExceptionContinueExecution) {
                 if (rec->ExceptionFlags & EXCEPTION_NONCONTINUABLE) {
-                    *orig_context = context;
-                    return STATUS_NONCONTINUABLE_EXCEPTION;
+                    FINISH_DISPATCH(STATUS_NONCONTINUABLE_EXCEPTION);
                 }
-                *orig_context = context;
-                return STATUS_SUCCESS;
+                FINISH_DISPATCH(STATUS_SUCCESS);
             }
             if (res == ExceptionContinueSearch) {
                 /* continue searching */
             } else if (res == ExceptionNestedException || res == ExceptionCollidedUnwind) {
                 rec->ExceptionFlags |= EXCEPTION_NESTED_CALL;
             } else {
-                *orig_context = context;
-                return STATUS_INVALID_DISPOSITION;
+                FINISH_DISPATCH(STATUS_INVALID_DISPOSITION);
             }
         } else {
             while (is_valid_teb_frame((uint64_t)(uintptr_t)teb_frame) &&
                    (uint64_t)(uintptr_t)teb_frame < context.Sp) {
+                handler_count++;
+                last_handler = (uint64_t)(uintptr_t)teb_frame->Handler;
                 EXCEPTION_DISPOSITION res = winemu_call_seh_handler(
                     rec,
                     (uint64_t)(uintptr_t)teb_frame,
-                    orig_context,
+                    &context,
                     &dispatch,
                     (PEXCEPTION_ROUTINE_ARM64)(uintptr_t)teb_frame->Handler
                 );
+                last_result = (uint64_t)res;
                 if (res == ExceptionContinueExecution) {
                     if (rec->ExceptionFlags & EXCEPTION_NONCONTINUABLE) {
-                        *orig_context = context;
-                        return STATUS_NONCONTINUABLE_EXCEPTION;
+                        FINISH_DISPATCH(STATUS_NONCONTINUABLE_EXCEPTION);
                     }
-                    *orig_context = context;
-                    return STATUS_SUCCESS;
+                    FINISH_DISPATCH(STATUS_SUCCESS);
                 }
                 if (res == ExceptionNestedException || res == ExceptionCollidedUnwind) {
                     rec->ExceptionFlags |= EXCEPTION_NESTED_CALL;
                 } else if (res != ExceptionContinueSearch) {
-                    *orig_context = context;
-                    return STATUS_INVALID_DISPOSITION;
+                    FINISH_DISPATCH(STATUS_INVALID_DISPOSITION);
                 }
                 teb_frame = teb_frame->Prev;
             }
@@ -2819,8 +2851,9 @@ static NTSTATUS dispatch_exception(EXCEPTION_RECORD64* rec, ARM64_NT_CONTEXT* or
         prev_sp = context.Sp;
         prev_pc = context.Pc;
     }
-    *orig_context = context;
-    return STATUS_UNHANDLED_EXCEPTION;
+    FINISH_DISPATCH(STATUS_UNHANDLED_EXCEPTION);
+
+#undef FINISH_DISPATCH
 }
 
 EXPORT void RtlUnwindEx(
@@ -2912,6 +2945,9 @@ EXPORT void RtlUnwind(void* frame, void* target_ip, EXCEPTION_RECORD64* rec, voi
 __attribute__((noreturn))
 void winemu_raise_exception_dispatch(EXCEPTION_RECORD64* record, ARM64_NT_CONTEXT* context) {
     uint64_t code = 0xE06D7363ULL;
+    uint64_t info2 = 0;
+    uint64_t info3 = 0;
+    uint64_t exaddr = 0;
     EXCEPTION_RECORD64 fallback;
     if (!record) {
         memset(&fallback, 0, sizeof(fallback));
@@ -2933,12 +2969,25 @@ void winemu_raise_exception_dispatch(EXCEPTION_RECORD64* record, ARM64_NT_CONTEX
 
     if (record) {
         code = record->ExceptionCode;
+        exaddr = (uint64_t)(uintptr_t)record->ExceptionAddress;
+        if (record->NumberParameters > 2) {
+            info2 = record->ExceptionInformation[2];
+        }
+        if (record->NumberParameters > 3) {
+            info3 = record->ExceptionInformation[3];
+        }
     }
-    (void)dispatch_status;
-    (void)syscall2(
+    uint64_t dispatch_diag = ((g_dispatch_handler_count & 0xFFFFULL) << 48)
+        | ((g_dispatch_last_result & 0xFFULL) << 40)
+        | (uint64_t)(uint32_t)dispatch_status;
+    (void)syscall6(
         NR_TERMINATE_PROCESS,
         (uint64_t)(HANDLE)(uint64_t)-1,
-        (uint64_t)(NTSTATUS)code
+        (uint64_t)(NTSTATUS)code,
+        info2,
+        info3,
+        g_dispatch_last_handler ? g_dispatch_last_handler : exaddr,
+        dispatch_diag
     );
     for (;;) {}
 }
