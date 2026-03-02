@@ -4,6 +4,7 @@
 
 Layout:
 - `guest/ntdll/`: ntdll implementation and build scripts.
+- `guest/win32u/`: win32u shim DLL and win32k syscall trampolines.
 - `guest/kernelbase/`: kernelbase scaffold for future compatibility exports.
 - `tests/guest/*`: C guest test programs (migrated out of `guest/`).
 
