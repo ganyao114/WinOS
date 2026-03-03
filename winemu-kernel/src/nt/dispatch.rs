@@ -6,9 +6,11 @@ use crate::hypercall;
 use core::sync::atomic::{AtomicU32, Ordering};
 use crate::sched::{
     charge_current_runtime_locked, check_timeouts, consume_pending_reschedule_locked,
-    current_slice_remaining_100ns, current_tid, next_wait_deadline_locked, now_ticks,
-    register_thread0, rotate_current_on_quantum_expire_locked, sched_lock_acquire,
-    sched_lock_release, schedule, set_vcpu_idle_locked, vcpu_id, with_thread_mut,
+    current_slice_remaining_100ns, current_tid, has_kernel_continuation, next_wait_deadline_locked,
+    now_ticks, register_thread0, rotate_current_on_quantum_expire_locked, sched_lock_acquire,
+    sched_lock_release, save_current_dispatch_continuation, schedule, set_current_in_kernel, set_thread_in_kernel,
+    set_vcpu_idle_locked, switch_kernel_continuation, thread_exists, vcpu_id, with_thread, with_thread_mut,
+    ThreadState,
 };
 use crate::timer;
 
@@ -26,9 +28,21 @@ use super::{
 static SYSCALL_ERR_TRACE_BUDGET: AtomicU32 = AtomicU32::new(512);
 
 #[no_mangle]
+pub extern "C" fn svc_migrate_frame_to_thread_stack(frame_ptr: u64, frame_size: u64) -> u64 {
+    crate::sched::migrate_svc_frame_to_current_kstack(frame_ptr as *mut u8, frame_size as usize)
+        as u64
+}
+
+#[no_mangle]
 pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
     if current_tid() == 0 {
         register_thread0(frame.tpidr);
+    }
+    set_current_in_kernel(true);
+    let resumed_dispatch = unsafe { save_current_dispatch_continuation() };
+    if resumed_dispatch != 0 {
+        schedule_from_trap(frame, true);
+        return;
     }
 
     let tag = frame.x8_orig;
@@ -196,6 +210,7 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
         save_ctx_for(from, frame);
     }
     loop {
+        crate::hostcall::pump_completions();
         file::poll_async_file_completions();
 
         let now = now_ticks();
@@ -206,17 +221,36 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
         if quantum_expired {
             rotate_current_on_quantum_expire_locked(vid, quantum_100ns);
         }
+        let cur_not_running = from != 0
+            && thread_exists(from)
+            && with_thread(from, |t| t.state != ThreadState::Running);
         let timeout_woke = check_timeouts(now);
         let next_deadline = next_wait_deadline_locked();
 
         // Defer scheduling decision to the unlock boundary:
         // only run schedule() when a committed reschedule request exists, or
         // timer logic produced runnable-state change.
-        if pending_resched || quantum_expired || timeout_woke || from == 0 {
+        if pending_resched || quantum_expired || timeout_woke || from == 0 || cur_not_running {
             let (from_sched, to) = schedule(vid, now, quantum_100ns);
             if to != 0 {
                 set_vcpu_idle_locked(vid, false);
                 crate::process::switch_to_thread_process(to);
+                if from_sched != 0 && from_sched != to && has_kernel_continuation(to) {
+                    save_ctx_for(from_sched, frame);
+                    sched_lock_release();
+                    let switched = unsafe { switch_kernel_continuation(from_sched, to) };
+                    if !switched {
+                        restore_ctx_to_frame(to, frame);
+                        let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
+                        set_thread_in_kernel(to, false);
+                        timer::schedule_running_slice_100ns(now, next_deadline, slice_remaining);
+                        return from_sched != to;
+                    }
+                    // Returned by a later kernel-continuation switch back into
+                    // this thread; restart scheduling decision with fresh state.
+                    from = current_tid();
+                    continue;
+                }
                 if from_sched != 0 && from_sched != to {
                     save_ctx_for(from_sched, frame);
                     restore_ctx_to_frame(to, frame);
@@ -226,6 +260,7 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
                 }
                 let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
                 sched_lock_release();
+                set_thread_in_kernel(to, false);
                 timer::schedule_running_slice_100ns(now, next_deadline, slice_remaining);
                 return from_sched != to;
             }
@@ -255,6 +290,10 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
 
         let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
         sched_lock_release();
+        let cur = current_tid();
+        if cur != 0 {
+            set_thread_in_kernel(cur, false);
+        }
         timer::schedule_running_slice_100ns(now, next_deadline, slice_remaining);
         return false;
     }
@@ -262,6 +301,7 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
 
 #[no_mangle]
 pub extern "C" fn timer_irq_dispatch(frame: &mut SvcFrame) {
+    set_current_in_kernel(true);
     let _ = schedule_from_trap(frame, false);
 }
 

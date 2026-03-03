@@ -12,11 +12,10 @@ use core::ptr::null_mut;
 use winemu_shared::status;
 
 use super::{
-    boost_thread_priority_locked, clear_wait_deadline_locked, current_tid, sched_lock_acquire,
-    sched_lock_release, set_thread_priority_locked, set_thread_state_locked,
-    set_wait_deadline_locked, thread_exists, wake, with_thread, with_thread_mut, ThreadState,
-    thread_count, MAX_WAIT_HANDLES, WAIT_KIND_DELAY, WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY,
-    WAIT_KIND_NONE, WAIT_KIND_SINGLE,
+    boost_thread_priority_locked, clear_wait_tracking_locked, current_tid, prepare_wait_locked,
+    sched_lock_acquire, sched_lock_release, set_thread_priority_locked, thread_exists, wake,
+    with_thread, with_thread_mut, ThreadState, thread_count, MAX_WAIT_HANDLES, WAIT_KIND_DELAY,
+    WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY, WAIT_KIND_SINGLE,
 };
 
 // ── NTSTATUS 常量 ─────────────────────────────────────────────
@@ -828,46 +827,12 @@ fn deadline_ticks(timeout: WaitDeadline) -> u64 {
 }
 
 fn set_wait_metadata(tid: u32, kind: u8, handles: &[u64], timeout: WaitDeadline) -> u32 {
-    let count = if handles.len() > MAX_WAIT_HANDLES {
-        MAX_WAIT_HANDLES
-    } else {
-        handles.len()
-    };
     let deadline = deadline_ticks(timeout);
-    with_thread_mut(tid, |t| {
-        t.wait_result = STATUS_PENDING;
-        t.wait_kind = kind;
-        t.wait_count = count as u8;
-        t.wait_signaled = 0;
-        t.wait_handles.fill(0);
-        let mut i = 0usize;
-        while i < count {
-            t.wait_handles[i] = handles[i];
-            i += 1;
-        }
-    });
-    if !set_wait_deadline_locked(tid, deadline) {
-        with_thread_mut(tid, |t| {
-            t.wait_result = 0;
-            t.wait_kind = WAIT_KIND_NONE;
-            t.wait_count = 0;
-            t.wait_signaled = 0;
-            t.wait_handles.fill(0);
-        });
-        return STATUS_NO_MEMORY;
-    }
-    set_thread_state_locked(tid, ThreadState::Waiting);
-    STATUS_SUCCESS
+    prepare_wait_locked(tid, kind, handles, deadline, STATUS_PENDING)
 }
 
 fn clear_wait_metadata(tid: u32) {
-    clear_wait_deadline_locked(tid);
-    with_thread_mut(tid, |t| {
-        t.wait_kind = WAIT_KIND_NONE;
-        t.wait_count = 0;
-        t.wait_signaled = 0;
-        t.wait_handles.fill(0);
-    });
+    clear_wait_tracking_locked(tid);
 }
 
 fn validate_thread_target_tid(target_tid: u32) -> bool {

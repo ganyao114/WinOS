@@ -28,12 +28,14 @@ pub use lock::{sched_lock_acquire, sched_lock_release};
 pub const MAX_VCPUS: usize = 8;
 pub const IDLE_TID: u32 = 0;
 pub const MAX_WAIT_HANDLES: usize = 64;
+pub const KERNEL_STACK_SIZE: usize = 64 * 1024;
 
 pub const WAIT_KIND_NONE: u8 = 0;
 pub const WAIT_KIND_SINGLE: u8 = 1;
 pub const WAIT_KIND_MULTI_ANY: u8 = 2;
 pub const WAIT_KIND_MULTI_ALL: u8 = 3;
 pub const WAIT_KIND_DELAY: u8 = 4;
+pub const WAIT_KIND_HOSTCALL: u8 = 5;
 const DYNAMIC_BOOST_DELTA: u8 = 2;
 const DYNAMIC_BOOST_MAX: u8 = 15;
 
@@ -62,6 +64,14 @@ pub struct ThreadContext {
     pub tpidr: u64,   // TPIDR_EL0 (TEB pointer)
 }
 
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct KernelContext {
+    pub x19_x30: [u64; 12],
+    pub sp_el1: u64,
+    pub lr_el1: u64,
+}
+
 // ── KThread ───────────────────────────────────────────────────
 
 #[repr(C)]
@@ -75,8 +85,14 @@ pub struct KThread {
     pub teb_va: u64,
     pub stack_base: u64,
     pub stack_size: u64,
+    pub kstack_base: u64,
+    pub kstack_size: u64,
+    pub in_kernel: bool,
 
     pub ctx: ThreadContext,
+    pub kctx: KernelContext,
+    pub dispatch_kctx: KernelContext,
+    pub dispatch_valid: bool,
 
     // 等待信息
     pub wait_result: u32,   // NTSTATUS written on wake
@@ -111,6 +127,9 @@ impl KThread {
             teb_va: 0,
             stack_base: 0,
             stack_size: 0,
+            kstack_base: 0,
+            kstack_size: 0,
+            in_kernel: false,
             ctx: ThreadContext {
                 x: [0u64; 31],
                 sp: 0,
@@ -118,6 +137,17 @@ impl KThread {
                 pstate: 0,
                 tpidr: 0,
             },
+            kctx: KernelContext {
+                x19_x30: [0u64; 12],
+                sp_el1: 0,
+                lr_el1: 0,
+            },
+            dispatch_kctx: KernelContext {
+                x19_x30: [0u64; 12],
+                sp_el1: 0,
+                lr_el1: 0,
+            },
+            dispatch_valid: false,
             wait_result: 0,
             wait_deadline: 0,
             wait_timer_task_id: 0,
@@ -145,6 +175,8 @@ impl KThread {
         teb_va: u64,
         stack_base: u64,
         stack_size: u64,
+        kstack_base: u64,
+        kstack_size: u64,
         priority: u8,
     ) {
         self.state = ThreadState::Free;
@@ -156,7 +188,13 @@ impl KThread {
         self.teb_va = teb_va;
         self.stack_base = stack_base;
         self.stack_size = stack_size;
+        self.kstack_base = kstack_base;
+        self.kstack_size = kstack_size;
+        self.in_kernel = false;
         self.ctx = ThreadContext::default();
+        self.kctx = KernelContext::default();
+        self.dispatch_kctx = KernelContext::default();
+        self.dispatch_valid = false;
         self.ctx.pc = pc;
         self.ctx.sp = sp;
         self.ctx.x[0] = arg;
@@ -165,7 +203,7 @@ impl KThread {
         self.ctx.tpidr = teb_va;
     }
 
-    fn init_thread0(&mut self, tid: u32, pid: u32, teb_va: u64) {
+    fn init_thread0(&mut self, tid: u32, pid: u32, teb_va: u64, kstack_base: u64, kstack_size: u64) {
         self.state = ThreadState::Running;
         self.priority = 8;
         self.base_priority = 8;
@@ -173,7 +211,13 @@ impl KThread {
         self.tid = tid;
         self.pid = pid;
         self.teb_va = teb_va;
+        self.kstack_base = kstack_base;
+        self.kstack_size = kstack_size;
+        self.in_kernel = false;
         self.ctx = ThreadContext::default();
+        self.kctx = KernelContext::default();
+        self.dispatch_kctx = KernelContext::default();
+        self.dispatch_valid = false;
         self.ctx.tpidr = teb_va;
     }
 
@@ -412,6 +456,9 @@ pub static SCHED: Scheduler = Scheduler {
     spinlock: UnsafeCell::new(0),
 };
 
+#[no_mangle]
+pub static mut __winemu_vcpu_kernel_sp: [u64; MAX_VCPUS] = [0; MAX_VCPUS];
+
 // ── 线程访问辅助 ──────────────────────────────────────────────
 
 fn thread_store_mut() -> &'static mut ObjectStore<KThread> {
@@ -429,6 +476,90 @@ fn thread_ptr(tid: u32) -> *mut KThread {
         return core::ptr::null_mut();
     }
     thread_store_mut().get_ptr(tid)
+}
+
+#[inline(always)]
+fn default_kernel_stack_top() -> u64 {
+    crate::arch::vectors::default_kernel_stack_top()
+}
+
+#[inline(always)]
+fn kstack_top_from_thread(t: &KThread) -> u64 {
+    if t.kstack_base != 0 && t.kstack_size != 0 {
+        t.kstack_base.saturating_add(t.kstack_size as u64)
+    } else {
+        default_kernel_stack_top()
+    }
+}
+
+#[inline(always)]
+fn set_vcpu_kernel_sp(vid: usize, sp: u64) {
+    if vid < MAX_VCPUS {
+        unsafe {
+            __winemu_vcpu_kernel_sp[vid] = if sp != 0 { sp } else { default_kernel_stack_top() };
+        }
+    }
+}
+
+#[inline(always)]
+fn set_vcpu_kernel_sp_for_tid(vid: usize, tid: u32) {
+    if tid != 0 && thread_exists(tid) {
+        let sp = with_thread(tid, kstack_top_from_thread);
+        set_vcpu_kernel_sp(vid, sp);
+    } else {
+        set_vcpu_kernel_sp(vid, default_kernel_stack_top());
+    }
+}
+
+pub fn current_thread_kernel_stack_top() -> u64 {
+    let tid = current_tid();
+    if tid == 0 || !thread_exists(tid) {
+        return default_kernel_stack_top();
+    }
+    with_thread(tid, kstack_top_from_thread)
+}
+
+pub fn current_thread_kernel_stack_base() -> u64 {
+    let tid = current_tid();
+    if tid == 0 || !thread_exists(tid) {
+        return 0;
+    }
+    with_thread(tid, |t| t.kstack_base)
+}
+
+pub fn migrate_svc_frame_to_current_kstack(frame_ptr: *mut u8, frame_size: usize) -> *mut u8 {
+    if frame_ptr.is_null() || frame_size == 0 {
+        return frame_ptr;
+    }
+    let tid = current_tid();
+    if tid == 0 || !thread_exists(tid) {
+        return frame_ptr;
+    }
+    let (base, top) = with_thread(tid, |t| (t.kstack_base, kstack_top_from_thread(t)));
+    if base == 0 || top == 0 {
+        return frame_ptr;
+    }
+    let base_usize = base as usize;
+    let top_usize = top as usize;
+    if top_usize <= base_usize || frame_size > top_usize.saturating_sub(base_usize) {
+        return frame_ptr;
+    }
+    let new_frame_usize = top_usize.saturating_sub(frame_size);
+    if new_frame_usize < base_usize {
+        return frame_ptr;
+    }
+    let new_frame = new_frame_usize as *mut u8;
+    if new_frame.is_null() || new_frame == frame_ptr {
+        return frame_ptr;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(frame_ptr, new_frame, frame_size);
+    }
+    with_thread_mut(tid, |t| {
+        t.kctx.sp_el1 = new_frame as u64;
+        t.in_kernel = true;
+    });
+    new_frame
 }
 
 pub fn thread_exists(tid: u32) -> bool {
@@ -483,6 +614,31 @@ pub fn set_current_cpu_thread(vcpu_id: usize, tid: u32) {
 
 pub fn current_thread_mut<R>(f: impl FnOnce(&mut KThread) -> R) -> R {
     with_thread_mut(current_tid(), f)
+}
+
+pub fn set_thread_in_kernel(tid: u32, in_kernel: bool) {
+    if tid == 0 || !thread_exists(tid) {
+        return;
+    }
+    with_thread_mut(tid, |t| {
+        t.in_kernel = in_kernel;
+        if !in_kernel {
+            // Returning to EL0 invalidates any previously captured EL1
+            // continuation resume target for this thread.
+            t.kctx.lr_el1 = 0;
+            t.kctx.sp_el1 = 0;
+            t.dispatch_valid = false;
+            t.dispatch_kctx.lr_el1 = 0;
+            t.dispatch_kctx.sp_el1 = 0;
+        }
+    });
+}
+
+pub fn set_current_in_kernel(in_kernel: bool) {
+    let tid = current_tid();
+    if tid != 0 {
+        set_thread_in_kernel(tid, in_kernel);
+    }
 }
 
 #[inline(always)]
@@ -782,6 +938,223 @@ pub(crate) fn clear_wait_deadline_locked(tid: u32) {
     let _ = set_wait_deadline_locked(tid, 0);
 }
 
+#[inline(always)]
+fn clear_wait_tracking_fields(thread: &mut KThread) {
+    thread.wait_kind = WAIT_KIND_NONE;
+    thread.wait_count = 0;
+    thread.wait_signaled = 0;
+    thread.wait_handles.fill(0);
+}
+
+pub(crate) fn clear_wait_tracking_locked(tid: u32) {
+    clear_wait_deadline_locked(tid);
+    with_thread_mut(tid, clear_wait_tracking_fields);
+}
+
+// Enter waiting state through a single scheduler-owned path so all wait users
+// (NtWait*, delay, hostcall wait) share the same invariants.
+pub(crate) fn prepare_wait_locked(
+    tid: u32,
+    wait_kind: u8,
+    wait_handles: &[u64],
+    wait_deadline: u64,
+    pending_result: u32,
+) -> u32 {
+    debug_assert!(
+        sched_lock_held_by_current_vcpu(),
+        "prepare_wait_locked requires sched lock"
+    );
+    if tid == 0 || !thread_exists(tid) {
+        return status::INVALID_PARAMETER;
+    }
+
+    let handle_count = wait_handles.len().min(MAX_WAIT_HANDLES);
+    with_thread_mut(tid, |t| {
+        t.wait_result = pending_result;
+        t.wait_kind = wait_kind;
+        t.wait_count = handle_count as u8;
+        t.wait_signaled = 0;
+        t.wait_handles.fill(0);
+        let mut i = 0usize;
+        while i < handle_count {
+            t.wait_handles[i] = wait_handles[i];
+            i += 1;
+        }
+    });
+    if !set_wait_deadline_locked(tid, wait_deadline) {
+        with_thread_mut(tid, |t| {
+            t.wait_result = 0;
+            clear_wait_tracking_fields(t);
+        });
+        return status::NO_MEMORY;
+    }
+
+    set_thread_state_locked(tid, ThreadState::Waiting);
+    status::SUCCESS
+}
+
+// Unified blocking primitive for "current thread waits for something".
+// The actual context switch is still performed by trap-exit scheduling path.
+pub fn block_current_and_resched(
+    wait_kind: u8,
+    wait_handles: &[u64],
+    wait_deadline: u64,
+    pending_result: u32,
+) -> u32 {
+    let tid = current_tid();
+    if tid == 0 || !thread_exists(tid) {
+        return status::INVALID_PARAMETER;
+    }
+    sched_lock_acquire();
+    let st = prepare_wait_locked(tid, wait_kind, wait_handles, wait_deadline, pending_result);
+    sched_lock_release();
+    if st != status::SUCCESS {
+        return st;
+    }
+    status::SUCCESS
+}
+
+// Try to block current thread and switch to another runnable kernel
+// continuation thread. Returns true only if a non-local kernel switch
+// happened and control later resumed here.
+pub fn block_current_and_switch_kernel(
+    wait_kind: u8,
+    wait_handles: &[u64],
+    wait_deadline: u64,
+    pending_result: u32,
+) -> bool {
+    let cur = current_tid();
+    if cur == 0 || !thread_exists(cur) {
+        return false;
+    }
+    let vid = vcpu_id();
+    let now = now_ticks();
+    let quantum_100ns = timer::DEFAULT_TIMESLICE_100NS.max(1);
+
+    sched_lock_acquire();
+    let st = prepare_wait_locked(cur, wait_kind, wait_handles, wait_deadline, pending_result);
+    if st != status::SUCCESS {
+        sched_lock_release();
+        return false;
+    }
+    if !has_dispatch_continuation(cur) {
+        rollback_wait_prepare_locked(cur, vid, now, quantum_100ns);
+        sched_lock_release();
+        return false;
+    }
+
+    sched_lock_release();
+    unsafe { switch_current_to_dispatch_continuation(cur) }
+}
+
+fn rollback_wait_prepare_locked(cur: u32, vid: usize, now: u64, quantum_100ns: u64) {
+    clear_wait_tracking_locked(cur);
+    with_thread_mut(cur, |t| t.wait_result = 0);
+    set_thread_state_locked(cur, ThreadState::Running);
+    with_thread_mut(cur, |t| {
+        t.slice_remaining_100ns = quantum_100ns;
+        t.last_start_100ns = now;
+        t.last_vcpu_hint = vid as u8;
+    });
+    unsafe {
+        (*SCHED.vcpus.get())[vid].current_tid = cur;
+    }
+    set_current_cpu_thread(vid, cur);
+    set_vcpu_kernel_sp_for_tid(vid, cur);
+}
+
+pub fn has_dispatch_continuation(tid: u32) -> bool {
+    if tid == 0 || !thread_exists(tid) {
+        return false;
+    }
+    with_thread(tid, |t| {
+        t.in_kernel && t.dispatch_valid && t.dispatch_kctx.sp_el1 != 0 && t.dispatch_kctx.lr_el1 != 0
+    })
+}
+
+pub unsafe fn save_current_dispatch_continuation() -> u64 {
+    let tid = current_tid();
+    if tid == 0 || !thread_exists(tid) {
+        return 0;
+    }
+    let ptr = thread_ptr(tid);
+    if ptr.is_null() {
+        return 0;
+    }
+    unsafe {
+        (*ptr).in_kernel = true;
+        (*ptr).dispatch_valid = true;
+        crate::arch::context::save_kernel_context(&mut (*ptr).dispatch_kctx as *mut KernelContext)
+    }
+}
+
+pub unsafe fn switch_current_to_dispatch_continuation(tid: u32) -> bool {
+    if tid == 0 || !thread_exists(tid) {
+        return false;
+    }
+    let ptr = thread_ptr(tid);
+    if ptr.is_null() {
+        return false;
+    }
+    let has_dispatch = unsafe {
+        (*ptr).dispatch_valid && (*ptr).dispatch_kctx.sp_el1 != 0 && (*ptr).dispatch_kctx.lr_el1 != 0
+    };
+    if !has_dispatch {
+        return false;
+    }
+    let from_kctx = unsafe { &mut (*ptr).kctx as *mut KernelContext };
+    let to_kctx = unsafe { &(*ptr).dispatch_kctx as *const KernelContext };
+    unsafe {
+        crate::arch::context::switch_kernel_context(from_kctx, to_kctx);
+    }
+    true
+}
+
+pub fn has_kernel_continuation(tid: u32) -> bool {
+    if tid == 0 || !thread_exists(tid) {
+        return false;
+    }
+    with_thread(tid, |t| t.in_kernel && t.kctx.sp_el1 != 0 && t.kctx.lr_el1 != 0)
+}
+
+pub unsafe fn switch_kernel_continuation(from_tid: u32, to_tid: u32) -> bool {
+    if from_tid == 0 || to_tid == 0 || from_tid == to_tid {
+        return false;
+    }
+    if !thread_exists(from_tid) || !thread_exists(to_tid) {
+        return false;
+    }
+    if !has_kernel_continuation(to_tid) {
+        return false;
+    }
+    let from_ptr = thread_ptr(from_tid);
+    let to_ptr = thread_ptr(to_tid);
+    if from_ptr.is_null() || to_ptr.is_null() {
+        return false;
+    }
+    let from_kctx = unsafe { &mut (*from_ptr).kctx as *mut KernelContext };
+    let to_kctx = unsafe { &(*to_ptr).kctx as *const KernelContext };
+    unsafe {
+        crate::arch::context::switch_kernel_context(from_kctx, to_kctx);
+    }
+    true
+}
+
+pub unsafe fn save_current_kernel_continuation() -> u64 {
+    let tid = current_tid();
+    if tid == 0 || !thread_exists(tid) {
+        return 0;
+    }
+    let ptr = thread_ptr(tid);
+    if ptr.is_null() {
+        return 0;
+    }
+    unsafe {
+        (*ptr).in_kernel = true;
+        crate::arch::context::save_kernel_context(&mut (*ptr).kctx as *mut KernelContext)
+    }
+}
+
 fn apply_dynamic_wake_boost_locked(tid: u32) {
     if tid == 0 || !thread_exists(tid) {
         return;
@@ -811,24 +1184,22 @@ pub(crate) fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
         return;
     }
 
-    unsafe {
-        if old_state == ThreadState::Ready {
-            ready_remove_tid_locked(tid);
-        }
+    if old_state == ThreadState::Ready {
+        ready_remove_tid_locked(tid);
+    }
 
-        with_thread_mut(tid, |t| {
-            t.state = new_state;
-            if new_state != ThreadState::Running {
-                t.last_start_100ns = 0;
-            }
-            if new_state != ThreadState::Ready {
-                t.sched_next = 0;
-            }
-        });
-
-        if new_state == ThreadState::Ready {
-            ready_push_tid_locked(tid);
+    with_thread_mut(tid, |t| {
+        t.state = new_state;
+        if new_state != ThreadState::Running {
+            t.last_start_100ns = 0;
         }
+        if new_state != ThreadState::Ready {
+            t.sched_next = 0;
+        }
+    });
+
+    if new_state == ThreadState::Ready {
+        ready_push_tid_locked(tid);
     }
     let (ready_prio, ready_hint) = if new_state == ThreadState::Ready {
         (
@@ -852,6 +1223,8 @@ pub fn spawn(
     teb_va: u64,
     stack_base: u64,
     stack_size: u64,
+    kstack_base: u64,
+    kstack_size: u64,
     priority: u8,
 ) -> u32 {
     sched_lock_acquire();
@@ -859,7 +1232,17 @@ pub fn spawn(
         .alloc_with(|id| {
             let mut t = KThread::zeroed();
             t.init_spawned(
-                id, pid, pc, sp, arg, teb_va, stack_base, stack_size, priority,
+                id,
+                pid,
+                pc,
+                sp,
+                arg,
+                teb_va,
+                stack_base,
+                stack_size,
+                kstack_base,
+                kstack_size,
+                priority,
             );
             t
         })
@@ -883,6 +1266,19 @@ fn normalize_stack_size(max_stack_size_arg: u64) -> u64 {
         DEFAULT_THREAD_STACK_RESERVE
     } else {
         (max_stack_size_arg + (THREAD_STACK_ALIGN - 1)) & !(THREAD_STACK_ALIGN - 1)
+    }
+}
+
+#[inline(always)]
+fn alloc_kernel_stack() -> Option<(u64, u64)> {
+    let ptr = crate::alloc::alloc_zeroed(KERNEL_STACK_SIZE, 16)?;
+    Some((ptr as u64, KERNEL_STACK_SIZE as u64))
+}
+
+#[inline(always)]
+fn free_kernel_stack(base: u64) {
+    if base != 0 {
+        crate::alloc::dealloc(base as *mut u8);
     }
 }
 
@@ -989,6 +1385,14 @@ pub fn create_user_thread(
         let _ = vm_free_region(pid, stack_base);
         return Err(CreateThreadError::NoMemory);
     }
+    let (kstack_base, kstack_size) = match alloc_kernel_stack() {
+        Some(v) => v,
+        None => {
+            let _ = vm_free_region(pid, stack_base);
+            let _ = vm_free_region(pid, teb_va);
+            return Err(CreateThreadError::NoMemory);
+        }
+    };
     let stack_top = stack_base + stack_size;
     let mut stack_limit = stack_top.saturating_sub(stack_commit);
     if stack_limit <= stack_base {
@@ -998,6 +1402,7 @@ pub fn create_user_thread(
     if guard_page < stack_base || !vm_make_guard_page(pid, guard_page) {
         let _ = vm_free_region(pid, stack_base);
         let _ = vm_free_region(pid, teb_va);
+        free_kernel_stack(kstack_base);
         return Err(CreateThreadError::NoMemory);
     }
 
@@ -1012,15 +1417,26 @@ pub fn create_user_thread(
     {
         let _ = vm_free_region(pid, stack_base);
         let _ = vm_free_region(pid, teb_va);
+        free_kernel_stack(kstack_base);
         return Err(CreateThreadError::NoMemory);
     }
 
     let tid = spawn(
-        pid, entry_va, stack_top, arg, teb_va, stack_base, stack_size, priority,
+        pid,
+        entry_va,
+        stack_top,
+        arg,
+        teb_va,
+        stack_base,
+        stack_size,
+        kstack_base,
+        kstack_size,
+        priority,
     );
     if tid == 0 {
         let _ = vm_free_region(pid, stack_base);
         let _ = vm_free_region(pid, teb_va);
+        free_kernel_stack(kstack_base);
         return Err(CreateThreadError::NoMemory);
     }
     if !write_teb_u64(pid, teb_va, teb_layout::CLIENT_ID + 8, tid as u64) {
@@ -1036,8 +1452,8 @@ pub fn terminate_thread_by_tid(tid: u32) -> bool {
         return false;
     }
     sched_lock_acquire();
-    let (state, pid, stack_base, teb_va) =
-        with_thread(tid, |t| (t.state, t.pid, t.stack_base, t.teb_va));
+    let (state, pid, stack_base, teb_va, kstack_base) =
+        with_thread(tid, |t| (t.state, t.pid, t.stack_base, t.teb_va, t.kstack_base));
     if state == ThreadState::Free || state == ThreadState::Terminated {
         sched_lock_release();
         return false;
@@ -1045,6 +1461,8 @@ pub fn terminate_thread_by_tid(tid: u32) -> bool {
     with_thread_mut(tid, |t| {
         t.stack_base = 0;
         t.stack_size = 0;
+        t.kstack_base = 0;
+        t.kstack_size = 0;
         t.teb_va = 0;
         t.ctx.tpidr = 0;
     });
@@ -1053,6 +1471,7 @@ pub fn terminate_thread_by_tid(tid: u32) -> bool {
 
     let _ = vm_free_region(pid, stack_base);
     let _ = vm_free_region(pid, teb_va);
+    free_kernel_stack(kstack_base);
     crate::process::on_thread_terminated(pid, tid);
     true
 }
@@ -1127,6 +1546,7 @@ pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32
             // No runnable threads at all → WFI
             vcpu.current_tid = 0;
             set_current_cpu_thread(vcpu_id, 0);
+            set_vcpu_kernel_sp(vcpu_id, default_kernel_stack_top());
             return (cur_tid, 0);
         }
 
@@ -1158,6 +1578,7 @@ pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32
         });
         vcpu.current_tid = next_tid;
         set_current_cpu_thread(vcpu_id, next_tid);
+        set_vcpu_kernel_sp_for_tid(vcpu_id, next_tid);
 
         (cur_tid, next_tid)
     }
@@ -1182,12 +1603,14 @@ pub fn block_current(vcpu_id: usize, deadline: u64) -> (u32, u32) {
 
         let next_tid = ready_pop_for_vcpu_locked(vcpu_id);
         if next_tid == 0 {
+            set_vcpu_kernel_sp(vcpu_id, default_kernel_stack_top());
             return (cur_tid, 0); // WFI
         }
 
         set_thread_state_locked(next_tid, ThreadState::Running);
         vcpu.current_tid = next_tid;
         set_current_cpu_thread(vcpu_id, next_tid);
+        set_vcpu_kernel_sp_for_tid(vcpu_id, next_tid);
         (cur_tid, next_tid)
     }
 }
@@ -1206,13 +1629,9 @@ pub fn wake(tid: u32, result: u32) {
     if should_boost {
         apply_dynamic_wake_boost_locked(tid);
     }
-    let _ = set_wait_deadline_locked(tid, 0);
+    clear_wait_tracking_locked(tid);
     with_thread_mut(tid, |t| {
         t.wait_result = result;
-        t.wait_kind = WAIT_KIND_NONE;
-        t.wait_count = 0;
-        t.wait_signaled = 0;
-        t.wait_handles.fill(0);
         // Resume point for blocked NtWait* should return wake result in x0.
         t.ctx.x[0] = result as u64;
     });
@@ -1251,6 +1670,7 @@ pub fn set_initial_thread(vcpu_id: usize, tid: u32) {
         vcpu.current_tid = tid;
         set_thread_state_locked(tid, ThreadState::Running);
         set_current_cpu_thread(vcpu_id, tid);
+        set_vcpu_kernel_sp_for_tid(vcpu_id, tid);
         if let Some(pid) = thread_pid(tid) {
             crate::process::set_current_vcpu_pid(vcpu_id, pid);
         }
@@ -1262,12 +1682,16 @@ pub fn set_initial_thread(vcpu_id: usize, tid: u32) {
 /// Called at the top of svc_dispatch when current_tid() == 0.
 pub fn register_thread0(teb_va: u64) {
     let pid = crate::process::boot_pid();
+    let Some((kstack_base, kstack_size)) = alloc_kernel_stack() else {
+        return;
+    };
     let tid = thread_store_mut().alloc_with(|id| {
         let mut t = KThread::zeroed();
-        t.init_thread0(id, pid, teb_va);
+        t.init_thread0(id, pid, teb_va, kstack_base, kstack_size);
         t
     });
     let Some(tid) = tid else {
+        free_kernel_stack(kstack_base);
         return;
     };
     crate::process::on_thread_created(pid, tid);
@@ -1276,6 +1700,7 @@ pub fn register_thread0(teb_va: u64) {
         let vcpu = &mut (*SCHED.vcpus.get())[vid];
         vcpu.current_tid = tid;
         set_current_cpu_thread(vid, tid);
+        set_vcpu_kernel_sp_for_tid(vid, tid);
         crate::process::set_current_vcpu_pid(vid, pid);
     }
 }
@@ -1312,19 +1737,16 @@ pub fn check_timeouts(now_ticks: u64) -> bool {
         if !still_waiting {
             return;
         }
+        let was_delay_wait = with_thread(tid, |t| t.wait_kind == WAIT_KIND_DELAY);
         crate::sched::sync::cleanup_wait_registration_locked(tid);
-        let _ = set_wait_deadline_locked(tid, 0);
+        clear_wait_tracking_locked(tid);
         with_thread_mut(tid, |t| {
-            let timeout_result = if t.wait_kind == WAIT_KIND_DELAY {
+            let timeout_result = if was_delay_wait {
                 status::SUCCESS
             } else {
                 status::TIMEOUT
             };
             t.wait_result = timeout_result;
-            t.wait_kind = WAIT_KIND_NONE;
-            t.wait_count = 0;
-            t.wait_signaled = 0;
-            t.wait_handles.fill(0);
             t.ctx.x[0] = timeout_result as u64;
         });
         let suspended = with_thread(tid, |t| t.suspend_count != 0);
