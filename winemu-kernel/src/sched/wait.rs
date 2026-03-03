@@ -252,7 +252,7 @@ pub(crate) fn prepare_wait_locked(
 }
 
 // Unified blocking primitive for "current thread waits for something".
-// The actual context switch is still performed by trap-exit scheduling path.
+// Actual CPU handoff is owned by scheduler unlock edge / trap scheduling path.
 pub fn block_current_and_resched(
     wait_kind: u8,
     wait_handles: &[u64],

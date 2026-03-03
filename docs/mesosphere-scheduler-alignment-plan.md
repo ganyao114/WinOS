@@ -144,9 +144,9 @@
 6. hostcall completion 收敛为单路径：移除 completion 存储中间层，改为“到达即分发或按 host result 唤醒 waiter”。
 7. direct `kctx` 主路径已接通：
    - `sched_lock_release` 外层解锁时，若当前线程已离开 `Running` 且本核存在 reschedule 请求，会优先尝试切换到就绪内核 continuation 线程。
-   - `schedule_from_trap` 在 pick 到具备 continuation 的目标线程时，优先走 `switch_kernel_continuation(from, to)`。
-   - 无可切 continuation 目标时回落到现有 trap-exit 调度路径（不使用轮询+WFI 回退，也不在 wait-result 读取接口里做补偿切换）。
+   - `schedule_from_trap` 在“当前线程已离开 `Running`”场景下，要求目标线程必须具备 continuation，并强制走 `switch_kernel_continuation(from, to)`。
+   - unlock-edge / trap direct-kctx 两条切换路径在 `switch_kernel_continuation` 失败时统一 `panic`（不再静默回落）。
 
 待完成：
 
-1. 仍待收敛为“纯 direct-kctx 主路径”：当前实现是“direct-kctx 优先 + trap-exit 回落”，尚未完全移除回落分支。
+1. 仍待收敛为“纯 direct-kctx 主路径”：常规抢占与首次运行切换仍保留 trap-exit frame restore 分支，尚未完全单一路径化。

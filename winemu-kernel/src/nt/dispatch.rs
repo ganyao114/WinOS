@@ -229,6 +229,30 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
             let (from_sched, to) = schedule(vid, now, quantum_100ns);
             if to != 0 {
                 set_vcpu_idle_locked(vid, false);
+                // Current trap owner already left Running (typically entered Waiting)
+                // in this kernel critical section: require direct-kctx handoff.
+                if from_sched != 0 && from_sched != to && cur_not_running {
+                    if !has_kernel_continuation(to) {
+                        panic!(
+                            "sched: trap direct-kctx required but target has no continuation from={} to={}",
+                            from_sched, to
+                        );
+                    }
+                    save_ctx_for(from_sched, frame);
+                    let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
+                    sched_lock_release();
+                    crate::process::switch_to_thread_process(to);
+                    timer::schedule_running_slice_100ns(now, next_deadline, slice_remaining);
+                    let switched = unsafe { switch_kernel_continuation(from_sched, to) };
+                    if !switched {
+                        panic!(
+                            "sched: trap direct-kctx switch failed from={} to={}",
+                            from_sched, to
+                        );
+                    }
+                    from = current_tid();
+                    continue;
+                }
                 if from_sched != 0 && from_sched != to && has_kernel_continuation(to) {
                     save_ctx_for(from_sched, frame);
                     let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
@@ -237,9 +261,10 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
                     timer::schedule_running_slice_100ns(now, next_deadline, slice_remaining);
                     let switched = unsafe { switch_kernel_continuation(from_sched, to) };
                     if !switched {
-                        restore_ctx_to_frame(to, frame);
-                        set_thread_in_kernel(to, false);
-                        return from_sched != to;
+                        panic!(
+                            "sched: trap opportunistic direct-kctx switch failed from={} to={}",
+                            from_sched, to
+                        );
                     }
                     from = current_tid();
                     continue;
