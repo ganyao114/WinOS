@@ -32,6 +32,7 @@ pub fn sched_lock_acquire() {
 }
 
 pub fn sched_lock_release() {
+    let mut try_immediate_resched = false;
     unsafe {
         let count = SCHED.lock_count.get();
         if *count == 0 {
@@ -39,11 +40,27 @@ pub fn sched_lock_release() {
         }
         *count -= 1;
         if *count == 0 {
-            let _owner_vid = vcpu_id();
+            let owner_vid = vcpu_id();
             commit_deferred_scheduling_locked();
+            let owner_bit = 1u32 << owner_vid;
+            let cur = super::current_tid();
+            if cur != 0
+                && super::thread_exists(cur)
+                && (*SCHED.pending_reschedule_mask.get() & owner_bit) != 0
+                && super::with_thread(cur, |t| t.state == super::ThreadState::Waiting)
+                && super::has_dispatch_continuation(cur)
+            {
+                try_immediate_resched = true;
+            }
             *SCHED.lock_owner.get() = 0;
             spinlock_release();
         }
+    }
+    // Mesosphere-like unlock edge: when current kernel thread just entered
+    // waiting state, immediately jump back to dispatch continuation so
+    // scheduler can run without waiting for later trap-exit opportunities.
+    if try_immediate_resched {
+        let _ = super::reschedule_current_via_dispatch_continuation();
     }
 }
 

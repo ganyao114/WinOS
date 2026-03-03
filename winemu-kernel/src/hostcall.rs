@@ -122,50 +122,13 @@ fn wait_sync_completion(request_id: u64, timeout: WaitDeadline) -> Result<Submit
         let _ = unregister_pending_request(request_id);
         return Err(status::TIMEOUT);
     }
-
-    let deadline = match timeout {
-        WaitDeadline::Infinite => u64::MAX,
-        WaitDeadline::DeadlineTicks(t) => t,
-        WaitDeadline::Immediate => 0,
-    };
-    let mut spin_budget = 64u32;
-    let sched_deadline = if deadline == u64::MAX { 0 } else { deadline };
-
-    loop {
-        pump_completions();
-        if let Some(cpl) = take_completion(request_id) {
-            return Ok(to_submit_done(cpl));
-        }
-        if deadline != u64::MAX && sched::now_ticks() >= deadline {
-            break;
-        }
-
-        if spin_budget != 0 {
-            spin_budget -= 1;
-            core::hint::spin_loop();
-            continue;
-        }
-
-        if sched::block_current_and_switch_kernel(
-            sched::WAIT_KIND_HOSTCALL,
-            core::slice::from_ref(&request_id),
-            sched_deadline,
-            STATUS_PENDING,
-        ) {
-            // Resumed from kernel continuation switch.
-            continue;
-        }
-
-        // Back off in-kernel while waiting for completion progress.
-        // IRQ toggling mirrors timer idle path and avoids hard busy-spin.
-        crate::arch::cpu::irq_enable();
-        crate::arch::cpu::wait_for_interrupt();
-        crate::arch::cpu::irq_disable();
+    let st = wait_current_for_request(request_id, timeout);
+    if st != status::SUCCESS {
+        return Err(st);
     }
-
-    let _ = hypercall::hostcall_cancel(request_id);
-    let _ = unregister_pending_request(request_id);
-    Err(status::TIMEOUT)
+    take_completion(request_id)
+        .map(to_submit_done)
+        .ok_or(status::NO_MEMORY)
 }
 
 pub fn call_sync(
@@ -174,12 +137,10 @@ pub fn call_sync(
     timeout: WaitDeadline,
 ) -> Result<SubmitDone, u32> {
     let cur_tid = sched::current_tid();
-    let waiter_tid = if cur_tid != 0 && sched::thread_exists(cur_tid) {
-        cur_tid
-    } else {
-        0
-    };
-    match submit_tracked(owner_pid, waiter_tid, args)? {
+    if cur_tid == 0 || !sched::thread_exists(cur_tid) {
+        return Err(status::INVALID_PARAMETER);
+    }
+    match submit_tracked(owner_pid, cur_tid, args)? {
         SubmitOutcome::Completed(done) => Ok(done),
         SubmitOutcome::Pending { request_id } => wait_sync_completion(request_id, timeout),
     }
@@ -220,6 +181,7 @@ pub fn wait_current_for_request(request_id: u64, timeout: WaitDeadline) -> u32 {
     }
     if timeout == WaitDeadline::Immediate {
         let _ = hypercall::hostcall_cancel(request_id);
+        let _ = unregister_pending_request(request_id);
         return status::TIMEOUT;
     }
     let deadline = wait_deadline_ticks(timeout);
@@ -231,9 +193,15 @@ pub fn wait_current_for_request(request_id: u64, timeout: WaitDeadline) -> u32 {
     );
     if wait_status != status::SUCCESS {
         let _ = hypercall::hostcall_cancel(request_id);
+        let _ = unregister_pending_request(request_id);
         return wait_status;
     }
-    STATUS_PENDING
+    let resolved = sched::wait_current_pending_result();
+    if resolved == status::TIMEOUT {
+        let _ = hypercall::hostcall_cancel(request_id);
+        let _ = unregister_pending_request(request_id);
+    }
+    resolved
 }
 
 fn find_waiter_id_by_request(request_id: u64) -> u32 {
@@ -339,12 +307,15 @@ fn reap_stale_waiters() {
     }
 }
 
-fn store_completion(cpl: hypercall::HostCallCompletion) {
+fn store_completion(cpl: hypercall::HostCallCompletion) -> bool {
     let _ = unregister_pending_request(cpl.request_id);
-    let _ = state_mut().completions.alloc_with(|_| CompletedHostCall {
-        request_id: cpl.request_id,
-        cpl,
-    });
+    state_mut()
+        .completions
+        .alloc_with(|_| CompletedHostCall {
+            request_id: cpl.request_id,
+            cpl,
+        })
+        .is_some()
 }
 
 pub fn pump_completions() {
@@ -361,11 +332,17 @@ pub fn pump_completions() {
         let Some(waiter) = take_waiter_by_request(cpl.request_id) else {
             continue;
         };
+        let completion_stored = store_completion(*cpl);
         if crate::process::process_exists(waiter.owner_pid) && waiter.waiter_tid != 0 {
-            let st = map_host_result_to_status(cpl.host_result as u64);
+            // Hostcall sync waiter consumes real host result from completion payload.
+            // Wake status only represents scheduler wait lifecycle progress.
+            let st = if completion_stored {
+                status::SUCCESS
+            } else {
+                status::NO_MEMORY
+            };
             sched::wake(waiter.waiter_tid, st);
         }
-        store_completion(*cpl);
     }
 }
 

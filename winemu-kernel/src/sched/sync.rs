@@ -12,9 +12,10 @@ use core::ptr::null_mut;
 use winemu_shared::status;
 
 use super::{
-    boost_thread_priority_locked, clear_wait_tracking_locked, current_tid, prepare_wait_locked,
-    sched_lock_acquire, sched_lock_release, set_thread_priority_locked, thread_exists, wake,
-    with_thread, with_thread_mut, ThreadState, thread_count, MAX_WAIT_HANDLES, WAIT_KIND_DELAY,
+    begin_wait_locked, boost_thread_priority_locked, cancel_wait_locked, clear_wait_tracking_locked,
+    current_tid, end_wait_locked, prepare_wait_locked, prepare_wait_tracking_locked,
+    sched_lock_acquire, sched_lock_release, set_thread_priority_locked, thread_count,
+    thread_exists, with_thread, with_thread_mut, ThreadState, MAX_WAIT_HANDLES, WAIT_KIND_DELAY,
     WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY, WAIT_KIND_SINGLE,
 };
 
@@ -52,13 +53,13 @@ impl WaitQueue {
         self.tids.len()
     }
 
-    pub fn enqueue(&mut self, tid: u32) {
+    pub fn enqueue(&mut self, tid: u32) -> bool {
         if tid == 0 {
-            return;
+            return false;
         }
         for i in 0..self.tids.len() {
             if self.tids[i] == tid {
-                return;
+                return true;
             }
         }
 
@@ -74,9 +75,10 @@ impl WaitQueue {
         }
 
         if self.tids.try_reserve(1).is_err() {
-            return;
+            return false;
         }
         self.tids.insert(pos, tid);
+        true
     }
 
     pub fn dequeue_waiting(&mut self) -> u32 {
@@ -835,6 +837,16 @@ fn clear_wait_metadata(tid: u32) {
     clear_wait_tracking_locked(tid);
 }
 
+fn end_wait_on_sync_objects_locked(tid: u32, result: u32) -> bool {
+    cleanup_wait_registration_locked(tid);
+    end_wait_locked(tid, result)
+}
+
+pub(crate) fn cancel_wait_on_sync_objects_locked(tid: u32, result: u32) -> bool {
+    cleanup_wait_registration_locked(tid);
+    cancel_wait_locked(tid, result)
+}
+
 fn validate_thread_target_tid(target_tid: u32) -> bool {
     if target_tid == 0 || !thread_exists(target_tid) {
         return false;
@@ -858,7 +870,7 @@ struct WaitableObjectOps {
     validate: fn(obj_idx: u32) -> bool,
     is_signaled: fn(waiter_tid: u32, obj_idx: u32) -> bool,
     consume_signal: fn(waiter_tid: u32, obj_idx: u32) -> bool,
-    register_waiter: fn(obj_idx: u32, waiter_tid: u32),
+    register_waiter: fn(obj_idx: u32, waiter_tid: u32) -> bool,
     remove_waiter: fn(obj_idx: u32, waiter_tid: u32),
 }
 
@@ -951,12 +963,12 @@ fn event_consume_signal(_waiter_tid: u32, idx: u32) -> bool {
     true
 }
 
-fn event_register_waiter(idx: u32, waiter_tid: u32) {
+fn event_register_waiter(idx: u32, waiter_tid: u32) -> bool {
     let ev = event_ptr(idx);
     if ev.is_null() {
-        return;
+        return false;
     }
-    unsafe { (*ev).waiters.enqueue(waiter_tid) };
+    unsafe { (*ev).waiters.enqueue(waiter_tid) }
 }
 
 fn event_remove_waiter(idx: u32, waiter_tid: u32) {
@@ -1000,19 +1012,23 @@ fn mutex_consume_signal(waiter_tid: u32, idx: u32) -> bool {
     false
 }
 
-fn mutex_register_waiter(idx: u32, waiter_tid: u32) {
+fn mutex_register_waiter(idx: u32, waiter_tid: u32) -> bool {
     let m = mutex_ptr(idx);
     if m.is_null() {
-        return;
+        return false;
+    }
+    let queued = unsafe { (*m).waiters.enqueue(waiter_tid) };
+    if !queued {
+        return false;
     }
     unsafe {
-        (*m).waiters.enqueue(waiter_tid);
         let owner_tid = (*m).owner_tid;
         if owner_tid != 0 && owner_tid != waiter_tid {
             let waiter_prio = with_thread(waiter_tid, |t| t.priority);
             boost_thread_priority_locked(owner_tid, waiter_prio);
         }
     }
+    true
 }
 
 fn mutex_remove_waiter(idx: u32, waiter_tid: u32) {
@@ -1049,12 +1065,12 @@ fn semaphore_consume_signal(_waiter_tid: u32, idx: u32) -> bool {
     true
 }
 
-fn semaphore_register_waiter(idx: u32, waiter_tid: u32) {
+fn semaphore_register_waiter(idx: u32, waiter_tid: u32) -> bool {
     let s = semaphore_ptr(idx);
     if s.is_null() {
-        return;
+        return false;
     }
-    unsafe { (*s).waiters.enqueue(waiter_tid) };
+    unsafe { (*s).waiters.enqueue(waiter_tid) }
 }
 
 fn semaphore_remove_waiter(idx: u32, waiter_tid: u32) {
@@ -1082,15 +1098,15 @@ fn thread_consume_signal(waiter_tid: u32, idx: u32) -> bool {
     thread_is_signaled(waiter_tid, idx)
 }
 
-fn thread_register_waiter(idx: u32, waiter_tid: u32) {
+fn thread_register_waiter(idx: u32, waiter_tid: u32) -> bool {
     if !validate_thread_target_tid(idx) || !ensure_thread_waiters_slot(idx) {
-        return;
+        return false;
     }
     let q = thread_waiters_ptr(idx);
     if q.is_null() {
-        return;
+        return false;
     }
-    unsafe { (*q).enqueue(waiter_tid) };
+    unsafe { (*q).enqueue(waiter_tid) }
 }
 
 fn thread_remove_waiter(idx: u32, waiter_tid: u32) {
@@ -1113,15 +1129,15 @@ fn process_consume_signal(waiter_tid: u32, idx: u32) -> bool {
     process_is_signaled(waiter_tid, idx)
 }
 
-fn process_register_waiter(idx: u32, waiter_tid: u32) {
+fn process_register_waiter(idx: u32, waiter_tid: u32) -> bool {
     if idx == 0 || !crate::process::process_exists(idx) || !ensure_process_waiters_slot(idx) {
-        return;
+        return false;
     }
     let q = process_waiters_ptr(idx);
     if q.is_null() {
-        return;
+        return false;
     }
-    unsafe { (*q).enqueue(waiter_tid) };
+    unsafe { (*q).enqueue(waiter_tid) }
 }
 
 fn process_remove_waiter(idx: u32, waiter_tid: u32) {
@@ -1196,14 +1212,14 @@ fn consume_wait_all_locked(tid: u32, handles: &[u64]) -> bool {
     true
 }
 
-fn register_waiter_on_handle_locked(h: u64, tid: u32) {
+fn register_waiter_on_handle_locked(h: u64, tid: u32) -> bool {
     let Some((ops, idx)) = resolve_waitable_target_for_waiter(tid, h) else {
-        return;
+        return false;
     };
     if !(ops.validate)(idx) {
-        return;
+        return false;
     }
-    (ops.register_waiter)(idx, tid);
+    (ops.register_waiter)(idx, tid)
 }
 
 fn remove_waiter_from_handle_locked(h: u64, tid: u32) {
@@ -1238,9 +1254,7 @@ fn wait_index_for_handle_locked(tid: u32, h: u64) -> Option<usize> {
 }
 
 fn complete_wait_locked(tid: u32, result: u32) {
-    cleanup_wait_registration_locked(tid);
-    clear_wait_metadata(tid);
-    wake(tid, result);
+    let _ = end_wait_on_sync_objects_locked(tid, result);
 }
 
 fn try_complete_waiter_for_handle_locked(tid: u32, signaled_handle: u64) -> bool {
@@ -1304,7 +1318,7 @@ fn wake_queue_one_for_handle_locked(queue: &mut WaitQueue, signaled_handle: u64)
             return true;
         }
         if thread_exists(tid) && with_thread(tid, |t| t.state == ThreadState::Waiting) {
-            queue.enqueue(tid);
+            let _ = queue.enqueue(tid);
         }
         i += 1;
     }
@@ -1323,7 +1337,7 @@ fn wake_queue_all_for_handle_locked(queue: &mut WaitQueue, signaled_handle: u64)
         if try_complete_waiter_for_handle_locked(tid, signaled_handle) {
             woke += 1;
         } else if thread_exists(tid) && with_thread(tid, |t| t.state == ThreadState::Waiting) {
-            queue.enqueue(tid);
+            let _ = queue.enqueue(tid);
         }
         i += 1;
     }
@@ -1387,15 +1401,32 @@ fn wait_common_locked(handles: &[u64], wait_all: bool, timeout: WaitDeadline) ->
     } else {
         WAIT_KIND_MULTI_ANY
     };
-    let prepare = set_wait_metadata(cur, kind, handles, timeout);
+    let prepare = prepare_wait_tracking_locked(cur, kind, handles, STATUS_PENDING);
     if prepare != STATUS_SUCCESS {
         return prepare;
     }
 
-    let mut i = 0usize;
-    while i < handles.len() {
-        register_waiter_on_handle_locked(handles[i], cur);
-        i += 1;
+    let mut registered = 0usize;
+    while registered < handles.len() {
+        if !register_waiter_on_handle_locked(handles[registered], cur) {
+            while registered > 0 {
+                registered -= 1;
+                remove_waiter_from_handle_locked(handles[registered], cur);
+            }
+            clear_wait_metadata(cur);
+            with_thread_mut(cur, |t| t.wait_result = 0);
+            return STATUS_NO_MEMORY;
+        }
+        registered += 1;
+    }
+
+    let wait_deadline = deadline_ticks(timeout);
+    let begin = begin_wait_locked(cur, wait_deadline);
+    if begin != STATUS_SUCCESS {
+        cleanup_wait_registration_locked(cur);
+        clear_wait_metadata(cur);
+        with_thread_mut(cur, |t| t.wait_result = 0);
+        return begin;
     }
 
     STATUS_PENDING
@@ -1412,71 +1443,7 @@ pub fn wait_handle(h: u64, timeout: WaitDeadline) -> u32 {
 }
 
 fn wait_current_pending_sync_result() -> u32 {
-    let cur = current_tid();
-    if cur == 0 || !thread_exists(cur) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    crate::log::debug_u64(0xD201_0001);
-    crate::log::debug_u64(cur as u64);
-    sched_lock_acquire();
-    let (state_before, result_before) = with_thread(cur, |t| (t.state, t.wait_result));
-    sched_lock_release();
-    crate::log::debug_u64(0xD201_0002);
-    crate::log::debug_u64(state_before as u64);
-    crate::log::debug_u64(result_before as u64);
-    if state_before != ThreadState::Waiting {
-        return result_before;
-    }
-    let (kctx_sp, kctx_lr, dispatch_sp, dispatch_lr) = crate::sched::with_thread(cur, |t| {
-        (
-            t.kctx.sp_el1,
-            t.kctx.lr_el1,
-            t.dispatch_kctx.sp_el1,
-            t.dispatch_kctx.lr_el1,
-        )
-    });
-    crate::log::debug_u64(0xD202_0001);
-    crate::log::debug_u64(kctx_sp);
-    crate::log::debug_u64(0xD202_0002);
-    crate::log::debug_u64(kctx_lr);
-    crate::log::debug_u64(0xD202_0003);
-    crate::log::debug_u64(dispatch_sp);
-    crate::log::debug_u64(0xD202_0004);
-    crate::log::debug_u64(dispatch_lr);
-    let cur_sp: u64;
-    let cur_lr: u64;
-    unsafe {
-        core::arch::asm!("mov {0}, sp", out(reg) cur_sp, options(nostack, preserves_flags));
-        core::arch::asm!("mov {0}, x30", out(reg) cur_lr, options(nostack, preserves_flags));
-    }
-    let cur_ret_slot = if (cur_sp & 0x7) == 0 {
-        unsafe { (cur_sp as *const u64).read_volatile() }
-    } else {
-        0
-    };
-    crate::log::debug_u64(0xD204_0001);
-    crate::log::debug_u64(cur_sp);
-    crate::log::debug_u64(cur_lr);
-    crate::log::debug_u64(cur_ret_slot);
-    crate::log::debug_u64(0xD201_0003);
-    if !crate::sched::reschedule_current_via_dispatch_continuation() {
-        // Conservative fallback: keep legacy STATUS_PENDING path when
-        // continuation switch is unavailable on this call site.
-        crate::log::debug_u64(0xD201_E001);
-        return STATUS_PENDING;
-    }
-    crate::log::debug_u64(0xD201_0004);
-    sched_lock_acquire();
-    let (state_after, result_after) = with_thread(cur, |t| (t.state, t.wait_result));
-    sched_lock_release();
-    crate::log::debug_u64(0xD201_0005);
-    crate::log::debug_u64(state_after as u64);
-    crate::log::debug_u64(result_after as u64);
-    if state_after == ThreadState::Waiting {
-        crate::log::debug_u64(0xD201_E002);
-        return STATUS_PENDING;
-    }
-    result_after
+    crate::sched::wait_current_pending_result()
 }
 
 pub fn wait_handle_sync(h: u64, timeout: WaitDeadline) -> u32 {

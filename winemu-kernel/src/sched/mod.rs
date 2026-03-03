@@ -948,9 +948,122 @@ fn clear_wait_tracking_fields(thread: &mut KThread) {
     thread.wait_handles.fill(0);
 }
 
+#[inline(always)]
+fn set_wait_tracking_fields(thread: &mut KThread, wait_kind: u8, wait_handles: &[u64], pending_result: u32) {
+    let handle_count = wait_handles.len().min(MAX_WAIT_HANDLES);
+    thread.wait_result = pending_result;
+    thread.wait_kind = wait_kind;
+    thread.wait_count = handle_count as u8;
+    thread.wait_signaled = 0;
+    thread.wait_handles.fill(0);
+    let mut i = 0usize;
+    while i < handle_count {
+        thread.wait_handles[i] = wait_handles[i];
+        i += 1;
+    }
+}
+
 pub(crate) fn clear_wait_tracking_locked(tid: u32) {
+    if tid == 0 || !thread_exists(tid) {
+        return;
+    }
     clear_wait_deadline_locked(tid);
     with_thread_mut(tid, clear_wait_tracking_fields);
+    debug_assert!(
+        with_thread(tid, |t| {
+            t.wait_deadline == 0
+                && t.wait_timer_task_id == 0
+                && t.wait_timer_generation == 0
+                && t.wait_kind == WAIT_KIND_NONE
+                && t.wait_count == 0
+        }),
+        "clear_wait_tracking_locked must fully clear wait/timer metadata"
+    );
+}
+
+// Prepare wait bookkeeping fields under scheduler lock, without changing
+// runnable state or timer registration yet.
+pub(crate) fn prepare_wait_tracking_locked(
+    tid: u32,
+    wait_kind: u8,
+    wait_handles: &[u64],
+    pending_result: u32,
+) -> u32 {
+    debug_assert!(
+        sched_lock_held_by_current_vcpu(),
+        "prepare_wait_tracking_locked requires sched lock"
+    );
+    if tid == 0 || !thread_exists(tid) {
+        return status::INVALID_PARAMETER;
+    }
+    with_thread_mut(tid, |t| {
+        set_wait_tracking_fields(t, wait_kind, wait_handles, pending_result);
+    });
+    status::SUCCESS
+}
+
+// Begin wait on current metadata: move thread to Waiting and arm timeout.
+pub(crate) fn begin_wait_locked(tid: u32, wait_deadline: u64) -> u32 {
+    debug_assert!(
+        sched_lock_held_by_current_vcpu(),
+        "begin_wait_locked requires sched lock"
+    );
+    if tid == 0 || !thread_exists(tid) {
+        return status::INVALID_PARAMETER;
+    }
+
+    let old_state = with_thread(tid, |t| t.state);
+    set_thread_state_locked(tid, ThreadState::Waiting);
+    if !set_wait_deadline_locked(tid, wait_deadline) {
+        set_thread_state_locked(tid, old_state);
+        return status::NO_MEMORY;
+    }
+    status::SUCCESS
+}
+
+// End a waiting thread through scheduler-owned path:
+// clear wait/timer metadata, publish x0 result, and transition to Ready/Suspended.
+pub(crate) fn end_wait_locked(tid: u32, result: u32) -> bool {
+    debug_assert!(
+        sched_lock_held_by_current_vcpu(),
+        "end_wait_locked requires sched lock"
+    );
+    if tid == 0 || !thread_exists(tid) {
+        return false;
+    }
+    let state = with_thread(tid, |t| t.state);
+    if state != ThreadState::Waiting {
+        return false;
+    }
+
+    let should_boost = with_thread(tid, |t| {
+        result == status::SUCCESS && t.wait_kind != WAIT_KIND_DELAY && t.base_priority < 16
+    });
+    if should_boost {
+        apply_dynamic_wake_boost_locked(tid);
+    }
+
+    clear_wait_tracking_locked(tid);
+    with_thread_mut(tid, |t| {
+        t.wait_result = result;
+        t.ctx.x[0] = result as u64;
+    });
+    let suspended = with_thread(tid, |t| t.suspend_count != 0);
+    if suspended {
+        set_thread_state_locked(tid, ThreadState::Suspended);
+    } else {
+        set_thread_state_locked(tid, ThreadState::Ready);
+    }
+    debug_assert!(
+        with_thread(tid, |t| t.state != ThreadState::Waiting),
+        "end_wait_locked must leave waiting state"
+    );
+    true
+}
+
+#[inline(always)]
+pub(crate) fn cancel_wait_locked(tid: u32, result: u32) -> bool {
+    end_wait_locked(tid, result)
 }
 
 // Enter waiting state through a single scheduler-owned path so all wait users
@@ -962,36 +1075,18 @@ pub(crate) fn prepare_wait_locked(
     wait_deadline: u64,
     pending_result: u32,
 ) -> u32 {
-    debug_assert!(
-        sched_lock_held_by_current_vcpu(),
-        "prepare_wait_locked requires sched lock"
-    );
-    if tid == 0 || !thread_exists(tid) {
-        return status::INVALID_PARAMETER;
+    let prep = prepare_wait_tracking_locked(tid, wait_kind, wait_handles, pending_result);
+    if prep != status::SUCCESS {
+        return prep;
     }
-
-    let handle_count = wait_handles.len().min(MAX_WAIT_HANDLES);
-    with_thread_mut(tid, |t| {
-        t.wait_result = pending_result;
-        t.wait_kind = wait_kind;
-        t.wait_count = handle_count as u8;
-        t.wait_signaled = 0;
-        t.wait_handles.fill(0);
-        let mut i = 0usize;
-        while i < handle_count {
-            t.wait_handles[i] = wait_handles[i];
-            i += 1;
-        }
-    });
-    if !set_wait_deadline_locked(tid, wait_deadline) {
+    let begin = begin_wait_locked(tid, wait_deadline);
+    if begin != status::SUCCESS {
         with_thread_mut(tid, |t| {
             t.wait_result = 0;
             clear_wait_tracking_fields(t);
         });
-        return status::NO_MEMORY;
+        return begin;
     }
-
-    set_thread_state_locked(tid, ThreadState::Waiting);
     status::SUCCESS
 }
 
@@ -1014,6 +1109,29 @@ pub fn block_current_and_resched(
         return st;
     }
     status::SUCCESS
+}
+
+// Wait until current blocked kernel thread transitions out of Waiting and
+// return the scheduler-owned wait result.
+pub fn wait_current_pending_result() -> u32 {
+    let cur = current_tid();
+    if cur == 0 || !thread_exists(cur) {
+        return status::INVALID_PARAMETER;
+    }
+    loop {
+        sched_lock_acquire();
+        let (state, result) = with_thread(cur, |t| (t.state, t.wait_result));
+        sched_lock_release();
+        if state != ThreadState::Waiting {
+            return result;
+        }
+        if reschedule_current_via_dispatch_continuation() {
+            continue;
+        }
+        crate::arch::cpu::irq_enable();
+        crate::arch::cpu::wait_for_interrupt();
+        crate::arch::cpu::irq_disable();
+    }
 }
 
 // Try to block current thread and switch to another runnable kernel
@@ -1156,7 +1274,13 @@ pub unsafe fn switch_kernel_continuation(from_tid: u32, to_tid: u32) -> bool {
     if !thread_exists(from_tid) || !thread_exists(to_tid) {
         return false;
     }
-    if !has_kernel_continuation(to_tid) {
+    let can_switch = with_thread(from_tid, |t| {
+        t.in_kernel
+            && t.dispatch_valid
+            && t.dispatch_kctx.sp_el1 != 0
+            && t.dispatch_kctx.x19_x30[11] != 0
+    }) && has_kernel_continuation(to_tid);
+    if !can_switch {
         return false;
     }
     let from_ptr = thread_ptr(from_tid);
@@ -1164,7 +1288,9 @@ pub unsafe fn switch_kernel_continuation(from_tid: u32, to_tid: u32) -> bool {
     if from_ptr.is_null() || to_ptr.is_null() {
         return false;
     }
-    let from_kctx = unsafe { &mut (*from_ptr).kctx as *mut KernelContext };
+    // schedule_from_trap runs on dispatch continuation. Save current EL1 state
+    // back into from.dispatch_kctx, then restore target thread's kernel continuation.
+    let from_kctx = unsafe { &mut (*from_ptr).dispatch_kctx as *mut KernelContext };
     let to_kctx = unsafe { &(*to_ptr).kctx as *const KernelContext };
     unsafe {
         crate::arch::context::switch_kernel_context(from_kctx, to_kctx);
@@ -1490,6 +1616,13 @@ pub fn terminate_thread_by_tid(tid: u32) -> bool {
         sched_lock_release();
         return false;
     }
+    if state == ThreadState::Waiting {
+        debug_assert!(
+            with_thread(tid, |t| t.wait_kind != WAIT_KIND_NONE),
+            "waiting thread must carry wait metadata"
+        );
+        let _ = crate::sched::sync::cancel_wait_on_sync_objects_locked(tid, status::TIMEOUT);
+    }
     with_thread_mut(tid, |t| {
         t.stack_base = 0;
         t.stack_size = 0;
@@ -1650,29 +1783,7 @@ pub fn block_current(vcpu_id: usize, deadline: u64) -> (u32, u32) {
 /// 唤醒指定线程
 pub fn wake(tid: u32, result: u32) {
     sched_lock_acquire();
-    let state = with_thread(tid, |t| t.state);
-    if state != ThreadState::Waiting {
-        sched_lock_release();
-        return;
-    }
-    let should_boost = with_thread(tid, |t| {
-        result == status::SUCCESS && t.wait_kind != WAIT_KIND_DELAY && t.base_priority < 16
-    });
-    if should_boost {
-        apply_dynamic_wake_boost_locked(tid);
-    }
-    clear_wait_tracking_locked(tid);
-    with_thread_mut(tid, |t| {
-        t.wait_result = result;
-        // Resume point for blocked NtWait* should return wake result in x0.
-        t.ctx.x[0] = result as u64;
-    });
-    let suspended = with_thread(tid, |t| t.suspend_count != 0);
-    if suspended {
-        set_thread_state_locked(tid, ThreadState::Suspended);
-    } else {
-        set_thread_state_locked(tid, ThreadState::Ready);
-    }
+    let _ = end_wait_locked(tid, result);
     sched_lock_release();
 }
 
@@ -1770,24 +1881,17 @@ pub fn check_timeouts(now_ticks: u64) -> bool {
             return;
         }
         let was_delay_wait = with_thread(tid, |t| t.wait_kind == WAIT_KIND_DELAY);
-        crate::sched::sync::cleanup_wait_registration_locked(tid);
-        clear_wait_tracking_locked(tid);
-        with_thread_mut(tid, |t| {
-            let timeout_result = if was_delay_wait {
-                status::SUCCESS
-            } else {
-                status::TIMEOUT
-            };
-            t.wait_result = timeout_result;
-            t.ctx.x[0] = timeout_result as u64;
-        });
-        let suspended = with_thread(tid, |t| t.suspend_count != 0);
-        if suspended {
-            set_thread_state_locked(tid, ThreadState::Suspended);
+        let timeout_result = if was_delay_wait {
+            status::SUCCESS
         } else {
-            set_thread_state_locked(tid, ThreadState::Ready);
-        }
-        woke_any = true;
+            status::TIMEOUT
+        };
+        let ended = crate::sched::sync::cancel_wait_on_sync_objects_locked(tid, timeout_result);
+        debug_assert!(
+            ended,
+            "timeout cancellation must finish waiting thread transition"
+        );
+        woke_any |= ended;
     };
 
     loop {
