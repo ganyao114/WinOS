@@ -422,7 +422,6 @@ struct SyncState {
     semaphores: UnsafeCell<Option<ObjectStore<KSemaphore>>>,
     handles: UnsafeCell<Option<ObjectStore<HandleEntry>>>,
     refs: UnsafeCell<Option<Vec<ObjectRef>>>,
-    process_waiters: UnsafeCell<Option<Vec<WaitQueue>>>,
     wait_queue_pool: UnsafeCell<WaitQueueNodePool>,
 }
 
@@ -434,7 +433,6 @@ static SYNC_STATE: SyncState = SyncState {
     semaphores: UnsafeCell::new(None),
     handles: UnsafeCell::new(None),
     refs: UnsafeCell::new(None),
-    process_waiters: UnsafeCell::new(None),
     wait_queue_pool: UnsafeCell::new(WaitQueueNodePool::new()),
 };
 
@@ -487,46 +485,15 @@ fn thread_waiters_ptr(tid: u32) -> *mut WaitQueue {
     ptr
 }
 
-fn process_waiters_mut() -> &'static mut Vec<WaitQueue> {
-    unsafe {
-        let slot = &mut *SYNC_STATE.process_waiters.get();
-        if slot.is_none() {
-            let mut v = Vec::new();
-            let _ = v.try_reserve(1);
-            v.push(WaitQueue::new()); // index 0 unused
-            *slot = Some(v);
-        }
-        slot.as_mut().unwrap()
-    }
-}
-
-fn ensure_process_waiters_slot(pid: u32) -> bool {
-    let idx = pid as usize;
-    let waiters = process_waiters_mut();
-    if idx < waiters.len() {
-        return true;
-    }
-    let need = idx + 1 - waiters.len();
-    if waiters.try_reserve(need).is_err() {
-        return false;
-    }
-    while waiters.len() <= idx {
-        waiters.push(WaitQueue::new());
-    }
-    true
-}
-
 fn process_waiters_ptr(pid: u32) -> *mut WaitQueue {
-    let idx = pid as usize;
-    unsafe {
-        let Some(waiters) = (&mut *SYNC_STATE.process_waiters.get()).as_mut() else {
-            return null_mut();
-        };
-        if idx >= waiters.len() {
-            return null_mut();
-        }
-        &mut waiters[idx] as *mut WaitQueue
+    if pid == 0 || !crate::process::process_exists(pid) {
+        return null_mut();
     }
+    let mut ptr = null_mut();
+    let _ = crate::process::with_process_mut(pid, |p| {
+        ptr = &mut p.waiters as *mut WaitQueue;
+    });
+    ptr
 }
 
 fn event_ptr(idx: u32) -> *mut KEvent {
@@ -1262,7 +1229,7 @@ fn process_consume_signal(waiter_tid: u32, idx: u32) -> bool {
 }
 
 fn process_register_waiter(idx: u32, waiter_tid: u32) -> bool {
-    if idx == 0 || !crate::process::process_exists(idx) || !ensure_process_waiters_slot(idx) {
+    if idx == 0 || !crate::process::process_exists(idx) {
         return false;
     }
     let q = process_waiters_ptr(idx);

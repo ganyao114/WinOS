@@ -37,6 +37,7 @@ pub struct KProcess {
     pub main_thread_tid: u32,
     pub thread_count: u32,
     pub create_time_100ns: u64,
+    pub waiters: crate::sched::sync::WaitQueue, // waiters on this process handle termination
     pub address_space: ProcessAddressSpace,
 }
 
@@ -59,6 +60,7 @@ impl KProcess {
             main_thread_tid: 0,
             thread_count: 0,
             create_time_100ns,
+            waiters: crate::sched::sync::WaitQueue::new(),
             address_space,
         }
     }
