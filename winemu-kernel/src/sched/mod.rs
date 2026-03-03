@@ -1166,7 +1166,10 @@ pub fn terminate_thread_by_tid(tid: u32) -> bool {
             with_thread(tid, |t| t.wait_kind != WAIT_KIND_NONE),
             "waiting thread must carry wait metadata"
         );
-        let _ = crate::sched::sync::cancel_wait_on_sync_objects_locked(tid, status::TIMEOUT);
+        let _ = crate::sched::sync::cancel_wait_on_sync_objects_locked(
+            tid,
+            status::THREAD_IS_TERMINATING,
+        );
     }
     with_thread_mut(tid, |t| {
         t.stack_base = 0;

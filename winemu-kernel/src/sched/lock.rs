@@ -40,13 +40,11 @@ pub fn sched_lock_release() {
         }
         *count -= 1;
         if *count == 0 {
-            let owner_vid = vcpu_id();
+            let _owner_vid = vcpu_id();
             commit_deferred_scheduling_locked();
-            let owner_bit = 1u32 << owner_vid;
             let cur = super::current_tid();
             if cur != 0
                 && super::thread_exists(cur)
-                && (*SCHED.pending_reschedule_mask.get() & owner_bit) != 0
                 && super::with_thread(cur, |t| t.state == super::ThreadState::Waiting)
                 && super::has_dispatch_continuation(cur)
             {

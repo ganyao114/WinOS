@@ -267,6 +267,8 @@ pub mod status {
     pub const NO_MORE_ENTRIES: u32 = 0x8000_001A;
     pub const BUFFER_TOO_SMALL: u32 = 0xC000_0023;
     pub const NO_MORE_FILES: u32 = 0x8000_0006;
+    pub const THREAD_IS_TERMINATING: u32 = 0xC000_004B;
+    pub const CANCELLED: u32 = 0xC000_0120;
     pub const NOT_IMPLEMENTED: u32 = 0xC000_0002;
 }
 

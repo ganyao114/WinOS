@@ -38,52 +38,195 @@ pub enum WaitDeadline {
     DeadlineTicks(u64),
 }
 
-// ── 等待队列（动态，按优先级排序）─────────────────────────────
+// ── 等待队列（固定节点池，按优先级排序，无堆分配）───────────────
+
+const WAIT_QUEUE_NODE_CAPACITY: usize = 16_384;
+
+#[derive(Clone, Copy)]
+struct WaitQueueNode {
+    tid: u32,
+    next: u32,
+}
+
+impl WaitQueueNode {
+    const EMPTY: Self = Self { tid: 0, next: 0 };
+}
+
+struct WaitQueueNodePool {
+    nodes: [WaitQueueNode; WAIT_QUEUE_NODE_CAPACITY + 1], // index 0 is null
+    free_head: u32,
+    initialized: bool,
+}
+
+impl WaitQueueNodePool {
+    const fn new() -> Self {
+        Self {
+            nodes: [WaitQueueNode::EMPTY; WAIT_QUEUE_NODE_CAPACITY + 1],
+            free_head: 0,
+            initialized: false,
+        }
+    }
+
+    fn ensure_init(&mut self) {
+        if self.initialized {
+            return;
+        }
+        if WAIT_QUEUE_NODE_CAPACITY == 0 {
+            self.free_head = 0;
+            self.initialized = true;
+            return;
+        }
+        let mut i = 1usize;
+        while i <= WAIT_QUEUE_NODE_CAPACITY {
+            let next = if i == WAIT_QUEUE_NODE_CAPACITY {
+                0
+            } else {
+                (i + 1) as u32
+            };
+            self.nodes[i] = WaitQueueNode { tid: 0, next };
+            i += 1;
+        }
+        self.free_head = 1;
+        self.initialized = true;
+    }
+
+    fn alloc_node(&mut self, tid: u32, next: u32) -> u32 {
+        if tid == 0 {
+            return 0;
+        }
+        self.ensure_init();
+        let idx = self.free_head;
+        if idx == 0 {
+            return 0;
+        }
+        self.free_head = self.nodes[idx as usize].next;
+        self.nodes[idx as usize] = WaitQueueNode { tid, next };
+        idx
+    }
+
+    fn free_node(&mut self, idx: u32) {
+        if idx == 0 {
+            return;
+        }
+        let uidx = idx as usize;
+        if uidx > WAIT_QUEUE_NODE_CAPACITY {
+            return;
+        }
+        self.nodes[uidx] = WaitQueueNode {
+            tid: 0,
+            next: self.free_head,
+        };
+        self.free_head = idx;
+    }
+
+    #[inline]
+    fn tid(&self, idx: u32) -> u32 {
+        if idx == 0 {
+            return 0;
+        }
+        let uidx = idx as usize;
+        if uidx > WAIT_QUEUE_NODE_CAPACITY {
+            return 0;
+        }
+        self.nodes[uidx].tid
+    }
+
+    #[inline]
+    fn next(&self, idx: u32) -> u32 {
+        if idx == 0 {
+            return 0;
+        }
+        let uidx = idx as usize;
+        if uidx > WAIT_QUEUE_NODE_CAPACITY {
+            return 0;
+        }
+        self.nodes[uidx].next
+    }
+
+    #[inline]
+    fn set_next(&mut self, idx: u32, next: u32) {
+        if idx == 0 {
+            return;
+        }
+        let uidx = idx as usize;
+        if uidx > WAIT_QUEUE_NODE_CAPACITY {
+            return;
+        }
+        self.nodes[uidx].next = next;
+    }
+}
+
+#[inline]
+fn waiter_priority(tid: u32) -> u8 {
+    if tid == 0 || !thread_exists(tid) {
+        0
+    } else {
+        with_thread(tid, |t| t.priority)
+    }
+}
 
 pub struct WaitQueue {
-    tids: Vec<u32>,
+    head: u32,
+    len: usize,
 }
 
 impl WaitQueue {
     pub fn new() -> Self {
-        Self { tids: Vec::new() }
+        Self { head: 0, len: 0 }
     }
 
     pub fn len(&self) -> usize {
-        self.tids.len()
+        self.len
     }
 
     pub fn enqueue(&mut self, tid: u32) -> bool {
         if tid == 0 {
             return false;
         }
-        for i in 0..self.tids.len() {
-            if self.tids[i] == tid {
+        let prio = waiter_priority(tid);
+        let pool = wait_queue_pool_mut();
+
+        let mut prev = 0u32;
+        let mut cur = self.head;
+        while cur != 0 {
+            let cur_tid = pool.tid(cur);
+            if cur_tid == tid {
                 return true;
             }
-        }
-
-        let prio = with_thread(tid, |t| t.priority);
-        let mut pos = self.tids.len();
-        for i in 0..self.tids.len() {
-            let cur_tid = self.tids[i];
-            let cur_prio = with_thread(cur_tid, |t| t.priority);
+            let cur_prio = waiter_priority(cur_tid);
             if prio > cur_prio {
-                pos = i;
                 break;
             }
+            prev = cur;
+            cur = pool.next(cur);
         }
 
-        if self.tids.try_reserve(1).is_err() {
+        let node = pool.alloc_node(tid, cur);
+        if node == 0 {
             return false;
         }
-        self.tids.insert(pos, tid);
+        if prev == 0 {
+            self.head = node;
+        } else {
+            pool.set_next(prev, node);
+        }
+        self.len = self.len.saturating_add(1);
         true
     }
 
     pub fn dequeue_waiting(&mut self) -> u32 {
-        while !self.tids.is_empty() {
-            let tid = self.tids.remove(0);
+        while self.head != 0 {
+            let tid = {
+                let pool = wait_queue_pool_mut();
+                let node = self.head;
+                let tid = pool.tid(node);
+                self.head = pool.next(node);
+                pool.free_node(node);
+                tid
+            };
+            if self.len != 0 {
+                self.len -= 1;
+            }
             if tid != 0
                 && thread_exists(tid)
                 && with_thread(tid, |t| t.state == ThreadState::Waiting)
@@ -95,37 +238,54 @@ impl WaitQueue {
     }
 
     pub fn remove(&mut self, tid: u32) {
-        if tid == 0 || self.tids.is_empty() {
+        if tid == 0 || self.head == 0 {
             return;
         }
-        for i in 0..self.tids.len() {
-            if self.tids[i] == tid {
-                self.tids.remove(i);
+        let pool = wait_queue_pool_mut();
+        let mut prev = 0u32;
+        let mut cur = self.head;
+        while cur != 0 {
+            let cur_tid = pool.tid(cur);
+            let next = pool.next(cur);
+            if cur_tid == tid {
+                if prev == 0 {
+                    self.head = next;
+                } else {
+                    pool.set_next(prev, next);
+                }
+                pool.free_node(cur);
+                if self.len != 0 {
+                    self.len -= 1;
+                }
                 return;
             }
+            prev = cur;
+            cur = next;
         }
     }
 
     pub fn highest_waiting_priority(&self) -> Option<u8> {
         let mut best: Option<u8> = None;
-        for i in 0..self.tids.len() {
-            let tid = self.tids[i];
-            if tid == 0 || !thread_exists(tid) {
-                continue;
-            }
-            let prio = with_thread(tid, |t| {
-                if t.state == ThreadState::Waiting {
-                    Some(t.priority)
-                } else {
-                    None
+        let pool = wait_queue_pool();
+        let mut cur = self.head;
+        while cur != 0 {
+            let tid = pool.tid(cur);
+            if tid != 0 && thread_exists(tid) {
+                let prio = with_thread(tid, |t| {
+                    if t.state == ThreadState::Waiting {
+                        Some(t.priority)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(p) = prio {
+                    best = match best {
+                        Some(cur_best) if cur_best >= p => Some(cur_best),
+                        _ => Some(p),
+                    };
                 }
-            });
-            if let Some(p) = prio {
-                best = match best {
-                    Some(cur) if cur >= p => Some(cur),
-                    _ => Some(p),
-                };
             }
+            cur = pool.next(cur);
         }
         best
     }
@@ -264,6 +424,7 @@ struct SyncState {
     refs: UnsafeCell<Option<Vec<ObjectRef>>>,
     thread_waiters: UnsafeCell<Option<Vec<WaitQueue>>>,
     process_waiters: UnsafeCell<Option<Vec<WaitQueue>>>,
+    wait_queue_pool: UnsafeCell<WaitQueueNodePool>,
 }
 
 unsafe impl Sync for SyncState {}
@@ -276,7 +437,16 @@ static SYNC_STATE: SyncState = SyncState {
     refs: UnsafeCell::new(None),
     thread_waiters: UnsafeCell::new(None),
     process_waiters: UnsafeCell::new(None),
+    wait_queue_pool: UnsafeCell::new(WaitQueueNodePool::new()),
 };
+
+fn wait_queue_pool_mut() -> &'static mut WaitQueueNodePool {
+    unsafe { &mut *SYNC_STATE.wait_queue_pool.get() }
+}
+
+fn wait_queue_pool() -> &'static WaitQueueNodePool {
+    unsafe { &*SYNC_STATE.wait_queue_pool.get() }
+}
 
 fn events_store_mut() -> &'static mut ObjectStore<KEvent> {
     unsafe {
@@ -1401,6 +1571,15 @@ fn wait_common_locked(handles: &[u64], wait_all: bool, timeout: WaitDeadline) ->
         return prepare;
     }
 
+    let old_state = with_thread(cur, |t| t.state);
+    let wait_deadline = deadline_ticks(timeout);
+    let begin = begin_wait_locked(cur, wait_deadline);
+    if begin != STATUS_SUCCESS {
+        clear_wait_metadata(cur);
+        with_thread_mut(cur, |t| t.wait_result = 0);
+        return begin;
+    }
+
     let mut registered = 0usize;
     while registered < handles.len() {
         if !register_waiter_on_handle_locked(handles[registered], cur) {
@@ -1410,18 +1589,10 @@ fn wait_common_locked(handles: &[u64], wait_all: bool, timeout: WaitDeadline) ->
             }
             clear_wait_metadata(cur);
             with_thread_mut(cur, |t| t.wait_result = 0);
+            set_thread_state_locked(cur, old_state);
             return STATUS_NO_MEMORY;
         }
         registered += 1;
-    }
-
-    let wait_deadline = deadline_ticks(timeout);
-    let begin = begin_wait_locked(cur, wait_deadline);
-    if begin != STATUS_SUCCESS {
-        cleanup_wait_registration_locked(cur);
-        clear_wait_metadata(cur);
-        with_thread_mut(cur, |t| t.wait_result = 0);
-        return begin;
     }
 
     STATUS_PENDING

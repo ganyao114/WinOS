@@ -261,6 +261,9 @@ pub fn wait_current_pending_result() -> u32 {
     if cur == 0 || !thread_exists(cur) {
         return status::INVALID_PARAMETER;
     }
+    if !has_dispatch_continuation(cur) {
+        return status::INVALID_PARAMETER;
+    }
     loop {
         sched_lock_acquire();
         let (state, result) = with_thread(cur, |t| (t.state, t.wait_result));
@@ -268,12 +271,9 @@ pub fn wait_current_pending_result() -> u32 {
         if state != ThreadState::Waiting {
             return result;
         }
-        if reschedule_current_via_dispatch_continuation() {
-            continue;
+        if !reschedule_current_via_dispatch_continuation() {
+            return status::INVALID_PARAMETER;
         }
-        crate::arch::cpu::irq_enable();
-        crate::arch::cpu::wait_for_interrupt();
-        crate::arch::cpu::irq_disable();
     }
 }
 
@@ -329,50 +329,13 @@ pub fn check_timeouts(now_ticks: u64) -> bool {
         timeout_now(tid);
     }
 
-    // Fallback scan: if timer task indexing becomes stale/corrupted, we still
-    // honor absolute wait deadlines and avoid indefinite waits.
-    unsafe {
-        if let Some(store) = (&*SCHED.threads.get()).as_ref() {
-            store.for_each_live_id(|tid| {
-                if tid == 0 {
-                    return;
-                }
-                let due = with_thread(tid, |t| {
-                    t.state == ThreadState::Waiting && t.wait_deadline != 0 && t.wait_deadline <= now_ticks
-                });
-                if due {
-                    timeout_now(tid);
-                }
-            });
-        }
-    }
-
     woke_any
 }
 
 /// Return the earliest waiting deadline (100ns), 0 if none.
 /// Caller must hold scheduler lock.
 pub fn next_wait_deadline_locked() -> u64 {
-    let timer_deadline = timer::next_deadline_locked();
-    if timer_deadline != 0 {
-        return timer_deadline;
-    }
-
-    let mut best = 0u64;
-    unsafe {
-        if let Some(store) = (&*SCHED.threads.get()).as_ref() {
-            store.for_each_live_ptr(|_tid, ptr| {
-                let t = &*ptr;
-                if t.state != ThreadState::Waiting || t.wait_deadline == 0 {
-                    return;
-                }
-                if best == 0 || t.wait_deadline < best {
-                    best = t.wait_deadline;
-                }
-            });
-        }
-    }
-    best
+    timer::next_deadline_locked()
 }
 
 /// Locking wrapper for callers that are not already in scheduler critical section.

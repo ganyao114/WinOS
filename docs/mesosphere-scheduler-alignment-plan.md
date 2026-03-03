@@ -102,3 +102,28 @@
 3. `target/debug/winemu run tests/thread_test/target/aarch64-pc-windows-msvc/release/thread_test.exe`
 4. `bash scripts/stress-regression.sh 2 core`
 5. `target/debug/winemu run tests/full_test/target/aarch64-pc-windows-msvc/release/full_test.exe`
+
+## 9. Phase C 严格差异收敛（按顺序执行）
+
+1. [x] 移除 `wait_current_pending_result()` 的 `WFI` 回退，强制 continuation 调度路径。
+2. [x] 强化 `sched_lock_release()` 的 unlock 边调度触发，使其更接近 Mesosphere `EnableScheduling` 语义。
+3. [x] 调整 `sync` 等待时序，收敛到 `BeginWait -> TimerTask -> Unlock+Schedule` 主序列（含失败回滚）。
+4. [x] 将 `WaitQueue` 从动态 `Vec` 收敛到预分配/无堆分配路径，降低 runtime 分配失败面。
+5. [x] 移除 timeout 全线程兜底扫描，改为 timer task 唯一真源路径。
+6. [x] 细化 terminate/cancel 的等待结果码语义，不再统一使用 `TIMEOUT`。
+
+### Phase C 每步验证要求
+
+1. `cargo test -q`
+2. `target/debug/winemu run guest/sysroot/process_test.exe`
+3. `target/debug/winemu run tests/thread_test/target/aarch64-pc-windows-msvc/release/thread_test.exe`
+4. `target/debug/winemu run tests/full_test/target/aarch64-pc-windows-msvc/release/full_test.exe`
+
+### Phase C 执行记录（2026-03-03）
+
+1. Step 1（移除 `WFI` 回退）已完成；4 项验证通过。
+2. Step 2（强化 unlock 边调度触发）已完成；4 项验证通过。
+3. Step 3（同步等待时序收敛 + 失败回滚）已完成；4 项验证通过。
+4. Step 4（`WaitQueue` 无堆分配化）已完成；4 项验证通过。
+5. Step 5（移除 timeout 全线程兜底扫描，timer task 唯一真源）已完成；4 项验证通过。
+6. Step 6（terminate/cancel 结果码语义细化）已完成；4 项验证通过。
