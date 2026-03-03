@@ -171,55 +171,6 @@ pub fn vcpu_thread(
                 continue 'run;
             }
             VmExit::Hypercall { nr, args } => {
-                if nr == winemu_shared::nr::NT_SYSCALL {
-                    let regs = vcpu.regs().unwrap();
-                    let syscall_nr = regs.x[9];
-                    let table_nr = regs.x[10];
-                    // x11 = orig_x0: SVC handler does `mov x11, x0` before hvc
-                    let x0 = regs.x[11];
-                    let x1 = regs.x[1];
-                    let x2 = regs.x[2];
-                    let x3 = regs.x[3];
-                    let x4 = regs.x[4];
-                    let x5 = regs.x[5];
-                    let x6 = regs.x[6];
-                    let x7 = regs.x[7];
-                    let sp_el0 = vcpu.sp_el0().unwrap_or(0); // user stack — for reading stack args
-                    let full_args = [syscall_nr, table_nr, x0, x1, x2, x3, x4, x5, x6, x7];
-                    let result = hc_mgr.dispatch_nt_syscall(full_args, sp_el0, tid);
-                    match result {
-                        HypercallResult::Sync(ret)
-                        | HypercallResult::Sched(SchedResult::Sync(ret)) => {
-                            set_x0(&mut *vcpu, ret);
-                            let ctx = save_ctx(&mut *vcpu);
-                            sched.save_ctx(tid, ctx);
-                        }
-                        HypercallResult::Sync2 { x0, x1 } => {
-                            set_x0_x1(&mut *vcpu, x0, x1);
-                            let ctx = save_ctx(&mut *vcpu);
-                            sched.save_ctx(tid, ctx);
-                        }
-                        HypercallResult::Sched(SchedResult::Block(req)) => {
-                            let ctx = save_ctx(&mut *vcpu);
-                            sched.save_ctx(tid, ctx);
-                            sched.set_waiting(tid, req);
-                            current = None;
-                        }
-                        HypercallResult::Sched(SchedResult::Yield) => {
-                            let ctx = save_ctx(&mut *vcpu);
-                            sched.save_ctx(tid, ctx);
-                            sched.push_ready(tid);
-                            current = None;
-                        }
-                        HypercallResult::Sched(SchedResult::Exit(code)) => {
-                            let ctx = save_ctx(&mut *vcpu);
-                            sched.save_ctx(tid, ctx);
-                            sched.terminate(tid, code);
-                            current = None;
-                        }
-                    }
-                    continue 'run;
-                }
                 let result = hc_mgr.dispatch(nr, args, tid);
                 match result {
                     HypercallResult::Sync(ret) | HypercallResult::Sched(SchedResult::Sync(ret)) => {

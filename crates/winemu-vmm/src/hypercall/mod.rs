@@ -5,12 +5,12 @@ use crate::memory::GuestMemory;
 use crate::sched::sync::{EventObj, MutexObj, SemaphoreObj, SyncHandle, SyncObject};
 use crate::sched::{SchedResult, Scheduler, ThreadId};
 use crate::section::SectionTable;
-use crate::syscall::{DispatchResult, SyscallDispatcher};
 use crate::vaspace::VaSpace;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use winemu_shared::hostcall as hc;
 use winemu_shared::nr;
+use winemu_shared::status;
 
 // HOST_MMAP can be used before KERNEL_READY (guest DLL resolve during boot).
 // Keep that early mapping away from kernel image/heap region to avoid clobbering.
@@ -136,7 +136,6 @@ pub enum HypercallResult {
 }
 
 pub struct HypercallManager {
-    syscall_table_toml: String,
     exe_image: Vec<u8>,
     exe_path: std::path::PathBuf,
     memory: Arc<RwLock<GuestMemory>>,
@@ -145,7 +144,6 @@ pub struct HypercallManager {
     files: FileTable,
     sections: SectionTable,
     pub sched: Arc<Scheduler>,
-    syscall_disp: SyscallDispatcher,
     host_files: Arc<HostFileTable>,
     hostcall: HostCallBroker,
     mono_start: Instant,
@@ -153,7 +151,7 @@ pub struct HypercallManager {
 
 impl HypercallManager {
     pub fn new(
-        syscall_table_toml: String,
+        _syscall_table_toml: String,
         memory: Arc<RwLock<GuestMemory>>,
         root: impl Into<std::path::PathBuf>,
         sched: Arc<Scheduler>,
@@ -162,7 +160,6 @@ impl HypercallManager {
         let exe_path: std::path::PathBuf = exe_path.into();
         let exe_image = std::fs::read(&exe_path).unwrap_or_default();
         let root_path: std::path::PathBuf = root.into();
-        let syscall_disp = SyscallDispatcher::new(&syscall_table_toml);
         let host_files = Arc::new(HostFileTable::new(root_path.clone()));
         let mut vaspace_init = VaSpace::new();
         vaspace_init.set_base(EARLY_HOST_MMAP_BASE);
@@ -174,7 +171,6 @@ impl HypercallManager {
             Arc::clone(&sched),
         );
         Self {
-            syscall_table_toml,
             exe_image,
             exe_path,
             memory,
@@ -183,7 +179,6 @@ impl HypercallManager {
             files: FileTable::new(root_path),
             sections: SectionTable::new(),
             sched,
-            syscall_disp,
             host_files,
             hostcall,
             mono_start: Instant::now(),
@@ -254,6 +249,10 @@ impl HypercallManager {
                     }
                 }
                 HypercallResult::Sync(0)
+            }
+            nr::NT_SYSCALL => {
+                log::warn!("legacy NT_SYSCALL path is removed; handle in guest kernel");
+                HypercallResult::Sync(status::NOT_IMPLEMENTED as u64)
             }
             nr::LOAD_SYSCALL_TABLE => {
                 if args[2] == 0 {
@@ -1004,35 +1003,6 @@ impl HypercallManager {
             read_u64(0x0e8), // x29_orig
             read_u64(0x0f0), // x30_orig
         ]
-    }
-
-    /// NT_SYSCALL with full register layout:
-    /// args = [syscall_nr, table_nr, x0, x1, x2, x3, x4, x5, x6, x7]
-    /// guest_sp = user stack pointer at SVC time
-    pub fn dispatch_nt_syscall(
-        &self,
-        args: [u64; 10],
-        guest_sp: u64,
-        tid: ThreadId,
-    ) -> HypercallResult {
-        let syscall_nr = args[0];
-        let table_nr = args[1];
-        let dispatch_args = [syscall_nr, table_nr, args[2], args[3], args[4], args[5]];
-        let result = self.syscall_disp.dispatch_full(
-            dispatch_args,
-            [args[6], args[7], args[8], args[9]],
-            tid,
-            &self.memory,
-            &self.files,
-            &self.sections,
-            &self.sched,
-            &self.vaspace,
-            guest_sp,
-        );
-        match result {
-            DispatchResult::Sync(v) => HypercallResult::Sync(v),
-            DispatchResult::Sched(s) => HypercallResult::Sched(s),
-        }
     }
 }
 

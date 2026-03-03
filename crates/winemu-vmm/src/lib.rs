@@ -6,7 +6,6 @@ pub mod memory;
 pub mod phys;
 pub mod sched;
 pub mod section;
-pub mod syscall;
 pub mod vaspace;
 pub mod vcpu;
 
