@@ -1,5 +1,10 @@
 use core::arch::global_asm;
 
+#[no_mangle]
+extern "C" fn timer_irq_el1_dispatch() {
+    crate::hostcall::pump_completions();
+}
+
 // Guest EOI contract for HVF:
 // clear CNTV_CTL_EL0.ENABLE in IRQ entry so host can observe end-of-interrupt
 // and unmask vtimer for the next one-shot.
@@ -9,6 +14,42 @@ global_asm!(
     "__timer_irq_el1:",
     "msr cntv_ctl_el0, xzr",
     "isb",
+    // Save interrupted EL1 GPRs, dispatch IRQ side effects, then resume.
+    "sub sp, sp, #0x100",
+    "stp x0,  x1,  [sp, #0x000]",
+    "stp x2,  x3,  [sp, #0x010]",
+    "stp x4,  x5,  [sp, #0x020]",
+    "stp x6,  x7,  [sp, #0x030]",
+    "stp x8,  x9,  [sp, #0x040]",
+    "stp x10, x11, [sp, #0x050]",
+    "stp x12, x13, [sp, #0x060]",
+    "stp x14, x15, [sp, #0x070]",
+    "stp x16, x17, [sp, #0x080]",
+    "stp x18, x19, [sp, #0x090]",
+    "stp x20, x21, [sp, #0x0a0]",
+    "stp x22, x23, [sp, #0x0b0]",
+    "stp x24, x25, [sp, #0x0c0]",
+    "stp x26, x27, [sp, #0x0d0]",
+    "stp x28, x29, [sp, #0x0e0]",
+    "str x30,      [sp, #0x0f0]",
+    "bl timer_irq_el1_dispatch",
+    "ldp x0,  x1,  [sp, #0x000]",
+    "ldp x2,  x3,  [sp, #0x010]",
+    "ldp x4,  x5,  [sp, #0x020]",
+    "ldp x6,  x7,  [sp, #0x030]",
+    "ldp x8,  x9,  [sp, #0x040]",
+    "ldp x10, x11, [sp, #0x050]",
+    "ldp x12, x13, [sp, #0x060]",
+    "ldp x14, x15, [sp, #0x070]",
+    "ldp x16, x17, [sp, #0x080]",
+    "ldp x18, x19, [sp, #0x090]",
+    "ldp x20, x21, [sp, #0x0a0]",
+    "ldp x22, x23, [sp, #0x0b0]",
+    "ldp x24, x25, [sp, #0x0c0]",
+    "ldp x26, x27, [sp, #0x0d0]",
+    "ldp x28, x29, [sp, #0x0e0]",
+    "ldr x30,      [sp, #0x0f0]",
+    "add sp, sp, #0x100",
     "eret",
 );
 

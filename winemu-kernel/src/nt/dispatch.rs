@@ -206,10 +206,10 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
     if from != 0 {
         save_ctx_for(from, frame);
     }
-    if drain_hostcall {
-        crate::hostcall::pump_completions();
-    }
     loop {
+        if drain_hostcall {
+            crate::hostcall::pump_completions();
+        }
         let now = now_ticks();
         sched_lock_acquire();
         set_vcpu_idle_locked(vid, false);
@@ -288,6 +288,11 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                 crate::process::switch_to_thread_process(to);
                 if from_sched == 0 {
                     // We were idling; current frame no longer belongs to a runnable thread.
+                    restore_ctx_to_frame(to, frame);
+                } else if from_sched == to && cur_not_running {
+                    // Current thread left Running earlier in this trap (e.g. wait -> Ready
+                    // via completion before trap-exit scheduling). Frame may still carry
+                    // stale syscall return regs; reload from thread ctx.
                     restore_ctx_to_frame(to, frame);
                 }
                 let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);

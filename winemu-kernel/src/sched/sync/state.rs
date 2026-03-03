@@ -26,7 +26,8 @@ impl KEvent {
         let h = make_handle(HANDLE_TYPE_EVENT, idx);
         if self.ev_type == EventType::SynchronizationEvent {
             self.signaled = true;
-            if wake_queue_one_for_handle_locked(&mut self.waiters, h) {
+            let woke = wake_queue_one_for_handle_locked(&mut self.waiters, h);
+            if woke {
                 self.signaled = false;
             }
             return;

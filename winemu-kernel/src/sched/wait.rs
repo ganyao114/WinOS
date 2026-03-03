@@ -280,28 +280,45 @@ pub fn current_wait_result() -> u32 {
     if cur == 0 || !thread_exists(cur) {
         return status::INVALID_PARAMETER;
     }
-    let (state, result) = {
-        let _guard = ScopedSchedulerLock::new();
-        with_thread(cur, |t| (t.state, t.wait_result))
-    };
-    if state == ThreadState::Waiting {
-        debug_assert!(
-            false,
-            "current_wait_result observed waiting thread tid={} (result={:#x})",
-            cur,
-            result
-        );
-        return status::INVALID_PARAMETER;
+    loop {
+        let mut now = 0u64;
+        let mut next_deadline = 0u64;
+        let mut resolved = None;
+        {
+            let _guard = ScopedSchedulerLock::new();
+            let (state, result) = with_thread(cur, |t| (t.state, t.wait_result));
+            if state != ThreadState::Waiting {
+                // Keep scheduler state coherent if wait completed without
+                // switching away from current kernel continuation.
+                if state == ThreadState::Ready {
+                    set_thread_state_locked(cur, ThreadState::Running);
+                }
+                resolved = Some(result);
+            } else {
+                now = now_ticks();
+                let _ = check_timeouts(now);
+                let (state2, result2) = with_thread(cur, |t| (t.state, t.wait_result));
+                if state2 != ThreadState::Waiting {
+                    if state2 == ThreadState::Ready {
+                        set_thread_state_locked(cur, ThreadState::Running);
+                    }
+                    resolved = Some(result2);
+                } else {
+                    next_deadline = next_wait_deadline_locked();
+                }
+            }
+        }
+
+        if let Some(result) = resolved {
+            if result == 0x0000_0103 {
+                return status::INVALID_PARAMETER;
+            }
+            return result;
+        }
+
+        crate::hostcall::pump_completions();
+        crate::timer::idle_wait_until_deadline_100ns(now, next_deadline);
     }
-    if result == 0x0000_0103 {
-        debug_assert!(
-            false,
-            "current_wait_result observed STATUS_PENDING after wait completion tid={}",
-            cur
-        );
-        return status::INVALID_PARAMETER;
-    }
-    result
 }
 
 /// Timeout dispatch hot path.

@@ -51,7 +51,8 @@ pub(crate) fn handle_reset_event_or_delay(frame: &mut SvcFrame) {
 pub(crate) fn handle_wait_single(frame: &mut SvcFrame) {
     let h = frame.x[0];
     let timeout = parse_timeout(frame.x[2] as *const i64);
-    frame.x[0] = wait_handle_sync(h, timeout) as u64;
+    let st = wait_handle_sync(h, timeout);
+    frame.x[0] = st as u64;
 }
 
 pub(crate) fn handle_wait_multiple(frame: &mut SvcFrame) {

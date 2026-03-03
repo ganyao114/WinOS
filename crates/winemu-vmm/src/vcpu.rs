@@ -120,7 +120,7 @@ pub fn vcpu_thread(
         };
         restore_ctx(&mut *vcpu, &ctx);
 
-        if sched.take_external_irq_request() {
+        if !external_irq_asserted && sched.take_external_irq_request() {
             if let Err(e) = vcpu.set_pending_irq(true) {
                 log::warn!("vcpu{} set_pending_irq(true) failed: {:?}", vcpu_id, e);
             } else {
@@ -136,7 +136,12 @@ pub fn vcpu_thread(
             }
         };
 
-        if external_irq_asserted {
+        let clear_external_irq = external_irq_asserted
+            && matches!(
+                exit,
+                VmExit::Hypercall { .. } | VmExit::Halt | VmExit::Shutdown
+            );
+        if clear_external_irq {
             if let Err(e) = vcpu.set_pending_irq(false) {
                 log::warn!("vcpu{} set_pending_irq(false) failed: {:?}", vcpu_id, e);
             }
