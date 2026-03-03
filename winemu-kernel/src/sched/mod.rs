@@ -134,6 +134,7 @@ pub struct KThread {
     // 侵入式链表节点（就绪队列 / 等待队列）
     pub sched_next: u32, // TID of next in ready queue (0 = end)
     pub wait_next: u32,  // TID of next in wait queue (0 = end)
+    pub waiters: sync::WaitQueue, // waiters blocked on this thread handle
     pub wait_handles: [u64; MAX_WAIT_HANDLES],
 }
 
@@ -183,6 +184,7 @@ impl KThread {
             transient_boost: 0,
             sched_next: 0,
             wait_next: 0,
+            waiters: sync::WaitQueue::new(),
             wait_handles: [0u64; MAX_WAIT_HANDLES],
         }
     }

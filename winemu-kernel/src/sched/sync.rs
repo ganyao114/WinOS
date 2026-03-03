@@ -171,7 +171,7 @@ pub struct WaitQueue {
 }
 
 impl WaitQueue {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { head: 0, len: 0 }
     }
 
@@ -422,7 +422,6 @@ struct SyncState {
     semaphores: UnsafeCell<Option<ObjectStore<KSemaphore>>>,
     handles: UnsafeCell<Option<ObjectStore<HandleEntry>>>,
     refs: UnsafeCell<Option<Vec<ObjectRef>>>,
-    thread_waiters: UnsafeCell<Option<Vec<WaitQueue>>>,
     process_waiters: UnsafeCell<Option<Vec<WaitQueue>>>,
     wait_queue_pool: UnsafeCell<WaitQueueNodePool>,
 }
@@ -435,7 +434,6 @@ static SYNC_STATE: SyncState = SyncState {
     semaphores: UnsafeCell::new(None),
     handles: UnsafeCell::new(None),
     refs: UnsafeCell::new(None),
-    thread_waiters: UnsafeCell::new(None),
     process_waiters: UnsafeCell::new(None),
     wait_queue_pool: UnsafeCell::new(WaitQueueNodePool::new()),
 };
@@ -478,46 +476,15 @@ fn semaphores_store_mut() -> &'static mut ObjectStore<KSemaphore> {
     }
 }
 
-fn thread_waiters_mut() -> &'static mut Vec<WaitQueue> {
-    unsafe {
-        let slot = &mut *SYNC_STATE.thread_waiters.get();
-        if slot.is_none() {
-            let mut v = Vec::new();
-            let _ = v.try_reserve(1);
-            v.push(WaitQueue::new()); // index 0 unused
-            *slot = Some(v);
-        }
-        slot.as_mut().unwrap()
-    }
-}
-
-fn ensure_thread_waiters_slot(tid: u32) -> bool {
-    let idx = tid as usize;
-    let waiters = thread_waiters_mut();
-    if idx < waiters.len() {
-        return true;
-    }
-    let need = idx + 1 - waiters.len();
-    if waiters.try_reserve(need).is_err() {
-        return false;
-    }
-    while waiters.len() <= idx {
-        waiters.push(WaitQueue::new());
-    }
-    true
-}
-
 fn thread_waiters_ptr(tid: u32) -> *mut WaitQueue {
-    let idx = tid as usize;
-    unsafe {
-        let Some(waiters) = (&mut *SYNC_STATE.thread_waiters.get()).as_mut() else {
-            return null_mut();
-        };
-        if idx >= waiters.len() {
-            return null_mut();
-        }
-        &mut waiters[idx] as *mut WaitQueue
+    if tid == 0 || !thread_exists(tid) {
+        return null_mut();
     }
+    let mut ptr = null_mut();
+    with_thread_mut(tid, |t| {
+        ptr = &mut t.waiters as *mut WaitQueue;
+    });
+    ptr
 }
 
 fn process_waiters_mut() -> &'static mut Vec<WaitQueue> {
@@ -1264,7 +1231,7 @@ fn thread_consume_signal(waiter_tid: u32, idx: u32) -> bool {
 }
 
 fn thread_register_waiter(idx: u32, waiter_tid: u32) -> bool {
-    if !validate_thread_target_tid(idx) || !ensure_thread_waiters_slot(idx) {
+    if !validate_thread_target_tid(idx) {
         return false;
     }
     let q = thread_waiters_ptr(idx);
