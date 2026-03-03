@@ -9,6 +9,7 @@ const STDOUT: u64 = 0xFFFF_FFFF_FFFF_FFF5;
 
 const NR_WRITE_FILE: u64        = 0x0008;
 const NR_WAIT_SINGLE: u64       = 0x0004;
+const NR_WAIT_MULTIPLE: u64     = 0x0040;
 const NR_SET_EVENT: u64         = 0x000E;
 const NR_CLOSE: u64             = 0x000F;
 const NR_SET_INFORMATION_THREAD: u64 = 0x000D;
@@ -45,6 +46,9 @@ static PREEMPT_FLAG: AtomicU32 = AtomicU32::new(0);
 static TIMEOUT_EVENT: AtomicU32 = AtomicU32::new(0);
 static TIMEOUT_DONE: AtomicU32 = AtomicU32::new(0);
 static TIMEOUT_STATUS: AtomicU32 = AtomicU32::new(0);
+static SET_EVENT_PREEMPT_TARGET: AtomicU32 = AtomicU32::new(0);
+static SET_EVENT_PREEMPT_READY: AtomicU32 = AtomicU32::new(0);
+static SET_EVENT_PREEMPT_WOKE: AtomicU32 = AtomicU32::new(0);
 
 static LOW_GO_EVENT: AtomicU32 = AtomicU32::new(0);
 static HIGH_GO_EVENT: AtomicU32 = AtomicU32::new(0);
@@ -294,6 +298,21 @@ unsafe fn wait_single_timeout_rel(handle: u64, rel_timeout_100ns: i64) -> u64 {
     )
 }
 
+unsafe fn wait_multiple_timeout_rel(handles: &[u64], wait_all: bool, rel_timeout_100ns: i64) -> u64 {
+    let mut timeout = rel_timeout_100ns;
+    svc(
+        NR_WAIT_MULTIPLE,
+        handles.len() as u64,
+        handles.as_ptr() as u64,
+        if wait_all { 0 } else { 1 },
+        0,
+        &mut timeout as *mut i64 as u64,
+        0,
+        0,
+        0,
+    )
+}
+
 unsafe fn close(handle: u64) -> u64 {
     svc(NR_CLOSE, handle, 0, 0, 0, 0, 0, 0, 0)
 }
@@ -404,6 +423,16 @@ extern "C" fn thread_timeout_wait(_arg: u64) -> ! {
     let st = unsafe { wait_single_timeout_rel(ev, -50_000) };
     TIMEOUT_STATUS.store(st as u32, Ordering::Release);
     TIMEOUT_DONE.store(1, Ordering::Release);
+    unsafe { exit_thread() }
+}
+
+extern "C" fn thread_set_event_preempt_waiter(_arg: u64) -> ! {
+    SET_EVENT_PREEMPT_READY.store(1, Ordering::Release);
+    let ev = SET_EVENT_PREEMPT_TARGET.load(Ordering::Acquire) as u64;
+    let st = unsafe { wait_single(ev) };
+    if st == STATUS_SUCCESS {
+        SET_EVENT_PREEMPT_WOKE.store(1, Ordering::Release);
+    }
     unsafe { exit_thread() }
 }
 
@@ -572,6 +601,101 @@ unsafe fn test_event_wake() {
 
     close(h_c);
     close(ev);
+}
+
+unsafe fn test_set_event_wake_preemption() {
+    print(b"== SetEvent Wake Preemption ==\r\n");
+
+    SET_EVENT_PREEMPT_READY.store(0, Ordering::Relaxed);
+    SET_EVENT_PREEMPT_WOKE.store(0, Ordering::Relaxed);
+
+    let (st_target, target) = create_event(false, false);
+    check(b"Create preempt target event", st_target == STATUS_SUCCESS && target != 0);
+    SET_EVENT_PREEMPT_TARGET.store(target as u32, Ordering::Release);
+
+    let (st_waiter, h_waiter) = create_thread(
+        thread_set_event_preempt_waiter as *const () as u64,
+        0,
+        0x10000,
+    );
+    check(
+        b"Create preempt waiter thread",
+        st_waiter == STATUS_SUCCESS && h_waiter != 0,
+    );
+
+    let st_prio_waiter = set_thread_priority(h_waiter, 20);
+    check(b"Set preempt waiter priority", st_prio_waiter == STATUS_SUCCESS);
+
+    let waiter_ready = wait_flag_with_yield(&SET_EVENT_PREEMPT_READY, 20_000);
+    check(b"Preempt waiter reached wait site", waiter_ready);
+    for _ in 0..64u32 {
+        yield_exec();
+    }
+
+    let st_set = set_event(target);
+    check(b"SetEvent returns SUCCESS", st_set == STATUS_SUCCESS);
+    let woke_immediately = SET_EVENT_PREEMPT_WOKE.load(Ordering::Acquire) != 0;
+    check(b"SetEvent caller yields to waiter before return", woke_immediately);
+
+    let waiter_woke = wait_flag_with_yield(&SET_EVENT_PREEMPT_WOKE, 20_000);
+    check(b"Preempt waiter thread woke", waiter_woke);
+
+    close(h_waiter);
+    close(target);
+}
+
+unsafe fn test_wait_timeout_edges() {
+    print(b"== NtWait Timeout Edge Cases ==\r\n");
+
+    let (st_unsig, ev_unsig) = create_event(false, false);
+    let (st_sig, ev_sig) = create_event(true, true);
+    check(
+        b"Create unsignaled timeout event",
+        st_unsig == STATUS_SUCCESS && ev_unsig != 0,
+    );
+    check(
+        b"Create signaled timeout event",
+        st_sig == STATUS_SUCCESS && ev_sig != 0,
+    );
+
+    let st_single_imm_to = wait_single_timeout_rel(ev_unsig, 0);
+    check(
+        b"NtWaitForSingleObject immediate timeout on unsignaled event",
+        st_single_imm_to == STATUS_TIMEOUT,
+    );
+    let st_single_imm_ok = wait_single_timeout_rel(ev_sig, 0);
+    check(
+        b"NtWaitForSingleObject immediate succeeds on signaled event",
+        st_single_imm_ok == STATUS_SUCCESS,
+    );
+
+    let handles_any_timeout = [ev_unsig, ev_unsig];
+    let st_multi_any_to = wait_multiple_timeout_rel(&handles_any_timeout, false, 0);
+    check(
+        b"NtWaitForMultipleObjects(Any) immediate timeout on unsignaled set",
+        st_multi_any_to == STATUS_TIMEOUT,
+    );
+
+    let handles_any_hit = [ev_unsig, ev_sig];
+    let st_multi_any_hit = wait_multiple_timeout_rel(&handles_any_hit, false, 0);
+    check(
+        b"NtWaitForMultipleObjects(Any) returns signaled index",
+        st_multi_any_hit == STATUS_SUCCESS + 1,
+    );
+
+    let st_single_rel_to = wait_single_timeout_rel(ev_unsig, -30_000);
+    check(
+        b"NtWaitForSingleObject relative timeout returns TIMEOUT",
+        st_single_rel_to == STATUS_TIMEOUT,
+    );
+    let st_multi_rel_to = wait_multiple_timeout_rel(&handles_any_timeout, false, -30_000);
+    check(
+        b"NtWaitForMultipleObjects(Any) relative timeout returns TIMEOUT",
+        st_multi_rel_to == STATUS_TIMEOUT,
+    );
+
+    close(ev_sig);
+    close(ev_unsig);
 }
 
 unsafe fn test_wait_timeout_interrupt_wake() {
@@ -927,6 +1051,12 @@ pub extern "C" fn mainCRTStartup() -> ! {
         print(b"\r\n");
 
         test_event_wake();
+        print(b"\r\n");
+
+        test_set_event_wake_preemption();
+        print(b"\r\n");
+
+        test_wait_timeout_edges();
         print(b"\r\n");
 
         test_wait_timeout_interrupt_wake();
