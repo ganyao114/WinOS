@@ -13,7 +13,7 @@ use winemu_shared::status;
 
 use super::{
     begin_wait_locked, boost_thread_priority_locked, cancel_wait_locked, clear_wait_tracking_locked,
-    current_tid, end_wait_locked, prepare_wait_locked, prepare_wait_tracking_locked,
+    current_tid, end_wait_locked, prepare_wait_tracking_locked,
     sched_lock_acquire, sched_lock_release, set_thread_priority_locked, thread_count,
     thread_exists, with_thread, with_thread_mut, ThreadState, MAX_WAIT_HANDLES, WAIT_KIND_DELAY,
     WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY, WAIT_KIND_SINGLE,
@@ -828,11 +828,6 @@ fn deadline_ticks(timeout: WaitDeadline) -> u64 {
     }
 }
 
-fn set_wait_metadata(tid: u32, kind: u8, handles: &[u64], timeout: WaitDeadline) -> u32 {
-    let deadline = deadline_ticks(timeout);
-    prepare_wait_locked(tid, kind, handles, deadline, STATUS_PENDING)
-}
-
 fn clear_wait_metadata(tid: u32) {
     clear_wait_tracking_locked(tid);
 }
@@ -1434,46 +1429,27 @@ fn wait_common_locked(handles: &[u64], wait_all: bool, timeout: WaitDeadline) ->
 
 // ── 对外接口：等待/清理/线程终止通知 ─────────────────────────
 
-/// Wait on a single handle. Returns NTSTATUS.
-pub fn wait_handle(h: u64, timeout: WaitDeadline) -> u32 {
+pub fn wait_handle_sync(h: u64, timeout: WaitDeadline) -> u32 {
     sched_lock_acquire();
     let st = wait_common_locked(core::slice::from_ref(&h), false, timeout);
     sched_lock_release();
-    st
-}
-
-fn wait_current_pending_sync_result() -> u32 {
+    if st != STATUS_PENDING {
+        return st;
+    }
     crate::sched::wait_current_pending_result()
 }
 
-pub fn wait_handle_sync(h: u64, timeout: WaitDeadline) -> u32 {
-    let st = wait_handle(h, timeout);
-    if st != STATUS_PENDING {
-        return st;
-    }
-    wait_current_pending_sync_result()
-}
-
-/// Wait on multiple handles. wait_all=false => WaitAny, true => WaitAll.
-pub fn wait_multiple(handles: &[u64], wait_all: bool, timeout: WaitDeadline) -> u32 {
+pub fn wait_multiple_sync(handles: &[u64], wait_all: bool, timeout: WaitDeadline) -> u32 {
     sched_lock_acquire();
     let st = wait_common_locked(handles, wait_all, timeout);
     sched_lock_release();
-    st
-}
-
-pub fn wait_multiple_sync(handles: &[u64], wait_all: bool, timeout: WaitDeadline) -> u32 {
-    let st = wait_multiple(handles, wait_all, timeout);
     if st != STATUS_PENDING {
         return st;
     }
-    wait_current_pending_sync_result()
+    crate::sched::wait_current_pending_result()
 }
 
-/// Delay current thread for specified timeout semantics.
-/// Return STATUS_PENDING if the thread is blocked; scheduler timeout path
-/// will resume it with STATUS_SUCCESS.
-pub fn delay_current_thread(timeout: WaitDeadline) -> u32 {
+pub fn delay_current_thread_sync(timeout: WaitDeadline) -> u32 {
     if timeout == WaitDeadline::Immediate {
         return STATUS_SUCCESS;
     }
@@ -1485,21 +1461,20 @@ pub fn delay_current_thread(timeout: WaitDeadline) -> u32 {
         return STATUS_INVALID_PARAMETER;
     }
 
-    let prepare = set_wait_metadata(cur, WAIT_KIND_DELAY, &[], timeout);
+    let prepare = prepare_wait_tracking_locked(cur, WAIT_KIND_DELAY, &[], STATUS_PENDING);
     if prepare != STATUS_SUCCESS {
         sched_lock_release();
         return prepare;
     }
-    sched_lock_release();
-    STATUS_PENDING
-}
-
-pub fn delay_current_thread_sync(timeout: WaitDeadline) -> u32 {
-    let st = delay_current_thread(timeout);
-    if st != STATUS_PENDING {
-        return st;
+    let begin = begin_wait_locked(cur, deadline_ticks(timeout));
+    if begin != STATUS_SUCCESS {
+        clear_wait_metadata(cur);
+        with_thread_mut(cur, |t| t.wait_result = 0);
+        sched_lock_release();
+        return begin;
     }
-    wait_current_pending_sync_result()
+    sched_lock_release();
+    crate::sched::wait_current_pending_result()
 }
 
 /// Remove a waiting thread from all object wait queues.

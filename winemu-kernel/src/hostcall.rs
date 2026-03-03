@@ -160,13 +160,6 @@ pub fn register_request(owner_pid: u32, request_id: u64, waiter_tid: u32) -> boo
         .is_some()
 }
 
-pub fn register_waiter(owner_pid: u32, request_id: u64, waiter_tid: u32) -> bool {
-    if waiter_tid == 0 {
-        return false;
-    }
-    register_request(owner_pid, request_id, waiter_tid)
-}
-
 fn wait_deadline_ticks(timeout: WaitDeadline) -> u64 {
     match timeout {
         WaitDeadline::Infinite | WaitDeadline::Immediate => 0,
