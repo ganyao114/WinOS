@@ -24,7 +24,7 @@ use core::cell::UnsafeCell;
 use winemu_shared::status;
 use winemu_shared::teb as teb_layout;
 
-pub use lock::{sched_lock_acquire, sched_lock_release};
+pub use lock::{sched_lock_acquire, sched_lock_release, ScopedSchedulerLock};
 pub use continuation::{
     has_dispatch_continuation, has_kernel_continuation, reschedule_current_via_dispatch_continuation,
     save_current_dispatch_continuation, switch_kernel_continuation,
@@ -38,7 +38,8 @@ pub use thread_control::{
 };
 pub(crate) use wait::{
     begin_wait_locked, cancel_wait_locked, clear_wait_deadline_locked, clear_wait_tracking_locked,
-    end_wait_locked, prepare_wait_locked, prepare_wait_tracking_locked, set_wait_deadline_locked,
+    end_wait_locked, ensure_current_wait_continuation_locked, prepare_wait_locked,
+    prepare_wait_tracking_locked, set_wait_deadline_locked,
 };
 pub use wait::{
     block_current_and_resched, check_timeouts, deadline_after_100ns, next_wait_deadline,
@@ -579,10 +580,12 @@ pub fn migrate_svc_frame_to_current_kstack(frame_ptr: *mut u8, frame_size: usize
     unsafe {
         core::ptr::copy_nonoverlapping(frame_ptr, new_frame, frame_size);
     }
+    sched_lock_acquire();
     with_thread_mut(tid, |t| {
         t.kctx.sp_el1 = new_frame as u64;
         t.in_kernel = true;
     });
+    sched_lock_release();
     new_frame
 }
 
@@ -636,7 +639,11 @@ pub fn set_current_cpu_thread(vcpu_id: usize, tid: u32) {
     crate::arch::cpu::set_current_cpu_local(val);
 }
 
-pub fn set_thread_in_kernel(tid: u32, in_kernel: bool) {
+pub(crate) fn set_thread_in_kernel_locked(tid: u32, in_kernel: bool) {
+    debug_assert!(
+        sched_lock_held_by_current_vcpu(),
+        "set_thread_in_kernel_locked requires sched lock"
+    );
     if tid == 0 || !thread_exists(tid) {
         return;
     }
@@ -654,6 +661,12 @@ pub fn set_thread_in_kernel(tid: u32, in_kernel: bool) {
             t.dispatch_kctx.sp_el1 = 0;
         }
     });
+}
+
+pub fn set_thread_in_kernel(tid: u32, in_kernel: bool) {
+    sched_lock_acquire();
+    set_thread_in_kernel_locked(tid, in_kernel);
+    sched_lock_release();
 }
 
 pub fn set_current_in_kernel(in_kernel: bool) {
@@ -851,14 +864,37 @@ fn mark_reschedule_targeted_locked(changed_tid: u32, ready_prio: Option<u8>, rea
 }
 
 pub(crate) fn consume_pending_reschedule_locked(vid: usize) -> bool {
+    debug_assert!(
+        sched_lock_held_by_current_vcpu(),
+        "consume_pending_reschedule_locked requires sched lock"
+    );
     unsafe {
         let bit = vcpu_bit(vid);
-        let mask = SCHED.pending_reschedule_mask.get();
-        if (*mask & bit) == 0 {
+        let pending = SCHED.pending_reschedule_mask.get();
+        let hinted = SCHED.reschedule_mask.get();
+        let had = ((*pending | *hinted) & bit) != 0;
+        if !had {
             return false;
         }
-        *mask &= !bit;
+        *pending &= !bit;
+        *hinted &= !bit;
         true
+    }
+}
+
+pub(crate) fn consume_idle_wakeup_mask_locked() -> u32 {
+    debug_assert!(
+        sched_lock_held_by_current_vcpu(),
+        "consume_idle_wakeup_mask_locked requires sched lock"
+    );
+    unsafe {
+        let hinted = SCHED.reschedule_mask.get();
+        let idle = *SCHED.idle_vcpu_mask.get();
+        let wake_mask = *hinted & idle;
+        if wake_mask != 0 {
+            *hinted &= !wake_mask;
+        }
+        wake_mask
     }
 }
 

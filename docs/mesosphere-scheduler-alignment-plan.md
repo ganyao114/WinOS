@@ -127,3 +127,22 @@
 4. Step 4（`WaitQueue` 无堆分配化）已完成；4 项验证通过。
 5. Step 5（移除 timeout 全线程兜底扫描，timer task 唯一真源）已完成；4 项验证通过。
 6. Step 6（terminate/cancel 结果码语义细化）已完成；4 项验证通过。
+
+## 10. Mesosphere 差异 1-8 收敛（2026-03-03）
+
+1. [x] `sched_lock_release()` 泛化 unlock 边调度触发（不再只限 `Waiting`，改为本核存在已提交 reschedule 且当前线程非 `Running`）。
+2. [x] 引入 `ScopedSchedulerLock`（RAII），并用于 `wait_handle_sync` / `wait_multiple_sync` / `delay_current_thread_sync` / `block_current_and_resched` 主等待入口。
+3. [x] 阻塞前 continuation 前置校验：新增 `ensure_current_wait_continuation_locked`，并在 wait/delay/hostcall 阻塞入口使用；`wait_current_pending_result` 改为断言路径（仅保留防御性返回）。
+4. [x] `WaitQueueNode` 使用 `SlabPool` 分配（已在上一轮提交完成并保留）。
+5. [x] 对象释放一致性：`event_free` / `mutex_free` / `semaphore_free` 在调度锁内先 drain/cancel waiter，再释放对象。
+6. [x] 跨核唤醒链路：补齐 `wait_for_event/send_event`，idle 等待切换到 `WFE`，并在 unlock 边根据 idle 唤醒 mask 触发 `SEV`。
+7. [x] 调度锁 owner 校验：`sched_lock_release` 增加非 owner 释放断言，避免静默破坏锁状态。
+8. [x] `in_kernel`/dispatch 写路径锁纪律：`set_thread_in_kernel` 改为经 sched lock 更新；`migrate_svc_frame_to_current_kstack` 与 `save_current_dispatch_continuation` 的相关字段更新收敛到锁保护路径。
+
+本轮验证：
+
+1. `cargo test -q`
+2. `target/debug/winemu run guest/sysroot/process_test.exe`
+3. `target/debug/winemu run tests/thread_test/target/aarch64-pc-windows-msvc/release/thread_test.exe`
+4. `target/debug/winemu run tests/full_test/target/aarch64-pc-windows-msvc/release/full_test.exe`
+5. `bash scripts/stress-regression.sh 2 core`

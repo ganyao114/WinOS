@@ -21,11 +21,25 @@ pub unsafe fn save_current_dispatch_continuation() -> u64 {
     if ptr.is_null() {
         return 0;
     }
-    unsafe {
-        (*ptr).in_kernel = true;
-        (*ptr).dispatch_valid = true;
-        crate::arch::context::save_kernel_context(&mut (*ptr).dispatch_kctx as *mut KernelContext)
+    sched_lock_acquire();
+    with_thread_mut(tid, |t| {
+        t.in_kernel = true;
+        t.dispatch_valid = false;
+    });
+    sched_lock_release();
+
+    let resumed =
+        unsafe { crate::arch::context::save_kernel_context(&mut (*ptr).dispatch_kctx as *mut KernelContext) };
+
+    sched_lock_acquire();
+    if thread_exists(tid) {
+        with_thread_mut(tid, |t| {
+            t.in_kernel = true;
+            t.dispatch_valid = t.dispatch_kctx.sp_el1 != 0 && t.dispatch_kctx.x19_x30[11] != 0;
+        });
     }
+    sched_lock_release();
+    resumed
 }
 
 pub fn reschedule_current_via_dispatch_continuation() -> bool {

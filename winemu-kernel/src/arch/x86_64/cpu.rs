@@ -29,6 +29,16 @@ pub fn wait_for_interrupt() {
 }
 
 #[inline(always)]
+pub fn wait_for_event() {
+    unsupported()
+}
+
+#[inline(always)]
+pub fn send_event() {
+    unsupported()
+}
+
+#[inline(always)]
 pub fn irq_enable() {
     unsupported()
 }

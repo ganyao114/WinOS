@@ -126,6 +126,28 @@ pub(crate) fn prepare_wait_tracking_locked(
     status::SUCCESS
 }
 
+pub(crate) fn ensure_current_wait_continuation_locked(tid: u32) -> u32 {
+    debug_assert!(
+        sched_lock_held_by_current_vcpu(),
+        "ensure_current_wait_continuation_locked requires sched lock"
+    );
+    if tid == 0 || !thread_exists(tid) {
+        return status::INVALID_PARAMETER;
+    }
+    if tid != current_tid() {
+        return status::SUCCESS;
+    }
+    let has = has_dispatch_continuation(tid);
+    debug_assert!(
+        has,
+        "blocking current thread wait requires dispatch continuation"
+    );
+    if !has {
+        return status::INVALID_PARAMETER;
+    }
+    status::SUCCESS
+}
+
 // Begin wait on current metadata: move thread to Waiting and arm timeout.
 pub(crate) fn begin_wait_locked(tid: u32, wait_deadline: u64) -> u32 {
     debug_assert!(
@@ -218,6 +240,10 @@ pub(crate) fn prepare_wait_locked(
     wait_deadline: u64,
     pending_result: u32,
 ) -> u32 {
+    let gate = ensure_current_wait_continuation_locked(tid);
+    if gate != status::SUCCESS {
+        return gate;
+    }
     let prep = prepare_wait_tracking_locked(tid, wait_kind, wait_handles, pending_result);
     if prep != status::SUCCESS {
         return prep;
@@ -245,9 +271,8 @@ pub fn block_current_and_resched(
     if tid == 0 || !thread_exists(tid) {
         return status::INVALID_PARAMETER;
     }
-    sched_lock_acquire();
+    let _guard = ScopedSchedulerLock::new();
     let st = prepare_wait_locked(tid, wait_kind, wait_handles, wait_deadline, pending_result);
-    sched_lock_release();
     if st != status::SUCCESS {
         return st;
     }
@@ -261,17 +286,28 @@ pub fn wait_current_pending_result() -> u32 {
     if cur == 0 || !thread_exists(cur) {
         return status::INVALID_PARAMETER;
     }
-    if !has_dispatch_continuation(cur) {
+    let has = has_dispatch_continuation(cur);
+    debug_assert!(
+        has,
+        "wait_current_pending_result requires dispatch continuation"
+    );
+    if !has {
         return status::INVALID_PARAMETER;
     }
     loop {
-        sched_lock_acquire();
-        let (state, result) = with_thread(cur, |t| (t.state, t.wait_result));
-        sched_lock_release();
+        let (state, result) = {
+            let _guard = ScopedSchedulerLock::new();
+            with_thread(cur, |t| (t.state, t.wait_result))
+        };
         if state != ThreadState::Waiting {
             return result;
         }
-        if !reschedule_current_via_dispatch_continuation() {
+        let switched = reschedule_current_via_dispatch_continuation();
+        debug_assert!(
+            switched,
+            "dispatch continuation switch failed while waiting"
+        );
+        if !switched {
             return status::INVALID_PARAMETER;
         }
     }

@@ -26,6 +26,16 @@ pub fn wait_for_interrupt() {
 }
 
 #[inline(always)]
+pub fn wait_for_event() {
+    <Backend as super::contract::CpuBackend>::wait_for_event();
+}
+
+#[inline(always)]
+pub fn send_event() {
+    <Backend as super::contract::CpuBackend>::send_event();
+}
+
+#[inline(always)]
 pub fn irq_enable() {
     <Backend as super::contract::CpuBackend>::irq_enable();
 }

@@ -93,6 +93,20 @@ pub fn wfi() {
 }
 
 #[inline(always)]
+pub fn wfe() {
+    unsafe {
+        core::arch::asm!("wfe", options(nostack));
+    }
+}
+
+#[inline(always)]
+pub fn sev() {
+    unsafe {
+        core::arch::asm!("sev", options(nostack));
+    }
+}
+
+#[inline(always)]
 pub fn cpu_local_read() -> u64 {
     read_tpidr_el1()
 }
@@ -115,6 +129,16 @@ pub fn fault_address_read() -> u64 {
 #[inline(always)]
 pub fn wait_for_interrupt() {
     wfi();
+}
+
+#[inline(always)]
+pub fn wait_for_event() {
+    wfe();
+}
+
+#[inline(always)]
+pub fn send_event() {
+    sev();
 }
 
 #[inline(always)]

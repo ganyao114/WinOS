@@ -36,6 +36,16 @@ impl super::contract::CpuBackend for ArchBackend {
     }
 
     #[inline(always)]
+    fn wait_for_event() {
+        cpu::wait_for_event();
+    }
+
+    #[inline(always)]
+    fn send_event() {
+        cpu::send_event();
+    }
+
+    #[inline(always)]
     fn irq_enable() {
         cpu::irq_enable();
     }

@@ -129,10 +129,11 @@ fn arm_vtimer_oneshot_100ns(delta_100ns: u64) {
 
 #[inline(always)]
 fn wait_for_timer_irq() {
-    // Mirror HOS-style flow: program one-shot, unmask IRQ, sleep in WFI,
-    // then re-mask on return so scheduler critical path keeps explicit IRQ control.
+    // Program one-shot timer, unmask IRQ, then sleep in WFE.
+    // Cross-core scheduler kick uses SEV to wake idle vCPUs even before the
+    // timer deadline, while timer IRQ still wakes the core for deadlines.
     super::cpu::daifclr_irq();
-    super::cpu::wait_for_interrupt();
+    super::cpu::wait_for_event();
     super::cpu::daifset_irq();
 }
 

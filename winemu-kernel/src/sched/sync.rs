@@ -13,10 +13,10 @@ use winemu_shared::status;
 
 use super::{
     begin_wait_locked, boost_thread_priority_locked, cancel_wait_locked, clear_wait_tracking_locked,
-    current_tid, end_wait_locked, prepare_wait_tracking_locked,
-    sched_lock_acquire, sched_lock_release, set_thread_priority_locked, thread_count,
-    thread_exists, with_thread, with_thread_mut, ThreadState, MAX_WAIT_HANDLES, WAIT_KIND_DELAY,
-    WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY, WAIT_KIND_SINGLE,
+    current_tid, end_wait_locked, ensure_current_wait_continuation_locked, prepare_wait_tracking_locked,
+    sched_lock_acquire, sched_lock_release, set_thread_priority_locked, set_thread_state_locked, thread_count,
+    thread_exists, with_thread, with_thread_mut, ScopedSchedulerLock, ThreadState, MAX_WAIT_HANDLES,
+    WAIT_KIND_DELAY, WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY, WAIT_KIND_SINGLE,
 };
 
 // ── NTSTATUS 常量 ─────────────────────────────────────────────
@@ -1371,6 +1371,27 @@ fn wake_queue_all_for_handle_locked(queue: &mut WaitQueue, signaled_handle: u64)
     woke
 }
 
+fn cancel_queue_all_locked(queue: &mut WaitQueue, result: u32) -> usize {
+    let attempts = queue.len();
+    let mut i = 0usize;
+    let mut canceled = 0usize;
+    while i < attempts {
+        let tid = queue.dequeue_waiting();
+        if tid == 0 {
+            break;
+        }
+        if tid != 0
+            && thread_exists(tid)
+            && with_thread(tid, |t| t.state == ThreadState::Waiting)
+            && cancel_wait_on_sync_objects_locked(tid, result)
+        {
+            canceled += 1;
+        }
+        i += 1;
+    }
+    canceled
+}
+
 fn wait_common_locked(handles: &[u64], wait_all: bool, timeout: WaitDeadline) -> u32 {
     if handles.is_empty() || handles.len() > MAX_WAIT_HANDLES {
         return STATUS_INVALID_PARAMETER;
@@ -1421,6 +1442,11 @@ fn wait_common_locked(handles: &[u64], wait_all: bool, timeout: WaitDeadline) ->
         return STATUS_TIMEOUT;
     }
 
+    let gate = ensure_current_wait_continuation_locked(cur);
+    if gate != STATUS_SUCCESS {
+        return gate;
+    }
+
     let kind = if handles.len() == 1 {
         WAIT_KIND_SINGLE
     } else if wait_all {
@@ -1463,9 +1489,10 @@ fn wait_common_locked(handles: &[u64], wait_all: bool, timeout: WaitDeadline) ->
 // ── 对外接口：等待/清理/线程终止通知 ─────────────────────────
 
 pub fn wait_handle_sync(h: u64, timeout: WaitDeadline) -> u32 {
-    sched_lock_acquire();
-    let st = wait_common_locked(core::slice::from_ref(&h), false, timeout);
-    sched_lock_release();
+    let st = {
+        let _guard = ScopedSchedulerLock::new();
+        wait_common_locked(core::slice::from_ref(&h), false, timeout)
+    };
     if st != STATUS_PENDING {
         return st;
     }
@@ -1473,9 +1500,10 @@ pub fn wait_handle_sync(h: u64, timeout: WaitDeadline) -> u32 {
 }
 
 pub fn wait_multiple_sync(handles: &[u64], wait_all: bool, timeout: WaitDeadline) -> u32 {
-    sched_lock_acquire();
-    let st = wait_common_locked(handles, wait_all, timeout);
-    sched_lock_release();
+    let st = {
+        let _guard = ScopedSchedulerLock::new();
+        wait_common_locked(handles, wait_all, timeout)
+    };
     if st != STATUS_PENDING {
         return st;
     }
@@ -1487,26 +1515,35 @@ pub fn delay_current_thread_sync(timeout: WaitDeadline) -> u32 {
         return STATUS_SUCCESS;
     }
 
-    sched_lock_acquire();
-    let cur = current_tid();
-    if cur == 0 || !thread_exists(cur) {
-        sched_lock_release();
-        return STATUS_INVALID_PARAMETER;
+    let st = {
+        let _guard = ScopedSchedulerLock::new();
+        let cur = current_tid();
+        if cur == 0 || !thread_exists(cur) {
+            STATUS_INVALID_PARAMETER
+        } else {
+            let gate = ensure_current_wait_continuation_locked(cur);
+            if gate != STATUS_SUCCESS {
+                gate
+            } else {
+                let prepare = prepare_wait_tracking_locked(cur, WAIT_KIND_DELAY, &[], STATUS_PENDING);
+                if prepare != STATUS_SUCCESS {
+                    prepare
+                } else {
+                    let begin = begin_wait_locked(cur, deadline_ticks(timeout));
+                    if begin != STATUS_SUCCESS {
+                        clear_wait_metadata(cur);
+                        with_thread_mut(cur, |t| t.wait_result = 0);
+                        begin
+                    } else {
+                        STATUS_PENDING
+                    }
+                }
+            }
+        }
+    };
+    if st != STATUS_PENDING {
+        return st;
     }
-
-    let prepare = prepare_wait_tracking_locked(cur, WAIT_KIND_DELAY, &[], STATUS_PENDING);
-    if prepare != STATUS_SUCCESS {
-        sched_lock_release();
-        return prepare;
-    }
-    let begin = begin_wait_locked(cur, deadline_ticks(timeout));
-    if begin != STATUS_SUCCESS {
-        clear_wait_metadata(cur);
-        with_thread_mut(cur, |t| t.wait_result = 0);
-        sched_lock_release();
-        return begin;
-    }
-    sched_lock_release();
     crate::sched::wait_current_pending_result()
 }
 
@@ -1627,6 +1664,15 @@ pub fn event_free(idx: u32) {
     if idx == 0 {
         return;
     }
+    let _guard = ScopedSchedulerLock::new();
+    let ev = event_ptr(idx);
+    if ev.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = cancel_queue_all_locked(&mut (*ev).waiters, STATUS_INVALID_HANDLE);
+        (*ev).signaled = false;
+    }
     let _ = events_store_mut().free(idx);
 }
 
@@ -1665,6 +1711,20 @@ pub fn mutex_release(idx: u32) -> u32 {
 pub fn mutex_free(idx: u32) {
     if idx == 0 {
         return;
+    }
+    let _guard = ScopedSchedulerLock::new();
+    let m = mutex_ptr(idx);
+    if m.is_null() {
+        return;
+    }
+    let owner_tid = unsafe { (*m).owner_tid };
+    unsafe {
+        let _ = cancel_queue_all_locked(&mut (*m).waiters, STATUS_INVALID_HANDLE);
+        (*m).owner_tid = 0;
+        (*m).recursion = 0;
+    }
+    if owner_tid != 0 && thread_exists(owner_tid) {
+        recompute_owned_mutex_priority_locked(owner_tid);
     }
     let _ = mutexes_store_mut().free(idx);
 }
@@ -1724,6 +1784,15 @@ pub fn semaphore_release(idx: u32, count: i32) -> u32 {
 pub fn semaphore_free(idx: u32) {
     if idx == 0 {
         return;
+    }
+    let _guard = ScopedSchedulerLock::new();
+    let s = semaphore_ptr(idx);
+    if s.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = cancel_queue_all_locked(&mut (*s).waiters, STATUS_INVALID_HANDLE);
+        (*s).count = 0;
     }
     let _ = semaphores_store_mut().free(idx);
 }
