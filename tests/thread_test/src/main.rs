@@ -22,6 +22,7 @@ const NR_CREATE_THREAD_EX: u64  = 0x00C1;
 
 const STATUS_SUCCESS: u64 = 0;
 const STATUS_TIMEOUT: u64 = 0x0000_0102;
+const STATUS_INVALID_HANDLE: u64 = 0xC000_0008;
 
 const PREEMPT_A_WORK: u32 = 12_000_000;
 const PREEMPT_B_WORK: u32 = 500_000;
@@ -67,6 +68,9 @@ static MUTEX_STRESS_START: AtomicU32 = AtomicU32::new(0);
 static MUTEX_STRESS_HANDLE: AtomicU32 = AtomicU32::new(0);
 static MUTEX_STRESS_DONE: AtomicU32 = AtomicU32::new(0);
 static MUTEX_STRESS_COUNTER: AtomicU32 = AtomicU32::new(0);
+static DESTROY_WAIT_HANDLE: AtomicU32 = AtomicU32::new(0);
+static DESTROY_WAIT_DONE: AtomicU32 = AtomicU32::new(0);
+static DESTROY_WAIT_STATUS: AtomicU32 = AtomicU32::new(0);
 
 static mut PASS_COUNT: u32 = 0;
 static mut FAIL_COUNT: u32 = 0;
@@ -459,6 +463,14 @@ extern "C" fn thread_mutex_stress(_arg: u64) -> ! {
     unsafe { exit_thread() }
 }
 
+extern "C" fn thread_destroy_waiter(_arg: u64) -> ! {
+    let h = DESTROY_WAIT_HANDLE.load(Ordering::Acquire) as u64;
+    let st = unsafe { wait_single(h) };
+    DESTROY_WAIT_STATUS.store(st as u32, Ordering::Release);
+    DESTROY_WAIT_DONE.store(1, Ordering::Release);
+    unsafe { exit_thread() }
+}
+
 // ── Tests ───────────────────────────────────────────────────
 
 unsafe fn wait_flag_with_yield(flag: &AtomicU32, max_iters: u32) -> bool {
@@ -831,6 +843,74 @@ unsafe fn test_mutex_contention_stress() {
     check(b"Mutex stress protected counter exact", done && actual == expected);
 }
 
+unsafe fn test_waiter_woken_by_event_destroy() {
+    print(b"== Waiter Wake On Event Destroy ==\r\n");
+
+    DESTROY_WAIT_DONE.store(0, Ordering::Relaxed);
+    DESTROY_WAIT_STATUS.store(0, Ordering::Relaxed);
+
+    let (st_ev, ev) = create_event(false, false);
+    check(b"Create event for destroy wake", st_ev == STATUS_SUCCESS && ev != 0);
+    DESTROY_WAIT_HANDLE.store(ev as u32, Ordering::Release);
+
+    let (st_t, h_t) = create_thread(thread_destroy_waiter as *const () as u64, 0, 0x10000);
+    check(b"Create destroy waiter thread (event)", st_t == STATUS_SUCCESS && h_t != 0);
+
+    for _ in 0..64u32 {
+        yield_exec();
+    }
+    let st_close = close(ev);
+    check(b"Close waited event returns SUCCESS", st_close == STATUS_SUCCESS);
+
+    let done = wait_flag_with_yield(&DESTROY_WAIT_DONE, 20_000);
+    check(b"Destroy waiter thread completed (event)", done);
+    if done {
+        let st = DESTROY_WAIT_STATUS.load(Ordering::Acquire) as u64;
+        check(
+            b"Waiter returns STATUS_INVALID_HANDLE after event destroy",
+            st == STATUS_INVALID_HANDLE,
+        );
+    }
+
+    close(h_t);
+}
+
+unsafe fn test_waiter_woken_by_mutex_destroy() {
+    print(b"== Waiter Wake On Mutex Destroy ==\r\n");
+
+    DESTROY_WAIT_DONE.store(0, Ordering::Relaxed);
+    DESTROY_WAIT_STATUS.store(0, Ordering::Relaxed);
+
+    // Main thread owns mutex so waiter must block.
+    let (st_mx, mutex) = create_mutex(true);
+    check(
+        b"Create owned mutex for destroy wake",
+        st_mx == STATUS_SUCCESS && mutex != 0,
+    );
+    DESTROY_WAIT_HANDLE.store(mutex as u32, Ordering::Release);
+
+    let (st_t, h_t) = create_thread(thread_destroy_waiter as *const () as u64, 0, 0x10000);
+    check(b"Create destroy waiter thread (mutex)", st_t == STATUS_SUCCESS && h_t != 0);
+
+    for _ in 0..64u32 {
+        yield_exec();
+    }
+    let st_close = close(mutex);
+    check(b"Close waited mutex returns SUCCESS", st_close == STATUS_SUCCESS);
+
+    let done = wait_flag_with_yield(&DESTROY_WAIT_DONE, 20_000);
+    check(b"Destroy waiter thread completed (mutex)", done);
+    if done {
+        let st = DESTROY_WAIT_STATUS.load(Ordering::Acquire) as u64;
+        check(
+            b"Waiter returns STATUS_INVALID_HANDLE after mutex destroy",
+            st == STATUS_INVALID_HANDLE,
+        );
+    }
+
+    close(h_t);
+}
+
 // ── Entry point ─────────────────────────────────────────────
 
 #[no_mangle]
@@ -868,6 +948,12 @@ pub extern "C" fn mainCRTStartup() -> ! {
         print(b"\r\n");
 
         test_mutex_contention_stress();
+        print(b"\r\n");
+
+        test_waiter_woken_by_event_destroy();
+        print(b"\r\n");
+
+        test_waiter_woken_by_mutex_destroy();
         print(b"\r\n");
 
         // Summary

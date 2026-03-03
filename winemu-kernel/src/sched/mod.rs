@@ -32,18 +32,16 @@ pub use continuation::{
 pub(crate) use thread_control::{boost_thread_priority_locked, set_thread_priority_locked};
 pub use thread_control::{
     charge_current_runtime_locked, current_slice_remaining_100ns, resolve_thread_tid_from_handle,
-    resume_thread_by_handle, resume_thread_by_tid, rotate_current_on_quantum_expire_locked,
-    set_thread_base_priority, set_thread_base_priority_by_handle, suspend_thread_by_handle,
-    suspend_thread_by_tid,
+    resume_thread_by_handle, rotate_current_on_quantum_expire_locked,
+    set_thread_base_priority_by_handle, suspend_thread_by_handle,
 };
 pub(crate) use wait::{
-    begin_wait_locked, cancel_wait_locked, clear_wait_deadline_locked, clear_wait_tracking_locked,
-    end_wait_locked, ensure_current_wait_continuation_locked, prepare_wait_locked,
-    prepare_wait_tracking_locked, set_wait_deadline_locked,
+    begin_wait_locked, cancel_wait_locked, clear_wait_tracking_locked, end_wait_locked,
+    ensure_current_wait_continuation_locked, prepare_wait_tracking_locked,
 };
 pub use wait::{
-    block_current_and_resched, check_timeouts, deadline_after_100ns, next_wait_deadline,
-    next_wait_deadline_locked, now_ticks, wait_current_pending_result,
+    block_current_and_resched, check_timeouts, deadline_after_100ns, next_wait_deadline_locked,
+    now_ticks, wait_current_pending_result,
 };
 
 // ── 常量 ─────────────────────────────────────────────────────
