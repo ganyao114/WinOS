@@ -53,7 +53,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
                 0x127 => {
                     // NtUserInitializeClientPfnArrays
                     win32k::handle_user_initialize_client_pfn_arrays(frame);
-                    schedule_from_trap(frame, true, false);
+                    schedule_from_trap(frame, true, true);
                     return;
                 }
                 _ => {}
@@ -63,7 +63,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         // Non-NT tables still need normal trap-exit scheduling so timer slice /
         // deadline programming remains consistent on this path.
         forward_to_vmm(frame, nr, table);
-        schedule_from_trap(frame, true, false);
+        schedule_from_trap(frame, true, true);
         return;
     }
 
@@ -143,7 +143,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
     }
 
     trace_syscall_error(nr, table, frame);
-    schedule_from_trap(frame, true, false);
+    schedule_from_trap(frame, true, true);
 }
 
 fn trace_syscall_error(nr: u16, table: u8, frame: &SvcFrame) {
