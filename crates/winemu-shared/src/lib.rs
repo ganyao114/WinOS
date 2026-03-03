@@ -16,6 +16,9 @@ pub mod nr {
     /// 加载 syscall 表 TOML
     /// args: [dst_gpa, max_len, write(1)/query(0), 0, 0, 0]
     pub const LOAD_SYSCALL_TABLE: u64 = 0x0002;
+    /// 按 vCPU mask 精确唤醒宿主调度线程
+    /// args: [vcpu_mask, 0, 0, 0, 0, 0]
+    pub const KICK_VCPU_MASK: u64 = 0x0003;
     // ── 进程/线程: 0x0010 - 0x001F ───────────────────────────
     /// args: [image_base_gva, 0, 0, 0, 0, 0]
     pub const PROCESS_CREATE: u64 = 0x0010;

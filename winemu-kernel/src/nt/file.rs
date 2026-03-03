@@ -8,6 +8,7 @@ use winemu_shared::status;
 
 use super::common::{
     file_handle_to_host_fd, map_open_flags, write_iosb, IoStatusBlock, FILE_OPEN, HOST_OPEN_READ,
+    STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use super::path::{read_oa_path, read_unicode_direct};
 use super::state::{
@@ -49,6 +50,11 @@ const FILE_DEVICE_DISK: u32 = 0x0000_0007;
 const FILE_CASE_SENSITIVE_SEARCH: u32 = 0x0000_0001;
 const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
 const FILE_UNICODE_ON_DISK: u32 = 0x0000_0004;
+
+#[inline(always)]
+fn is_std_file_handle(h: u64) -> bool {
+    matches!(h, STD_INPUT_HANDLE | STD_OUTPUT_HANDLE | STD_ERROR_HANDLE)
+}
 
 #[derive(Clone, Copy)]
 struct PendingDirNotify {
@@ -529,44 +535,56 @@ fn on_hostcall_file_write(cookie: u32, cpl: hypercall::HostCallCompletion) {
     complete_pending_file_io(&req, status::SUCCESS, cpl.value0);
 }
 
-pub(crate) fn poll_async_file_completions() {
-    let mut dir_ready: Vec<(u32, hypercall::HostCallCompletion)> = Vec::new();
+fn find_pending_dir_notify_id_by_request(request_id: u64) -> u32 {
+    let mut found = 0u32;
     async_state_mut()
         .pending_dir_notify
         .for_each_live_ptr(|id, ptr| unsafe {
-            let req = *ptr;
-            if req.request_id == 0 {
-                return;
-            }
-            if let Some(cpl) = hostcall::take_completion(req.request_id) {
-                let _ = dir_ready.try_reserve(1);
-                dir_ready.push((id, cpl));
+            if found == 0 && (*ptr).request_id == request_id {
+                found = id;
             }
         });
-    for (id, cpl) in dir_ready {
-        on_hostcall_dir_notify(id, cpl);
-    }
+    found
+}
 
-    let mut io_ready: Vec<(u32, u8, hypercall::HostCallCompletion)> = Vec::new();
+fn find_pending_file_io_id_by_request(request_id: u64) -> u32 {
+    let mut found = 0u32;
     async_state_mut()
         .pending_file_io
         .for_each_live_ptr(|id, ptr| unsafe {
-            let req = *ptr;
-            if req.request_id == 0 {
-                return;
-            }
-            if let Some(cpl) = hostcall::take_completion(req.request_id) {
-                let _ = io_ready.try_reserve(1);
-                io_ready.push((id, req.io_kind, cpl));
+            if found == 0 && (*ptr).request_id == request_id {
+                found = id;
             }
         });
-    for (id, kind, cpl) in io_ready {
-        if kind == FILE_IO_KIND_WRITE {
-            on_hostcall_file_write(id, cpl);
-        } else {
-            on_hostcall_file_read(id, cpl);
-        }
+    found
+}
+
+pub(crate) fn dispatch_async_hostcall_completion(cpl: hypercall::HostCallCompletion) -> bool {
+    if cpl.request_id == 0 {
+        return false;
     }
+    let dir_cookie = find_pending_dir_notify_id_by_request(cpl.request_id);
+    if dir_cookie != 0 {
+        on_hostcall_dir_notify(dir_cookie, cpl);
+        return true;
+    }
+
+    let io_cookie = find_pending_file_io_id_by_request(cpl.request_id);
+    if io_cookie == 0 {
+        return false;
+    }
+    let req_ptr = async_state_mut().pending_file_io.get_ptr(io_cookie);
+    if req_ptr.is_null() {
+        let _ = async_state_mut().pending_file_io.free(io_cookie);
+        return false;
+    }
+    let io_kind = unsafe { (*req_ptr).io_kind };
+    if io_kind == FILE_IO_KIND_WRITE {
+        on_hostcall_file_write(io_cookie, cpl);
+    } else {
+        on_hostcall_file_read(io_cookie, cpl);
+    }
+    true
 }
 
 // x0=*FileHandle, x1=DesiredAccess, x2=ObjectAttributes, x3=*IoStatusBlock
@@ -662,11 +680,6 @@ pub(crate) fn handle_write_file(frame: &mut SvcFrame) {
     }
 
     let file_idx = sync::handle_idx_by_owner(file_handle, owner_pid);
-    if file_idx == 0 {
-        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
-        frame.x[0] = status::INVALID_HANDLE as u64;
-        return;
-    }
 
     let host_fd = match file_handle_to_host_fd(file_handle) {
         Some(fd) => fd,
@@ -676,6 +689,11 @@ pub(crate) fn handle_write_file(frame: &mut SvcFrame) {
             return;
         }
     };
+    if file_idx == 0 && !is_std_file_handle(file_handle) {
+        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    }
 
     let offset = if byte_offset_ptr.is_null() {
         u64::MAX
@@ -683,7 +701,7 @@ pub(crate) fn handle_write_file(frame: &mut SvcFrame) {
         unsafe { byte_offset_ptr.read_volatile() }
     };
 
-    if event_handle != 0 && len != 0 {
+    if event_handle != 0 && len != 0 && file_idx != 0 {
         let user_tag = ((owner_pid as u64) << 32) | file_idx as u64;
         let submit = hostcall::submit_tracked(
             owner_pid,
@@ -764,11 +782,6 @@ pub(crate) fn handle_read_file(frame: &mut SvcFrame) {
     }
 
     let file_idx = sync::handle_idx_by_owner(file_handle, owner_pid);
-    if file_idx == 0 {
-        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
-        frame.x[0] = status::INVALID_HANDLE as u64;
-        return;
-    }
 
     let host_fd = match file_handle_to_host_fd(file_handle) {
         Some(fd) => fd,
@@ -778,6 +791,11 @@ pub(crate) fn handle_read_file(frame: &mut SvcFrame) {
             return;
         }
     };
+    if file_idx == 0 && !is_std_file_handle(file_handle) {
+        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    }
 
     let offset = if byte_offset_ptr.is_null() {
         u64::MAX
@@ -785,7 +803,7 @@ pub(crate) fn handle_read_file(frame: &mut SvcFrame) {
         unsafe { byte_offset_ptr.read_volatile() }
     };
 
-    if event_handle != 0 && len != 0 {
+    if event_handle != 0 && len != 0 && file_idx != 0 {
         let user_tag = ((owner_pid as u64) << 32) | file_idx as u64;
         let submit = hostcall::submit_tracked(
             owner_pid,

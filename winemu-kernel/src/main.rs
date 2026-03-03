@@ -177,6 +177,19 @@ pub extern "C" fn kernel_main() -> ! {
     mm::init();
     crate::kinfo!("kernel_main: mmu ok");
     alloc::init();
+
+    // Bootstrap process/thread context first so sync hostcall path runs under
+    // kernel-thread semantics from the beginning of image loading.
+    if !process::init_boot_process(0, 0) {
+        crate::kerror!("kernel: bootstrap process init failed");
+        hypercall::process_exit(1);
+    }
+    if !sched::register_thread0(0) {
+        crate::kerror!("kernel: bootstrap thread0 init failed");
+        hypercall::process_exit(1);
+    }
+    sched::set_current_in_kernel(true);
+
     hostcall::init();
     if hypercall::hostcall_setup() != winemu_shared::hostcall::HC_OK {
         crate::kwarn!("kernel: hostcall setup failed");
@@ -249,6 +262,7 @@ pub extern "C" fn kernel_main() -> ! {
         crate::kerror!("kernel: boot process update failed");
         hypercall::process_exit(1);
     }
+    sched::set_current_thread_teb(teb_peb.teb_va);
 
     // ── 4. 通知 VMM 创建 Thread 0 ───────────────────────────
     let app_entry_va = loaded.base + loaded.entry_rva as u64;

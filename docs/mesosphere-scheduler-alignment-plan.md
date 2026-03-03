@@ -1,148 +1,152 @@
-# Mesosphere 调度对齐改造方案
+# Mesosphere 调度对齐设计（重构版）
 
-## 1. 目标
+## 1. 背景与问题定义
 
-严格对齐 Mesosphere 的内核线程等待/调度时序（以 `KSynchronizationObject::Wait` 为基准）：
+当前 WinEmu 调度器在“等待后立即进入调度”这条链路上，存在一个 Mesosphere 不具备的中间机制：`dispatch_kctx`。
 
-1. 进入调度锁。
-2. 将当前内核线程切到 `Waiting`（`BeginWait` 语义）。
-3. 在解锁前注册绝对超时任务（`RegisterAbsoluteTask`）。
-4. 解锁后进入调度（`EnableScheduling` 语义）。
+该机制把“当前线程在 syscall 深栈中的执行点”先跳回一个 dispatch continuation，再进入调度。它能工作，但有三个问题：
 
-重点是 **内核线程阻塞与切换**，不是用户线程轮询或返回 `STATUS_PENDING` 后用户态自旋。
+1. 语义偏离 Mesosphere：不是 `Unlock -> RescheduleCurrentCoreImpl` 直达调度。
+2. 状态复杂度高：每线程双内核上下文（`kctx` + `dispatch_kctx`）增加一致性成本。
+3. 故障面增大：和 unlock-edge 触发、等待唤醒、抢占时序叠加时，容易出现重入/坏续点问题。
 
-## 2. 现状差异（WinEmu）
+本次文档重构目标是：以你确认的生命周期为准，收敛到“单 `KThread.kctx` 模型”。
 
-1. `sched_lock_release()` 目前只做 deferred commit，不直接触发当前核调度。
-2. `prepare_wait_locked()` 中等待时序是“先注册 timer，再设 `Waiting`”，与 Mesosphere 顺序相反。
-3. 同步对象 waiter 注册存在“静默失败”路径（内存不足时直接 return），会导致等待状态与对象队列不一致。
-4. `NtWait*`/`Delay` 慢路径虽然可阻塞，但关键路径缺少“解锁即进入调度”的收敛点。
+## 2. 目标行为（强约束）
 
-## 3. 改造原则
+以 `SetEvent/NtWait*` 为代表，统一采用如下内核线程生命周期：
 
-1. 保持状态变迁单入口（`set_thread_state_locked`）不变。
-2. 锁顺序继续保持 `sched lock -> timer lock`。
-3. 等待注册必须事务化：任一步失败都完整回滚。
-4. 先做 P0 级时序一致性，再做 P1/P2 扩展收敛。
+1. 用户态进入 syscall。
+2. 当前 `KThread` 在内核态执行 syscall 逻辑。
+3. 若进入等待：
+   1. 持调度锁设置 `Waiting`。
+   2. 注册 timeout `TimerTask`。
+   3. 解锁并触发调度。
+4. 调度器选择下一个 `Ready` 线程。
+5. 在同一 vCPU 上执行 `switch_kernel_context(cur.kctx, next.kctx)`。
+6. 当前线程被唤醒后恢复 `cur.kctx`，继续从原 syscall 位置执行并返回结果。
 
-## 4. 分阶段计划
+关键点：不允许引入“跳到 dispatch continuation 再调度”的中间层。
 
-### Phase A（本次落地）
+## 3. 与 Mesosphere 对齐原则
 
-1. 调整等待准备顺序：
-   - 在调度锁内先写等待元数据；
-   - `BeginWait`（切 `Waiting`）；
-   - 注册超时 `TimerTask`；
-   - 失败回滚到原状态。
+1. 调度决策边界在 unlock 之后，行为等价于 `EnableScheduling`。
+2. 等待顺序固定为：`BeginWait -> RegisterTimerTask -> Unlock -> Reschedule`。
+3. 调度状态变迁单入口（`set_thread_state_locked`）。
+4. 锁顺序固定：`sched lock -> timer lock`。
+5. waiter 注册和撤销必须事务化，失败必须回滚。
 
-2. waiter 注册事务化：
-   - `WaitQueue::enqueue` 返回 `bool`；
-   - 各对象 `register_waiter` 返回 `bool`；
-   - 任一 handle 注册失败时，撤销已注册项并清理等待元数据。
+## 4. 架构收敛方案
 
-3. 解锁触发调度（局部 EnableScheduling 语义）：
-   - 在 `sched_lock_release()` 外层解锁时，若当前核存在 pending reschedule 且当前线程处于 `Waiting` 且有 dispatch continuation，立即尝试切回 dispatch continuation，触发调度决策。
+### 4.1 内核上下文模型
 
-### Phase B（后续）
+1. 保留：`KThread.kctx`（唯一内核上下文）。
+2. 删除：`dispatch_kctx` / `dispatch_valid` / `dispatch_save_gen`。
+3. 删除：`save_current_dispatch_continuation` / `reschedule_current_via_dispatch_continuation` 及其调用链。
 
-1. [x] 将 `NtWait*` 慢路径统一为“内核线程阻塞恢复”主路径，减少 `STATUS_PENDING` 兼容分支。
-2. [x] 统一 `BeginWait/EndWait/CancelWait` 风格 API，减少 `sync.rs` 分散状态拼装。
-3. [x] 增加 wait-cancel/termination 与 timer-cancel 的一致性断言。
+### 4.2 unlock-edge 调度模型
 
-## 5. 代码落点
+1. `sched_lock_release()` 只负责：
+   1. 提交 deferred scheduling。
+   2. 唤醒 idle vCPU（`KICK_VCPU_MASK`）。
+   3. 标记“当前核需要立即重调度”。
+2. 立即重调度动作直接进入 `RescheduleCurrentCore` 语义，不经过 dispatch trampoline。
+3. 若发生线程切换，直接 `switch_kernel_context(cur.kctx, next.kctx)`。
 
-1. `winemu-kernel/src/sched/mod.rs`
-   - 拆分/重构等待准备 API：
-     - `prepare_wait_tracking_locked`
-     - `begin_wait_locked`
-     - `prepare_wait_locked`（组合）
+### 4.3 等待/唤醒模型
 
-2. `winemu-kernel/src/sched/sync.rs`
-   - waiter 注册改为可失败并事务回滚。
-   - `wait_common_locked` 改为“注册 waiters -> BeginWait -> 注册 timer”时序。
+1. `NtWait*`/`Delay`/同步 hostcall 的阻塞全部走同一 `BeginWait` 主路径。
+2. 唤醒路径统一走 `EndWait`，写入 `wait_result` 并转 `Ready`。
+3. timer 到期、对象销毁、线程终止、对象 signal 都走同一 cancel/wake 收敛点。
 
-3. `winemu-kernel/src/sched/lock.rs`
-   - 外层 unlock 后补本核立即调度触发点（受条件保护）。
+### 4.4 SetEvent 语义
 
-## 6. 验收标准
+1. `SetEvent` 仅做：设置对象信号态 + 唤醒 waiter 到 `Ready`。
+2. 抢占由调度器决定，触发点在 unlock/schedule 边界。
+3. 不允许 `SetEvent` 路径依赖 dispatch continuation 才能让出 CPU。
 
-1. `cargo test -q` 通过。
-2. `scripts/stress-regression.sh 10 core` 通过。
-3. `thread_test`/`process_test` 无新增 hang。
-4. 关键不变量满足：
-   - `Waiting` 线程不会出现“无对象 waiter 且无 timer 且无唤醒来源”的悬空状态；
-   - waiter 注册失败可完全回滚。
+## 5. 分阶段实施计划
 
-## 7. Phase B 执行记录（2026-03-03）
+### Phase A：删除 dispatch continuation 基础设施
 
-1. [x] `NtWait*` 慢路径已统一走 `wait_*_sync`，由内核线程阻塞恢复返回结果，不再依赖用户态轮询 `STATUS_PENDING`。
-2. [x] 已落地 `begin_wait_locked` / `end_wait_locked` / `cancel_wait_locked`，并在 timeout/terminate/wake 路径收敛到统一状态迁移。
-3. [x] 已补充等待元数据一致性断言，覆盖 wait/timer 清理与 timeout 取消路径。
+1. 从 `KThread` 移除 `dispatch_*` 字段。
+2. 从 `sched/continuation.rs` 移除 dispatch 保存/恢复 API。
+3. 清理 `sched/mod.rs`、`nt/dispatch.rs`、`sched/lock.rs` 中相关调用。
+4. 编译通过 + 基础回归通过。
 
-已执行回归：
+完成标准：
 
-1. `cargo test -q`
-2. `target/debug/winemu run guest/sysroot/process_test.exe`
+1. 代码中不再出现 `dispatch_kctx`、`dispatch_valid`、`dispatch_save_gen`。
+2. 代码中不再出现 `reschedule_current_via_dispatch_continuation`。
+
+### Phase B：建立 direct kctx 切换路径
+
+1. 在调度入口实现“当前线程在内核阻塞后直接切 next.kctx”。
+2. 确认等待线程被唤醒后能从原 syscall 点继续执行。
+3. 收敛 `wait_result` 读取点，避免 `STATUS_PENDING` 泄露到用户态。
+
+完成标准：
+
+1. `NtWait*` 在用户态只看到最终结果（`SUCCESS/TIMEOUT/...`）。
+2. `SetEvent` 后可稳定触发 caller 让出 CPU（单 vCPU 场景）。
+
+### Phase C：模块职责拆分（对应 `sched/mod.rs` 臃肿问题）
+
+1. `sched/core.rs`：runqueue、pick-next、timeslice。
+2. `sched/context_switch.rs`：`kctx` 保存/恢复和切换。
+3. `sched/wait_path.rs`：`BeginWait/EndWait/CancelWait`。
+4. `sched/lock.rs`：锁、deferred commit、unlock-edge 触发。
+5. `sched/topology.rs`：vCPU mask、idle 唤醒。
+
+完成标准：
+
+1. `sched/mod.rs` 只保留 re-export 和初始化入口。
+2. 每个子文件职责单一，禁止交叉复制状态机逻辑。
+
+## 6. 验证矩阵
+
+每阶段至少执行：
+
+1. `bash scripts/build-kernel-bin.sh`
+2. `cargo build`
 3. `target/debug/winemu run tests/thread_test/target/aarch64-pc-windows-msvc/release/thread_test.exe`
-4. `bash scripts/stress-regression.sh 3 core`
-
-## 8. Hostcall 收敛（2026-03-03）
-
-1. [x] 线程上下文下的 hostcall 等待改为调度器主路径：
-   - `block_current_and_resched(WAIT_KIND_HOSTCALL, ...)`
-   - `consume_current_wait_result()`
-2. [x] 移除轮询+WFI 回退；`call_sync` 严格要求当前内核线程上下文，确保 hostcall 只走 IRQ/调度阻塞链路。
-3. [x] completion 发布与 waiter 唤醒顺序调整为“先存 completion，再唤醒 waiter”，避免唤醒后取不到 completion 的竞态。
-4. [x] `wait_current_for_request` 语义收敛为“同步阻塞直到 resolved status”，不再返回 `STATUS_PENDING`。
-
-本轮附加回归：
-
-1. `cargo test -q`
-2. `target/debug/winemu run guest/sysroot/process_test.exe`
-3. `target/debug/winemu run tests/thread_test/target/aarch64-pc-windows-msvc/release/thread_test.exe`
-4. `bash scripts/stress-regression.sh 2 core`
+4. `target/debug/winemu run guest/sysroot/process_test.exe`
 5. `target/debug/winemu run tests/full_test/target/aarch64-pc-windows-msvc/release/full_test.exe`
 
-## 9. Phase C 严格差异收敛（按顺序执行）
+强制观察项：
 
-1. [x] 移除 `consume_current_wait_result()` 的 `WFI` 回退，强制 continuation 调度路径。
-2. [x] 强化 `sched_lock_release()` 的 unlock 边调度触发，使其更接近 Mesosphere `EnableScheduling` 语义。
-3. [x] 调整 `sync` 等待时序，收敛到 `BeginWait -> TimerTask -> Unlock+Schedule` 主序列（含失败回滚）。
-4. [x] 将 `WaitQueue` 从动态 `Vec` 收敛到预分配/无堆分配路径，降低 runtime 分配失败面。
-5. [x] 移除 timeout 全线程兜底扫描，改为 timer task 唯一真源路径。
-6. [x] 细化 terminate/cancel 的等待结果码语义，不再统一使用 `TIMEOUT`。
+1. 不出现 `KERNEL_FAULT`。
+2. `thread_test` 完整输出并 `PROCESS_EXIT: code=0`。
+3. `NtClose INVALID_HANDLE` 仅在预期测试路径出现，不可导致活锁或错误退出。
 
-### Phase C 每步验证要求
+## 7. 风险与回滚策略
 
-1. `cargo test -q`
-2. `target/debug/winemu run guest/sysroot/process_test.exe`
-3. `target/debug/winemu run tests/thread_test/target/aarch64-pc-windows-msvc/release/thread_test.exe`
-4. `target/debug/winemu run tests/full_test/target/aarch64-pc-windows-msvc/release/full_test.exe`
+1. 风险：去掉 dispatch trampoline 后，部分 syscall 深栈阻塞路径可能暴露新的切换点缺陷。
+2. 缓解：先在 `NtWait*`、`SetEvent`、`Delay`、sync hostcall 四条关键路径灰度启用 direct kctx 切换。
+3. 回滚：保留单开关回退到“仅 trap-exit 调度”，但不回退到 `dispatch_kctx` 设计。
 
-### Phase C 执行记录（2026-03-03）
+## 8. 当前结论
 
-1. Step 1（移除 `WFI` 回退）已完成；4 项验证通过。
-2. Step 2（强化 unlock 边调度触发）已完成；4 项验证通过。
-3. Step 3（同步等待时序收敛 + 失败回滚）已完成；4 项验证通过。
-4. Step 4（`WaitQueue` 无堆分配化）已完成；4 项验证通过。
-5. Step 5（移除 timeout 全线程兜底扫描，timer task 唯一真源）已完成；4 项验证通过。
-6. Step 6（terminate/cancel 结果码语义细化）已完成；4 项验证通过。
+1. `dispatch_kctx` 不是目标架构，不符合 Mesosphere 对齐方向。
+2. 目标是“单 `kctx` + unlock 后直接调度 + 线程间 direct kctx 切换”。
+3. 后续代码改造以本文件 Phase A/B/C 顺序执行，不再引入新的 continuation 中间层。
 
-## 10. Mesosphere 差异 1-8 收敛（2026-03-03）
+## 9. 落地状态（2026-03-03）
 
-1. [x] `sched_lock_release()` 泛化 unlock 边调度触发（不再只限 `Waiting`，改为本核存在已提交 reschedule 且当前线程非 `Running`）。
-2. [x] 引入 `ScopedSchedulerLock`（RAII），并用于 `wait_handle_sync` / `wait_multiple_sync` / `delay_current_thread_sync` / `block_current_and_resched` 主等待入口。
-3. [x] 阻塞前 continuation 前置校验：新增 `ensure_current_wait_continuation_locked`，并在 wait/delay/hostcall 阻塞入口使用；`consume_current_wait_result` 改为断言路径（仅保留防御性返回）。
-4. [x] `WaitQueueNode` 使用 `SlabPool` 分配（已在上一轮提交完成并保留）。
-5. [x] 对象释放一致性：`event_free` / `mutex_free` / `semaphore_free` 在调度锁内先 drain/cancel waiter，再释放对象。
-6. [x] 跨核唤醒链路：补齐 `wait_for_event/send_event`，idle 等待切换到 `WFE`，并在 unlock 边根据 idle 唤醒 mask 触发 `SEV`。
-7. [x] 调度锁 owner 校验：`sched_lock_release` 增加非 owner 释放断言，避免静默破坏锁状态。
-8. [x] `in_kernel`/dispatch 写路径锁纪律：`set_thread_in_kernel` 改为经 sched lock 更新；`migrate_svc_frame_to_current_kstack` 与 `save_current_dispatch_continuation` 的相关字段更新收敛到锁保护路径。
+已完成：
 
-本轮验证：
+1. Phase A 基础设施收敛：`dispatch_*` 相关字段与调度入口依赖已移除。
+2. 等待门禁命名收敛：`ensure_current_wait_continuation_locked` 更名为 `ensure_current_wait_preconditions_locked`，去除 continuation 语义残留。
+3. `wait_current_for_request` 收敛到统一等待结果接口：通过 `current_wait_result_or_pending` 读取解锁后状态，不在结果读取接口里做调度/切换。
+4. `call_sync` 收敛为“仅同步 hostcall”：遇到 host 侧 `PENDING` 立即 cancel + unregister 并返回错误，避免错误进入内核等待态。
+   - 接口层同时移除 `call_sync` 的 `timeout` 形参，避免语义漂移。
+5. idle 路径移除 1ms fallback 轮询：无 deadline 时不再周期性定时唤醒，仅依赖 IRQ/SEV 唤醒。
+6. hostcall completion 收敛为单路径：移除 completion 存储中间层，改为“到达即分发或按 host result 唤醒 waiter”。
+7. direct `kctx` 主路径已接通：
+   - `sched_lock_release` 外层解锁时，若当前线程已离开 `Running` 且本核存在 reschedule 请求，会优先尝试切换到就绪内核 continuation 线程。
+   - `schedule_from_trap` 在 pick 到具备 continuation 的目标线程时，优先走 `switch_kernel_continuation(from, to)`。
+   - 无可切 continuation 目标时回落到现有 trap-exit 调度路径（不使用轮询+WFI 回退，也不在 wait-result 读取接口里做补偿切换）。
 
-1. `cargo test -q`
-2. `target/debug/winemu run guest/sysroot/process_test.exe`
-3. `target/debug/winemu run tests/thread_test/target/aarch64-pc-windows-msvc/release/thread_test.exe`
-4. `target/debug/winemu run tests/full_test/target/aarch64-pc-windows-msvc/release/full_test.exe`
-5. `bash scripts/stress-regression.sh 2 core`
+待完成：
+
+1. 仍待收敛为“纯 direct-kctx 主路径”：当前实现是“direct-kctx 优先 + trap-exit 回落”，尚未完全移除回落分支。

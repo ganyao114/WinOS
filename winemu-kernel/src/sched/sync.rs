@@ -13,7 +13,7 @@ use winemu_shared::status;
 
 use super::{
     begin_wait_locked, boost_thread_priority_locked, cancel_wait_locked, clear_wait_tracking_locked,
-    current_tid, end_wait_locked, ensure_current_wait_continuation_locked, prepare_wait_tracking_locked,
+    current_tid, end_wait_locked, ensure_current_wait_preconditions_locked, prepare_wait_tracking_locked,
     sched_lock_acquire, sched_lock_release, set_thread_priority_locked, set_thread_state_locked, thread_count,
     thread_exists, with_thread, with_thread_mut, ScopedSchedulerLock, ThreadState, MAX_WAIT_HANDLES,
     WAIT_KIND_DELAY, WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY, WAIT_KIND_SINGLE,
@@ -1428,7 +1428,7 @@ fn wait_common_locked(handles: &[u64], wait_all: bool, timeout: WaitDeadline) ->
         return STATUS_TIMEOUT;
     }
 
-    let gate = ensure_current_wait_continuation_locked(cur);
+    let gate = ensure_current_wait_preconditions_locked(cur);
     if gate != STATUS_SUCCESS {
         return gate;
     }
@@ -1482,7 +1482,7 @@ pub fn wait_handle_sync(h: u64, timeout: WaitDeadline) -> u32 {
     if st != STATUS_PENDING {
         return st;
     }
-    crate::sched::consume_current_wait_result()
+    crate::sched::current_wait_result_or_pending()
 }
 
 pub fn wait_multiple_sync(handles: &[u64], wait_all: bool, timeout: WaitDeadline) -> u32 {
@@ -1493,7 +1493,7 @@ pub fn wait_multiple_sync(handles: &[u64], wait_all: bool, timeout: WaitDeadline
     if st != STATUS_PENDING {
         return st;
     }
-    crate::sched::consume_current_wait_result()
+    crate::sched::current_wait_result_or_pending()
 }
 
 pub fn delay_current_thread_sync(timeout: WaitDeadline) -> u32 {
@@ -1507,7 +1507,7 @@ pub fn delay_current_thread_sync(timeout: WaitDeadline) -> u32 {
         if cur == 0 || !thread_exists(cur) {
             STATUS_INVALID_PARAMETER
         } else {
-            let gate = ensure_current_wait_continuation_locked(cur);
+            let gate = ensure_current_wait_preconditions_locked(cur);
             if gate != STATUS_SUCCESS {
                 gate
             } else {
@@ -1530,7 +1530,7 @@ pub fn delay_current_thread_sync(timeout: WaitDeadline) -> u32 {
     if st != STATUS_PENDING {
         return st;
     }
-    crate::sched::consume_current_wait_result()
+    crate::sched::current_wait_result_or_pending()
 }
 
 /// Remove a waiting thread from all object wait queues.

@@ -16,12 +16,6 @@ struct PendingWaiter {
 }
 
 #[derive(Clone, Copy)]
-struct CompletedHostCall {
-    request_id: u64,
-    cpl: hypercall::HostCallCompletion,
-}
-
-#[derive(Clone, Copy)]
 pub struct SubmitArgs {
     pub opcode: u64,
     pub flags: u64,
@@ -46,7 +40,6 @@ pub enum SubmitOutcome {
 
 struct HostCallState {
     requests: ObjectStore<PendingWaiter>,
-    completions: ObjectStore<CompletedHostCall>,
 }
 
 static mut HOSTCALL_STATE: Option<HostCallState> = None;
@@ -56,7 +49,6 @@ fn state_mut() -> &'static mut HostCallState {
         if HOSTCALL_STATE.is_none() {
             HOSTCALL_STATE = Some(HostCallState {
                 requests: ObjectStore::new(),
-                completions: ObjectStore::new(),
             });
         }
         HOSTCALL_STATE.as_mut().unwrap()
@@ -106,35 +98,9 @@ pub fn submit_tracked(
     Err(status::NO_MEMORY)
 }
 
-fn to_submit_done(cpl: hypercall::HostCallCompletion) -> SubmitDone {
-    SubmitDone {
-        host_result: (cpl.host_result as u32) as u64,
-        value0: cpl.value0,
-    }
-}
-
-fn wait_sync_completion(request_id: u64, timeout: WaitDeadline) -> Result<SubmitDone, u32> {
-    if request_id == 0 {
-        return Err(status::INVALID_PARAMETER);
-    }
-    if timeout == WaitDeadline::Immediate {
-        let _ = hypercall::hostcall_cancel(request_id);
-        let _ = unregister_pending_request(request_id);
-        return Err(status::TIMEOUT);
-    }
-    let st = wait_current_for_request(request_id, timeout);
-    if st != status::SUCCESS {
-        return Err(st);
-    }
-    take_completion(request_id)
-        .map(to_submit_done)
-        .ok_or(status::NO_MEMORY)
-}
-
 pub fn call_sync(
     owner_pid: u32,
     args: SubmitArgs,
-    timeout: WaitDeadline,
 ) -> Result<SubmitDone, u32> {
     let cur_tid = sched::current_tid();
     if cur_tid == 0 || !sched::thread_exists(cur_tid) {
@@ -142,7 +108,13 @@ pub fn call_sync(
     }
     match submit_tracked(owner_pid, cur_tid, args)? {
         SubmitOutcome::Completed(done) => Ok(done),
-        SubmitOutcome::Pending { request_id } => wait_sync_completion(request_id, timeout),
+        // call_sync is for synchronous hostcalls. Pending response means host
+        // side violated synchronous contract for this opcode.
+        SubmitOutcome::Pending { request_id } => {
+            let _ = hypercall::hostcall_cancel(request_id);
+            let _ = unregister_pending_request(request_id);
+            Err(status::NOT_IMPLEMENTED)
+        }
     }
 }
 
@@ -189,7 +161,7 @@ pub fn wait_current_for_request(request_id: u64, timeout: WaitDeadline) -> u32 {
         let _ = unregister_pending_request(request_id);
         return wait_status;
     }
-    let resolved = sched::consume_current_wait_result();
+    let resolved = sched::current_wait_result_or_pending();
     if resolved == status::TIMEOUT {
         let _ = hypercall::hostcall_cancel(request_id);
         let _ = unregister_pending_request(request_id);
@@ -207,50 +179,16 @@ fn find_waiter_id_by_request(request_id: u64) -> u32 {
     found
 }
 
-fn find_completion_id_by_request(request_id: u64) -> u32 {
-    let mut found = 0u32;
-    state_mut().completions.for_each_live_ptr(|id, ptr| unsafe {
-        if found == 0 && (*ptr).request_id == request_id {
-            found = id;
-        }
-    });
-    found
-}
-
 pub fn unregister_pending_request(request_id: u64) -> bool {
     if request_id == 0 {
         return false;
     }
-    let mut changed = false;
     let waiter_id = find_waiter_id_by_request(request_id);
     if waiter_id != 0 {
         let _ = state_mut().requests.free(waiter_id);
-        changed = true;
+        return true;
     }
-    let cpl_id = find_completion_id_by_request(request_id);
-    if cpl_id != 0 {
-        let _ = state_mut().completions.free(cpl_id);
-        changed = true;
-    }
-    changed
-}
-
-pub fn take_completion(request_id: u64) -> Option<hypercall::HostCallCompletion> {
-    if request_id == 0 {
-        return None;
-    }
-    let cpl_id = find_completion_id_by_request(request_id);
-    if cpl_id == 0 {
-        return None;
-    }
-    let ptr = state_mut().completions.get_ptr(cpl_id);
-    if ptr.is_null() {
-        let _ = state_mut().completions.free(cpl_id);
-        return None;
-    }
-    let out = unsafe { (*ptr).cpl };
-    let _ = state_mut().completions.free(cpl_id);
-    Some(out)
+    false
 }
 
 fn waiter_still_pending(waiter_tid: u32, request_id: u64) -> bool {
@@ -300,17 +238,6 @@ fn reap_stale_waiters() {
     }
 }
 
-fn store_completion(cpl: hypercall::HostCallCompletion) -> bool {
-    let _ = unregister_pending_request(cpl.request_id);
-    state_mut()
-        .completions
-        .alloc_with(|_| CompletedHostCall {
-            request_id: cpl.request_id,
-            cpl,
-        })
-        .is_some()
-}
-
 pub fn pump_completions() {
     reap_stale_waiters();
 
@@ -322,18 +249,19 @@ pub fn pump_completions() {
     }
 
     for cpl in cpls.iter().take(got.min(cpls.len())) {
+        let cpl = *cpl;
         let Some(waiter) = take_waiter_by_request(cpl.request_id) else {
             continue;
         };
-        let completion_stored = store_completion(*cpl);
-        if crate::process::process_exists(waiter.owner_pid) && waiter.waiter_tid != 0 {
-            // Hostcall sync waiter consumes real host result from completion payload.
-            // Wake status only represents scheduler wait lifecycle progress.
-            let st = if completion_stored {
-                status::SUCCESS
-            } else {
-                status::NO_MEMORY
-            };
+        if waiter.waiter_tid == 0 {
+            let _ = crate::nt::file::dispatch_async_hostcall_completion(cpl);
+            continue;
+        }
+        if crate::nt::file::dispatch_async_hostcall_completion(cpl) {
+            continue;
+        }
+        if crate::process::process_exists(waiter.owner_pid) {
+            let st = map_host_result_to_status(cpl.host_result as u64);
             sched::wake(waiter.waiter_tid, st);
         }
     }

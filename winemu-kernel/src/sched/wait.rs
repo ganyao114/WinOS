@@ -126,23 +126,15 @@ pub(crate) fn prepare_wait_tracking_locked(
     status::SUCCESS
 }
 
-pub(crate) fn ensure_current_wait_continuation_locked(tid: u32) -> u32 {
+pub(crate) fn ensure_current_wait_preconditions_locked(tid: u32) -> u32 {
     debug_assert!(
         sched_lock_held_by_current_vcpu(),
-        "ensure_current_wait_continuation_locked requires sched lock"
+        "ensure_current_wait_preconditions_locked requires sched lock"
     );
     if tid == 0 || !thread_exists(tid) {
         return status::INVALID_PARAMETER;
     }
-    if tid != current_tid() {
-        return status::SUCCESS;
-    }
-    let has = has_dispatch_continuation(tid);
-    debug_assert!(
-        has,
-        "blocking current thread wait requires dispatch continuation"
-    );
-    if !has {
+    if tid == current_tid() && !with_thread(tid, |t| t.in_kernel) {
         return status::INVALID_PARAMETER;
     }
     status::SUCCESS
@@ -240,7 +232,7 @@ pub(crate) fn prepare_wait_locked(
     wait_deadline: u64,
     pending_result: u32,
 ) -> u32 {
-    let gate = ensure_current_wait_continuation_locked(tid);
+    let gate = ensure_current_wait_preconditions_locked(tid);
     if gate != status::SUCCESS {
         return gate;
     }
@@ -278,10 +270,7 @@ pub fn block_current_and_resched(
     }
     status::SUCCESS
 }
-
-// Consume wait result after unlock-edge scheduling has already blocked and
-// resumed the current kernel thread.
-pub fn consume_current_wait_result() -> u32 {
+pub fn current_wait_result_or_pending() -> u32 {
     let cur = current_tid();
     if cur == 0 || !thread_exists(cur) {
         return status::INVALID_PARAMETER;
@@ -291,11 +280,7 @@ pub fn consume_current_wait_result() -> u32 {
         with_thread(cur, |t| (t.state, t.wait_result))
     };
     if state == ThreadState::Waiting {
-        debug_assert!(
-            state != ThreadState::Waiting,
-            "consume_current_wait_result observed Waiting: unlock-edge reschedule missing"
-        );
-        return status::INVALID_PARAMETER;
+        return 0x0000_0103;
     }
     result
 }

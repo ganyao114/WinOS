@@ -49,7 +49,6 @@ fn hostcall_sync(opcode: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> (u6
             arg3,
             user_tag: 0,
         },
-        crate::sched::sync::WaitDeadline::Infinite,
     );
     match res {
         Ok(done) => (done.host_result, done.value0),
@@ -103,6 +102,14 @@ pub fn free_virtual(base: u64) -> u64 {
 
 pub fn yield_execution() {
     hypercall(nr::NT_YIELD_EXECUTION, 0, 0, 0);
+}
+
+#[inline(always)]
+pub fn kick_vcpu_mask(mask: u32) {
+    if mask == 0 {
+        return;
+    }
+    let _ = hypercall6(nr::KICK_VCPU_MASK, mask as u64, 0, 0, 0, 0, 0);
 }
 
 /// NtCreateSection — file_handle=0 表示 pagefile-backed

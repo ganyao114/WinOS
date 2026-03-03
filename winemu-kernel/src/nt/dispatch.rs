@@ -6,10 +6,11 @@ use crate::hypercall;
 use core::sync::atomic::{AtomicU32, Ordering};
 use crate::sched::{
     charge_current_runtime_locked, check_timeouts, consume_pending_reschedule_locked,
-    current_slice_remaining_100ns, current_tid, has_kernel_continuation, next_wait_deadline_locked,
+    current_slice_remaining_100ns, current_tid, next_wait_deadline_locked,
     now_ticks, register_thread0, rotate_current_on_quantum_expire_locked, sched_lock_acquire,
-    sched_lock_release, save_current_dispatch_continuation, schedule, set_current_in_kernel, set_thread_in_kernel,
+    sched_lock_release, schedule, set_current_in_kernel, set_thread_in_kernel,
     set_vcpu_idle_locked, switch_kernel_continuation, thread_exists, vcpu_id, with_thread, with_thread_mut,
+    has_kernel_continuation,
     ThreadState,
 };
 use crate::timer;
@@ -36,14 +37,11 @@ pub extern "C" fn svc_migrate_frame_to_thread_stack(frame_ptr: u64, frame_size: 
 #[no_mangle]
 pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
     if current_tid() == 0 {
-        register_thread0(frame.tpidr);
+        let _ = register_thread0(frame.tpidr);
     }
     set_current_in_kernel(true);
-    let resumed_dispatch = unsafe { save_current_dispatch_continuation() };
-    if resumed_dispatch != 0 {
-        schedule_from_trap(frame, true);
-        return;
-    }
+    crate::sched::reclaim_deferred_kernel_stacks();
+    crate::hostcall::pump_completions();
 
     let tag = frame.x8_orig;
     let nr = (tag & SVC_TAG_NR_MASK) as u16;
@@ -210,9 +208,6 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
         save_ctx_for(from, frame);
     }
     loop {
-        crate::hostcall::pump_completions();
-        file::poll_async_file_completions();
-
         let now = now_ticks();
         sched_lock_acquire();
         set_vcpu_idle_locked(vid, false);
@@ -234,23 +229,22 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
             let (from_sched, to) = schedule(vid, now, quantum_100ns);
             if to != 0 {
                 set_vcpu_idle_locked(vid, false);
-                crate::process::switch_to_thread_process(to);
                 if from_sched != 0 && from_sched != to && has_kernel_continuation(to) {
                     save_ctx_for(from_sched, frame);
+                    let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
                     sched_lock_release();
+                    crate::process::switch_to_thread_process(to);
+                    timer::schedule_running_slice_100ns(now, next_deadline, slice_remaining);
                     let switched = unsafe { switch_kernel_continuation(from_sched, to) };
                     if !switched {
                         restore_ctx_to_frame(to, frame);
-                        let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
                         set_thread_in_kernel(to, false);
-                        timer::schedule_running_slice_100ns(now, next_deadline, slice_remaining);
                         return from_sched != to;
                     }
-                    // Returned by a later kernel-continuation switch back into
-                    // this thread; restart scheduling decision with fresh state.
                     from = current_tid();
                     continue;
                 }
+                crate::process::switch_to_thread_process(to);
                 if from_sched != 0 && from_sched != to {
                     save_ctx_for(from_sched, frame);
                     restore_ctx_to_frame(to, frame);
@@ -302,6 +296,8 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
 #[no_mangle]
 pub extern "C" fn timer_irq_dispatch(frame: &mut SvcFrame) {
     set_current_in_kernel(true);
+    crate::sched::reclaim_deferred_kernel_stacks();
+    crate::hostcall::pump_completions();
     let _ = schedule_from_trap(frame, false);
 }
 

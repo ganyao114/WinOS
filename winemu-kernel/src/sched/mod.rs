@@ -4,7 +4,6 @@
 // vCPU 空闲时执行 WFI → VM exit → VMM park 宿主线程。
 
 mod lock;
-mod continuation;
 pub mod sync;
 mod thread_control;
 mod wait;
@@ -25,10 +24,6 @@ use winemu_shared::status;
 use winemu_shared::teb as teb_layout;
 
 pub use lock::{sched_lock_acquire, sched_lock_release, ScopedSchedulerLock};
-pub use continuation::{
-    has_dispatch_continuation, has_kernel_continuation, reschedule_current_via_dispatch_continuation,
-    save_current_dispatch_continuation, switch_kernel_continuation,
-};
 pub(crate) use thread_control::{boost_thread_priority_locked, set_thread_priority_locked};
 pub use thread_control::{
     charge_current_runtime_locked, current_slice_remaining_100ns, resolve_thread_tid_from_handle,
@@ -37,11 +32,11 @@ pub use thread_control::{
 };
 pub(crate) use wait::{
     begin_wait_locked, cancel_wait_locked, clear_wait_tracking_locked, end_wait_locked,
-    ensure_current_wait_continuation_locked, prepare_wait_tracking_locked,
+    ensure_current_wait_preconditions_locked, prepare_wait_tracking_locked,
 };
 pub use wait::{
     block_current_and_resched, check_timeouts, deadline_after_100ns, next_wait_deadline_locked,
-    now_ticks, consume_current_wait_result,
+    now_ticks, current_wait_result_or_pending,
 };
 
 // ── 常量 ─────────────────────────────────────────────────────
@@ -50,6 +45,7 @@ pub const MAX_VCPUS: usize = 8;
 pub const IDLE_TID: u32 = 0;
 pub const MAX_WAIT_HANDLES: usize = 64;
 pub const KERNEL_STACK_SIZE: usize = 64 * 1024;
+const DEFERRED_KSTACK_CAP: usize = 1024;
 
 pub const WAIT_KIND_NONE: u8 = 0;
 pub const WAIT_KIND_SINGLE: u8 = 1;
@@ -112,8 +108,6 @@ pub struct KThread {
 
     pub ctx: ThreadContext,
     pub kctx: KernelContext,
-    pub dispatch_kctx: KernelContext,
-    pub dispatch_valid: bool,
 
     // 等待信息
     pub wait_result: u32,   // NTSTATUS written on wake
@@ -164,12 +158,6 @@ impl KThread {
                 sp_el1: 0,
                 lr_el1: 0,
             },
-            dispatch_kctx: KernelContext {
-                x19_x30: [0u64; 12],
-                sp_el1: 0,
-                lr_el1: 0,
-            },
-            dispatch_valid: false,
             wait_result: 0,
             wait_deadline: 0,
             wait_timer_task_id: 0,
@@ -216,8 +204,6 @@ impl KThread {
         self.in_kernel = false;
         self.ctx = ThreadContext::default();
         self.kctx = KernelContext::default();
-        self.dispatch_kctx = KernelContext::default();
-        self.dispatch_valid = false;
         self.ctx.pc = pc;
         self.ctx.sp = sp;
         self.ctx.x[0] = arg;
@@ -239,8 +225,6 @@ impl KThread {
         self.in_kernel = false;
         self.ctx = ThreadContext::default();
         self.kctx = KernelContext::default();
-        self.dispatch_kctx = KernelContext::default();
-        self.dispatch_valid = false;
         self.ctx.tpidr = teb_va;
     }
 
@@ -457,6 +441,8 @@ pub struct Scheduler {
     pending_reschedule_mask: UnsafeCell<u32>,
     reschedule_mask: UnsafeCell<u32>,
     idle_vcpu_mask: UnsafeCell<u32>,
+    deferred_kstack_bases: UnsafeCell<[u64; DEFERRED_KSTACK_CAP]>,
+    deferred_kstack_len: UnsafeCell<usize>,
     // 全局调度锁（可重入，保护 ready queue 和线程状态）
     // 多 vCPU：底层用原子自旋锁
     lock_count: UnsafeCell<u32>,
@@ -474,6 +460,8 @@ pub static SCHED: Scheduler = Scheduler {
     pending_reschedule_mask: UnsafeCell::new(0),
     reschedule_mask: UnsafeCell::new(0),
     idle_vcpu_mask: UnsafeCell::new(0),
+    deferred_kstack_bases: UnsafeCell::new([0; DEFERRED_KSTACK_CAP]),
+    deferred_kstack_len: UnsafeCell::new(0),
     lock_count: UnsafeCell::new(0),
     lock_owner: UnsafeCell::new(0),
     spinlock: UnsafeCell::new(0),
@@ -648,17 +636,48 @@ pub(crate) fn set_thread_in_kernel_locked(tid: u32, in_kernel: bool) {
     with_thread_mut(tid, |t| {
         t.in_kernel = in_kernel;
         if !in_kernel {
-            // Returning to EL0 invalidates any previously captured EL1
-            // continuation resume target for this thread.
-            t.kctx.x19_x30[11] = 0;
-            t.kctx.lr_el1 = 0;
-            t.kctx.sp_el1 = 0;
-            t.dispatch_kctx.x19_x30[11] = 0;
-            t.dispatch_valid = false;
-            t.dispatch_kctx.lr_el1 = 0;
-            t.dispatch_kctx.sp_el1 = 0;
+            clear_thread_kernel_continuation_locked_inner(t);
         }
     });
+}
+
+#[inline(always)]
+fn clear_thread_kernel_continuation_locked_inner(t: &mut KThread) {
+    t.kctx.x19_x30[11] = 0;
+    t.kctx.lr_el1 = 0;
+    t.kctx.sp_el1 = 0;
+}
+
+pub fn has_kernel_continuation(tid: u32) -> bool {
+    if tid == 0 || !thread_exists(tid) {
+        return false;
+    }
+    with_thread(tid, |t| {
+        t.in_kernel && t.kctx.sp_el1 != 0 && t.kctx.x19_x30[11] != 0
+    })
+}
+
+pub unsafe fn switch_kernel_continuation(from_tid: u32, to_tid: u32) -> bool {
+    if from_tid == 0 || to_tid == 0 || from_tid == to_tid {
+        return false;
+    }
+    if !thread_exists(from_tid) || !thread_exists(to_tid) {
+        return false;
+    }
+    if !has_kernel_continuation(to_tid) {
+        return false;
+    }
+    let from_ptr = thread_ptr(from_tid);
+    let to_ptr = thread_ptr(to_tid);
+    if from_ptr.is_null() || to_ptr.is_null() {
+        return false;
+    }
+    let from_kctx = unsafe { &mut (*from_ptr).kctx as *mut KernelContext };
+    let to_kctx = unsafe { &(*to_ptr).kctx as *const KernelContext };
+    unsafe {
+        crate::arch::context::switch_kernel_context(from_kctx, to_kctx);
+    }
+    true
 }
 
 pub fn set_thread_in_kernel(tid: u32, in_kernel: bool) {
@@ -896,6 +915,98 @@ pub(crate) fn consume_idle_wakeup_mask_locked() -> u32 {
     }
 }
 
+pub(crate) struct UnlockEdgeKernelSwitch {
+    pub from_tid: u32,
+    pub to_tid: u32,
+    pub now_100ns: u64,
+    pub next_deadline_100ns: u64,
+    pub slice_remaining_100ns: u64,
+}
+
+fn local_reschedule_pending_locked(vid: usize) -> bool {
+    debug_assert!(
+        sched_lock_held_by_current_vcpu(),
+        "local_reschedule_pending_locked requires sched lock"
+    );
+    unsafe {
+        let bit = vcpu_bit(vid);
+        ((*SCHED.pending_reschedule_mask.get() | *SCHED.reschedule_mask.get()) & bit) != 0
+    }
+}
+
+fn pick_ready_kernel_continuation_locked(vcpu_id: usize) -> u32 {
+    let mut skipped = Vec::new();
+    let mut picked = 0u32;
+    loop {
+        let tid = ready_pop_for_vcpu_locked(vcpu_id);
+        if tid == 0 {
+            break;
+        }
+        if has_kernel_continuation(tid) {
+            picked = tid;
+            break;
+        }
+        let _ = skipped.try_reserve(1);
+        skipped.push(tid);
+    }
+    for tid in skipped {
+        ready_push_tid_locked(tid);
+    }
+    picked
+}
+
+pub(crate) fn prepare_unlock_edge_kernel_switch_locked(
+    vid: usize,
+) -> Option<UnlockEdgeKernelSwitch> {
+    debug_assert!(
+        sched_lock_held_by_current_vcpu(),
+        "prepare_unlock_edge_kernel_switch_locked requires sched lock"
+    );
+    if vid >= MAX_VCPUS || !local_reschedule_pending_locked(vid) {
+        return None;
+    }
+
+    let from_tid = current_tid();
+    if from_tid == 0 || !thread_exists(from_tid) {
+        return None;
+    }
+    // Unlock-edge direct kctx switch is only valid when current thread already
+    // left Running state (e.g. entered Waiting in the same critical section).
+    if with_thread(from_tid, |t| t.state == ThreadState::Running) {
+        return None;
+    }
+
+    let now = now_ticks();
+    let quantum_100ns = timer::DEFAULT_TIMESLICE_100NS.max(1);
+    let to_tid = pick_ready_kernel_continuation_locked(vid);
+    if to_tid == 0 {
+        return None;
+    }
+
+    let _ = consume_pending_reschedule_locked(vid);
+    set_thread_state_locked(to_tid, ThreadState::Running);
+    with_thread_mut(to_tid, |t| {
+        if t.slice_remaining_100ns == 0 {
+            t.slice_remaining_100ns = quantum_100ns;
+        }
+        t.last_start_100ns = now;
+        t.last_vcpu_hint = vid as u8;
+    });
+    unsafe {
+        (*SCHED.vcpus.get())[vid].current_tid = to_tid;
+    }
+    set_current_cpu_thread(vid, to_tid);
+    set_vcpu_kernel_sp_for_tid(vid, to_tid);
+
+    Some(UnlockEdgeKernelSwitch {
+        from_tid,
+        to_tid,
+        now_100ns: now,
+        next_deadline_100ns: next_wait_deadline_locked(),
+        slice_remaining_100ns: current_slice_remaining_100ns(vid, quantum_100ns),
+    })
+}
+
 pub(crate) fn set_vcpu_idle_locked(vid: usize, idle: bool) {
     unsafe {
         let bit = vcpu_bit(vid);
@@ -1018,6 +1129,65 @@ fn alloc_kernel_stack() -> Option<(u64, u64)> {
 fn free_kernel_stack(base: u64) {
     if base != 0 {
         crate::alloc::dealloc(base as *mut u8);
+    }
+}
+
+fn defer_kernel_stack_free_locked(base: u64) {
+    debug_assert!(
+        sched_lock_held_by_current_vcpu(),
+        "defer_kernel_stack_free_locked requires sched lock"
+    );
+    if base == 0 {
+        return;
+    }
+    unsafe {
+        let len_ptr = SCHED.deferred_kstack_len.get();
+        let slots = &mut *SCHED.deferred_kstack_bases.get();
+        let len = *len_ptr;
+        if len < DEFERRED_KSTACK_CAP {
+            slots[len] = base;
+            *len_ptr = len + 1;
+        } else {
+            crate::kwarn!("sched: deferred kernel stack queue full; leaking {:#x}", base);
+        }
+    }
+}
+
+fn pop_deferred_kernel_stack_locked(current_base: u64) -> u64 {
+    debug_assert!(
+        sched_lock_held_by_current_vcpu(),
+        "pop_deferred_kernel_stack_locked requires sched lock"
+    );
+    unsafe {
+        let len_ptr = SCHED.deferred_kstack_len.get();
+        let slots = &mut *SCHED.deferred_kstack_bases.get();
+        let mut len = *len_ptr;
+        let mut i = 0usize;
+        while i < len {
+            let base = slots[i];
+            if base != 0 && base != current_base {
+                len -= 1;
+                slots[i] = slots[len];
+                slots[len] = 0;
+                *len_ptr = len;
+                return base;
+            }
+            i += 1;
+        }
+        0
+    }
+}
+
+pub fn reclaim_deferred_kernel_stacks() {
+    let current_base = current_thread_kernel_stack_base();
+    loop {
+        sched_lock_acquire();
+        let base = pop_deferred_kernel_stack_locked(current_base);
+        sched_lock_release();
+        if base == 0 {
+            break;
+        }
+        free_kernel_stack(base);
     }
 }
 
@@ -1191,6 +1361,7 @@ pub fn terminate_thread_by_tid(tid: u32) -> bool {
         return false;
     }
     sched_lock_acquire();
+    let cur_tid = current_tid();
     let (state, pid, stack_base, teb_va, kstack_base) =
         with_thread(tid, |t| (t.state, t.pid, t.stack_base, t.teb_va, t.kstack_base));
     if state == ThreadState::Free || state == ThreadState::Terminated {
@@ -1216,11 +1387,17 @@ pub fn terminate_thread_by_tid(tid: u32) -> bool {
         t.ctx.tpidr = 0;
     });
     set_thread_state_locked(tid, ThreadState::Terminated);
+    let defer_kstack = tid == cur_tid;
+    if defer_kstack {
+        defer_kernel_stack_free_locked(kstack_base);
+    }
     sched_lock_release();
 
     let _ = vm_free_region(pid, stack_base);
     let _ = vm_free_region(pid, teb_va);
-    free_kernel_stack(kstack_base);
+    if !defer_kstack {
+        free_kernel_stack(kstack_base);
+    }
     crate::process::on_thread_terminated(pid, tid);
     true
 }
@@ -1376,10 +1553,10 @@ pub fn set_initial_thread(vcpu_id: usize, tid: u32) {
 
 /// Lazily register Thread 0 on first SVC entry.
 /// Called at the top of svc_dispatch when current_tid() == 0.
-pub fn register_thread0(teb_va: u64) {
+pub fn register_thread0(teb_va: u64) -> bool {
     let pid = crate::process::boot_pid();
     let Some((kstack_base, kstack_size)) = alloc_kernel_stack() else {
-        return;
+        return false;
     };
     let tid = thread_store_mut().alloc_with(|id| {
         let mut t = KThread::zeroed();
@@ -1388,7 +1565,7 @@ pub fn register_thread0(teb_va: u64) {
     });
     let Some(tid) = tid else {
         free_kernel_stack(kstack_base);
-        return;
+        return false;
     };
     crate::process::on_thread_created(pid, tid);
     unsafe {
@@ -1399,6 +1576,24 @@ pub fn register_thread0(teb_va: u64) {
         set_vcpu_kernel_sp_for_tid(vid, tid);
         crate::process::set_current_vcpu_pid(vid, pid);
     }
+    true
+}
+
+pub fn set_current_thread_teb(teb_va: u64) {
+    if teb_va == 0 {
+        return;
+    }
+    let tid = current_tid();
+    if tid == 0 || !thread_exists(tid) {
+        return;
+    }
+    sched_lock_acquire();
+    with_thread_mut(tid, |t| {
+        t.teb_va = teb_va;
+        t.ctx.tpidr = teb_va;
+        t.ctx.x[18] = teb_va;
+    });
+    sched_lock_release();
 }
 /// Returns true if all allocated threads are Terminated or Free (process can exit).
 pub fn all_threads_done() -> bool {

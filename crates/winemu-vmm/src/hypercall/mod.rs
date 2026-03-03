@@ -277,6 +277,10 @@ impl HypercallManager {
                     HypercallResult::Sync(write_len as u64)
                 }
             }
+            nr::KICK_VCPU_MASK => {
+                self.sched.unpark_vcpu_mask(args[0] as u32);
+                HypercallResult::Sync(0)
+            }
             nr::LOAD_DLL_IMAGE | nr::GET_PROC_ADDRESS => HypercallResult::Sync(u64::MAX),
             nr::PROCESS_CREATE => {
                 // args[0] = image_base_gva

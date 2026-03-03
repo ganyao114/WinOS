@@ -94,16 +94,6 @@ global_asm!(
 );
 
 pub const DEFAULT_TIMESLICE_100NS: u64 = 150_000; // 15ms
-const IDLE_FALLBACK_SLEEP_100NS: u64 = 10_000; // 1ms
-
-#[inline(always)]
-fn sleep_delta_100ns(now_100ns: u64, deadline_100ns: u64, fallback_100ns: u64) -> u64 {
-    if deadline_100ns > now_100ns {
-        (deadline_100ns - now_100ns).max(1)
-    } else {
-        fallback_100ns.max(1)
-    }
-}
 
 #[inline(always)]
 fn timer_frequency() -> u64 {
@@ -124,6 +114,12 @@ fn arm_vtimer_oneshot_100ns(delta_100ns: u64) {
     // ENABLE=1, IMASK=0
     super::cpu::write_cntv_cval_el0(cval);
     super::cpu::write_cntv_ctl_el0(1);
+    super::cpu::isb();
+}
+
+#[inline(always)]
+fn disarm_vtimer() {
+    super::cpu::write_cntv_ctl_el0(0);
     super::cpu::isb();
 }
 
@@ -153,7 +149,10 @@ pub fn schedule_running_slice_100ns(now_100ns: u64, next_deadline_100ns: u64, qu
 
 #[inline(always)]
 pub fn idle_wait_until_deadline_100ns(now_100ns: u64, next_deadline_100ns: u64) {
-    let delta = sleep_delta_100ns(now_100ns, next_deadline_100ns, IDLE_FALLBACK_SLEEP_100NS);
-    arm_vtimer_oneshot_100ns(delta);
+    if next_deadline_100ns > now_100ns {
+        arm_vtimer_oneshot_100ns(next_deadline_100ns - now_100ns);
+    } else {
+        disarm_vtimer();
+    }
     wait_for_timer_irq();
 }

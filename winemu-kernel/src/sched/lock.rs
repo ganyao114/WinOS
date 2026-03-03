@@ -1,4 +1,7 @@
-use super::{commit_deferred_scheduling_locked, vcpu_id, SCHED};
+use super::{
+    commit_deferred_scheduling_locked, prepare_unlock_edge_kernel_switch_locked,
+    switch_kernel_continuation, vcpu_id, SCHED,
+};
 
 // 可重入；底层用原子自旋锁保护多 vCPU 并发。
 // lock_owner 存 vcpu_id+1（0 = 未持有）。
@@ -61,8 +64,12 @@ pub fn sched_lock_acquire() {
 }
 
 pub fn sched_lock_release() {
-    let mut try_immediate_resched = false;
+    sched_lock_release_impl();
+}
+
+fn sched_lock_release_impl() {
     let mut wake_idle_mask = 0u32;
+    let mut unlock_switch = None;
     unsafe {
         let vid = vcpu_id();
         let owner_key = (vid as u32) + 1;
@@ -84,31 +91,29 @@ pub fn sched_lock_release() {
         *count -= 1;
         if *count == 0 {
             commit_deferred_scheduling_locked();
-            let local_bit = super::vcpu_bit(vid);
-            let local_pending = (*SCHED.pending_reschedule_mask.get() & local_bit) != 0
-                || (*SCHED.reschedule_mask.get() & local_bit) != 0;
-            let cur = super::current_tid();
-            if local_pending
-                && cur != 0
-                && super::thread_exists(cur)
-                && super::with_thread(cur, |t| t.state != super::ThreadState::Running)
-                && super::has_dispatch_continuation(cur)
-            {
-                try_immediate_resched = true;
-            }
+            unlock_switch = prepare_unlock_edge_kernel_switch_locked(vid);
             wake_idle_mask = super::consume_idle_wakeup_mask_locked();
             *SCHED.lock_owner.get() = 0;
             spinlock_release();
         }
     }
     if wake_idle_mask != 0 {
-        crate::arch::cpu::send_event();
+        crate::hypercall::kick_vcpu_mask(wake_idle_mask);
     }
-    // Mesosphere-like unlock edge: if this vCPU has a committed reschedule
-    // request and current thread is no longer running, jump to dispatch
-    // continuation immediately instead of waiting for later trap-exit points.
-    if try_immediate_resched {
-        let _ = super::reschedule_current_via_dispatch_continuation();
+    if let Some(sw) = unlock_switch {
+        crate::process::switch_to_thread_process(sw.to_tid);
+        crate::timer::schedule_running_slice_100ns(
+            sw.now_100ns,
+            sw.next_deadline_100ns,
+            sw.slice_remaining_100ns,
+        );
+        let switched = unsafe { switch_kernel_continuation(sw.from_tid, sw.to_tid) };
+        debug_assert!(
+            switched,
+            "unlock-edge kernel continuation switch failed from={} to={}",
+            sw.from_tid,
+            sw.to_tid
+        );
     }
 }
 
