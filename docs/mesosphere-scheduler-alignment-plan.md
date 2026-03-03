@@ -90,7 +90,7 @@
 
 1. [x] 线程上下文下的 hostcall 等待改为调度器主路径：
    - `block_current_and_resched(WAIT_KIND_HOSTCALL, ...)`
-   - `wait_current_pending_result()`
+   - `consume_current_wait_result()`
 2. [x] 移除轮询+WFI 回退；`call_sync` 严格要求当前内核线程上下文，确保 hostcall 只走 IRQ/调度阻塞链路。
 3. [x] completion 发布与 waiter 唤醒顺序调整为“先存 completion，再唤醒 waiter”，避免唤醒后取不到 completion 的竞态。
 4. [x] `wait_current_for_request` 语义收敛为“同步阻塞直到 resolved status”，不再返回 `STATUS_PENDING`。
@@ -105,7 +105,7 @@
 
 ## 9. Phase C 严格差异收敛（按顺序执行）
 
-1. [x] 移除 `wait_current_pending_result()` 的 `WFI` 回退，强制 continuation 调度路径。
+1. [x] 移除 `consume_current_wait_result()` 的 `WFI` 回退，强制 continuation 调度路径。
 2. [x] 强化 `sched_lock_release()` 的 unlock 边调度触发，使其更接近 Mesosphere `EnableScheduling` 语义。
 3. [x] 调整 `sync` 等待时序，收敛到 `BeginWait -> TimerTask -> Unlock+Schedule` 主序列（含失败回滚）。
 4. [x] 将 `WaitQueue` 从动态 `Vec` 收敛到预分配/无堆分配路径，降低 runtime 分配失败面。
@@ -132,7 +132,7 @@
 
 1. [x] `sched_lock_release()` 泛化 unlock 边调度触发（不再只限 `Waiting`，改为本核存在已提交 reschedule 且当前线程非 `Running`）。
 2. [x] 引入 `ScopedSchedulerLock`（RAII），并用于 `wait_handle_sync` / `wait_multiple_sync` / `delay_current_thread_sync` / `block_current_and_resched` 主等待入口。
-3. [x] 阻塞前 continuation 前置校验：新增 `ensure_current_wait_continuation_locked`，并在 wait/delay/hostcall 阻塞入口使用；`wait_current_pending_result` 改为断言路径（仅保留防御性返回）。
+3. [x] 阻塞前 continuation 前置校验：新增 `ensure_current_wait_continuation_locked`，并在 wait/delay/hostcall 阻塞入口使用；`consume_current_wait_result` 改为断言路径（仅保留防御性返回）。
 4. [x] `WaitQueueNode` 使用 `SlabPool` 分配（已在上一轮提交完成并保留）。
 5. [x] 对象释放一致性：`event_free` / `mutex_free` / `semaphore_free` 在调度锁内先 drain/cancel waiter，再释放对象。
 6. [x] 跨核唤醒链路：补齐 `wait_for_event/send_event`，idle 等待切换到 `WFE`，并在 unlock 边根据 idle 唤醒 mask 触发 `SEV`。

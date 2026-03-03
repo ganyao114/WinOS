@@ -279,38 +279,25 @@ pub fn block_current_and_resched(
     status::SUCCESS
 }
 
-// Wait until current blocked kernel thread transitions out of Waiting and
-// return the scheduler-owned wait result.
-pub fn wait_current_pending_result() -> u32 {
+// Consume wait result after unlock-edge scheduling has already blocked and
+// resumed the current kernel thread.
+pub fn consume_current_wait_result() -> u32 {
     let cur = current_tid();
     if cur == 0 || !thread_exists(cur) {
         return status::INVALID_PARAMETER;
     }
-    let has = has_dispatch_continuation(cur);
-    debug_assert!(
-        has,
-        "wait_current_pending_result requires dispatch continuation"
-    );
-    if !has {
+    let (state, result) = {
+        let _guard = ScopedSchedulerLock::new();
+        with_thread(cur, |t| (t.state, t.wait_result))
+    };
+    if state == ThreadState::Waiting {
+        debug_assert!(
+            state != ThreadState::Waiting,
+            "consume_current_wait_result observed Waiting: unlock-edge reschedule missing"
+        );
         return status::INVALID_PARAMETER;
     }
-    loop {
-        let (state, result) = {
-            let _guard = ScopedSchedulerLock::new();
-            with_thread(cur, |t| (t.state, t.wait_result))
-        };
-        if state != ThreadState::Waiting {
-            return result;
-        }
-        let switched = reschedule_current_via_dispatch_continuation();
-        debug_assert!(
-            switched,
-            "dispatch continuation switch failed while waiting"
-        );
-        if !switched {
-            return status::INVALID_PARAMETER;
-        }
-    }
+    result
 }
 
 /// Timeout dispatch hot path.

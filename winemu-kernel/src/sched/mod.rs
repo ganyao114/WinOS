@@ -41,7 +41,7 @@ pub(crate) use wait::{
 };
 pub use wait::{
     block_current_and_resched, check_timeouts, deadline_after_100ns, next_wait_deadline_locked,
-    now_ticks, wait_current_pending_result,
+    now_ticks, consume_current_wait_result,
 };
 
 // ── 常量 ─────────────────────────────────────────────────────
