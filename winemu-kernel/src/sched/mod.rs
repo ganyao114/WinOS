@@ -1134,55 +1134,6 @@ pub fn wait_current_pending_result() -> u32 {
     }
 }
 
-// Try to block current thread and switch to another runnable kernel
-// continuation thread. Returns true only if a non-local kernel switch
-// happened and control later resumed here.
-pub fn block_current_and_switch_kernel(
-    wait_kind: u8,
-    wait_handles: &[u64],
-    wait_deadline: u64,
-    pending_result: u32,
-) -> bool {
-    let cur = current_tid();
-    if cur == 0 || !thread_exists(cur) {
-        return false;
-    }
-    let vid = vcpu_id();
-    let now = now_ticks();
-    let quantum_100ns = timer::DEFAULT_TIMESLICE_100NS.max(1);
-
-    sched_lock_acquire();
-    let st = prepare_wait_locked(cur, wait_kind, wait_handles, wait_deadline, pending_result);
-    if st != status::SUCCESS {
-        sched_lock_release();
-        return false;
-    }
-    if !has_dispatch_continuation(cur) {
-        rollback_wait_prepare_locked(cur, vid, now, quantum_100ns);
-        sched_lock_release();
-        return false;
-    }
-
-    sched_lock_release();
-    unsafe { switch_current_to_dispatch_continuation(cur) }
-}
-
-fn rollback_wait_prepare_locked(cur: u32, vid: usize, now: u64, quantum_100ns: u64) {
-    clear_wait_tracking_locked(cur);
-    with_thread_mut(cur, |t| t.wait_result = 0);
-    set_thread_state_locked(cur, ThreadState::Running);
-    with_thread_mut(cur, |t| {
-        t.slice_remaining_100ns = quantum_100ns;
-        t.last_start_100ns = now;
-        t.last_vcpu_hint = vid as u8;
-    });
-    unsafe {
-        (*SCHED.vcpus.get())[vid].current_tid = cur;
-    }
-    set_current_cpu_thread(vid, cur);
-    set_vcpu_kernel_sp_for_tid(vid, cur);
-}
-
 pub fn has_dispatch_continuation(tid: u32) -> bool {
     if tid == 0 || !thread_exists(tid) {
         return false;
