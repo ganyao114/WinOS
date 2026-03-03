@@ -45,47 +45,33 @@ struct WaitQueueNode {
     next: *mut WaitQueueNode,
 }
 
-struct WaitQueueNodePool {
-    pool: Option<SlabPool<WaitQueueNode>>,
+fn wait_queue_alloc_node(tid: u32, next: *mut WaitQueueNode) -> *mut WaitQueueNode {
+    if tid == 0 {
+        return null_mut();
+    }
+    let pool_slot = wait_queue_pool_mut();
+    if pool_slot.is_none() {
+        *pool_slot = Some(SlabPool::new());
+    }
+    let Some(ptr) = pool_slot.as_mut().unwrap().alloc_slot() else {
+        return null_mut();
+    };
+    unsafe {
+        ptr.write(WaitQueueNode { tid, next });
+    }
+    ptr
 }
 
-impl WaitQueueNodePool {
-    const fn new() -> Self {
-        Self { pool: None }
+fn wait_queue_free_node(node: *mut WaitQueueNode) {
+    if node.is_null() {
+        return;
     }
-
-    #[inline]
-    fn pool_mut(&mut self) -> &mut SlabPool<WaitQueueNode> {
-        if self.pool.is_none() {
-            self.pool = Some(SlabPool::new());
-        }
-        self.pool.as_mut().unwrap()
-    }
-
-    fn alloc_node(&mut self, tid: u32, next: *mut WaitQueueNode) -> *mut WaitQueueNode {
-        if tid == 0 {
-            return null_mut();
-        }
-        let Some(ptr) = self.pool_mut().alloc_slot() else {
-            return null_mut();
-        };
-        unsafe {
-            ptr.write(WaitQueueNode { tid, next });
-        }
-        ptr
-    }
-
-    fn free_node(&mut self, node: *mut WaitQueueNode) {
-        if node.is_null() {
-            return;
-        }
-        let Some(pool) = self.pool.as_mut() else {
-            return;
-        };
-        unsafe {
-            core::ptr::drop_in_place(node);
-            pool.free_slot(node);
-        }
+    let Some(pool) = wait_queue_pool_mut().as_mut() else {
+        return;
+    };
+    unsafe {
+        core::ptr::drop_in_place(node);
+        pool.free_slot(node);
     }
 }
 
@@ -135,7 +121,7 @@ impl WaitQueue {
             cur = unsafe { (*cur).next };
         }
 
-        let node = wait_queue_pool_mut().alloc_node(tid, cur);
+        let node = wait_queue_alloc_node(tid, cur);
         if node.is_null() {
             return false;
         }
@@ -155,7 +141,7 @@ impl WaitQueue {
             let node = self.head;
             let tid = unsafe { (*node).tid };
             self.head = unsafe { (*node).next };
-            wait_queue_pool_mut().free_node(node);
+            wait_queue_free_node(node);
             if self.len != 0 {
                 self.len -= 1;
             }
@@ -186,7 +172,7 @@ impl WaitQueue {
                         (*prev).next = next;
                     }
                 }
-                wait_queue_pool_mut().free_node(cur);
+                wait_queue_free_node(cur);
                 if self.len != 0 {
                     self.len -= 1;
                 }
@@ -354,7 +340,7 @@ struct SyncState {
     semaphores: UnsafeCell<Option<ObjectStore<KSemaphore>>>,
     handles: UnsafeCell<Option<ObjectStore<HandleEntry>>>,
     refs: UnsafeCell<Option<Vec<ObjectRef>>>,
-    wait_queue_pool: UnsafeCell<WaitQueueNodePool>,
+    wait_queue_pool: UnsafeCell<Option<SlabPool<WaitQueueNode>>>,
 }
 
 unsafe impl Sync for SyncState {}
@@ -365,10 +351,10 @@ static SYNC_STATE: SyncState = SyncState {
     semaphores: UnsafeCell::new(None),
     handles: UnsafeCell::new(None),
     refs: UnsafeCell::new(None),
-    wait_queue_pool: UnsafeCell::new(WaitQueueNodePool::new()),
+    wait_queue_pool: UnsafeCell::new(None),
 };
 
-fn wait_queue_pool_mut() -> &'static mut WaitQueueNodePool {
+fn wait_queue_pool_mut() -> &'static mut Option<SlabPool<WaitQueueNode>> {
     unsafe { &mut *SYNC_STATE.wait_queue_pool.get() }
 }
 
