@@ -17,6 +17,7 @@ typedef void *HANDLE;
 
 #define SYSTEM_BASIC_INFORMATION_CLASS 0U
 #define SYSTEM_TIME_OF_DAY_INFORMATION_CLASS 3U
+#define SYSTEM_HOSTCALL_FORCE_ASYNC_CLASS 0x80001001U
 
 typedef struct {
     uint64_t Status;
@@ -119,6 +120,7 @@ void mainCRTStartup(void) {
 
     SYSTEM_BASIC_INFORMATION sbi;
     SYSTEM_TIME_OF_DAY_INFORMATION tod;
+    uint64_t force_async_fd = 0;
     uint8_t short_buf[8];
 
     write_str("== syscall_sysinfo_test ==\r\n");
@@ -173,6 +175,17 @@ void mainCRTStartup(void) {
 
     st = NtQuerySystemInformation(0xFFFFU, &sbi, (ULONG)sizeof(sbi), &ret_len);
     check("Unknown SystemInformationClass returns STATUS_INVALID_PARAMETER", st == STATUS_INVALID_PARAMETER);
+
+    ret_len = 0;
+    force_async_fd = 0;
+    st = NtQuerySystemInformation(
+        SYSTEM_HOSTCALL_FORCE_ASYNC_CLASS,
+        &force_async_fd,
+        (ULONG)sizeof(force_async_fd),
+        &ret_len);
+    check("Hostcall force-async selftest returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("Hostcall force-async selftest return length matches", ret_len == (ULONG)sizeof(force_async_fd));
+    check("Hostcall force-async selftest returns valid fd marker", force_async_fd != 0 && force_async_fd != (uint64_t)-1);
 
     write_str("syscall_sysinfo_test summary: pass=");
     write_u64_hex(g_pass);

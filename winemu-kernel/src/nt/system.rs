@@ -1,5 +1,6 @@
 use core::mem::size_of;
 
+use winemu_shared::hostcall as hc;
 use winemu_shared::status;
 
 use crate::sched::sync::WaitDeadline;
@@ -9,6 +10,8 @@ use super::SvcFrame;
 
 const SYSTEM_INFO_CLASS_BASIC: u32 = 0;
 const SYSTEM_INFO_CLASS_TIME_OF_DAY: u32 = 3;
+// Test-only class: force async hostcall through call_sync pending path.
+const SYSTEM_INFO_CLASS_HOSTCALL_FORCE_ASYNC: u32 = 0x8000_1001;
 
 const PERF_COUNTER_FREQUENCY_100NS: u64 = 10_000_000;
 const ALLOCATION_GRANULARITY: u32 = 0x10000;
@@ -104,6 +107,43 @@ fn query_system_time_of_day_information(buf: *mut u8, buf_len: usize, ret_len: *
     write_info_struct(buf, buf_len, ret_len, &info)
 }
 
+fn query_hostcall_force_async_information(buf: *mut u8, buf_len: usize, ret_len: *mut u32) -> u32 {
+    let owner_pid = crate::process::current_pid();
+    let path = "guest/sysroot/syscall_sysinfo_test.exe";
+    let open = crate::hostcall::call_sync(
+        owner_pid,
+        crate::hostcall::SubmitArgs {
+            opcode: hc::OP_OPEN,
+            flags: hc::FLAG_FORCE_ASYNC,
+            arg0: path.as_ptr() as u64,
+            arg1: path.len() as u64,
+            arg2: 0,
+            arg3: 0,
+            user_tag: 0,
+        },
+    );
+    let Ok(open_done) = open else {
+        return status::INVALID_PARAMETER;
+    };
+    let fd = open_done.value0;
+    if fd == 0 || fd == u64::MAX {
+        return status::INVALID_PARAMETER;
+    }
+    let _ = crate::hostcall::call_sync(
+        owner_pid,
+        crate::hostcall::SubmitArgs {
+            opcode: hc::OP_CLOSE,
+            flags: 0,
+            arg0: fd,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            user_tag: 0,
+        },
+    );
+    write_info_struct(buf, buf_len, ret_len, &fd)
+}
+
 pub(crate) fn handle_query_system_information(frame: &mut SvcFrame) {
     let info_class = frame.x[0] as u32;
     let buf = frame.x[1] as *mut u8;
@@ -114,6 +154,9 @@ pub(crate) fn handle_query_system_information(frame: &mut SvcFrame) {
         SYSTEM_INFO_CLASS_BASIC => query_system_basic_information(buf, buf_len, ret_len),
         SYSTEM_INFO_CLASS_TIME_OF_DAY => {
             query_system_time_of_day_information(buf, buf_len, ret_len)
+        }
+        SYSTEM_INFO_CLASS_HOSTCALL_FORCE_ASYNC => {
+            query_hostcall_force_async_information(buf, buf_len, ret_len)
         }
         _ => status::INVALID_PARAMETER,
     };
