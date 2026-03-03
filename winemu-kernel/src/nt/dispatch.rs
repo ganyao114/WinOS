@@ -236,49 +236,6 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
                 set_vcpu_idle_locked(vid, false);
                 crate::process::switch_to_thread_process(to);
                 if from_sched != 0 && from_sched != to && has_kernel_continuation(to) {
-                    let (from_sp, from_lr, from_x30) = with_thread(from_sched, |t| {
-                        (t.kctx.sp_el1, t.kctx.lr_el1, t.kctx.x19_x30[11])
-                    });
-                    let (to_sp, to_lr, to_x30) =
-                        with_thread(to, |t| (t.kctx.sp_el1, t.kctx.lr_el1, t.kctx.x19_x30[11]));
-                    let (to_ret_slot, to_saved_x19) = if to_sp >= 0x4000_0000 && (to_sp & 0x7) == 0 {
-                        unsafe {
-                            (
-                                (to_sp as *const u64).read_volatile(),
-                                ((to_sp + 8) as *const u64).read_volatile(),
-                            )
-                        }
-                    } else {
-                        (0, 0)
-                    };
-                    crate::log::debug_u64(0xD203_0001);
-                    crate::log::debug_u64(from_sched as u64);
-                    crate::log::debug_u64(to as u64);
-                    crate::log::debug_u64(0xD203_0002);
-                    crate::log::debug_u64(from_sp);
-                    crate::log::debug_u64(from_lr);
-                    crate::log::debug_u64(from_x30);
-                    crate::log::debug_u64(0xD203_0003);
-                    crate::log::debug_u64(to_sp);
-                    crate::log::debug_u64(to_lr);
-                    crate::log::debug_u64(to_x30);
-                    crate::log::debug_u64(to_ret_slot);
-                    crate::log::debug_u64(to_saved_x19);
-                    crate::kdebug!(
-                        "sched: kctx to tid={} sp={:#x} x30={:#x} ret_slot={:#x} saved_x19={:#x}",
-                        to,
-                        to_sp,
-                        to_x30,
-                        to_ret_slot,
-                        to_saved_x19
-                    );
-                    crate::kdebug!(
-                        "sched: kctx from tid={} sp={:#x} lr={:#x} x30={:#x}",
-                        from_sched,
-                        from_sp,
-                        from_lr,
-                        from_x30,
-                    );
                     save_ctx_for(from_sched, frame);
                     sched_lock_release();
                     let switched = unsafe { switch_kernel_continuation(from_sched, to) };
