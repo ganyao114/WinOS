@@ -1,5 +1,6 @@
 use crate::file_io::FileTable;
 use crate::host_file::HostFileTable;
+use crate::hostcall::HostCallBroker;
 use crate::memory::GuestMemory;
 use crate::sched::sync::{EventObj, MutexObj, SemaphoreObj, SyncHandle, SyncObject};
 use crate::sched::{SchedResult, Scheduler, ThreadId};
@@ -8,14 +9,129 @@ use crate::syscall::{DispatchResult, SyscallDispatcher};
 use crate::vaspace::VaSpace;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use winemu_core::hypercall::nr;
+use winemu_shared::hostcall as hc;
+use winemu_shared::nr;
 
 // HOST_MMAP can be used before KERNEL_READY (guest DLL resolve during boot).
 // Keep that early mapping away from kernel image/heap region to avoid clobbering.
 const EARLY_HOST_MMAP_BASE: u64 = 0x5000_0000;
+const MAX_HOSTCALL_EXT_BUF: usize = 256;
+
+fn encode_completion(cpl: &crate::hostcall::HostCallCompletion) -> [u8; hc::CPL_SIZE] {
+    let mut out = [0u8; hc::CPL_SIZE];
+    out[0..8].copy_from_slice(&cpl.request_id.to_le_bytes());
+    out[8..12].copy_from_slice(&cpl.host_result.to_le_bytes());
+    out[12..16].copy_from_slice(&cpl.flags.to_le_bytes());
+    out[16..24].copy_from_slice(&cpl.value0.to_le_bytes());
+    out[24..32].copy_from_slice(&cpl.value1.to_le_bytes());
+    out[32..40].copy_from_slice(&cpl.user_tag.to_le_bytes());
+    out
+}
+
+fn decode_hostcall_submit_ext(
+    memory: &Arc<RwLock<GuestMemory>>,
+    ext_gpa: u64,
+    ext_len: usize,
+) -> Option<([u64; 4], u64)> {
+    if ext_len < (4 * core::mem::size_of::<u64>())
+        || ext_len > MAX_HOSTCALL_EXT_BUF
+        || (ext_len & (core::mem::size_of::<u64>() - 1)) != 0
+    {
+        return None;
+    }
+    let words = {
+        let mem = memory.read().ok()?;
+        let bytes = mem.read_bytes(winemu_core::addr::Gpa(ext_gpa), ext_len);
+        if bytes.len() < ext_len {
+            return None;
+        }
+        let word_count = ext_len / core::mem::size_of::<u64>();
+        let mut out = [0u64; 4];
+        let mut i = 0usize;
+        while i < 4 {
+            let off = i * 8;
+            out[i] = u64::from_le_bytes([
+                bytes[off],
+                bytes[off + 1],
+                bytes[off + 2],
+                bytes[off + 3],
+                bytes[off + 4],
+                bytes[off + 5],
+                bytes[off + 6],
+                bytes[off + 7],
+            ]);
+            i += 1;
+        }
+        let user_tag = if word_count >= 5 {
+            let off = 4 * 8;
+            u64::from_le_bytes([
+                bytes[off],
+                bytes[off + 1],
+                bytes[off + 2],
+                bytes[off + 3],
+                bytes[off + 4],
+                bytes[off + 5],
+                bytes[off + 6],
+                bytes[off + 7],
+            ])
+        } else {
+            0
+        };
+        (out, user_tag)
+    };
+    Some(words)
+}
+
+fn append_u64_le(dst: &mut Vec<u8>, v: u64) -> bool {
+    if dst.try_reserve(8).is_err() {
+        return false;
+    }
+    dst.extend_from_slice(&v.to_le_bytes());
+    true
+}
+
+fn encode_hostcall_stats(snap: &crate::hostcall::HostCallStatsSnapshot, dst_cap: usize) -> Vec<u8> {
+    if dst_cap < hc::STATS_HEADER_SIZE {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut max_ops = (dst_cap - hc::STATS_HEADER_SIZE) / hc::STATS_OP_SIZE;
+    if max_ops > snap.op_stats.len() {
+        max_ops = snap.op_stats.len();
+    }
+
+    if !append_u64_le(&mut out, hc::STATS_VERSION)
+        || !append_u64_le(&mut out, snap.submit_sync_total)
+        || !append_u64_le(&mut out, snap.submit_async_total)
+        || !append_u64_le(&mut out, snap.complete_sync_total)
+        || !append_u64_le(&mut out, snap.complete_async_total)
+        || !append_u64_le(&mut out, snap.cancel_total)
+        || !append_u64_le(&mut out, snap.backpressure_total)
+        || !append_u64_le(&mut out, snap.completion_queue_high_watermark as u64)
+        || !append_u64_le(&mut out, max_ops as u64)
+    {
+        return Vec::new();
+    }
+
+    for op in snap.op_stats.iter().take(max_ops) {
+        if !append_u64_le(&mut out, op.opcode)
+            || !append_u64_le(&mut out, op.submit_sync)
+            || !append_u64_le(&mut out, op.submit_async)
+            || !append_u64_le(&mut out, op.complete_sync)
+            || !append_u64_le(&mut out, op.complete_async)
+            || !append_u64_le(&mut out, op.cancel)
+            || !append_u64_le(&mut out, op.backpressure)
+        {
+            break;
+        }
+    }
+
+    out
+}
 
 pub enum HypercallResult {
     Sync(u64),
+    Sync2 { x0: u64, x1: u64 },
     Sched(SchedResult),
 }
 
@@ -30,7 +146,8 @@ pub struct HypercallManager {
     sections: SectionTable,
     pub sched: Arc<Scheduler>,
     syscall_disp: SyscallDispatcher,
-    host_files: HostFileTable,
+    host_files: Arc<HostFileTable>,
+    hostcall: HostCallBroker,
     mono_start: Instant,
 }
 
@@ -46,21 +163,29 @@ impl HypercallManager {
         let exe_image = std::fs::read(&exe_path).unwrap_or_default();
         let root_path: std::path::PathBuf = root.into();
         let syscall_disp = SyscallDispatcher::new(&syscall_table_toml);
-        let host_files = HostFileTable::new(root_path.clone());
-        let mut vaspace = VaSpace::new();
-        vaspace.set_base(EARLY_HOST_MMAP_BASE);
+        let host_files = Arc::new(HostFileTable::new(root_path.clone()));
+        let mut vaspace_init = VaSpace::new();
+        vaspace_init.set_base(EARLY_HOST_MMAP_BASE);
+        let vaspace = Arc::new(Mutex::new(vaspace_init));
+        let hostcall = HostCallBroker::new(
+            Arc::clone(&memory),
+            Arc::clone(&host_files),
+            Arc::clone(&vaspace),
+            Arc::clone(&sched),
+        );
         Self {
             syscall_table_toml,
             exe_image,
             exe_path,
             memory,
-            vaspace: Arc::new(Mutex::new(vaspace)),
+            vaspace,
             phys_pool: Mutex::new(crate::phys::PhysPagePool::new()),
             files: FileTable::new(root_path),
             sections: SectionTable::new(),
             sched,
             syscall_disp,
             host_files,
+            hostcall,
             mono_start: Instant::now(),
         }
     }
@@ -572,153 +697,245 @@ impl HypercallManager {
             }
             // ── Host 文件操作 ──────────────────────────────────
             nr::HOST_OPEN => {
-                let path_gpa = winemu_core::addr::Gpa(args[0]);
-                let path_len = args[1] as usize;
-                let flags = args[2];
-                if path_len == 0 || path_len > 1024 {
-                    return HypercallResult::Sync(u64::MAX);
+                let (host_result, aux) =
+                    match self
+                        .hostcall
+                        .submit(hc::OP_OPEN, 0, [args[0], args[1], args[2], 0], 0)
+                    {
+                        crate::hostcall::SubmitResult::Completed { host_result, aux } => {
+                            (host_result, aux)
+                        }
+                        crate::hostcall::SubmitResult::Pending { .. } => (hc::HC_BUSY, 0),
+                    };
+                if host_result == hc::HC_OK {
+                    HypercallResult::Sync(aux)
+                } else {
+                    HypercallResult::Sync(u64::MAX)
                 }
-                let path = {
-                    let mem = self.memory.read().unwrap();
-                    let bytes = mem.read_bytes(path_gpa, path_len);
-                    match std::str::from_utf8(bytes) {
-                        Ok(s) => s.to_owned(),
-                        Err(_) => return HypercallResult::Sync(u64::MAX),
-                    }
-                };
-                let fd = self.host_files.open(&path, flags);
-                log::debug!("HOST_OPEN: path={} flags={} fd={}", path, flags, fd);
-                HypercallResult::Sync(fd)
             }
             nr::HOST_READ => {
-                let fd = args[0];
-                let dst_gpa = args[1];
-                let len = args[2] as usize;
-                let offset = args[3];
-                if len == 0 || len > 64 * 1024 * 1024 {
-                    return HypercallResult::Sync(0);
+                let (host_result, aux) = match self.hostcall.submit(
+                    hc::OP_READ,
+                    0,
+                    [args[0], args[1], args[2], args[3]],
+                    0,
+                ) {
+                    crate::hostcall::SubmitResult::Completed { host_result, aux } => {
+                        (host_result, aux)
+                    }
+                    crate::hostcall::SubmitResult::Pending { .. } => (hc::HC_BUSY, 0),
+                };
+                if host_result == hc::HC_OK {
+                    HypercallResult::Sync(aux)
+                } else {
+                    HypercallResult::Sync(0)
                 }
-                let mut buf = vec![0u8; len];
-                let got = self.host_files.read(fd, &mut buf, offset);
-                if got > 0 {
-                    let mut mem = self.memory.write().unwrap();
-                    mem.write_bytes(winemu_core::addr::Gpa(dst_gpa), &buf[..got]);
-                }
-                HypercallResult::Sync(got as u64)
             }
             nr::HOST_WRITE => {
-                let fd = args[0];
-                let src_gpa = args[1];
-                let len = args[2] as usize;
-                let offset = args[3];
-                if len == 0 || len > 64 * 1024 * 1024 {
-                    return HypercallResult::Sync(0);
-                }
-                let buf = {
-                    let mem = self.memory.read().unwrap();
-                    mem.read_bytes(winemu_core::addr::Gpa(src_gpa), len)
-                        .to_vec()
+                let (host_result, aux) = match self.hostcall.submit(
+                    hc::OP_WRITE,
+                    0,
+                    [args[0], args[1], args[2], args[3]],
+                    0,
+                ) {
+                    crate::hostcall::SubmitResult::Completed { host_result, aux } => {
+                        (host_result, aux)
+                    }
+                    crate::hostcall::SubmitResult::Pending { .. } => (hc::HC_BUSY, 0),
                 };
-                let written = self.host_files.write(fd, &buf, offset);
-                HypercallResult::Sync(written as u64)
+                if host_result == hc::HC_OK {
+                    HypercallResult::Sync(aux)
+                } else {
+                    HypercallResult::Sync(0)
+                }
             }
             nr::HOST_CLOSE => {
-                self.host_files.close(args[0]);
+                let _ = self.hostcall.submit(hc::OP_CLOSE, 0, [args[0], 0, 0, 0], 0);
                 HypercallResult::Sync(0)
             }
             nr::HOST_STAT => {
-                let size = self.host_files.stat(args[0]);
-                HypercallResult::Sync(size)
+                let (host_result, aux) =
+                    match self.hostcall.submit(hc::OP_STAT, 0, [args[0], 0, 0, 0], 0) {
+                        crate::hostcall::SubmitResult::Completed { host_result, aux } => {
+                            (host_result, aux)
+                        }
+                        crate::hostcall::SubmitResult::Pending { .. } => (hc::HC_BUSY, 0),
+                    };
+                if host_result == hc::HC_OK {
+                    HypercallResult::Sync(aux)
+                } else {
+                    HypercallResult::Sync(0)
+                }
             }
             nr::HOST_READDIR => {
-                // args: [host_fd, dst_gpa, dst_len, restart, 0, 0]
-                let fd = args[0];
-                let dst_gpa = args[1];
-                let len = args[2] as usize;
-                let restart = args[3] != 0;
-                if len == 0 || len > 4096 {
-                    return HypercallResult::Sync(u64::MAX);
-                }
-                let mut buf = vec![0u8; len];
-                let ret = self.host_files.readdir(fd, &mut buf, restart);
-                if ret != 0 && ret != u64::MAX {
-                    let copied = (ret & 0xFFFF_FFFF) as usize;
-                    if copied != 0 {
-                        let copied = copied.min(len);
-                        let mut mem = self.memory.write().unwrap();
-                        mem.write_bytes(winemu_core::addr::Gpa(dst_gpa), &buf[..copied]);
+                let (host_result, aux) = match self.hostcall.submit(
+                    hc::OP_READDIR,
+                    0,
+                    [args[0], args[1], args[2], args[3]],
+                    0,
+                ) {
+                    crate::hostcall::SubmitResult::Completed { host_result, aux } => {
+                        (host_result, aux)
                     }
+                    crate::hostcall::SubmitResult::Pending { .. } => (hc::HC_BUSY, 0),
+                };
+                if host_result == hc::HC_OK {
+                    HypercallResult::Sync(aux)
+                } else {
+                    HypercallResult::Sync(u64::MAX)
                 }
-                HypercallResult::Sync(ret)
             }
             nr::HOST_NOTIFY_DIR => {
-                // args: [host_fd, dst_gpa, dst_len, watch_tree, completion_filter, 0]
-                let fd = args[0];
-                let dst_gpa = args[1];
-                let len = args[2] as usize;
                 let watch_tree = args[3] != 0;
                 let completion_filter = args[4] as u32;
-                if len == 0 || len > 4096 {
-                    return HypercallResult::Sync(u64::MAX);
+                let mut notify_opts = completion_filter as u64;
+                if watch_tree {
+                    notify_opts |= 1u64 << 63;
                 }
-                let mut buf = vec![0u8; len];
-                let ret =
-                    self.host_files
-                        .notify_dir_change(fd, &mut buf, watch_tree, completion_filter);
-                if ret != 0 && ret != u64::MAX {
-                    let copied = (ret & 0xFFFF_FFFF) as usize;
-                    if copied != 0 {
-                        let copied = copied.min(len);
-                        let mut mem = self.memory.write().unwrap();
-                        mem.write_bytes(winemu_core::addr::Gpa(dst_gpa), &buf[..copied]);
+                let (host_result, aux) = match self.hostcall.submit(
+                    hc::OP_NOTIFY_DIR,
+                    0,
+                    [args[0], args[1], args[2], notify_opts],
+                    0,
+                ) {
+                    crate::hostcall::SubmitResult::Completed { host_result, aux } => {
+                        (host_result, aux)
+                    }
+                    crate::hostcall::SubmitResult::Pending { .. } => (hc::HC_BUSY, 0),
+                };
+                if host_result == hc::HC_OK {
+                    HypercallResult::Sync(aux)
+                } else {
+                    HypercallResult::Sync(u64::MAX)
+                }
+            }
+            nr::HOSTCALL_SUBMIT => {
+                // args: [opcode, flags, arg0, arg1, arg2, arg3]
+                let opcode = args[0];
+                let flags = args[1];
+                let mut submit_args = [args[2], args[3], args[4], args[5]];
+                let mut user_tag = 0u64;
+                if (flags & hc::FLAG_EXT_BUF) != 0 {
+                    let ext_ptr = args[2];
+                    let ext_len = args[3] as usize;
+                    let Some((decoded_args, decoded_tag)) =
+                        decode_hostcall_submit_ext(&self.memory, ext_ptr, ext_len)
+                    else {
+                        return HypercallResult::Sync2 {
+                            x0: hc::HC_INVALID,
+                            x1: 0,
+                        };
+                    };
+                    submit_args = decoded_args;
+                    user_tag = decoded_tag;
+                }
+                match self.hostcall.submit(opcode, flags, submit_args, user_tag) {
+                    crate::hostcall::SubmitResult::Completed { host_result, aux } => {
+                        HypercallResult::Sync2 {
+                            x0: host_result,
+                            x1: aux,
+                        }
+                    }
+                    crate::hostcall::SubmitResult::Pending { request_id } => {
+                        HypercallResult::Sync2 {
+                            x0: hc::PENDING_RESULT,
+                            x1: request_id,
+                        }
                     }
                 }
-                HypercallResult::Sync(ret)
             }
-            nr::HOST_MMAP => {
-                // args: [host_fd, offset, size, prot, 0, 0] → gpa (0 on failure)
-                // Simple implementation: read file contents into guest memory
-                let fd = args[0];
-                let offset = args[1];
-                let size = args[2] as usize;
-                if size == 0 || size > 64 * 1024 * 1024 {
+            nr::HOSTCALL_SETUP => HypercallResult::Sync(hc::HC_OK),
+            nr::HOSTCALL_CANCEL => {
+                let request_id = args[0];
+                HypercallResult::Sync(self.hostcall.cancel(request_id))
+            }
+            nr::HOSTCALL_POLL => {
+                let dst_gpa = args[0];
+                let cap = args[1] as usize;
+                if cap == 0 {
                     return HypercallResult::Sync(0);
                 }
-                // Allocate VA space for the mapping
-                let va = self
-                    .vaspace
-                    .lock()
-                    .unwrap()
-                    .alloc(0, size as u64, args[3] as u32);
-                match va {
-                    Some(gpa) => {
-                        let mut buf = vec![0u8; size];
-                        let got = self.host_files.read(fd, &mut buf, offset);
-                        if got > 0 {
-                            let mut mem = self.memory.write().unwrap();
-                            mem.write_bytes(winemu_core::addr::Gpa(gpa), &buf[..got]);
-                        }
-                        log::debug!(
-                            "HOST_MMAP: fd={} off={:#x} size={:#x} → gpa={:#x}",
-                            fd,
-                            offset,
-                            size,
-                            gpa
-                        );
-                        HypercallResult::Sync(gpa)
+                let batch = self.hostcall.poll_batch(cap.min(1));
+                if batch.is_empty() {
+                    return HypercallResult::Sync(0);
+                }
+                let mut mem = self.memory.write().unwrap();
+                let bytes = encode_completion(&batch[0]);
+                mem.write_bytes(winemu_core::addr::Gpa(dst_gpa), &bytes);
+                HypercallResult::Sync(1)
+            }
+            nr::HOSTCALL_POLL_BATCH => {
+                let dst_gpa = args[0];
+                let cap_entries = args[1] as usize;
+                if cap_entries == 0 {
+                    return HypercallResult::Sync(0);
+                }
+                let batch = self.hostcall.poll_batch(cap_entries);
+                if batch.is_empty() {
+                    return HypercallResult::Sync(0);
+                }
+                let mut mem = self.memory.write().unwrap();
+                let mut off = 0u64;
+                for cpl in batch.iter() {
+                    let bytes = encode_completion(cpl);
+                    mem.write_bytes(winemu_core::addr::Gpa(dst_gpa + off), &bytes);
+                    off += hc::CPL_SIZE as u64;
+                }
+                HypercallResult::Sync(batch.len() as u64)
+            }
+            nr::HOSTCALL_QUERY_STATS => {
+                let dst_gpa = args[0];
+                let dst_len = args[1] as usize;
+                let flags = args[2];
+                if dst_len < hc::STATS_HEADER_SIZE {
+                    return HypercallResult::Sync(0);
+                }
+                let snap = self.hostcall.stats_snapshot();
+                let bytes = encode_hostcall_stats(&snap, dst_len);
+                if bytes.is_empty() {
+                    return HypercallResult::Sync(0);
+                }
+                let mut mem = self.memory.write().unwrap();
+                mem.write_bytes(winemu_core::addr::Gpa(dst_gpa), &bytes);
+                if (flags & hc::STATS_RESET_AFTER_READ) != 0 {
+                    self.hostcall.reset_stats();
+                }
+                HypercallResult::Sync(bytes.len() as u64)
+            }
+            nr::HOST_MMAP => {
+                let (host_result, aux) = match self.hostcall.submit(
+                    hc::OP_MMAP,
+                    0,
+                    [args[0], args[1], args[2], args[3]],
+                    0,
+                ) {
+                    crate::hostcall::SubmitResult::Completed { host_result, aux } => {
+                        (host_result, aux)
                     }
-                    None => {
-                        log::warn!("HOST_MMAP: VA alloc failed size={:#x}", size);
-                        HypercallResult::Sync(0)
-                    }
+                    crate::hostcall::SubmitResult::Pending { .. } => (hc::HC_BUSY, 0),
+                };
+                if host_result == hc::HC_OK {
+                    HypercallResult::Sync(aux)
+                } else {
+                    HypercallResult::Sync(0)
                 }
             }
             nr::HOST_MUNMAP => {
-                // args: [gpa, size, 0, 0, 0, 0]
-                let base = args[0];
-                let ok = self.vaspace.lock().unwrap().free(base);
-                log::debug!("HOST_MUNMAP: gpa={:#x} ok={}", base, ok);
-                HypercallResult::Sync(if ok { 0 } else { u64::MAX })
+                let (host_result, _) =
+                    match self
+                        .hostcall
+                        .submit(hc::OP_MUNMAP, 0, [args[0], args[1], 0, 0], 0)
+                    {
+                        crate::hostcall::SubmitResult::Completed { host_result, aux } => {
+                            (host_result, aux)
+                        }
+                        crate::hostcall::SubmitResult::Pending { .. } => (hc::HC_BUSY, 0),
+                    };
+                HypercallResult::Sync(if host_result == hc::HC_OK {
+                    0
+                } else {
+                    u64::MAX
+                })
             }
             nr::QUERY_EXE_INFO => {
                 let fd = self.host_files.open_absolute(&self.exe_path, 0);
@@ -747,6 +964,10 @@ impl HypercallManager {
                 HypercallResult::Sync(u32::MAX as u64)
             }
         }
+    }
+
+    pub fn pump_hostcall_main_thread(&self, max_jobs: usize) -> usize {
+        self.hostcall.run_main_thread_budget(max_jobs)
     }
 
     /// Read EL0 return context snapshot from guest SVC frame (SP_EL1 at hvc time).
@@ -808,5 +1029,104 @@ impl HypercallManager {
             DispatchResult::Sync(v) => HypercallResult::Sync(v),
             DispatchResult::Sched(s) => HypercallResult::Sched(s),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_hostcall_submit_ext;
+    use super::encode_hostcall_stats;
+    use crate::hostcall::{HostCallOpStats, HostCallStatsSnapshot};
+    use crate::memory::GuestMemory;
+    use std::sync::{Arc, RwLock};
+    use winemu_core::addr::Gpa;
+    use winemu_shared::hostcall as hc;
+
+    #[test]
+    fn decode_submit_ext_reads_args_and_user_tag() {
+        let memory = Arc::new(RwLock::new(GuestMemory::new(1024 * 1024).unwrap()));
+        let base = memory.read().unwrap().base_gpa().0;
+        let ptr = base + 0x2000;
+        let words = [0x11u64, 0x22, 0x33, 0x44, 0x55AA55AA];
+        let mut bytes = [0u8; hc::EXT_SUBMIT_SIZE];
+        for (i, w) in words.iter().enumerate() {
+            let off = i * 8;
+            bytes[off..off + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        memory.write().unwrap().write_bytes(Gpa(ptr), &bytes);
+
+        let decoded = decode_hostcall_submit_ext(&memory, ptr, hc::EXT_SUBMIT_SIZE)
+            .expect("decode ext submit payload");
+        assert_eq!(decoded.0, [0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(decoded.1, 0x55AA55AA);
+    }
+
+    #[test]
+    fn decode_submit_ext_rejects_short_payload() {
+        let memory = Arc::new(RwLock::new(GuestMemory::new(1024 * 1024).unwrap()));
+        let base = memory.read().unwrap().base_gpa().0;
+        assert!(decode_hostcall_submit_ext(&memory, base + 0x1000, 16).is_none());
+    }
+
+    #[test]
+    fn decode_submit_ext_supports_variable_word_count() {
+        let memory = Arc::new(RwLock::new(GuestMemory::new(1024 * 1024).unwrap()));
+        let base = memory.read().unwrap().base_gpa().0;
+        let ptr = base + 0x2400;
+        let words = [0x1u64, 0x2, 0x3, 0x4, 0xA5A5, 0xB6B6, 0xC7C7];
+        let mut bytes = [0u8; 56];
+        for (i, w) in words.iter().enumerate() {
+            let off = i * 8;
+            bytes[off..off + 8].copy_from_slice(&w.to_le_bytes());
+        }
+        memory.write().unwrap().write_bytes(Gpa(ptr), &bytes);
+        let decoded =
+            decode_hostcall_submit_ext(&memory, ptr, bytes.len()).expect("decode variable ext");
+        assert_eq!(decoded.0, [1, 2, 3, 4]);
+        assert_eq!(decoded.1, 0xA5A5);
+    }
+
+    #[test]
+    fn encode_hostcall_stats_respects_capacity() {
+        let mut snap = HostCallStatsSnapshot {
+            submit_sync_total: 1,
+            submit_async_total: 2,
+            complete_sync_total: 3,
+            complete_async_total: 4,
+            cancel_total: 5,
+            backpressure_total: 6,
+            completion_queue_high_watermark: 7,
+            op_stats: Vec::new(),
+        };
+        snap.op_stats.push(HostCallOpStats {
+            opcode: hc::OP_OPEN,
+            submit_sync: 11,
+            submit_async: 12,
+            complete_sync: 13,
+            complete_async: 14,
+            cancel: 15,
+            backpressure: 16,
+        });
+        snap.op_stats.push(HostCallOpStats {
+            opcode: hc::OP_READ,
+            submit_sync: 21,
+            submit_async: 22,
+            complete_sync: 23,
+            complete_async: 24,
+            cancel: 25,
+            backpressure: 26,
+        });
+
+        let one_op_cap = hc::STATS_HEADER_SIZE + hc::STATS_OP_SIZE;
+        let one_op = encode_hostcall_stats(&snap, one_op_cap);
+        assert_eq!(one_op.len(), one_op_cap);
+        let op_count = u64::from_le_bytes(one_op[64..72].try_into().unwrap());
+        assert_eq!(op_count, 1);
+
+        let full_cap = hc::STATS_HEADER_SIZE + hc::STATS_OP_SIZE * 4;
+        let full = encode_hostcall_stats(&snap, full_cap);
+        assert_eq!(full.len(), hc::STATS_HEADER_SIZE + hc::STATS_OP_SIZE * 2);
+        let op_count = u64::from_le_bytes(full[64..72].try_into().unwrap());
+        assert_eq!(op_count, 2);
     }
 }

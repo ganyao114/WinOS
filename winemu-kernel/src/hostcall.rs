@@ -123,16 +123,46 @@ fn wait_sync_completion(request_id: u64, timeout: WaitDeadline) -> Result<Submit
         return Err(status::TIMEOUT);
     }
 
-    // Synchronous hostcall API cannot safely block in-kernel on an async
-    // request because the current kernel architecture has no per-thread kernel
-    // stack/continuation to yield and resume this call frame.
-    //
-    // Therefore, if a "sync" request unexpectedly falls back to async, we try
-    // one opportunistic completion drain, then fail fast instead of spin waiting.
-    pump_completions();
-    if let Some(cpl) = take_completion(request_id) {
-        return Ok(to_submit_done(cpl));
+    let deadline = match timeout {
+        WaitDeadline::Infinite => u64::MAX,
+        WaitDeadline::DeadlineTicks(t) => t,
+        WaitDeadline::Immediate => 0,
+    };
+    let mut spin_budget = 64u32;
+    let sched_deadline = if deadline == u64::MAX { 0 } else { deadline };
+
+    loop {
+        pump_completions();
+        if let Some(cpl) = take_completion(request_id) {
+            return Ok(to_submit_done(cpl));
+        }
+        if deadline != u64::MAX && sched::now_ticks() >= deadline {
+            break;
+        }
+
+        if spin_budget != 0 {
+            spin_budget -= 1;
+            core::hint::spin_loop();
+            continue;
+        }
+
+        if sched::block_current_and_switch_kernel(
+            sched::WAIT_KIND_HOSTCALL,
+            core::slice::from_ref(&request_id),
+            sched_deadline,
+            STATUS_PENDING,
+        ) {
+            // Resumed from kernel continuation switch.
+            continue;
+        }
+
+        // Back off in-kernel while waiting for completion progress.
+        // IRQ toggling mirrors timer idle path and avoids hard busy-spin.
+        crate::arch::cpu::irq_enable();
+        crate::arch::cpu::wait_for_interrupt();
+        crate::arch::cpu::irq_disable();
     }
+
     let _ = hypercall::hostcall_cancel(request_id);
     let _ = unregister_pending_request(request_id);
     Err(status::TIMEOUT)
@@ -143,7 +173,13 @@ pub fn call_sync(
     args: SubmitArgs,
     timeout: WaitDeadline,
 ) -> Result<SubmitDone, u32> {
-    match submit_tracked(owner_pid, 0, args)? {
+    let cur_tid = sched::current_tid();
+    let waiter_tid = if cur_tid != 0 && sched::thread_exists(cur_tid) {
+        cur_tid
+    } else {
+        0
+    };
+    match submit_tracked(owner_pid, waiter_tid, args)? {
         SubmitOutcome::Completed(done) => Ok(done),
         SubmitOutcome::Pending { request_id } => wait_sync_completion(request_id, timeout),
     }
@@ -187,29 +223,16 @@ pub fn wait_current_for_request(request_id: u64, timeout: WaitDeadline) -> u32 {
         return status::TIMEOUT;
     }
     let deadline = wait_deadline_ticks(timeout);
-    sched::sched_lock_acquire();
-    sched::with_thread_mut(cur, |t| {
-        t.wait_result = STATUS_PENDING;
-        t.wait_kind = sched::WAIT_KIND_HOSTCALL;
-        t.wait_count = 1;
-        t.wait_signaled = 0;
-        t.wait_handles.fill(0);
-        t.wait_handles[0] = request_id;
-    });
-    if !sched::set_wait_deadline_locked(cur, deadline) {
-        sched::with_thread_mut(cur, |t| {
-            t.wait_result = 0;
-            t.wait_kind = sched::WAIT_KIND_NONE;
-            t.wait_count = 0;
-            t.wait_signaled = 0;
-            t.wait_handles.fill(0);
-        });
-        sched::sched_lock_release();
+    let wait_status = sched::block_current_and_resched(
+        sched::WAIT_KIND_HOSTCALL,
+        core::slice::from_ref(&request_id),
+        deadline,
+        STATUS_PENDING,
+    );
+    if wait_status != status::SUCCESS {
         let _ = hypercall::hostcall_cancel(request_id);
-        return status::NO_MEMORY;
+        return wait_status;
     }
-    sched::set_thread_state_locked(cur, sched::ThreadState::Waiting);
-    sched::sched_lock_release();
     STATUS_PENDING
 }
 

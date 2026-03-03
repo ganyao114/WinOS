@@ -14,6 +14,7 @@ mod contract;
 // Arch capability surface exposed to the rest of the kernel.
 // Each backend must provide modules: cpu/hypercall/mmu/spin/timer/vectors.
 pub mod cpu;
+pub mod context;
 pub mod hypercall;
 pub mod mmu;
 pub mod spin;

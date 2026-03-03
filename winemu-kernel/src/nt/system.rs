@@ -179,7 +179,7 @@ pub(crate) fn handle_delay_execution(frame: &mut SvcFrame) {
     };
     crate::log::debug_u64(0xD100_0003);
     crate::log::debug_u64(deadline_dbg);
-    let st = crate::sched::sync::delay_current_thread(timeout);
+    let st = crate::sched::sync::delay_current_thread_sync(timeout);
     crate::log::debug_u64(0xD100_0004);
     crate::log::debug_u64(st as u64);
     frame.x[0] = st as u64;

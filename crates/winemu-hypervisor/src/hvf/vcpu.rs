@@ -385,6 +385,19 @@ impl Vcpu for HvfVcpu {
         self.get_sys_reg(ffi::HV_SYS_REG_SP_EL0)
     }
 
+    fn set_pending_irq(&mut self, pending: bool) -> Result<()> {
+        let ret = unsafe {
+            ffi::hv_vcpu_set_pending_interrupt(self.id, ffi::HV_INTERRUPT_TYPE_IRQ, pending)
+        };
+        if ret != ffi::HV_SUCCESS {
+            return Err(WinemuError::Hypervisor(format!(
+                "hv_vcpu_set_pending_interrupt(IRQ={}) failed: {:#x}",
+                pending, ret
+            )));
+        }
+        Ok(())
+    }
+
     fn wfi_idle_hint(&self) -> Option<Duration> {
         self.wfi_idle_hint_inner()
     }

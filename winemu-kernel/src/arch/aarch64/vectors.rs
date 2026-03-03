@@ -92,9 +92,9 @@ global_asm!(
     // configuration. Keep this compat path for those EC values only; all
     // other unknown sync traps are treated as fatal and routed to diagnostics.
     "cmp x9, #0x18",
-    "b.eq __el0_undef_skip",
+    "b.eq 93f",
     "cmp x9, #0x00",
-    "b.eq __el0_undef_skip",
+    "b.eq 93f",
     "b __el0_undef",
     ".balign 128",
 
@@ -176,36 +176,44 @@ global_asm!(
     // Restore original user x9 from tpidrro_el0 shadow into frame.x[9].
     "mrs x16, tpidrro_el0",
     "str x16, [sp, #0x048]",
-    // Call Rust dispatcher: svc_dispatch(&mut frame)
+    // Migrate SVC frame onto current thread private EL1 kernel stack so
+    // kernel continuations can safely resume after cross-thread switches.
     "mov x0, sp",
+    "mov x1, #0x120",
+    "bl svc_migrate_frame_to_thread_stack",
+    // Keep frame base in x28 (callee-saved); run EL1 call stack below frame to avoid
+    // overlap between continuation stack slots and mutable SvcFrame bytes.
+    "mov x28, x0",
+    "sub sp, x28, #0x10",
+    // Call Rust dispatcher: svc_dispatch(&mut frame)
+    "mov x0, x28",
     "bl svc_dispatch",
     // Restore ELR/SPSR/SP_EL0/TPIDR_EL0 from possibly modified frame.
-    "ldr x16, [sp, #0x100]",
+    "ldr x16, [x28, #0x100]",
     "msr elr_el1, x16",
-    "ldr x16, [sp, #0x108]",
+    "ldr x16, [x28, #0x108]",
     "msr spsr_el1, x16",
-    "ldr x16, [sp, #0x0f8]",
+    "ldr x16, [x28, #0x0f8]",
     "msr sp_el0, x16",
-    "ldr x16, [sp, #0x110]",
+    "ldr x16, [x28, #0x110]",
     "msr tpidr_el0, x16",
     // Restore x0-x30 and return to EL0.
-    "ldp x0,  x1,  [sp, #0x000]",
-    "ldp x2,  x3,  [sp, #0x010]",
-    "ldp x4,  x5,  [sp, #0x020]",
-    "ldp x6,  x7,  [sp, #0x030]",
-    "ldp x8,  x9,  [sp, #0x040]",
-    "ldp x10, x11, [sp, #0x050]",
-    "ldp x12, x13, [sp, #0x060]",
-    "ldp x14, x15, [sp, #0x070]",
-    "ldp x16, x17, [sp, #0x080]",
-    "ldp x18, x19, [sp, #0x090]",
-    "ldp x20, x21, [sp, #0x0a0]",
-    "ldp x22, x23, [sp, #0x0b0]",
-    "ldp x24, x25, [sp, #0x0c0]",
-    "ldp x26, x27, [sp, #0x0d0]",
-    "ldp x28, x29, [sp, #0x0e0]",
-    "ldr x30,      [sp, #0x0f0]",
-    "add sp, sp, #0x120",
+    "ldp x0,  x1,  [x28, #0x000]",
+    "ldp x2,  x3,  [x28, #0x010]",
+    "ldp x4,  x5,  [x28, #0x020]",
+    "ldp x6,  x7,  [x28, #0x030]",
+    "ldp x8,  x9,  [x28, #0x040]",
+    "ldp x10, x11, [x28, #0x050]",
+    "ldp x12, x13, [x28, #0x060]",
+    "ldp x14, x15, [x28, #0x070]",
+    "ldp x16, x17, [x28, #0x080]",
+    "ldp x18, x19, [x28, #0x090]",
+    "ldp x20, x21, [x28, #0x0a0]",
+    "ldp x22, x23, [x28, #0x0b0]",
+    "ldp x24, x25, [x28, #0x0c0]",
+    "ldp x26, x27, [x28, #0x0d0]",
+    "ldr x30,      [x28, #0x0f0]",
+    "ldp x28, x29, [x28, #0x0e0]",
     "eret",
 
     // ── Data Abort / Instruction Abort from EL0 ────────────────
@@ -245,6 +253,11 @@ global_asm!(
     "str x16, [sp, #0x108]",
     "mrs x16, tpidrro_el0",
     "str x16, [sp, #0x048]",
+    // Migrate fault frame onto current thread's private EL1 kernel stack.
+    "mov x0, sp",
+    "mov x1, #0x110",
+    "bl svc_migrate_frame_to_thread_stack",
+    "mov sp, x0",
     // Args for Rust handler: (far, esr, elr)
     "mrs x0, far_el1",
     "mrs x1, esr_el1",
@@ -296,6 +309,7 @@ global_asm!(
     "b .",
 
     // ── EC=0x00 compat skip path ──────────────────────────────
+    "93:",
     "__el0_undef_skip:",
     "mrs x16, elr_el1",
     "add x16, x16, #4",
@@ -327,4 +341,9 @@ pub fn install() {
 #[inline(always)]
 pub fn install_exception_vectors() {
     install();
+}
+
+#[inline(always)]
+pub fn default_kernel_stack_top() -> u64 {
+    core::ptr::addr_of!(__svc_stack_top) as u64
 }

@@ -7,3 +7,8 @@ fn unsupported() -> ! {
 pub fn install_exception_vectors() {
     unsupported()
 }
+
+#[inline(always)]
+pub fn default_kernel_stack_top() -> u64 {
+    0
+}

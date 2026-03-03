@@ -101,6 +101,7 @@ pub struct Scheduler {
     vcpu_threads: Mutex<Vec<(u32, std::thread::Thread)>>,
     idle_vcpu_mask: AtomicU32,
     wake_cursor: AtomicU32,
+    external_irq_pending: AtomicBool,
     pub shutdown: AtomicBool,
 }
 
@@ -116,6 +117,7 @@ impl Scheduler {
             vcpu_threads: Mutex::new(Vec::new()),
             idle_vcpu_mask: AtomicU32::new(0),
             wake_cursor: AtomicU32::new(0),
+            external_irq_pending: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
         })
     }
@@ -166,6 +168,15 @@ impl Scheduler {
         }
         let idx = (self.wake_cursor.fetch_add(1, Ordering::Relaxed) as usize) % len;
         threads[idx].1.unpark();
+    }
+
+    pub fn request_external_irq(&self) {
+        self.external_irq_pending.store(true, Ordering::Release);
+        self.unpark_one_vcpu();
+    }
+
+    pub fn take_external_irq_request(&self) -> bool {
+        self.external_irq_pending.swap(false, Ordering::AcqRel)
     }
 
     // ── ThreadId 分片 ────────────────────────────────────────

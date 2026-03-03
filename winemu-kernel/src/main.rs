@@ -8,6 +8,7 @@ mod alloc;
 mod arch;
 mod dll;
 mod hypercall;
+mod hostcall;
 mod kobj;
 mod ldr;
 mod log;
@@ -94,11 +95,23 @@ pub extern "C" fn el0_page_fault(far: u64, esr: u64, elr: u64, frame_ptr: u64) -
 /// Called from vectors with: far=fault address, esr=syndrome, elr=faulting PC.
 #[no_mangle]
 pub extern "C" fn el1_sync_fault(far: u64, esr: u64, elr: u64) -> ! {
-    let insn_m2 = unsafe { (elr.wrapping_sub(8) as *const u32).read_volatile() as u64 };
-    let insn_m1 = unsafe { (elr.wrapping_sub(4) as *const u32).read_volatile() as u64 };
-    let insn = unsafe { (elr as *const u32).read_volatile() as u64 };
-    let insn_p1 = unsafe { (elr.wrapping_add(4) as *const u32).read_volatile() as u64 };
-    let insn_p2 = unsafe { (elr.wrapping_add(8) as *const u32).read_volatile() as u64 };
+    const KERNEL_TEXT_MIN: u64 = 0x4000_0000;
+    const KERNEL_TEXT_MAX: u64 = 0x5000_0000;
+    let mut insn_m2 = 0u64;
+    let mut insn_m1 = 0u64;
+    let mut insn = 0u64;
+    let mut insn_p1 = 0u64;
+    let mut insn_p2 = 0u64;
+    if elr >= KERNEL_TEXT_MIN
+        && elr + 8 < KERNEL_TEXT_MAX
+        && (elr & 0x3) == 0
+    {
+        insn_m2 = unsafe { (elr.wrapping_sub(8) as *const u32).read_volatile() as u64 };
+        insn_m1 = unsafe { (elr.wrapping_sub(4) as *const u32).read_volatile() as u64 };
+        insn = unsafe { (elr as *const u32).read_volatile() as u64 };
+        insn_p1 = unsafe { (elr.wrapping_add(4) as *const u32).read_volatile() as u64 };
+        insn_p2 = unsafe { (elr.wrapping_add(8) as *const u32).read_volatile() as u64 };
+    }
     crate::log::debug_print("KERNEL_FAULT: FAR=");
     crate::log::debug_u64(far);
     crate::log::debug_print(" ESR=");
@@ -118,7 +131,7 @@ pub extern "C" fn el1_sync_fault(far: u64, esr: u64, elr: u64) -> ! {
     crate::log::debug_print(",");
     crate::log::debug_u64(insn_p2);
     crate::log::debug_print("\n");
-    loop { core::hint::spin_loop(); }
+    hypercall::process_exit(0xE1)
 }
 
 fn register_process_boot_file_mappings(owner_pid: u32, exe_base: u64, exe_size: u64) {
@@ -164,6 +177,10 @@ pub extern "C" fn kernel_main() -> ! {
     mm::init();
     crate::kinfo!("kernel_main: mmu ok");
     alloc::init();
+    hostcall::init();
+    if hypercall::hostcall_setup() != winemu_shared::hostcall::HC_OK {
+        crate::kwarn!("kernel: hostcall setup failed");
+    }
 
     // ── 1. 通过 host fd 加载 EXE ─────────────────────────────
     let (exe_fd, exe_size) = hypercall::query_exe_info();

@@ -20,7 +20,7 @@ use core::arch::global_asm;
 //   6. 恢复 LR，ret
 //
 // 注意：VMM 侧 NT_SYSCALL hypercall 约定：
-//   hypercall_nr = NT_SYSCALL (0x0700)
+//   hypercall_nr = winemu_shared::nr::NT_SYSCALL
 //   args[0] = syscall_nr (x8 & 0xFFF)
 //   args[1] = table_nr  (x8 >> 12 & 0x3)
 //   args[2] = arg0 (x0)
@@ -39,7 +39,7 @@ global_asm!(
     "stp x9, x30, [sp, #-16]!",
     // 构造 hypercall 参数
     // x0 = NT_SYSCALL hypercall 号
-    "mov x16, #0x0700", // NT_SYSCALL nr
+    "mov x16, #{nt_syscall_nr}", // NT_SYSCALL nr
     // 把 syscall 号和表号打包到 x17
     "and x17, x8, #0xFFF", // x17 = syscall_nr
     "lsr x18, x8, #12",
@@ -48,7 +48,7 @@ global_asm!(
     // HVC 约定：x0=nr, x1-x6=args
     // 需要把 syscall_nr/table_nr 插入，先移位参数
     // 实际约定：
-    //   x0 = NT_SYSCALL (0x0700)
+    //   x0 = winemu_shared::nr::NT_SYSCALL
     //   x1 = syscall_nr
     //   x2 = table_nr
     //   x3 = original x0 (arg0)
@@ -67,6 +67,7 @@ global_asm!(
     // 恢复 LR 并返回
     "ldp x9, x30, [sp], #16",
     "ret x9",
+    nt_syscall_nr = const winemu_shared::nr::NT_SYSCALL,
 );
 
 // ── syscall 表初始化 ─────────────────────────────────────────

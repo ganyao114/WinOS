@@ -55,6 +55,11 @@ global_asm!(
     "mrs x16, tpidr_el0",
     "str x16, [sp, #0x110]",
     "str xzr, [sp, #0x118]", // x8_orig is irrelevant for IRQ path
+    // Migrate SvcFrame onto current thread's private EL1 kernel stack.
+    "mov x0, sp",
+    "mov x1, #0x120",
+    "bl svc_migrate_frame_to_thread_stack",
+    "mov sp, x0",
     // Call Rust dispatcher: timer_irq_dispatch(&mut frame)
     "mov x0, sp",
     "bl timer_irq_dispatch",

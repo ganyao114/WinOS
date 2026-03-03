@@ -9,11 +9,16 @@ pub fn vcpu_thread(
     mut vcpu: Box<dyn Vcpu>,
     hc_mgr: Arc<HypercallManager>,
     sched: Arc<Scheduler>,
+    main_executor: bool,
 ) {
+    const HOSTCALL_MAIN_BUDGET: usize = 32;
     // ── Phase 1: 直接运行 Guest Kernel，直到 KERNEL_READY ────────
     // 内核不是调度线程，用 ThreadId(0) 作为占位符
     let kernel_tid = ThreadId(0);
     'kernel: loop {
+        if main_executor {
+            let _ = hc_mgr.pump_hostcall_main_thread(HOSTCALL_MAIN_BUDGET);
+        }
         let exit = match vcpu.run() {
             Ok(e) => e,
             Err(e) => {
@@ -40,6 +45,9 @@ pub fn vcpu_thread(
                     HypercallResult::Sync(ret) => {
                         set_x0(&mut *vcpu, ret);
                         // HVF auto-advances PC past hvc — do NOT call advance_pc
+                    }
+                    HypercallResult::Sync2 { x0, x1 } => {
+                        set_x0_x1(&mut *vcpu, x0, x1);
                     }
                     HypercallResult::Sched(SchedResult::Exit(code)) => {
                         log::info!("vcpu{} kernel exited: code={}", vcpu_id, code);
@@ -80,8 +88,12 @@ pub fn vcpu_thread(
     // ── Phase 2: 调度循环，运行 Guest 用户线程 ───────────────────
     sched.register_vcpu_thread(vcpu_id);
     let mut current: Option<ThreadId> = None;
+    let mut external_irq_asserted = false;
 
     'run: loop {
+        if main_executor {
+            let _ = hc_mgr.pump_hostcall_main_thread(HOSTCALL_MAIN_BUDGET);
+        }
         if sched.shutdown.load(std::sync::atomic::Ordering::Acquire) {
             log::info!("vcpu{} all threads terminated — shutting down", vcpu_id);
             break 'run;
@@ -108,6 +120,14 @@ pub fn vcpu_thread(
         };
         restore_ctx(&mut *vcpu, &ctx);
 
+        if sched.take_external_irq_request() {
+            if let Err(e) = vcpu.set_pending_irq(true) {
+                log::warn!("vcpu{} set_pending_irq(true) failed: {:?}", vcpu_id, e);
+            } else {
+                external_irq_asserted = true;
+            }
+        }
+
         let exit = match vcpu.run() {
             Ok(e) => e,
             Err(e) => {
@@ -115,6 +135,13 @@ pub fn vcpu_thread(
                 break;
             }
         };
+
+        if external_irq_asserted {
+            if let Err(e) = vcpu.set_pending_irq(false) {
+                log::warn!("vcpu{} set_pending_irq(false) failed: {:?}", vcpu_id, e);
+            }
+            external_irq_asserted = false;
+        }
 
         match exit {
             VmExit::Wfi => {
@@ -162,6 +189,11 @@ pub fn vcpu_thread(
                             let ctx = save_ctx(&mut *vcpu);
                             sched.save_ctx(tid, ctx);
                         }
+                        HypercallResult::Sync2 { x0, x1 } => {
+                            set_x0_x1(&mut *vcpu, x0, x1);
+                            let ctx = save_ctx(&mut *vcpu);
+                            sched.save_ctx(tid, ctx);
+                        }
                         HypercallResult::Sched(SchedResult::Block(req)) => {
                             let ctx = save_ctx(&mut *vcpu);
                             sched.save_ctx(tid, ctx);
@@ -187,6 +219,11 @@ pub fn vcpu_thread(
                 match result {
                     HypercallResult::Sync(ret) | HypercallResult::Sched(SchedResult::Sync(ret)) => {
                         set_x0(&mut *vcpu, ret);
+                        let ctx = save_ctx(&mut *vcpu);
+                        sched.save_ctx(tid, ctx);
+                    }
+                    HypercallResult::Sync2 { x0, x1 } => {
+                        set_x0_x1(&mut *vcpu, x0, x1);
                         let ctx = save_ctx(&mut *vcpu);
                         sched.save_ctx(tid, ctx);
                     }
@@ -278,6 +315,21 @@ fn save_ctx(vcpu: &mut dyn Vcpu) -> ThreadContext {
 
 fn set_x0(vcpu: &mut dyn Vcpu, val: u64) {
     vcpu.set_return_value(val).unwrap();
+}
+
+fn set_x0_x1(vcpu: &mut dyn Vcpu, x0: u64, x1: u64) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut regs = vcpu.regs().unwrap();
+        regs.x[0] = x0;
+        regs.x[1] = x1;
+        vcpu.set_regs(&regs).unwrap();
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = x1;
+        vcpu.set_return_value(x0).unwrap();
+    }
 }
 
 fn bounded_wfi_wait(vcpu: &dyn Vcpu) -> Option<Duration> {

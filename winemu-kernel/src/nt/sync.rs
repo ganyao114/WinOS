@@ -1,7 +1,7 @@
 use crate::sched::sync::{
     create_event_handle, create_mutex_handle, create_semaphore_handle, event_reset_by_handle,
-    event_set_by_handle, mutex_release_by_handle, semaphore_release_by_handle, wait_handle,
-    wait_multiple, EventType, WaitDeadline, HANDLE_TYPE_EVENT, HANDLE_TYPE_MUTEX,
+    event_set_by_handle, mutex_release_by_handle, semaphore_release_by_handle, wait_handle_sync,
+    wait_multiple_sync, EventType, WaitDeadline, HANDLE_TYPE_EVENT, HANDLE_TYPE_MUTEX,
     HANDLE_TYPE_SEMAPHORE, STATUS_SUCCESS,
 };
 use winemu_shared::status;
@@ -51,7 +51,7 @@ pub(crate) fn handle_reset_event_or_delay(frame: &mut SvcFrame) {
 pub(crate) fn handle_wait_single(frame: &mut SvcFrame) {
     let h = frame.x[0];
     let timeout = parse_timeout(frame.x[2] as *const i64);
-    frame.x[0] = wait_handle(h, timeout) as u64;
+    frame.x[0] = wait_handle_sync(h, timeout) as u64;
 }
 
 pub(crate) fn handle_wait_multiple(frame: &mut SvcFrame) {
@@ -77,7 +77,7 @@ pub(crate) fn handle_wait_multiple(frame: &mut SvcFrame) {
         handles[i] = unsafe { arr.add(i).read_volatile() };
         i += 1;
     }
-    frame.x[0] = wait_multiple(&handles[..count], wait_all, timeout) as u64;
+    frame.x[0] = wait_multiple_sync(&handles[..count], wait_all, timeout) as u64;
 }
 
 // x0 = MutantHandle* (out), x1 = DesiredAccess, x2 = ObjAttr*

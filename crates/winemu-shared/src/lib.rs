@@ -170,6 +170,74 @@ pub mod nr {
     ///   - u64::MAX: invalid / not a directory
     ///   - 其他: bits[39:32]=action, low32=name_len
     pub const HOST_NOTIFY_DIR: u64 = 0x081B;
+
+    // ── HostCall IPC: 0x0820 - 0x082F ──────────────────────
+    /// HostCall 通道初始化（预留）
+    pub const HOSTCALL_SETUP: u64 = 0x0820;
+    /// 统一 HostCall 提交入口
+    /// args: [opcode, flags, arg0, arg1, arg2, arg3]
+    /// returns: x0=host_result, x1=aux(request_id or opcode-defined value)
+    pub const HOSTCALL_SUBMIT: u64 = 0x0821;
+    /// 取消异步请求
+    /// args: [request_id, 0, 0, 0, 0, 0]
+    /// returns: host_result
+    pub const HOSTCALL_CANCEL: u64 = 0x0822;
+    /// 拉取一个 completion
+    /// args: [dst_gpa, dst_cap, 0, 0, 0, 0]
+    /// returns: 写入条目数（0/1）
+    pub const HOSTCALL_POLL: u64 = 0x0823;
+    /// 批量拉取 completion
+    /// args: [dst_gpa, dst_cap_entries, 0, 0, 0, 0]
+    /// returns: 写入条目数
+    pub const HOSTCALL_POLL_BATCH: u64 = 0x0824;
+    /// 查询 hostcall 统计快照
+    /// args: [dst_gpa, dst_len, flags(bit0=reset_after_read), 0, 0, 0]
+    /// returns: 实际写入字节数
+    pub const HOSTCALL_QUERY_STATS: u64 = 0x0825;
+}
+
+pub mod hostcall {
+    // Submit flags
+    pub const FLAG_ALLOW_ASYNC: u64 = 1 << 0;
+    pub const FLAG_FORCE_ASYNC: u64 = 1 << 1;
+    pub const FLAG_EXT_BUF: u64 = 1 << 2;
+    pub const FLAG_MAIN_THREAD: u64 = 1 << 3;
+
+    // Submit return sentinel
+    pub const PENDING_RESULT: u64 = 0xFFFF_FFFF_FFFF_FFFEu64;
+
+    // HostCall result codes (host-domain, non-NT)
+    pub const HC_OK: u64 = 0;
+    pub const HC_INVALID: u64 = 1;
+    pub const HC_BUSY: u64 = 2;
+    pub const HC_NO_MEMORY: u64 = 3;
+    pub const HC_CANCELED: u64 = 4;
+    pub const HC_IO_ERROR: u64 = 5;
+
+    // Opcodes
+    pub const OP_OPEN: u64 = 1;
+    pub const OP_READ: u64 = 2;
+    pub const OP_WRITE: u64 = 3;
+    pub const OP_CLOSE: u64 = 4;
+    pub const OP_STAT: u64 = 5;
+    pub const OP_READDIR: u64 = 6;
+    pub const OP_NOTIFY_DIR: u64 = 7;
+    pub const OP_MMAP: u64 = 8;
+    pub const OP_MUNMAP: u64 = 9;
+
+    // HostCallCpl binary layout size (u64 + i32 + u32 + u64 + u64 + u64)
+    pub const CPL_SIZE: usize = 40;
+    pub const CPLF_MAIN_THREAD: u32 = 1 << 0;
+    pub const CPLF_CANCELED: u32 = 1 << 1;
+    pub const STATS_RESET_AFTER_READ: u64 = 1 << 0;
+    pub const STATS_VERSION: u64 = 1;
+    pub const STATS_HEADER_SIZE: usize = 9 * core::mem::size_of::<u64>();
+    pub const STATS_OP_SIZE: usize = 7 * core::mem::size_of::<u64>();
+
+    // EXT_BUF payload layout for HOSTCALL_SUBMIT:
+    // [u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 user_tag]
+    pub const EXT_SUBMIT_WORDS: usize = 5;
+    pub const EXT_SUBMIT_SIZE: usize = EXT_SUBMIT_WORDS * core::mem::size_of::<u64>();
 }
 
 /// NT 超时常量（100ns 单位）

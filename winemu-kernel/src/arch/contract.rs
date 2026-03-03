@@ -1,4 +1,5 @@
 use crate::nt::SvcFrame;
+use crate::sched::KernelContext;
 
 pub trait CpuBackend {
     fn cpu_local_read() -> u64;
@@ -26,6 +27,7 @@ pub trait MmuBackend {
 
 pub trait HypercallBackend {
     fn invoke6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64;
+    fn invoke6_pair(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> (u64, u64);
     fn forward_nt_syscall(frame: &SvcFrame, nr: u16, table: u8) -> u64;
 }
 
@@ -42,14 +44,39 @@ pub trait TimerBackend {
 
 pub trait VectorsBackend {
     fn install_exception_vectors();
+    fn default_kernel_stack_top() -> u64;
+}
+
+pub trait ContextBackend {
+    // Capture current EL1 kernel continuation into ctx.
+    // Returns 0 on initial capture; non-zero when resumed through
+    // switch_kernel_context().
+    unsafe fn save_kernel_context(ctx: *mut KernelContext) -> u64;
+
+    // Non-local context switch between two EL1 kernel continuations.
+    // Safety: pointers must refer to valid KernelContext objects that live
+    // across switches.
+    unsafe fn switch_kernel_context(from: *mut KernelContext, to: *const KernelContext);
 }
 
 pub trait KernelArchBackend:
-    CpuBackend + MmuBackend + HypercallBackend + SpinBackend + TimerBackend + VectorsBackend
+    CpuBackend
+    + MmuBackend
+    + HypercallBackend
+    + SpinBackend
+    + TimerBackend
+    + VectorsBackend
+    + ContextBackend
 {
 }
 
 impl<T> KernelArchBackend for T where
-    T: CpuBackend + MmuBackend + HypercallBackend + SpinBackend + TimerBackend + VectorsBackend
+    T: CpuBackend
+        + MmuBackend
+        + HypercallBackend
+        + SpinBackend
+        + TimerBackend
+        + VectorsBackend
+        + ContextBackend
 {
 }

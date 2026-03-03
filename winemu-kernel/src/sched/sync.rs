@@ -1411,12 +1411,96 @@ pub fn wait_handle(h: u64, timeout: WaitDeadline) -> u32 {
     st
 }
 
+fn wait_current_pending_sync_result() -> u32 {
+    let cur = current_tid();
+    if cur == 0 || !thread_exists(cur) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    crate::log::debug_u64(0xD201_0001);
+    crate::log::debug_u64(cur as u64);
+    sched_lock_acquire();
+    let (state_before, result_before) = with_thread(cur, |t| (t.state, t.wait_result));
+    sched_lock_release();
+    crate::log::debug_u64(0xD201_0002);
+    crate::log::debug_u64(state_before as u64);
+    crate::log::debug_u64(result_before as u64);
+    if state_before != ThreadState::Waiting {
+        return result_before;
+    }
+    let (kctx_sp, kctx_lr, dispatch_sp, dispatch_lr) = crate::sched::with_thread(cur, |t| {
+        (
+            t.kctx.sp_el1,
+            t.kctx.lr_el1,
+            t.dispatch_kctx.sp_el1,
+            t.dispatch_kctx.lr_el1,
+        )
+    });
+    crate::log::debug_u64(0xD202_0001);
+    crate::log::debug_u64(kctx_sp);
+    crate::log::debug_u64(0xD202_0002);
+    crate::log::debug_u64(kctx_lr);
+    crate::log::debug_u64(0xD202_0003);
+    crate::log::debug_u64(dispatch_sp);
+    crate::log::debug_u64(0xD202_0004);
+    crate::log::debug_u64(dispatch_lr);
+    let cur_sp: u64;
+    let cur_lr: u64;
+    unsafe {
+        core::arch::asm!("mov {0}, sp", out(reg) cur_sp, options(nostack, preserves_flags));
+        core::arch::asm!("mov {0}, x30", out(reg) cur_lr, options(nostack, preserves_flags));
+    }
+    let cur_ret_slot = if (cur_sp & 0x7) == 0 {
+        unsafe { (cur_sp as *const u64).read_volatile() }
+    } else {
+        0
+    };
+    crate::log::debug_u64(0xD204_0001);
+    crate::log::debug_u64(cur_sp);
+    crate::log::debug_u64(cur_lr);
+    crate::log::debug_u64(cur_ret_slot);
+    crate::log::debug_u64(0xD201_0003);
+    if !crate::sched::reschedule_current_via_dispatch_continuation() {
+        // Conservative fallback: keep legacy STATUS_PENDING path when
+        // continuation switch is unavailable on this call site.
+        crate::log::debug_u64(0xD201_E001);
+        return STATUS_PENDING;
+    }
+    crate::log::debug_u64(0xD201_0004);
+    sched_lock_acquire();
+    let (state_after, result_after) = with_thread(cur, |t| (t.state, t.wait_result));
+    sched_lock_release();
+    crate::log::debug_u64(0xD201_0005);
+    crate::log::debug_u64(state_after as u64);
+    crate::log::debug_u64(result_after as u64);
+    if state_after == ThreadState::Waiting {
+        crate::log::debug_u64(0xD201_E002);
+        return STATUS_PENDING;
+    }
+    result_after
+}
+
+pub fn wait_handle_sync(h: u64, timeout: WaitDeadline) -> u32 {
+    let st = wait_handle(h, timeout);
+    if st != STATUS_PENDING {
+        return st;
+    }
+    wait_current_pending_sync_result()
+}
+
 /// Wait on multiple handles. wait_all=false => WaitAny, true => WaitAll.
 pub fn wait_multiple(handles: &[u64], wait_all: bool, timeout: WaitDeadline) -> u32 {
     sched_lock_acquire();
     let st = wait_common_locked(handles, wait_all, timeout);
     sched_lock_release();
     st
+}
+
+pub fn wait_multiple_sync(handles: &[u64], wait_all: bool, timeout: WaitDeadline) -> u32 {
+    let st = wait_multiple(handles, wait_all, timeout);
+    if st != STATUS_PENDING {
+        return st;
+    }
+    wait_current_pending_sync_result()
 }
 
 /// Delay current thread for specified timeout semantics.
@@ -1441,6 +1525,14 @@ pub fn delay_current_thread(timeout: WaitDeadline) -> u32 {
     }
     sched_lock_release();
     STATUS_PENDING
+}
+
+pub fn delay_current_thread_sync(timeout: WaitDeadline) -> u32 {
+    let st = delay_current_thread(timeout);
+    if st != STATUS_PENDING {
+        return st;
+    }
+    wait_current_pending_sync_result()
 }
 
 /// Remove a waiting thread from all object wait queues.

@@ -1,5 +1,6 @@
 pub mod file_io;
 pub mod host_file;
+pub mod hostcall;
 pub mod hypercall;
 pub mod memory;
 pub mod phys;
@@ -84,22 +85,38 @@ impl Vmm {
                 vcpu,
                 Arc::clone(&self.hypercall_mgr),
                 Arc::clone(&self.sched),
+                true,
             );
             return Ok(());
         }
 
         let mut joins = Vec::with_capacity(vcpus.len());
+        let mut main_vcpu: Option<Box<dyn winemu_hypervisor::Vcpu>> = None;
         for (id, vcpu) in vcpus {
+            if id == 0 {
+                main_vcpu = Some(vcpu);
+                continue;
+            }
             let hc_mgr = Arc::clone(&self.hypercall_mgr);
             let sched = Arc::clone(&self.sched);
             let name = format!("winemu-vcpu-{id}");
             let handle = std::thread::Builder::new()
                 .name(name)
                 .spawn(move || {
-                    vcpu::vcpu_thread(id, vcpu, hc_mgr, sched);
+                    vcpu::vcpu_thread(id, vcpu, hc_mgr, sched, false);
                 })
                 .map_err(|e| WinemuError::Hypervisor(format!("spawn vcpu thread failed: {e}")))?;
             joins.push(handle);
+        }
+
+        if let Some(vcpu0) = main_vcpu {
+            vcpu::vcpu_thread(
+                0,
+                vcpu0,
+                Arc::clone(&self.hypercall_mgr),
+                Arc::clone(&self.sched),
+                true,
+            );
         }
 
         for handle in joins {

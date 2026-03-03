@@ -1,4 +1,5 @@
 pub mod boot;
+pub mod context;
 pub mod cpu;
 pub mod hypercall;
 pub mod mmu;
@@ -109,6 +110,11 @@ impl super::contract::HypercallBackend for ArchBackend {
     }
 
     #[inline(always)]
+    fn invoke6_pair(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> (u64, u64) {
+        hypercall::invoke6_pair(nr, a0, a1, a2, a3, a4, a5)
+    }
+
+    #[inline(always)]
     fn forward_nt_syscall(frame: &crate::nt::SvcFrame, nr: u16, table: u8) -> u64 {
         hypercall::forward_nt_syscall(frame, nr, table)
     }
@@ -144,5 +150,25 @@ impl super::contract::VectorsBackend for ArchBackend {
     #[inline(always)]
     fn install_exception_vectors() {
         vectors::install_exception_vectors();
+    }
+
+    #[inline(always)]
+    fn default_kernel_stack_top() -> u64 {
+        vectors::default_kernel_stack_top()
+    }
+}
+
+impl super::contract::ContextBackend for ArchBackend {
+    #[inline(always)]
+    unsafe fn save_kernel_context(ctx: *mut crate::sched::KernelContext) -> u64 {
+        context::save_kernel_context(ctx)
+    }
+
+    #[inline(always)]
+    unsafe fn switch_kernel_context(
+        from: *mut crate::sched::KernelContext,
+        to: *const crate::sched::KernelContext,
+    ) {
+        context::switch_kernel_context(from, to);
     }
 }

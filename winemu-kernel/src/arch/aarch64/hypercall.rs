@@ -44,8 +44,56 @@ pub fn call6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u
 }
 
 #[inline(always)]
+pub fn call6_pair(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> (u64, u64) {
+    let ret0: u64;
+    let ret1: u64;
+    unsafe {
+        core::arch::asm!(
+            "stp x19, x20, [sp, #-16]!",
+            "stp x21, x22, [sp, #-16]!",
+            "stp x23, x24, [sp, #-16]!",
+            "stp x25, x26, [sp, #-16]!",
+            "stp x27, x28, [sp, #-16]!",
+            "stp x29, x30, [sp, #-16]!",
+            "hvc #0",
+            "ldp x29, x30, [sp], #16",
+            "ldp x27, x28, [sp], #16",
+            "ldp x25, x26, [sp], #16",
+            "ldp x23, x24, [sp], #16",
+            "ldp x21, x22, [sp], #16",
+            "ldp x19, x20, [sp], #16",
+            inout("x0") nr => ret0,
+            inlateout("x1") a0 => ret1,
+            in("x2") a1,
+            in("x3") a2,
+            in("x4") a3,
+            in("x5") a4,
+            in("x6") a5,
+            lateout("x20") _,
+            lateout("x21") _,
+            lateout("x22") _,
+            lateout("x23") _,
+            lateout("x24") _,
+            lateout("x25") _,
+            lateout("x26") _,
+            lateout("x27") _,
+            lateout("x28") _,
+            lateout("x30") _,
+            clobber_abi("C"),
+            options()
+        );
+    }
+    (ret0, ret1)
+}
+
+#[inline(always)]
 pub fn invoke6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     call6(nr, a0, a1, a2, a3, a4, a5)
+}
+
+#[inline(always)]
+pub fn invoke6_pair(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> (u64, u64) {
+    call6_pair(nr, a0, a1, a2, a3, a4, a5)
 }
 
 /// Forward a guest NT syscall frame to VMM fallback dispatcher.

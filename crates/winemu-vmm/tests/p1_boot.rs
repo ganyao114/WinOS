@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod p1_boot {
     use memmap2::MmapMut;
-    use winemu_core::{addr::Gpa, hypercall::nr, mem::MemProt};
+    use winemu_core::{addr::Gpa, mem::MemProt};
     use winemu_hypervisor::{create_hypervisor, types::VmExit, VmConfig};
+    use winemu_shared::nr;
 
     fn load_kernel_bin() -> Option<Vec<u8>> {
         let paths = [
