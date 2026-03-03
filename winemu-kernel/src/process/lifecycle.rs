@@ -220,6 +220,7 @@ fn finalize_process_if_no_threads(pid: u32) {
     let _ = with_process_mut(pid, |p| p.state = ProcessState::Terminated);
     crate::nt::file::cancel_pending_dir_notify_for_pid(pid);
     crate::nt::state::cleanup_process_owned_resources(pid);
+    let _ = crate::hostcall::cancel_requests_for_owner_pid(pid);
     crate::sched::sync::process_notify_terminated(pid);
     maybe_free_if_unreferenced(pid);
 }

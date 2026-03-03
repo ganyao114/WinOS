@@ -329,6 +329,9 @@ pub fn terminate_thread_by_tid(tid: u32) -> bool {
     }
     sched_lock_release();
 
+    // Targeted hostcall cleanup replaces IRQ-time stale waiter scanning.
+    let _ = crate::hostcall::cancel_requests_for_waiter_tid(tid);
+
     let _ = vm_free_region(pid, stack_base);
     let _ = vm_free_region(pid, teb_va);
     if !defer_kstack {

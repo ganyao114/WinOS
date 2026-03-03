@@ -41,7 +41,6 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
     }
     set_current_in_kernel(true);
     crate::sched::reclaim_deferred_kernel_stacks();
-    crate::hostcall::pump_completions();
 
     let tag = frame.x8_orig;
     let nr = (tag & SVC_TAG_NR_MASK) as u16;
@@ -54,7 +53,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
                 0x127 => {
                     // NtUserInitializeClientPfnArrays
                     win32k::handle_user_initialize_client_pfn_arrays(frame);
-                    schedule_from_trap(frame, true);
+                    schedule_from_trap(frame, true, false);
                     return;
                 }
                 _ => {}
@@ -64,7 +63,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         // Non-NT tables still need normal trap-exit scheduling so timer slice /
         // deadline programming remains consistent on this path.
         forward_to_vmm(frame, nr, table);
-        schedule_from_trap(frame, true);
+        schedule_from_trap(frame, true, false);
         return;
     }
 
@@ -144,7 +143,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
     }
 
     trace_syscall_error(nr, table, frame);
-    schedule_from_trap(frame, true);
+    schedule_from_trap(frame, true, false);
 }
 
 fn trace_syscall_error(nr: u16, table: u8, frame: &SvcFrame) {
@@ -200,12 +199,15 @@ fn restore_ctx_to_frame(tid: u32, frame: &mut SvcFrame) {
     });
 }
 
-fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
+fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcall: bool) -> bool {
     let vid = vcpu_id();
     let quantum_100ns = timer::DEFAULT_TIMESLICE_100NS;
     let mut from = current_tid();
     if from != 0 {
         save_ctx_for(from, frame);
+    }
+    if drain_hostcall {
+        crate::hostcall::pump_completions();
     }
     loop {
         let now = now_ticks();
@@ -320,8 +322,7 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool) -> bool {
 pub extern "C" fn timer_irq_dispatch(frame: &mut SvcFrame) {
     set_current_in_kernel(true);
     crate::sched::reclaim_deferred_kernel_stacks();
-    crate::hostcall::pump_completions();
-    let _ = schedule_from_trap(frame, false);
+    let _ = schedule_from_trap(frame, false, true);
 }
 
 #[no_mangle]

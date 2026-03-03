@@ -7,12 +7,24 @@ use winemu_shared::hostcall as hc;
 use winemu_shared::status;
 
 const STATUS_PENDING: u32 = 0x0000_0103;
+const REQUEST_BUCKETS: usize = 256;
+const SYNC_DONE_BUCKETS: usize = 128;
 
 #[derive(Clone, Copy)]
 struct PendingWaiter {
     owner_pid: u32,
     request_id: u64,
     waiter_tid: u32,
+    need_submit_done: bool,
+    req_next: u32,
+}
+
+#[derive(Clone, Copy)]
+struct SyncCompletion {
+    request_id: u64,
+    host_result: u64,
+    value0: u64,
+    req_next: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -40,6 +52,9 @@ pub enum SubmitOutcome {
 
 struct HostCallState {
     requests: ObjectStore<PendingWaiter>,
+    request_heads: [u32; REQUEST_BUCKETS],
+    sync_done: ObjectStore<SyncCompletion>,
+    sync_done_heads: [u32; SYNC_DONE_BUCKETS],
 }
 
 static mut HOSTCALL_STATE: Option<HostCallState> = None;
@@ -49,10 +64,23 @@ fn state_mut() -> &'static mut HostCallState {
         if HOSTCALL_STATE.is_none() {
             HOSTCALL_STATE = Some(HostCallState {
                 requests: ObjectStore::new(),
+                request_heads: [0u32; REQUEST_BUCKETS],
+                sync_done: ObjectStore::new(),
+                sync_done_heads: [0u32; SYNC_DONE_BUCKETS],
             });
         }
         HOSTCALL_STATE.as_mut().unwrap()
     }
+}
+
+#[inline(always)]
+fn request_bucket(request_id: u64) -> usize {
+    ((request_id ^ (request_id >> 32)).wrapping_mul(0x9E37_79B1u64) as usize) % REQUEST_BUCKETS
+}
+
+#[inline(always)]
+fn sync_done_bucket(request_id: u64) -> usize {
+    ((request_id ^ (request_id >> 29)).wrapping_mul(0x85EB_CA77u64) as usize) % SYNC_DONE_BUCKETS
 }
 
 pub fn init() {
@@ -79,6 +107,91 @@ pub fn submit(args: SubmitArgs) -> SubmitOutcome {
     }
 }
 
+pub fn call_sync(
+    owner_pid: u32,
+    args: SubmitArgs,
+) -> Result<SubmitDone, u32> {
+    let cur_tid = sched::current_tid();
+    if cur_tid == 0 || !sched::thread_exists(cur_tid) {
+        return Err(status::INVALID_PARAMETER);
+    }
+    match submit(args) {
+        SubmitOutcome::Completed(done) => Ok(done),
+        SubmitOutcome::Pending { request_id } => {
+            if request_id == 0 {
+                return Err(status::INVALID_PARAMETER);
+            }
+            if !register_request(owner_pid, request_id, cur_tid, true) {
+                let _ = hypercall::hostcall_cancel(request_id);
+                return Err(status::NO_MEMORY);
+            }
+            let wait_st = wait_current_for_request(request_id, WaitDeadline::Infinite);
+            let done = take_sync_completion(request_id);
+            if wait_st != status::SUCCESS {
+                return Err(wait_st);
+            }
+            let Some(done) = done else {
+                return Err(status::INVALID_PARAMETER);
+            };
+            if map_host_result_to_status(done.host_result) != status::SUCCESS {
+                return Err(map_host_result_to_status(done.host_result));
+            }
+            Ok(done)
+        }
+    }
+}
+
+pub fn register_request(owner_pid: u32, request_id: u64, waiter_tid: u32, need_submit_done: bool) -> bool {
+    if request_id == 0 {
+        return false;
+    }
+    if request_lookup_id(request_id) != 0 {
+        return false;
+    }
+    let bucket = request_bucket(request_id);
+    let state = state_mut();
+    let head = state.request_heads[bucket];
+    let Some(id) = state.requests.alloc_with(|_| PendingWaiter {
+        owner_pid,
+        request_id,
+        waiter_tid,
+        need_submit_done,
+        req_next: head,
+    }) else {
+        return false;
+    };
+    state.request_heads[bucket] = id;
+    true
+}
+
+fn store_sync_completion(request_id: u64, host_result: u64, value0: u64) -> bool {
+    if request_id == 0 {
+        return false;
+    }
+    let _ = sync_done_remove_by_request(request_id);
+    let bucket = sync_done_bucket(request_id);
+    let state = state_mut();
+    let head = state.sync_done_heads[bucket];
+    let Some(id) = state.sync_done.alloc_with(|_| SyncCompletion {
+        request_id,
+        host_result,
+        value0,
+        req_next: head,
+    }) else {
+        return false;
+    };
+    state.sync_done_heads[bucket] = id;
+    true
+}
+
+fn take_sync_completion(request_id: u64) -> Option<SubmitDone> {
+    let done = sync_done_remove_by_request(request_id)?;
+    Some(SubmitDone {
+        host_result: done.host_result,
+        value0: done.value0,
+    })
+}
+
 pub fn submit_tracked(
     owner_pid: u32,
     waiter_tid: u32,
@@ -91,45 +204,101 @@ pub fn submit_tracked(
     if request_id == 0 {
         return Err(status::INVALID_PARAMETER);
     }
-    if register_request(owner_pid, request_id, waiter_tid) {
+    if register_request(owner_pid, request_id, waiter_tid, false) {
         return Ok(out);
     }
     let _ = hypercall::hostcall_cancel(request_id);
     Err(status::NO_MEMORY)
 }
 
-pub fn call_sync(
-    owner_pid: u32,
-    args: SubmitArgs,
-) -> Result<SubmitDone, u32> {
-    let cur_tid = sched::current_tid();
-    if cur_tid == 0 || !sched::thread_exists(cur_tid) {
-        return Err(status::INVALID_PARAMETER);
-    }
-    match submit_tracked(owner_pid, cur_tid, args)? {
-        SubmitOutcome::Completed(done) => Ok(done),
-        // call_sync is for synchronous hostcalls. Pending response means host
-        // side violated synchronous contract for this opcode.
-        SubmitOutcome::Pending { request_id } => {
-            let _ = hypercall::hostcall_cancel(request_id);
-            let _ = unregister_pending_request(request_id);
-            Err(status::NOT_IMPLEMENTED)
-        }
-    }
+pub fn unregister_pending_request(request_id: u64) -> bool {
+    request_remove_by_request(request_id).is_some()
 }
 
-pub fn register_request(owner_pid: u32, request_id: u64, waiter_tid: u32) -> bool {
+fn request_lookup_id(request_id: u64) -> u32 {
     if request_id == 0 {
-        return false;
+        return 0;
     }
-    state_mut()
-        .requests
-        .alloc_with(|_| PendingWaiter {
-            owner_pid,
-            request_id,
-            waiter_tid,
-        })
-        .is_some()
+    let state = state_mut();
+    let mut cur = state.request_heads[request_bucket(request_id)];
+    while cur != 0 {
+        let ptr = state.requests.get_ptr(cur);
+        if ptr.is_null() {
+            break;
+        }
+        let node = unsafe { &*ptr };
+        if node.request_id == request_id {
+            return cur;
+        }
+        cur = node.req_next;
+    }
+    0
+}
+
+fn request_remove_by_request(request_id: u64) -> Option<PendingWaiter> {
+    if request_id == 0 {
+        return None;
+    }
+    let bucket = request_bucket(request_id);
+    let state = state_mut();
+    let mut prev = 0u32;
+    let mut cur = state.request_heads[bucket];
+    while cur != 0 {
+        let ptr = state.requests.get_ptr(cur);
+        if ptr.is_null() {
+            break;
+        }
+        let node = unsafe { *ptr };
+        let next = node.req_next;
+        if node.request_id == request_id {
+            if prev == 0 {
+                state.request_heads[bucket] = next;
+            } else {
+                let prev_ptr = state.requests.get_ptr(prev);
+                if !prev_ptr.is_null() {
+                    unsafe { (*prev_ptr).req_next = next };
+                }
+            }
+            let _ = state.requests.free(cur);
+            return Some(node);
+        }
+        prev = cur;
+        cur = next;
+    }
+    None
+}
+
+fn sync_done_remove_by_request(request_id: u64) -> Option<SyncCompletion> {
+    if request_id == 0 {
+        return None;
+    }
+    let bucket = sync_done_bucket(request_id);
+    let state = state_mut();
+    let mut prev = 0u32;
+    let mut cur = state.sync_done_heads[bucket];
+    while cur != 0 {
+        let ptr = state.sync_done.get_ptr(cur);
+        if ptr.is_null() {
+            break;
+        }
+        let node = unsafe { *ptr };
+        let next = node.req_next;
+        if node.request_id == request_id {
+            if prev == 0 {
+                state.sync_done_heads[bucket] = next;
+            } else {
+                let prev_ptr = state.sync_done.get_ptr(prev);
+                if !prev_ptr.is_null() {
+                    unsafe { (*prev_ptr).req_next = next };
+                }
+            }
+            let _ = state.sync_done.free(cur);
+            return Some(node);
+        }
+        prev = cur;
+        cur = next;
+    }
+    None
 }
 
 fn wait_deadline_ticks(timeout: WaitDeadline) -> u64 {
@@ -145,8 +314,7 @@ pub fn wait_current_for_request(request_id: u64, timeout: WaitDeadline) -> u32 {
         return status::INVALID_PARAMETER;
     }
     if timeout == WaitDeadline::Immediate {
-        let _ = hypercall::hostcall_cancel(request_id);
-        let _ = unregister_pending_request(request_id);
+        cleanup_request(request_id, true);
         return status::TIMEOUT;
     }
     let deadline = wait_deadline_ticks(timeout);
@@ -157,90 +325,32 @@ pub fn wait_current_for_request(request_id: u64, timeout: WaitDeadline) -> u32 {
         STATUS_PENDING,
     );
     if wait_status != status::SUCCESS {
-        let _ = hypercall::hostcall_cancel(request_id);
-        let _ = unregister_pending_request(request_id);
+        cleanup_request(request_id, true);
         return wait_status;
     }
     let resolved = sched::current_wait_result();
     if resolved == status::TIMEOUT {
-        let _ = hypercall::hostcall_cancel(request_id);
-        let _ = unregister_pending_request(request_id);
+        cleanup_request(request_id, true);
     }
     resolved
 }
 
-fn find_waiter_id_by_request(request_id: u64) -> u32 {
-    let mut found = 0u32;
-    state_mut().requests.for_each_live_ptr(|id, ptr| unsafe {
-        if found == 0 && (*ptr).request_id == request_id {
-            found = id;
-        }
-    });
-    found
-}
-
-pub fn unregister_pending_request(request_id: u64) -> bool {
-    if request_id == 0 {
-        return false;
-    }
-    let waiter_id = find_waiter_id_by_request(request_id);
-    if waiter_id != 0 {
-        let _ = state_mut().requests.free(waiter_id);
-        return true;
-    }
-    false
-}
-
-fn waiter_still_pending(waiter_tid: u32, request_id: u64) -> bool {
-    if waiter_tid == 0 || request_id == 0 || !sched::thread_exists(waiter_tid) {
-        return false;
-    }
-    sched::sched_lock_acquire();
-    let keep = sched::with_thread(waiter_tid, |t| {
-        t.state == sched::ThreadState::Waiting
-            && t.wait_kind == sched::WAIT_KIND_HOSTCALL
-            && t.wait_count != 0
-            && t.wait_handles[0] == request_id
-    });
-    sched::sched_lock_release();
-    keep
-}
-
 fn take_waiter_by_request(request_id: u64) -> Option<PendingWaiter> {
-    let waiter_id = find_waiter_id_by_request(request_id);
-    if waiter_id == 0 {
-        return None;
-    }
-    let ptr = state_mut().requests.get_ptr(waiter_id);
-    if ptr.is_null() {
-        let _ = state_mut().requests.free(waiter_id);
-        return None;
-    }
-    let waiter = unsafe { *ptr };
-    let _ = state_mut().requests.free(waiter_id);
-    Some(waiter)
+    request_remove_by_request(request_id)
 }
 
-fn reap_stale_waiters() {
-    let mut stale = Vec::new();
-    state_mut().requests.for_each_live_ptr(|_id, ptr| unsafe {
-        let p = *ptr;
-        if p.waiter_tid != 0 && !waiter_still_pending(p.waiter_tid, p.request_id) {
-            let _ = stale.try_reserve(1);
-            stale.push(p.request_id);
-        }
-    });
-    for req in stale {
-        if req != 0 {
-            let _ = hypercall::hostcall_cancel(req);
-            let _ = unregister_pending_request(req);
-        }
+fn cleanup_request(request_id: u64, cancel_host: bool) {
+    if request_id == 0 {
+        return;
     }
+    if cancel_host {
+        let _ = hypercall::hostcall_cancel(request_id);
+    }
+    let _ = unregister_pending_request(request_id);
+    let _ = take_sync_completion(request_id);
 }
 
 pub fn pump_completions() {
-    reap_stale_waiters();
-
     const CPL_BATCH: usize = 32;
     let mut cpls = [hypercall::HostCallCompletion::default(); CPL_BATCH];
     let got = hypercall::hostcall_poll_batch(cpls.as_mut_ptr(), cpls.len());
@@ -260,11 +370,69 @@ pub fn pump_completions() {
         if crate::nt::file::dispatch_async_hostcall_completion(cpl) {
             continue;
         }
+        let host_result = if cpl.host_result < 0 {
+            hc::HC_INVALID
+        } else {
+            cpl.host_result as u64
+        };
+        let mut wake_st = map_host_result_to_status(host_result);
+        if waiter.need_submit_done && wake_st == status::SUCCESS {
+            if !store_sync_completion(cpl.request_id, host_result, cpl.value0) {
+                wake_st = status::NO_MEMORY;
+            }
+        }
         if crate::process::process_exists(waiter.owner_pid) {
-            let st = map_host_result_to_status(cpl.host_result as u64);
-            sched::wake(waiter.waiter_tid, st);
+            sched::wake(waiter.waiter_tid, wake_st);
         }
     }
+}
+
+fn collect_requests_for_waiter_tid(waiter_tid: u32, out: &mut Vec<u64>) {
+    state_mut().requests.for_each_live_ptr(|_id, ptr| unsafe {
+        let p = *ptr;
+        if p.waiter_tid == waiter_tid && p.request_id != 0 {
+            let _ = out.try_reserve(1);
+            out.push(p.request_id);
+        }
+    });
+}
+
+fn collect_requests_for_owner_pid(owner_pid: u32, out: &mut Vec<u64>) {
+    state_mut().requests.for_each_live_ptr(|_id, ptr| unsafe {
+        let p = *ptr;
+        if p.owner_pid == owner_pid && p.request_id != 0 {
+            let _ = out.try_reserve(1);
+            out.push(p.request_id);
+        }
+    });
+}
+
+pub fn cancel_requests_for_waiter_tid(waiter_tid: u32) -> usize {
+    if waiter_tid == 0 {
+        return 0;
+    }
+    let mut reqs = Vec::new();
+    collect_requests_for_waiter_tid(waiter_tid, &mut reqs);
+    let mut canceled = 0usize;
+    for req in reqs {
+        cleanup_request(req, true);
+        canceled = canceled.saturating_add(1);
+    }
+    canceled
+}
+
+pub fn cancel_requests_for_owner_pid(owner_pid: u32) -> usize {
+    if owner_pid == 0 {
+        return 0;
+    }
+    let mut reqs = Vec::new();
+    collect_requests_for_owner_pid(owner_pid, &mut reqs);
+    let mut canceled = 0usize;
+    for req in reqs {
+        cleanup_request(req, true);
+        canceled = canceled.saturating_add(1);
+    }
+    canceled
 }
 
 pub fn map_host_result_to_status(host_result: u64) -> u32 {
@@ -273,6 +441,7 @@ pub fn map_host_result_to_status(host_result: u64) -> u32 {
         v if v == hc::HC_BUSY => winemu_shared::status::NO_MEMORY,
         v if v == hc::HC_NO_MEMORY => winemu_shared::status::NO_MEMORY,
         v if v == hc::HC_CANCELED => winemu_shared::status::INVALID_HANDLE,
+        v if v == hc::HC_IO_ERROR => winemu_shared::status::OBJECT_NAME_NOT_FOUND,
         _ => winemu_shared::status::INVALID_PARAMETER,
     }
 }
