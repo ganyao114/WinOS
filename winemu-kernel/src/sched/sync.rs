@@ -2,7 +2,7 @@
 // KEvent, KMutex, KSemaphore, Thread waiters, HandleTable
 // 所有状态机在 guest 内完成，不走 HVC。
 
-use crate::kobj::ObjectStore;
+use crate::kobj::{ObjectStore, SlabPool};
 use crate::nt::constants::{
     HANDLE_SLOT_BITS, HANDLE_SLOT_MASK, HANDLE_TYPE_MASK, NTSTATUS_ERROR_BIT,
 };
@@ -38,121 +38,54 @@ pub enum WaitDeadline {
     DeadlineTicks(u64),
 }
 
-// ── 等待队列（固定节点池，按优先级排序，无堆分配）───────────────
+// ── 等待队列（slab 节点池，按优先级排序）───────────────────────
 
-const WAIT_QUEUE_NODE_CAPACITY: usize = 16_384;
-
-#[derive(Clone, Copy)]
 struct WaitQueueNode {
     tid: u32,
-    next: u32,
-}
-
-impl WaitQueueNode {
-    const EMPTY: Self = Self { tid: 0, next: 0 };
+    next: *mut WaitQueueNode,
 }
 
 struct WaitQueueNodePool {
-    nodes: [WaitQueueNode; WAIT_QUEUE_NODE_CAPACITY + 1], // index 0 is null
-    free_head: u32,
-    initialized: bool,
+    pool: Option<SlabPool<WaitQueueNode>>,
 }
 
 impl WaitQueueNodePool {
     const fn new() -> Self {
-        Self {
-            nodes: [WaitQueueNode::EMPTY; WAIT_QUEUE_NODE_CAPACITY + 1],
-            free_head: 0,
-            initialized: false,
-        }
+        Self { pool: None }
     }
 
-    fn ensure_init(&mut self) {
-        if self.initialized {
-            return;
+    #[inline]
+    fn pool_mut(&mut self) -> &mut SlabPool<WaitQueueNode> {
+        if self.pool.is_none() {
+            self.pool = Some(SlabPool::new());
         }
-        if WAIT_QUEUE_NODE_CAPACITY == 0 {
-            self.free_head = 0;
-            self.initialized = true;
-            return;
-        }
-        let mut i = 1usize;
-        while i <= WAIT_QUEUE_NODE_CAPACITY {
-            let next = if i == WAIT_QUEUE_NODE_CAPACITY {
-                0
-            } else {
-                (i + 1) as u32
-            };
-            self.nodes[i] = WaitQueueNode { tid: 0, next };
-            i += 1;
-        }
-        self.free_head = 1;
-        self.initialized = true;
+        self.pool.as_mut().unwrap()
     }
 
-    fn alloc_node(&mut self, tid: u32, next: u32) -> u32 {
+    fn alloc_node(&mut self, tid: u32, next: *mut WaitQueueNode) -> *mut WaitQueueNode {
         if tid == 0 {
-            return 0;
+            return null_mut();
         }
-        self.ensure_init();
-        let idx = self.free_head;
-        if idx == 0 {
-            return 0;
-        }
-        self.free_head = self.nodes[idx as usize].next;
-        self.nodes[idx as usize] = WaitQueueNode { tid, next };
-        idx
-    }
-
-    fn free_node(&mut self, idx: u32) {
-        if idx == 0 {
-            return;
-        }
-        let uidx = idx as usize;
-        if uidx > WAIT_QUEUE_NODE_CAPACITY {
-            return;
-        }
-        self.nodes[uidx] = WaitQueueNode {
-            tid: 0,
-            next: self.free_head,
+        let Some(ptr) = self.pool_mut().alloc_slot() else {
+            return null_mut();
         };
-        self.free_head = idx;
+        unsafe {
+            ptr.write(WaitQueueNode { tid, next });
+        }
+        ptr
     }
 
-    #[inline]
-    fn tid(&self, idx: u32) -> u32 {
-        if idx == 0 {
-            return 0;
-        }
-        let uidx = idx as usize;
-        if uidx > WAIT_QUEUE_NODE_CAPACITY {
-            return 0;
-        }
-        self.nodes[uidx].tid
-    }
-
-    #[inline]
-    fn next(&self, idx: u32) -> u32 {
-        if idx == 0 {
-            return 0;
-        }
-        let uidx = idx as usize;
-        if uidx > WAIT_QUEUE_NODE_CAPACITY {
-            return 0;
-        }
-        self.nodes[uidx].next
-    }
-
-    #[inline]
-    fn set_next(&mut self, idx: u32, next: u32) {
-        if idx == 0 {
+    fn free_node(&mut self, node: *mut WaitQueueNode) {
+        if node.is_null() {
             return;
         }
-        let uidx = idx as usize;
-        if uidx > WAIT_QUEUE_NODE_CAPACITY {
+        let Some(pool) = self.pool.as_mut() else {
             return;
+        };
+        unsafe {
+            core::ptr::drop_in_place(node);
+            pool.free_slot(node);
         }
-        self.nodes[uidx].next = next;
     }
 }
 
@@ -166,13 +99,16 @@ fn waiter_priority(tid: u32) -> u8 {
 }
 
 pub struct WaitQueue {
-    head: u32,
+    head: *mut WaitQueueNode,
     len: usize,
 }
 
 impl WaitQueue {
     pub const fn new() -> Self {
-        Self { head: 0, len: 0 }
+        Self {
+            head: null_mut(),
+            len: 0,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -184,12 +120,10 @@ impl WaitQueue {
             return false;
         }
         let prio = waiter_priority(tid);
-        let pool = wait_queue_pool_mut();
-
-        let mut prev = 0u32;
+        let mut prev: *mut WaitQueueNode = null_mut();
         let mut cur = self.head;
-        while cur != 0 {
-            let cur_tid = pool.tid(cur);
+        while !cur.is_null() {
+            let cur_tid = unsafe { (*cur).tid };
             if cur_tid == tid {
                 return true;
             }
@@ -198,32 +132,30 @@ impl WaitQueue {
                 break;
             }
             prev = cur;
-            cur = pool.next(cur);
+            cur = unsafe { (*cur).next };
         }
 
-        let node = pool.alloc_node(tid, cur);
-        if node == 0 {
+        let node = wait_queue_pool_mut().alloc_node(tid, cur);
+        if node.is_null() {
             return false;
         }
-        if prev == 0 {
+        if prev.is_null() {
             self.head = node;
         } else {
-            pool.set_next(prev, node);
+            unsafe {
+                (*prev).next = node;
+            }
         }
         self.len = self.len.saturating_add(1);
         true
     }
 
     pub fn dequeue_waiting(&mut self) -> u32 {
-        while self.head != 0 {
-            let tid = {
-                let pool = wait_queue_pool_mut();
-                let node = self.head;
-                let tid = pool.tid(node);
-                self.head = pool.next(node);
-                pool.free_node(node);
-                tid
-            };
+        while !self.head.is_null() {
+            let node = self.head;
+            let tid = unsafe { (*node).tid };
+            self.head = unsafe { (*node).next };
+            wait_queue_pool_mut().free_node(node);
             if self.len != 0 {
                 self.len -= 1;
             }
@@ -238,22 +170,23 @@ impl WaitQueue {
     }
 
     pub fn remove(&mut self, tid: u32) {
-        if tid == 0 || self.head == 0 {
+        if tid == 0 || self.head.is_null() {
             return;
         }
-        let pool = wait_queue_pool_mut();
-        let mut prev = 0u32;
+        let mut prev: *mut WaitQueueNode = null_mut();
         let mut cur = self.head;
-        while cur != 0 {
-            let cur_tid = pool.tid(cur);
-            let next = pool.next(cur);
+        while !cur.is_null() {
+            let cur_tid = unsafe { (*cur).tid };
+            let next = unsafe { (*cur).next };
             if cur_tid == tid {
-                if prev == 0 {
+                if prev.is_null() {
                     self.head = next;
                 } else {
-                    pool.set_next(prev, next);
+                    unsafe {
+                        (*prev).next = next;
+                    }
                 }
-                pool.free_node(cur);
+                wait_queue_pool_mut().free_node(cur);
                 if self.len != 0 {
                     self.len -= 1;
                 }
@@ -266,10 +199,9 @@ impl WaitQueue {
 
     pub fn highest_waiting_priority(&self) -> Option<u8> {
         let mut best: Option<u8> = None;
-        let pool = wait_queue_pool();
         let mut cur = self.head;
-        while cur != 0 {
-            let tid = pool.tid(cur);
+        while !cur.is_null() {
+            let tid = unsafe { (*cur).tid };
             if tid != 0 && thread_exists(tid) {
                 let prio = with_thread(tid, |t| {
                     if t.state == ThreadState::Waiting {
@@ -285,7 +217,7 @@ impl WaitQueue {
                     };
                 }
             }
-            cur = pool.next(cur);
+            cur = unsafe { (*cur).next };
         }
         best
     }
@@ -438,10 +370,6 @@ static SYNC_STATE: SyncState = SyncState {
 
 fn wait_queue_pool_mut() -> &'static mut WaitQueueNodePool {
     unsafe { &mut *SYNC_STATE.wait_queue_pool.get() }
-}
-
-fn wait_queue_pool() -> &'static WaitQueueNodePool {
-    unsafe { &*SYNC_STATE.wait_queue_pool.get() }
 }
 
 fn events_store_mut() -> &'static mut ObjectStore<KEvent> {
