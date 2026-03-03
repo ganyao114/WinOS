@@ -321,6 +321,8 @@ pub fn terminate_thread_by_tid(tid: u32) -> bool {
         t.kstack_size = 0;
         t.teb_va = 0;
         t.ctx.tpidr = 0;
+        t.in_kernel = false;
+        t.kctx = KernelContext::default();
     });
     set_thread_state_locked(tid, ThreadState::Terminated);
     let defer_kstack = tid == cur_tid;

@@ -205,6 +205,11 @@ pub(crate) fn end_wait_locked(tid: u32, result: u32) -> bool {
         t.wait_result = result;
         t.ctx.x[0] = result as u64;
     });
+    // If a waiter has no saved kernel continuation, it cannot resume EL1
+    // continuation flow; normalize it to EL0-resumable state.
+    if !has_kernel_continuation(tid) {
+        set_thread_in_kernel_locked(tid, false);
+    }
     let suspended = with_thread(tid, |t| t.suspend_count != 0);
     if suspended {
         set_thread_state_locked(tid, ThreadState::Suspended);

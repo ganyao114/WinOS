@@ -233,11 +233,17 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                 set_vcpu_idle_locked(vid, false);
                 if from_sched != 0 && from_sched != to {
                     let to_has_kctx = has_kernel_continuation(to);
-                    if cur_not_running && !to_has_kctx {
-                        panic!(
-                            "sched: trap direct-kctx required but target has no continuation from={} to={}",
-                            from_sched, to
-                        );
+                    let mut to_in_kernel = with_thread(to, |t| t.in_kernel);
+                    // Tighten direct-kctx only for true kernel-thread targets:
+                    // first-run/user-resume targets still use EL0 frame restore.
+                    if cur_not_running && to_in_kernel && !to_has_kctx {
+                        // No kernel continuation means this target can only be resumed
+                        // through EL0 frame restore; normalize stale in-kernel marker.
+                        crate::sched::set_thread_in_kernel_locked(to, false);
+                        to_in_kernel = false;
+                    }
+                    if cur_not_running && with_thread(from_sched, |t| t.state == ThreadState::Terminated) {
+                        crate::sched::set_thread_in_kernel_locked(from_sched, false);
                     }
                     if to_has_kctx {
                         save_ctx_for(from_sched, frame);
@@ -255,7 +261,7 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                         from = current_tid();
                         continue;
                     }
-                    if with_thread(to, |t| t.in_kernel) {
+                    if to_in_kernel {
                         panic!(
                             "sched: in-kernel target missing continuation from={} to={}",
                             from_sched, to
@@ -268,6 +274,13 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                     restore_ctx_to_frame(to, frame);
                     let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
                     sched_lock_release();
+                    // If trap-exit chooses EL0 frame-restore (instead of direct-kctx),
+                    // the preempted running thread will resume from EL0 next time.
+                    // Clear its in-kernel marker to avoid stale "in_kernel=true but
+                    // no continuation" state.
+                    if !cur_not_running {
+                        set_thread_in_kernel(from_sched, false);
+                    }
                     set_thread_in_kernel(to, false);
                     timer::schedule_running_slice_100ns(now, next_deadline, slice_remaining);
                     return true;
