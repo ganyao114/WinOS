@@ -1,6 +1,13 @@
+mod hostcall;
+
+use winemu_shared::hostcall as hc;
 use winemu_shared::nr;
 
 pub use crate::log::{logf, LogLevel};
+pub use hostcall::{
+    hostcall_cancel, hostcall_poll_batch, hostcall_setup, hostcall_submit_tagged,
+    HostCallCompletion,
+};
 
 /// 6 引数 hypercall（HVC #0）
 /// x0 = nr, x1-x6 = args, 返回值在 x0
@@ -9,9 +16,45 @@ pub fn hypercall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64)
     crate::arch::hypercall::invoke6(nr, a0, a1, a2, a3, a4, a5)
 }
 
+/// 6 引数 hypercall，返回 (x0, x1)
+#[inline(always)]
+pub fn hypercall6_pair(
+    nr: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+) -> (u64, u64) {
+    crate::arch::hypercall::invoke6_pair(nr, a0, a1, a2, a3, a4, a5)
+}
+
 #[inline(always)]
 pub fn hypercall(nr: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     hypercall6(nr, a0, a1, a2, 0, 0, 0)
+}
+
+#[inline(always)]
+fn hostcall_sync(opcode: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> (u64, u64) {
+    let owner_pid = crate::process::current_pid();
+    let res = crate::hostcall::call_sync(
+        owner_pid,
+        crate::hostcall::SubmitArgs {
+            opcode,
+            flags: 0,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            user_tag: 0,
+        },
+        crate::sched::sync::WaitDeadline::Infinite,
+    );
+    match res {
+        Ok(done) => (done.host_result, done.value0),
+        Err(_) => (hc::HC_BUSY, 0),
+    }
 }
 
 /// KERNEL_READY — 通知 VMM 内核已就绪，传入 PE 入口点、栈、TEB、heap_start
@@ -104,32 +147,53 @@ pub fn unmap_view_of_section(base_va: u64) -> u64 {
 
 /// HOST_OPEN — 打开宿主文件，返回 fd（失败返回 u64::MAX）
 pub fn host_open(path: &str, flags: u64) -> u64 {
-    hypercall(
-        nr::HOST_OPEN,
+    let (ret, aux) = hostcall_sync(
+        hc::OP_OPEN,
         path.as_ptr() as u64,
         path.len() as u64,
         flags,
-    )
+        0,
+    );
+    if ret == hc::HC_OK {
+        aux
+    } else {
+        u64::MAX
+    }
 }
 
 /// HOST_READ — 读取文件到 dst 指针，返回实际读取字节数
 pub fn host_read(fd: u64, dst: *mut u8, len: usize, offset: u64) -> usize {
-    hypercall6(nr::HOST_READ, fd, dst as u64, len as u64, offset, 0, 0) as usize
+    let (ret, aux) = hostcall_sync(hc::OP_READ, fd, dst as u64, len as u64, offset);
+    if ret == hc::HC_OK {
+        aux as usize
+    } else {
+        0
+    }
 }
 
 /// HOST_WRITE — 写入 src 指针到文件，返回实际写入字节数
 pub fn host_write(fd: u64, src: *const u8, len: usize, offset: u64) -> usize {
-    hypercall6(nr::HOST_WRITE, fd, src as u64, len as u64, offset, 0, 0) as usize
+    let (ret, aux) = hostcall_sync(hc::OP_WRITE, fd, src as u64, len as u64, offset);
+    if ret == hc::HC_OK {
+        aux as usize
+    } else {
+        0
+    }
 }
 
 /// HOST_CLOSE — 关闭文件
 pub fn host_close(fd: u64) {
-    hypercall(nr::HOST_CLOSE, fd, 0, 0);
+    let _ = hostcall_sync(hc::OP_CLOSE, fd, 0, 0, 0);
 }
 
 /// HOST_STAT — 查询文件大小
 pub fn host_stat(fd: u64) -> u64 {
-    hypercall(nr::HOST_STAT, fd, 0, 0)
+    let (ret, aux) = hostcall_sync(hc::OP_STAT, fd, 0, 0, 0);
+    if ret == hc::HC_OK {
+        aux
+    } else {
+        0
+    }
 }
 
 /// HOST_READDIR — 读取目录下一项名称
@@ -138,15 +202,12 @@ pub fn host_stat(fd: u64) -> u64 {
 /// - u64::MAX: invalid / not directory
 /// - 其他: bit63=is_dir, low32=name_len
 pub fn host_readdir(fd: u64, dst: *mut u8, len: usize, restart: bool) -> u64 {
-    hypercall6(
-        nr::HOST_READDIR,
-        fd,
-        dst as u64,
-        len as u64,
-        restart as u64,
-        0,
-        0,
-    )
+    let (ret, aux) = hostcall_sync(hc::OP_READDIR, fd, dst as u64, len as u64, restart as u64);
+    if ret == hc::HC_OK {
+        aux
+    } else {
+        u64::MAX
+    }
 }
 
 /// HOST_NOTIFY_DIR — 查询目录变更（非阻塞）
@@ -161,21 +222,27 @@ pub fn host_notify_dir(
     watch_tree: bool,
     completion_filter: u32,
 ) -> u64 {
-    hypercall6(
-        nr::HOST_NOTIFY_DIR,
-        fd,
-        dst as u64,
-        len as u64,
-        watch_tree as u64,
-        completion_filter as u64,
-        0,
-    )
+    let mut opts = completion_filter as u64;
+    if watch_tree {
+        opts |= 1u64 << 63;
+    }
+    let (ret, aux) = hostcall_sync(hc::OP_NOTIFY_DIR, fd, dst as u64, len as u64, opts);
+    if ret == hc::HC_OK {
+        aux
+    } else {
+        u64::MAX
+    }
 }
 
 /// Raw HOST_MMAP primitive. Keep internal so callers must choose explicit
 /// tracked/untracked mapping semantics.
 fn host_mmap_raw(fd: u64, offset: u64, size: u64, prot: u32) -> u64 {
-    hypercall6(nr::HOST_MMAP, fd, offset, size, prot as u64, 0, 0)
+    let (ret, aux) = hostcall_sync(hc::OP_MMAP, fd, offset, size, prot as u64);
+    if ret == hc::HC_OK {
+        aux
+    } else {
+        0
+    }
 }
 
 /// HOST_MMAP (untracked) — for transient in-kernel file source mappings.
@@ -210,7 +277,12 @@ pub fn host_mmap_tracked(fd: u64, offset: u64, size: u64, map_prot: u32, vm_prot
 /// HOST_MUNMAP — 解除映射
 /// 返回 0 表示成功
 pub fn host_munmap(base: u64, size: u64) -> u64 {
-    hypercall6(nr::HOST_MUNMAP, base, size, 0, 0, 0, 0)
+    let (ret, _) = hostcall_sync(hc::OP_MUNMAP, base, size, 0, 0);
+    if ret == hc::HC_OK {
+        0
+    } else {
+        u64::MAX
+    }
 }
 
 /// QUERY_EXE_INFO — VMM 打开 exe 并返回 packed (size<<32 | fd)
