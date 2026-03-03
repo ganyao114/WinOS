@@ -270,7 +270,7 @@ pub fn block_current_and_resched(
     }
     status::SUCCESS
 }
-pub fn current_wait_result_or_pending() -> u32 {
+pub fn current_wait_result() -> u32 {
     let cur = current_tid();
     if cur == 0 || !thread_exists(cur) {
         return status::INVALID_PARAMETER;
@@ -280,7 +280,21 @@ pub fn current_wait_result_or_pending() -> u32 {
         with_thread(cur, |t| (t.state, t.wait_result))
     };
     if state == ThreadState::Waiting {
-        return 0x0000_0103;
+        debug_assert!(
+            false,
+            "current_wait_result observed waiting thread tid={} (result={:#x})",
+            cur,
+            result
+        );
+        return status::INVALID_PARAMETER;
+    }
+    if result == 0x0000_0103 {
+        debug_assert!(
+            false,
+            "current_wait_result observed STATUS_PENDING after wait completion tid={}",
+            cur
+        );
+        return status::INVALID_PARAMETER;
     }
     result
 }

@@ -137,7 +137,7 @@
 
 1. Phase A 基础设施收敛：`dispatch_*` 相关字段与调度入口依赖已移除。
 2. 等待门禁命名收敛：`ensure_current_wait_continuation_locked` 更名为 `ensure_current_wait_preconditions_locked`，去除 continuation 语义残留。
-3. `wait_current_for_request` 收敛到统一等待结果接口：通过 `current_wait_result_or_pending` 读取解锁后状态，不在结果读取接口里做调度/切换。
+3. `wait_current_for_request` 收敛到统一等待结果接口：通过 `current_wait_result` 读取解锁后状态，不在结果读取接口里做调度/切换。
 4. `call_sync` 收敛为“仅同步 hostcall”：遇到 host 侧 `PENDING` 立即 cancel + unregister 并返回错误，避免错误进入内核等待态。
    - 接口层同时移除 `call_sync` 的 `timeout` 形参，避免语义漂移。
 5. idle 路径移除 1ms fallback 轮询：无 deadline 时不再周期性定时唤醒，仅依赖 IRQ/SEV 唤醒。

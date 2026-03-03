@@ -108,12 +108,12 @@ fn sched_lock_release_impl() {
             sw.slice_remaining_100ns,
         );
         let switched = unsafe { switch_kernel_continuation(sw.from_tid, sw.to_tid) };
-        debug_assert!(
-            switched,
-            "unlock-edge kernel continuation switch failed from={} to={}",
-            sw.from_tid,
-            sw.to_tid
-        );
+        if !switched {
+            panic!(
+                "sched: unlock-edge kernel continuation switch failed from={} to={}",
+                sw.from_tid, sw.to_tid
+            );
+        }
     }
 }
 

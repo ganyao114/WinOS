@@ -1482,7 +1482,7 @@ pub fn wait_handle_sync(h: u64, timeout: WaitDeadline) -> u32 {
     if st != STATUS_PENDING {
         return st;
     }
-    crate::sched::current_wait_result_or_pending()
+    crate::sched::current_wait_result()
 }
 
 pub fn wait_multiple_sync(handles: &[u64], wait_all: bool, timeout: WaitDeadline) -> u32 {
@@ -1493,7 +1493,7 @@ pub fn wait_multiple_sync(handles: &[u64], wait_all: bool, timeout: WaitDeadline
     if st != STATUS_PENDING {
         return st;
     }
-    crate::sched::current_wait_result_or_pending()
+    crate::sched::current_wait_result()
 }
 
 pub fn delay_current_thread_sync(timeout: WaitDeadline) -> u32 {
@@ -1530,7 +1530,7 @@ pub fn delay_current_thread_sync(timeout: WaitDeadline) -> u32 {
     if st != STATUS_PENDING {
         return st;
     }
-    crate::sched::current_wait_result_or_pending()
+    crate::sched::current_wait_result()
 }
 
 /// Remove a waiting thread from all object wait queues.

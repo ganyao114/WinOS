@@ -161,7 +161,7 @@ pub fn wait_current_for_request(request_id: u64, timeout: WaitDeadline) -> u32 {
         let _ = unregister_pending_request(request_id);
         return wait_status;
     }
-    let resolved = sched::current_wait_result_or_pending();
+    let resolved = sched::current_wait_result();
     if resolved == status::TIMEOUT {
         let _ = hypercall::hostcall_cancel(request_id);
         let _ = unregister_pending_request(request_id);
