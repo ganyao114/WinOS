@@ -1,6 +1,4 @@
-// Guest kernel 同步原语 — EL1
 // KEvent, KMutex, KSemaphore, Thread waiters, HandleTable
-// 所有状态机在 guest 内完成，不走 HVC。
 
 use crate::kobj::{ObjectStore, SlabPool};
 use crate::nt::constants::{
@@ -38,7 +36,6 @@ pub enum WaitDeadline {
     DeadlineTicks(u64),
 }
 
-// ── 拆分实现（按职责）────────────────────────────────────────
 // 等待队列节点与按优先级队列操作
 include!("sync/wait_queue.rs");
 // 同步对象定义与全局状态存储
