@@ -142,13 +142,90 @@ pub fn current_tid() -> u32 {
 }
 
 pub fn vcpu_id() -> usize {
-    // High 32 bits of TPIDR_EL1 hold vcpu_id.
-    (crate::arch::cpu::current_cpu_local() >> 32) as usize
+    // High 32 bits of TPIDR_EL1 hold vcpu_id once scheduler binds this CPU.
+    let local = crate::arch::cpu::current_cpu_local();
+    let vid = (local >> 32) as usize;
+    if vid != 0 || (local as u32) != 0 {
+        return vid;
+    }
+    bootstrap_vcpu_id()
+}
+
+#[inline(always)]
+fn bootstrap_vcpu_id() -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Early-boot fallback for CPUs that haven't populated TPIDR_EL1 yet.
+        // Use MPIDR affinity level 0 as a stable vCPU index seed.
+        let mpidr: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nostack, nomem));
+        }
+        (mpidr as usize) & 0xff
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        0
+    }
 }
 
 pub fn set_current_cpu_thread(vcpu_id: usize, tid: u32) {
     let val = ((vcpu_id as u64) << 32) | (tid as u64);
     crate::arch::cpu::set_current_cpu_local(val);
+}
+
+pub fn running_vcpu_of_tid(tid: u32) -> Option<usize> {
+    if tid == 0 || !thread_exists(tid) {
+        return None;
+    }
+    unsafe {
+        for vid in 0..MAX_VCPUS {
+            if (*SCHED.vcpus.get())[vid].current_tid == tid {
+                return Some(vid);
+            }
+        }
+    }
+    None
+}
+
+extern "C" fn thread_user_entry_continuation() -> ! {
+    let tid = current_tid();
+    if tid == 0 || !thread_exists(tid) {
+        panic!("sched: invalid current tid in user-entry continuation");
+    }
+    // Enter EL0 from the scheduled kernel-thread continuation, not from scheduler loop.
+    set_thread_in_kernel(tid, false);
+    unsafe {
+        enter_user_thread_noreturn(tid);
+    }
+}
+
+pub(crate) fn ensure_user_entry_continuation_locked(tid: u32) -> bool {
+    debug_assert!(
+        sched_lock_held_by_current_vcpu(),
+        "ensure_user_entry_continuation_locked requires sched lock"
+    );
+    if tid == 0 || !thread_exists(tid) {
+        return false;
+    }
+    if has_kernel_continuation(tid) {
+        return true;
+    }
+    if with_thread(tid, |t| t.in_kernel) {
+        return false;
+    }
+    let sp_top = with_thread(tid, kstack_top_from_thread);
+    if sp_top == 0 {
+        return false;
+    }
+    with_thread_mut(tid, |t| {
+        t.in_kernel = true;
+        t.kctx = KernelContext::default();
+        t.kctx.sp_el1 = sp_top;
+        t.kctx.x19_x30[11] = thread_user_entry_continuation as usize as u64; // x30
+        t.kctx.lr_el1 = thread_user_entry_continuation as usize as u64;
+    });
+    true
 }
 
 pub(crate) fn set_thread_in_kernel_locked(tid: u32, in_kernel: bool) {
@@ -217,4 +294,20 @@ pub fn set_current_in_kernel(in_kernel: bool) {
     if tid != 0 {
         set_thread_in_kernel(tid, in_kernel);
     }
+}
+
+pub unsafe fn enter_user_thread_noreturn(tid: u32) -> ! {
+    if tid == 0 || !thread_exists(tid) {
+        loop {
+            crate::arch::cpu::wait_for_event();
+        }
+    }
+    let ptr = thread_ptr(tid);
+    if ptr.is_null() {
+        loop {
+            crate::arch::cpu::wait_for_event();
+        }
+    }
+    let ctx_ptr = core::ptr::addr_of!((*ptr).ctx);
+    crate::arch::context::enter_user_thread_context(ctx_ptr)
 }

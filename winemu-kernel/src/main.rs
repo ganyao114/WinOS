@@ -3,12 +3,13 @@
 #![allow(dead_code)]
 
 extern crate alloc as rust_alloc;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 mod alloc;
 mod arch;
 mod dll;
-mod hypercall;
 mod hostcall;
+mod hypercall;
 mod kobj;
 mod ldr;
 mod log;
@@ -19,6 +20,38 @@ mod sched;
 mod teb;
 mod timer;
 mod vectors;
+
+#[no_mangle]
+pub static __boot_primary_ready: AtomicU32 = AtomicU32::new(0);
+
+#[inline(always)]
+fn set_primary_boot_ready() {
+    __boot_primary_ready.store(1, Ordering::Release);
+    crate::arch::cpu::send_event();
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_secondary_main() -> ! {
+    // Secondary CPUs must install vectors locally and then participate in the
+    // kernel scheduler idle path. Waiting in bare WFE would never pick ready
+    // threads.
+    vectors::install();
+    // MMU/system control registers are per-CPU; secondary CPUs need local MMU
+    // init before touching scheduler global state under virtual addresses.
+    mm::init_per_cpu();
+    let vid = sched::vcpu_id().min(sched::MAX_VCPUS - 1);
+    #[cfg(target_arch = "aarch64")]
+    let mpidr = {
+        let v: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, mpidr_el1", out(reg) v, options(nostack, nomem));
+        }
+        v
+    };
+    #[cfg(target_arch = "aarch64")]
+    crate::kdebug!("secondary: mpidr={:#x} vid={}", mpidr, vid);
+    sched::enter_core_scheduler_entry(vid)
+}
 
 /// EL0 Data Abort / Instruction Abort handler.
 /// Called from assembly with: far=faulting address, esr=syndrome, elr=faulting PC.
@@ -102,10 +135,7 @@ pub extern "C" fn el1_sync_fault(far: u64, esr: u64, elr: u64) -> ! {
     let mut insn = 0u64;
     let mut insn_p1 = 0u64;
     let mut insn_p2 = 0u64;
-    if elr >= KERNEL_TEXT_MIN
-        && elr + 8 < KERNEL_TEXT_MAX
-        && (elr & 0x3) == 0
-    {
+    if elr >= KERNEL_TEXT_MIN && elr + 8 < KERNEL_TEXT_MAX && (elr & 0x3) == 0 {
         insn_m2 = unsafe { (elr.wrapping_sub(8) as *const u32).read_volatile() as u64 };
         insn_m1 = unsafe { (elr.wrapping_sub(4) as *const u32).read_volatile() as u64 };
         insn = unsafe { (elr as *const u32).read_volatile() as u64 };
@@ -174,7 +204,8 @@ pub extern "C" fn kernel_main() -> ! {
     crate::kinfo!("kernel_main: start");
     // Install vectors early so MMU-init faults can be diagnosed.
     vectors::install();
-    mm::init();
+    mm::init_global_bootstrap();
+    mm::init_per_cpu();
     crate::kinfo!("kernel_main: mmu ok");
     alloc::init();
 
@@ -210,14 +241,23 @@ pub extern "C" fn kernel_main() -> ! {
             let lfanew = u32::from_le_bytes([hdr[60], hdr[61], hdr[62], hdr[63]]) as usize;
             let oh = lfanew + 24;
             if oh + 88 <= got {
-                let reserve = u64::from_le_bytes(hdr[oh + 72..oh + 80].try_into().unwrap_or([0; 8]));
+                let reserve =
+                    u64::from_le_bytes(hdr[oh + 72..oh + 80].try_into().unwrap_or([0; 8]));
                 let commit = u64::from_le_bytes(hdr[oh + 80..oh + 88].try_into().unwrap_or([0; 8]));
                 (reserve, commit)
-            } else { (0x10_0000, 0x1000) }
-        } else { (0x10_0000, 0x1000) }
+            } else {
+                (0x10_0000, 0x1000)
+            }
+        } else {
+            (0x10_0000, 0x1000)
+        }
     };
 
-    let loaded = unsafe { ldr::load_from_fd(exe_fd, exe_size, |dll_name, imp| dll::resolve_import(dll_name, imp)) };
+    let loaded = unsafe {
+        ldr::load_from_fd(exe_fd, exe_size, |dll_name, imp| {
+            dll::resolve_import(dll_name, imp)
+        })
+    };
 
     // 关闭 exe fd
     hypercall::host_close(exe_fd);
@@ -264,16 +304,63 @@ pub extern "C" fn kernel_main() -> ! {
     }
     sched::set_current_thread_teb(teb_peb.teb_va);
 
-    // ── 4. 通知 VMM 创建 Thread 0 ───────────────────────────
+    // ── 4. 通知 VMM 内核已就绪 + 内核侧直入首用户线程 ───────────
     let app_entry_va = loaded.base + loaded.entry_rva as u64;
-    let entry_va = dll::resolve_import("ntdll.dll", ldr::ImportRef::Name("RtlUserThreadStart"))
-        .unwrap_or(app_entry_va);
-    if entry_va == app_entry_va {
+    let start_thunk_va =
+        dll::resolve_import("ntdll.dll", ldr::ImportRef::Name("RtlUserThreadStart"))
+            .unwrap_or(app_entry_va);
+    if start_thunk_va == app_entry_va {
         crate::kwarn!("kernel: start thunk missing, fallback to app entry");
     }
-    hypercall::kernel_ready(entry_va, teb_peb.stack_base, teb_peb.teb_va, crate::alloc::heap_end());
 
-    loop { core::hint::spin_loop(); }
+    // Compatibility reservation: keep prior user VA layout stable.
+    const SECONDARY_STACK_SIZE: u64 = 0x10000;
+    let _ = crate::nt::state::vm_alloc_region_typed(
+        boot_pid,
+        0,
+        SECONDARY_STACK_SIZE,
+        0x04,
+        crate::mm::vaspace::VmaType::ThreadStack,
+    );
+
+    // KERNEL_READY is notify-only: it should not own thread0 launch semantics.
+    hypercall::kernel_ready(
+        start_thunk_va,
+        teb_peb.stack_base,
+        teb_peb.teb_va,
+        crate::alloc::heap_end(),
+        0,
+        0,
+    );
+
+    let thread0_tid = sched::current_tid();
+    if thread0_tid == 0 || !sched::thread_exists(thread0_tid) {
+        crate::kerror!("kernel: thread0 missing");
+        hypercall::process_exit(1);
+    }
+    let now = sched::now_ticks();
+    sched::with_thread_mut(thread0_tid, |t| {
+        t.state = sched::ThreadState::Running;
+        t.ctx.pc = start_thunk_va;
+        t.ctx.sp = teb_peb.stack_base;
+        t.ctx.x[0] = app_entry_va;
+        t.ctx.x[1] = teb_peb.peb_va;
+        t.ctx.x[18] = teb_peb.teb_va;
+        t.ctx.tpidr = teb_peb.teb_va;
+        t.ctx.pstate = 0;
+        t.slice_remaining_100ns = timer::DEFAULT_TIMESLICE_100NS;
+        t.last_start_100ns = now;
+        t.in_kernel = false;
+    });
+    process::switch_to_thread_process(thread0_tid);
+
+    // Release secondary CPUs from early boot hold loop only after thread0
+    // bootstrap context is fully committed.
+    set_primary_boot_ready();
+
+    let vid = sched::vcpu_id().min(sched::MAX_VCPUS - 1);
+    crate::kinfo!("kernel: thread0 tid={} enter bootstrap dispatch", thread0_tid);
+    sched::enter_core_scheduler_entry(vid)
 }
 
 #[panic_handler]
@@ -300,7 +387,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         snap.alloc_fail_large_oom,
         snap.direct_alloc_failures
     );
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 fn fmt_u64_dec<'a>(buf: &'a mut [u8; 32], mut val: u64) -> &'a str {

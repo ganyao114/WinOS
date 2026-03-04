@@ -1,9 +1,22 @@
 // ── 调度核心 ──────────────────────────────────────────────────
 
+#[inline(always)]
+fn running_on_other_vcpu_locked(tid: u32, self_vcpu: usize) -> bool {
+    unsafe {
+        for vid in 0..MAX_VCPUS {
+            if vid != self_vcpu && (*SCHED.vcpus.get())[vid].current_tid == tid {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// 选取下一个线程并切换（在 trap 路径持锁调用）
 /// 返回 (from_tid, to_tid)；若无需切换则 from == to；to == 0 表示 WFI idle
 pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32) {
     unsafe {
+        mark_vcpu_online_locked(vcpu_id);
         let vcpu = &mut (*SCHED.vcpus.get())[vcpu_id];
         let mut cur_tid = vcpu.current_tid;
         if cur_tid != 0 && !thread_exists(cur_tid) {
@@ -24,7 +37,30 @@ pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32
             }
         }
 
-        let next_tid = ready_pop_for_vcpu_locked(vcpu_id);
+        let mut next_tid = ready_pop_for_vcpu_locked(vcpu_id);
+        while next_tid != 0 {
+            if !thread_exists(next_tid) {
+                next_tid = ready_pop_for_vcpu_locked(vcpu_id);
+                continue;
+            }
+            let state = with_thread(next_tid, |t| t.state);
+            if state != ThreadState::Ready {
+                next_tid = ready_pop_for_vcpu_locked(vcpu_id);
+                continue;
+            }
+            if running_on_other_vcpu_locked(next_tid, vcpu_id) {
+                // Stale ready node: this thread is already bound to another vCPU.
+                with_thread_mut(next_tid, |t| {
+                    if t.state == ThreadState::Ready {
+                        t.state = ThreadState::Running;
+                    }
+                    t.sched_next = 0;
+                });
+                next_tid = ready_pop_for_vcpu_locked(vcpu_id);
+                continue;
+            }
+            break;
+        }
 
         if next_tid == 0 {
             // No ready threads — if current thread is still Running, keep it
@@ -83,6 +119,10 @@ pub fn wake(tid: u32, result: u32) {
 pub fn yield_current_thread() {
     sched_lock_acquire();
     let cur = current_tid();
+    if cur == 0 || !thread_exists(cur) {
+        sched_lock_release();
+        return;
+    }
     let cur_state = with_thread(cur, |t| t.state);
     if cur_state == ThreadState::Running {
         set_thread_state_locked(cur, ThreadState::Ready);
@@ -101,9 +141,11 @@ pub fn terminate_current_thread() {
 pub fn set_initial_thread(vcpu_id: usize, tid: u32) {
     sched_lock_acquire();
     unsafe {
+        mark_vcpu_online_locked(vcpu_id);
         let vcpu = &mut (*SCHED.vcpus.get())[vcpu_id];
         vcpu.current_tid = tid;
         set_thread_state_locked(tid, ThreadState::Running);
+        with_thread_mut(tid, |t| t.last_vcpu_hint = vcpu_id as u8);
         set_current_cpu_thread(vcpu_id, tid);
         set_vcpu_kernel_sp_for_tid(vcpu_id, tid);
         if let Some(pid) = thread_pid(tid) {
@@ -132,8 +174,10 @@ pub fn register_thread0(teb_va: u64) -> bool {
     crate::process::on_thread_created(pid, tid);
     unsafe {
         let vid = vcpu_id().min(MAX_VCPUS - 1);
+        mark_vcpu_online_locked(vid);
         let vcpu = &mut (*SCHED.vcpus.get())[vid];
         vcpu.current_tid = tid;
+        with_thread_mut(tid, |t| t.last_vcpu_hint = vid as u8);
         set_current_cpu_thread(vid, tid);
         set_vcpu_kernel_sp_for_tid(vid, tid);
         crate::process::set_current_vcpu_pid(vid, pid);
@@ -157,6 +201,58 @@ pub fn set_current_thread_teb(teb_va: u64) {
     });
     sched_lock_release();
 }
+
+fn enter_bootstrap_thread_dispatch(vcpu_id: usize) -> ! {
+    let vid = vcpu_id.min(MAX_VCPUS - 1);
+    let quantum_100ns = timer::DEFAULT_TIMESLICE_100NS.max(1);
+    let tid = current_tid();
+    if tid == 0 || !thread_exists(tid) {
+        panic!("sched: bootstrap current tid is invalid");
+    }
+
+    let now_100ns = now_ticks();
+    let next_deadline_100ns;
+    let slice_remaining_100ns;
+
+    sched_lock_acquire();
+    set_vcpu_idle_locked(vid, false);
+    next_deadline_100ns = next_wait_deadline_locked();
+    slice_remaining_100ns = current_slice_remaining_100ns(vid, quantum_100ns);
+    sched_lock_release();
+
+    crate::process::switch_to_thread_process(tid);
+    timer::schedule_running_slice_100ns(now_100ns, next_deadline_100ns, slice_remaining_100ns);
+    set_thread_in_kernel(tid, false);
+    unsafe { enter_user_thread_noreturn(tid) }
+}
+
+fn enter_secondary_idle_loop(vcpu_id: usize) -> ! {
+    let vid = vcpu_id.min(MAX_VCPUS - 1);
+
+    set_current_cpu_thread(vid, 0);
+    set_vcpu_kernel_sp(vid, default_kernel_stack_top());
+
+    loop {
+        let now_100ns = now_ticks();
+        let next_deadline_100ns;
+
+        sched_lock_acquire();
+        set_vcpu_idle_locked(vid, true);
+        next_deadline_100ns = next_wait_deadline_locked();
+        sched_lock_release();
+        crate::hostcall::pump_completions();
+        timer::idle_wait_until_deadline_100ns(now_100ns, next_deadline_100ns);
+    }
+}
+
+pub fn enter_core_scheduler_entry(vcpu_id: usize) -> ! {
+    let cur = current_tid();
+    if cur != 0 && thread_exists(cur) {
+        return enter_bootstrap_thread_dispatch(vcpu_id);
+    }
+    enter_secondary_idle_loop(vcpu_id)
+}
+
 /// Returns true if all allocated threads are Terminated or Free (process can exit).
 pub fn all_threads_done() -> bool {
     unsafe {
