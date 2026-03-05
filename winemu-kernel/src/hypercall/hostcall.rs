@@ -1,5 +1,5 @@
-use winemu_shared::nr;
 use winemu_shared::hostcall as hc;
+use winemu_shared::nr;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -95,5 +95,26 @@ pub fn hostcall_poll_batch(dst: *mut HostCallCompletion, cap_entries: usize) -> 
 
 #[inline(always)]
 pub fn hostcall_query_stats(dst: *mut u8, len: usize, flags: u64) -> usize {
-    super::hypercall6(nr::HOSTCALL_QUERY_STATS, dst as u64, len as u64, flags, 0, 0, 0) as usize
+    super::hypercall6(
+        nr::HOSTCALL_QUERY_STATS,
+        dst as u64,
+        len as u64,
+        flags,
+        0,
+        0,
+        0,
+    ) as usize
+}
+
+#[inline(always)]
+pub fn hostcall_query_sched_wake_stats(dst: *mut u8, len: usize, flags: u64) -> usize {
+    super::hypercall6(
+        nr::HOSTCALL_QUERY_SCHED_WAKE_STATS,
+        dst as u64,
+        len as u64,
+        flags,
+        0,
+        0,
+        0,
+    ) as usize
 }
