@@ -589,11 +589,6 @@ fn wait_common_locked(handles: &[u64], wait_all: bool, timeout: WaitDeadline) ->
         return STATUS_TIMEOUT;
     }
 
-    let gate = ensure_current_wait_preconditions_locked(cur);
-    if gate != STATUS_SUCCESS {
-        return gate;
-    }
-
     let kind = if handles.len() == 1 {
         WAIT_KIND_SINGLE
     } else if wait_all {
@@ -601,17 +596,10 @@ fn wait_common_locked(handles: &[u64], wait_all: bool, timeout: WaitDeadline) ->
     } else {
         WAIT_KIND_MULTI_ANY
     };
-    let prepare = prepare_wait_tracking_locked(cur, kind, handles, STATUS_PENDING);
-    if prepare != STATUS_SUCCESS {
-        return prepare;
-    }
-
     let old_state = with_thread(cur, |t| t.state);
     let wait_deadline = deadline_ticks(timeout);
-    let begin = begin_wait_locked(cur, wait_deadline);
+    let begin = prepare_wait_locked(cur, kind, handles, wait_deadline, STATUS_PENDING);
     if begin != STATUS_SUCCESS {
-        clear_wait_metadata(cur);
-        with_thread_mut(cur, |t| t.wait_result = 0);
         return begin;
     }
 
@@ -662,24 +650,13 @@ pub fn delay_current_thread_sync(timeout: WaitDeadline) -> u32 {
         if cur == 0 || !thread_exists(cur) {
             STATUS_INVALID_PARAMETER
         } else {
-            let gate = ensure_current_wait_preconditions_locked(cur);
-            if gate != STATUS_SUCCESS {
-                gate
-            } else {
-                let prepare = prepare_wait_tracking_locked(cur, WAIT_KIND_DELAY, &[], STATUS_PENDING);
-                if prepare != STATUS_SUCCESS {
-                    prepare
-                } else {
-                    let begin = begin_wait_locked(cur, deadline_ticks(timeout));
-                    if begin != STATUS_SUCCESS {
-                        clear_wait_metadata(cur);
-                        with_thread_mut(cur, |t| t.wait_result = 0);
-                        begin
-                    } else {
-                        STATUS_PENDING
-                    }
-                }
-            }
+            prepare_wait_locked(
+                cur,
+                WAIT_KIND_DELAY,
+                &[],
+                deadline_ticks(timeout),
+                STATUS_PENDING,
+            )
         }
     };
     st

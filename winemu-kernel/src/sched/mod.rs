@@ -15,10 +15,11 @@ use crate::nt::constants::{
     PSEUDO_CURRENT_THREAD_ALT, THREAD_BASIC_INFORMATION_SIZE, THREAD_STACK_ALIGN,
 };
 use crate::nt::state::{
-    vm_alloc_region_typed, vm_free_region, vm_handle_page_fault, vm_make_guard_page, VM_ACCESS_WRITE,
+    vm_alloc_region_typed, vm_free_region, vm_handle_page_fault, vm_make_guard_page,
+    VM_ACCESS_WRITE,
 };
-use crate::timer::{self, TimerTaskHandle, TimerTaskKind};
 use crate::rust_alloc::vec::Vec;
+use crate::timer::{self, TimerTaskHandle, TimerTaskKind};
 use core::cell::UnsafeCell;
 use winemu_shared::status;
 use winemu_shared::teb as teb_layout;
@@ -30,13 +31,12 @@ pub use thread_control::{
     resume_thread_by_handle, rotate_current_on_quantum_expire_locked,
     set_thread_base_priority_by_handle, suspend_thread_by_handle,
 };
-pub(crate) use wait::{
-    begin_wait_locked, cancel_wait_locked, clear_wait_tracking_locked, end_wait_locked,
-    ensure_current_wait_preconditions_locked, prepare_wait_tracking_locked,
-};
 pub use wait::{
     block_current_and_resched, check_timeouts, deadline_after_100ns, next_wait_deadline_locked,
-    now_ticks, current_wait_result,
+    now_ticks,
+};
+pub(crate) use wait::{
+    cancel_wait_locked, clear_wait_tracking_locked, end_wait_locked, prepare_wait_locked,
 };
 
 // ── 常量 ─────────────────────────────────────────────────────
@@ -53,8 +53,19 @@ pub const WAIT_KIND_MULTI_ANY: u8 = 2;
 pub const WAIT_KIND_MULTI_ALL: u8 = 3;
 pub const WAIT_KIND_DELAY: u8 = 4;
 pub const WAIT_KIND_HOSTCALL: u8 = 5;
+pub const VCPU_HINT_NONE: u8 = u8::MAX;
 const DYNAMIC_BOOST_DELTA: u8 = 2;
 const DYNAMIC_BOOST_MAX: u8 = 15;
+
+const fn all_vcpu_affinity_mask() -> u32 {
+    if MAX_VCPUS == 0 {
+        0
+    } else if MAX_VCPUS >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << MAX_VCPUS) - 1
+    }
+}
 
 // ── 线程状态 ──────────────────────────────────────────────────
 
@@ -122,11 +133,12 @@ pub struct KThread {
     pub slice_remaining_100ns: u64,
     pub last_start_100ns: u64,
     pub last_vcpu_hint: u8,
+    pub affinity_mask: u32,
     pub transient_boost: u8,
 
     // 侵入式链表节点（就绪队列 / 等待队列）
-    pub sched_next: u32, // TID of next in ready queue (0 = end)
-    pub wait_next: u32,  // TID of next in wait queue (0 = end)
+    pub sched_next: u32,          // TID of next in ready queue (0 = end)
+    pub wait_next: u32,           // TID of next in wait queue (0 = end)
     pub waiters: sync::WaitQueue, // waiters blocked on this thread handle
     pub wait_handles: [u64; MAX_WAIT_HANDLES],
 }
@@ -167,7 +179,8 @@ impl KThread {
             wait_signaled: 0,
             slice_remaining_100ns: 0,
             last_start_100ns: 0,
-            last_vcpu_hint: 0,
+            last_vcpu_hint: VCPU_HINT_NONE,
+            affinity_mask: all_vcpu_affinity_mask(),
             transient_boost: 0,
             sched_next: 0,
             wait_next: 0,
@@ -204,6 +217,8 @@ impl KThread {
         self.in_kernel = false;
         self.ctx = ThreadContext::default();
         self.kctx = KernelContext::default();
+        self.last_vcpu_hint = VCPU_HINT_NONE;
+        self.affinity_mask = all_vcpu_affinity_mask();
         self.ctx.pc = pc;
         self.ctx.sp = sp;
         self.ctx.x[0] = arg;
@@ -212,7 +227,14 @@ impl KThread {
         self.ctx.tpidr = teb_va;
     }
 
-    fn init_thread0(&mut self, tid: u32, pid: u32, teb_va: u64, kstack_base: u64, kstack_size: u64) {
+    fn init_thread0(
+        &mut self,
+        tid: u32,
+        pid: u32,
+        teb_va: u64,
+        kstack_base: u64,
+        kstack_size: u64,
+    ) {
         self.state = ThreadState::Running;
         self.priority = 8;
         self.base_priority = 8;
@@ -225,6 +247,8 @@ impl KThread {
         self.in_kernel = false;
         self.ctx = ThreadContext::default();
         self.kctx = KernelContext::default();
+        self.last_vcpu_hint = VCPU_HINT_NONE;
+        self.affinity_mask = all_vcpu_affinity_mask();
         self.ctx.tpidr = teb_va;
     }
 
@@ -306,61 +330,90 @@ impl ReadyQueue {
         0
     }
 
-    pub fn pop_highest_prefer_vcpu(&mut self, prefer_vcpu: usize) -> u32 {
-        if self.present == 0 {
-            return 0;
-        }
-        let p = 31 - self.present.leading_zeros() as usize;
-        let head = self.heads[p];
-        if head == 0 {
-            return 0;
-        }
-
-        let hint = prefer_vcpu as u8;
-        let mut prev = 0u32;
-        let mut cur = head;
-        while cur != 0 {
-            if !thread_exists(cur) {
-                if prev == 0 {
-                    self.heads[p] = 0;
-                    self.tails[p] = 0;
-                    self.present &= !(1u32 << p);
+    pub fn pop_highest_matching<F>(&mut self, mut matcher: F) -> u32
+    where
+        F: FnMut(u32) -> bool,
+    {
+        let mut present = self.present;
+        while present != 0 {
+            let p = 31 - present.leading_zeros() as usize;
+            let mut prev = 0u32;
+            let mut cur = self.heads[p];
+            while cur != 0 {
+                let mut next = if thread_exists(cur) {
+                    with_thread(cur, |t| t.sched_next)
                 } else {
-                    with_thread_mut(prev, |t| t.sched_next = 0);
-                    self.tails[p] = prev;
+                    0
+                };
+                if next != 0 && !thread_exists(next) {
+                    next = 0;
                 }
-                break;
+
+                if !thread_exists(cur) {
+                    if prev == 0 {
+                        self.heads[p] = next;
+                    } else {
+                        with_thread_mut(prev, |t| t.sched_next = next);
+                    }
+                    if next == 0 {
+                        self.tails[p] = prev;
+                    }
+                    cur = next;
+                    continue;
+                }
+
+                if matcher(cur) {
+                    if prev == 0 {
+                        self.heads[p] = next;
+                    } else {
+                        with_thread_mut(prev, |t| t.sched_next = next);
+                    }
+                    if next == 0 {
+                        self.tails[p] = prev;
+                    }
+                    if self.heads[p] == 0 {
+                        self.present &= !(1u32 << p);
+                    }
+                    with_thread_mut(cur, |t| t.sched_next = 0);
+                    return cur;
+                }
+
+                prev = cur;
+                cur = next;
             }
-            let cur_hint = with_thread(cur, |t| t.last_vcpu_hint);
-            if cur_hint == hint {
+
+            if self.heads[p] == 0 {
+                self.present &= !(1u32 << p);
+            }
+            present &= !(1u32 << p);
+        }
+        0
+    }
+
+    pub fn highest_priority_matching<F>(&self, mut matcher: F) -> Option<u8>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        let mut present = self.present;
+        while present != 0 {
+            let p = 31 - present.leading_zeros() as usize;
+            let mut cur = self.heads[p];
+            while cur != 0 {
+                if !thread_exists(cur) {
+                    break;
+                }
+                if matcher(cur) {
+                    return Some(p as u8);
+                }
                 let mut next = with_thread(cur, |t| t.sched_next);
                 if next != 0 && !thread_exists(next) {
                     next = 0;
                 }
-                if prev == 0 {
-                    self.heads[p] = next;
-                } else {
-                    with_thread_mut(prev, |t| t.sched_next = next);
-                }
-                if next == 0 {
-                    self.tails[p] = prev;
-                }
-                if self.heads[p] == 0 {
-                    self.present &= !(1u32 << p);
-                }
-                with_thread_mut(cur, |t| t.sched_next = 0);
-                return cur;
+                cur = next;
             }
-            prev = cur;
-            let mut next = with_thread(cur, |t| t.sched_next);
-            if next != 0 && !thread_exists(next) {
-                next = 0;
-                with_thread_mut(cur, |t| t.sched_next = 0);
-            }
-            cur = next;
+            present &= !(1u32 << p);
         }
-
-        self.pop_highest()
+        None
     }
 
     pub fn highest_priority(&self) -> Option<u8> {
@@ -416,6 +469,18 @@ impl ReadyQueue {
     }
 }
 
+pub struct KPriorityQueue {
+    ready: ReadyQueue,
+}
+
+impl KPriorityQueue {
+    const fn new() -> Self {
+        Self {
+            ready: ReadyQueue::new(),
+        }
+    }
+}
+
 // ── 全局调度器状态（静态分配）────────────────────────────────
 
 // 每 vCPU 调度器：记录当前运行线程
@@ -435,12 +500,15 @@ impl KScheduler {
 
 pub struct Scheduler {
     threads: UnsafeCell<Option<ObjectStore<KThread>>>,
-    ready_global: UnsafeCell<ReadyQueue>,
-    ready_local: UnsafeCell<[ReadyQueue; MAX_VCPUS]>,
+    priority_queue: UnsafeCell<KPriorityQueue>,
     vcpus: UnsafeCell<[KScheduler; MAX_VCPUS]>,
     pending_reschedule_mask: UnsafeCell<u32>,
     reschedule_mask: UnsafeCell<u32>,
     idle_vcpu_mask: UnsafeCell<u32>,
+    online_vcpu_mask: UnsafeCell<u32>,
+    enqueue_rr: UnsafeCell<u8>,
+    schedule_unlock_edge_count: UnsafeCell<u64>,
+    schedule_trap_count: UnsafeCell<u64>,
     deferred_kstack_bases: UnsafeCell<[u64; DEFERRED_KSTACK_CAP]>,
     deferred_kstack_len: UnsafeCell<usize>,
     // 全局调度锁（可重入，保护 ready queue 和线程状态）
@@ -454,12 +522,15 @@ unsafe impl Sync for Scheduler {}
 
 pub static SCHED: Scheduler = Scheduler {
     threads: UnsafeCell::new(None),
-    ready_global: UnsafeCell::new(ReadyQueue::new()),
-    ready_local: UnsafeCell::new([const { ReadyQueue::new() }; MAX_VCPUS]),
+    priority_queue: UnsafeCell::new(KPriorityQueue::new()),
     vcpus: UnsafeCell::new([const { KScheduler::new() }; MAX_VCPUS]),
     pending_reschedule_mask: UnsafeCell::new(0),
     reschedule_mask: UnsafeCell::new(0),
     idle_vcpu_mask: UnsafeCell::new(0),
+    online_vcpu_mask: UnsafeCell::new(0),
+    enqueue_rr: UnsafeCell::new(0),
+    schedule_unlock_edge_count: UnsafeCell::new(0),
+    schedule_trap_count: UnsafeCell::new(0),
     deferred_kstack_bases: UnsafeCell::new([0; DEFERRED_KSTACK_CAP]),
     deferred_kstack_len: UnsafeCell::new(0),
     lock_count: UnsafeCell::new(0),

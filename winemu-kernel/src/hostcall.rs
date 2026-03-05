@@ -107,10 +107,7 @@ pub fn submit(args: SubmitArgs) -> SubmitOutcome {
     }
 }
 
-pub fn call_sync(
-    owner_pid: u32,
-    args: SubmitArgs,
-) -> Result<SubmitDone, u32> {
+pub fn call_sync(owner_pid: u32, args: SubmitArgs) -> Result<SubmitDone, u32> {
     let cur_tid = sched::current_tid();
     if cur_tid == 0 || !sched::thread_exists(cur_tid) {
         return Err(status::INVALID_PARAMETER);
@@ -125,23 +122,86 @@ pub fn call_sync(
                 let _ = hypercall::hostcall_cancel(request_id);
                 return Err(status::NO_MEMORY);
             }
-            let wait_st = wait_current_for_request(request_id, WaitDeadline::Infinite);
-            let done = take_sync_completion(request_id);
-            if wait_st != status::SUCCESS {
+            let wait_st = wait_current_for_request_pending(request_id, WaitDeadline::Infinite);
+            if wait_st != STATUS_PENDING {
                 return Err(wait_st);
             }
-            let Some(done) = done else {
-                return Err(status::INVALID_PARAMETER);
-            };
-            if map_host_result_to_status(done.host_result) != status::SUCCESS {
-                return Err(map_host_result_to_status(done.host_result));
-            }
-            Ok(done)
+            wait_for_sync_completion(request_id, cur_tid)
         }
     }
 }
 
-pub fn register_request(owner_pid: u32, request_id: u64, waiter_tid: u32, need_submit_done: bool) -> bool {
+fn wait_for_sync_completion(request_id: u64, waiter_tid: u32) -> Result<SubmitDone, u32> {
+    if request_id == 0 || waiter_tid == 0 {
+        return Err(status::INVALID_PARAMETER);
+    }
+    loop {
+        if let Some(done) = take_sync_completion(request_id) {
+            let mapped = map_host_result_to_status(done.host_result);
+            if mapped != status::SUCCESS {
+                return Err(mapped);
+            }
+            return Ok(done);
+        }
+
+        let mut resolved = None;
+        let mut now = 0u64;
+        let mut next_deadline = 0u64;
+        {
+            let _guard = sched::ScopedSchedulerLock::new();
+            if !sched::thread_exists(waiter_tid) {
+                return Err(status::INVALID_PARAMETER);
+            }
+            let (state, result) = sched::with_thread(waiter_tid, |t| (t.state, t.wait_result));
+            if state != sched::ThreadState::Waiting {
+                resolved = Some(result);
+            } else {
+                now = sched::now_ticks();
+                let _ = sched::check_timeouts(now);
+                let (state2, result2) =
+                    sched::with_thread(waiter_tid, |t| (t.state, t.wait_result));
+                if state2 != sched::ThreadState::Waiting {
+                    resolved = Some(result2);
+                } else {
+                    next_deadline = sched::next_wait_deadline_locked();
+                }
+            }
+        }
+
+        if let Some(result) = resolved {
+            if result != status::SUCCESS {
+                cleanup_request(request_id, true);
+                return Err(result);
+            }
+            let Some(done) = take_sync_completion(request_id) else {
+                cleanup_request(request_id, true);
+                return Err(status::INVALID_PARAMETER);
+            };
+            let mapped = map_host_result_to_status(done.host_result);
+            if mapped != status::SUCCESS {
+                return Err(mapped);
+            }
+            return Ok(done);
+        }
+
+        pump_completions();
+        if let Some(done) = take_sync_completion(request_id) {
+            let mapped = map_host_result_to_status(done.host_result);
+            if mapped != status::SUCCESS {
+                return Err(mapped);
+            }
+            return Ok(done);
+        }
+        crate::timer::idle_wait_until_deadline_100ns(now, next_deadline);
+    }
+}
+
+pub fn register_request(
+    owner_pid: u32,
+    request_id: u64,
+    waiter_tid: u32,
+    need_submit_done: bool,
+) -> bool {
     if request_id == 0 {
         return false;
     }
@@ -308,7 +368,7 @@ fn wait_deadline_ticks(timeout: WaitDeadline) -> u64 {
     }
 }
 
-pub fn wait_current_for_request(request_id: u64, timeout: WaitDeadline) -> u32 {
+pub fn wait_current_for_request_pending(request_id: u64, timeout: WaitDeadline) -> u32 {
     let cur = sched::current_tid();
     if cur == 0 || !sched::thread_exists(cur) || request_id == 0 {
         return status::INVALID_PARAMETER;
@@ -318,21 +378,17 @@ pub fn wait_current_for_request(request_id: u64, timeout: WaitDeadline) -> u32 {
         return status::TIMEOUT;
     }
     let deadline = wait_deadline_ticks(timeout);
-    let wait_status = sched::block_current_and_resched(
+    let st = sched::block_current_and_resched(
         sched::WAIT_KIND_HOSTCALL,
         core::slice::from_ref(&request_id),
         deadline,
         STATUS_PENDING,
     );
-    if wait_status != status::SUCCESS {
+    if st != status::SUCCESS {
         cleanup_request(request_id, true);
-        return wait_status;
+        return st;
     }
-    let resolved = sched::current_wait_result();
-    if resolved == status::TIMEOUT {
-        cleanup_request(request_id, true);
-    }
-    resolved
+    STATUS_PENDING
 }
 
 fn take_waiter_by_request(request_id: u64) -> Option<PendingWaiter> {

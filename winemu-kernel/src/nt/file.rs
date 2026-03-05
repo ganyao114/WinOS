@@ -1,5 +1,5 @@
-use crate::hypercall;
 use crate::hostcall;
+use crate::hypercall;
 use crate::kobj::ObjectStore;
 use crate::rust_alloc::vec::Vec;
 use crate::sched::sync::{self, make_new_handle, HANDLE_TYPE_FILE};
@@ -8,7 +8,8 @@ use winemu_shared::status;
 
 use super::common::{
     file_handle_to_host_fd, map_open_flags, write_iosb, IoStatusBlock, FILE_OPEN, HOST_OPEN_READ,
-    STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    HOST_PSEUDO_FD_WINEMU_HOST, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    WINEMU_HOST_DEVICE_PATH, WINEMU_HOST_DEVICE_PATH_NORMALIZED,
 };
 use super::path::{read_oa_path, read_unicode_direct};
 use super::state::{
@@ -45,6 +46,9 @@ const FILE_FS_ATTRIBUTE_INFORMATION: u32 = 5;
 const FILE_FS_SIZE_INFORMATION_SIZE: usize = 24;
 const FILE_FS_DEVICE_INFORMATION_SIZE: usize = 8;
 const FILE_FS_ATTRIBUTE_INFORMATION_SIZE: usize = 12;
+const WINEMU_IOCTL_PACKET_VERSION: u32 = 1;
+const IOCTL_WINEMU_HOST_PING: u32 = 0x0022_A000;
+const IOCTL_WINEMU_HOSTCALL_SYNC: u32 = 0x0022_A004;
 
 const FILE_DEVICE_DISK: u32 = 0x0000_0007;
 const FILE_CASE_SENSITIVE_SEARCH: u32 = 0x0000_0001;
@@ -82,9 +86,44 @@ struct PendingFileIo {
     requested_len: usize,
 }
 
+#[derive(Clone, Copy)]
+struct PendingHostIoctl {
+    owner_pid: u32,
+    file_idx: u32,
+    waiter_tid: u32,
+    event_handle: u64,
+    iosb_ptr: *mut IoStatusBlock,
+    out_ptr: *mut u8,
+    out_len: usize,
+    request_id: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WinEmuHostcallRequest {
+    version: u32,
+    _reserved: u32,
+    opcode: u64,
+    flags: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    user_tag: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WinEmuHostcallResponse {
+    host_result: u64,
+    aux: u64,
+    request_id: u64,
+}
+
 struct FileAsyncState {
     pending_dir_notify: ObjectStore<PendingDirNotify>,
     pending_file_io: ObjectStore<PendingFileIo>,
+    pending_host_ioctl: ObjectStore<PendingHostIoctl>,
 }
 
 static mut FILE_ASYNC_STATE: Option<FileAsyncState> = None;
@@ -95,6 +134,7 @@ fn async_state_mut() -> &'static mut FileAsyncState {
             FILE_ASYNC_STATE = Some(FileAsyncState {
                 pending_dir_notify: ObjectStore::new(),
                 pending_file_io: ObjectStore::new(),
+                pending_host_ioctl: ObjectStore::new(),
             });
         }
         FILE_ASYNC_STATE.as_mut().unwrap()
@@ -155,6 +195,22 @@ fn lower_ascii(b: u8) -> u8 {
     } else {
         b
     }
+}
+
+fn eq_ascii_ci(a: &str, b: &str) -> bool {
+    let aa = a.as_bytes();
+    let bb = b.as_bytes();
+    if aa.len() != bb.len() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < aa.len() {
+        if lower_ascii(aa[i]) != lower_ascii(bb[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 fn wildcard_match_ci(name: &[u8], pattern: &[u8]) -> bool {
@@ -393,6 +449,33 @@ fn cancel_pending_file_io_for_file(owner_pid: u32, file_idx: u32) {
     }
 }
 
+fn cancel_pending_host_ioctl_for_file(owner_pid: u32, file_idx: u32) {
+    let mut to_remove = Vec::new();
+    async_state_mut()
+        .pending_host_ioctl
+        .for_each_live_ptr(|id, ptr| unsafe {
+            let req = *ptr;
+            if req.owner_pid == owner_pid && req.file_idx == file_idx {
+                if req.request_id != 0 {
+                    let _ = hypercall::hostcall_cancel(req.request_id);
+                    let _ = hostcall::unregister_pending_request(req.request_id);
+                }
+                complete_pending_host_ioctl(
+                    &req,
+                    status::INVALID_HANDLE,
+                    hc::HC_CANCELED,
+                    0,
+                    req.request_id,
+                );
+                let _ = to_remove.try_reserve(1);
+                to_remove.push(id);
+            }
+        });
+    for id in to_remove {
+        let _ = async_state_mut().pending_host_ioctl.free(id);
+    }
+}
+
 pub(crate) fn cancel_pending_dir_notify_for_pid(owner_pid: u32) {
     let mut to_remove = Vec::new();
     async_state_mut()
@@ -436,6 +519,31 @@ pub(crate) fn cancel_pending_dir_notify_for_pid(owner_pid: u32) {
     for id in io_remove {
         let _ = async_state_mut().pending_file_io.free(id);
     }
+
+    let mut ioctl_remove = Vec::new();
+    async_state_mut()
+        .pending_host_ioctl
+        .for_each_live_ptr(|id, ptr| unsafe {
+            let req = *ptr;
+            if req.owner_pid == owner_pid {
+                if req.request_id != 0 {
+                    let _ = hypercall::hostcall_cancel(req.request_id);
+                    let _ = hostcall::unregister_pending_request(req.request_id);
+                }
+                complete_pending_host_ioctl(
+                    &req,
+                    status::INVALID_HANDLE,
+                    hc::HC_CANCELED,
+                    0,
+                    req.request_id,
+                );
+                let _ = ioctl_remove.try_reserve(1);
+                ioctl_remove.push(id);
+            }
+        });
+    for id in ioctl_remove {
+        let _ = async_state_mut().pending_host_ioctl.free(id);
+    }
 }
 
 fn queue_pending_file_io(req: PendingFileIo) -> u32 {
@@ -444,6 +552,65 @@ fn queue_pending_file_io(req: PendingFileIo) -> u32 {
         status::SUCCESS
     } else {
         status::NO_MEMORY
+    }
+}
+
+fn queue_pending_host_ioctl(req: PendingHostIoctl) -> u32 {
+    let state = async_state_mut();
+    if state.pending_host_ioctl.alloc_with(|_| req).is_some() {
+        status::SUCCESS
+    } else {
+        status::NO_MEMORY
+    }
+}
+
+fn complete_pending_host_ioctl(
+    req: &PendingHostIoctl,
+    mut st: u32,
+    host_result: u64,
+    aux: u64,
+    request_id: u64,
+) {
+    if !crate::process::process_exists(req.owner_pid) {
+        return;
+    }
+
+    let mut info = 0u64;
+    let write_result = with_owner_ttbr0(req.owner_pid, || {
+        if req.out_ptr.is_null() || req.out_len < core::mem::size_of::<WinEmuHostcallResponse>() {
+            return false;
+        }
+        let resp = WinEmuHostcallResponse {
+            host_result,
+            aux,
+            request_id,
+        };
+        unsafe {
+            core::ptr::write_unaligned(req.out_ptr as *mut WinEmuHostcallResponse, resp);
+        }
+        true
+    });
+
+    if st == status::SUCCESS {
+        match write_result {
+            Some(true) => {
+                info = core::mem::size_of::<WinEmuHostcallResponse>() as u64;
+            }
+            Some(false) => {
+                st = status::BUFFER_TOO_SMALL;
+            }
+            None => return,
+        }
+    }
+
+    let _ = with_owner_ttbr0(req.owner_pid, || {
+        write_iosb(req.iosb_ptr, st, info);
+    });
+    if req.event_handle != 0 {
+        let _ = sync::event_set_by_handle_for_pid(req.owner_pid, req.event_handle);
+    }
+    if req.waiter_tid != 0 {
+        crate::sched::wake(req.waiter_tid, st);
     }
 }
 
@@ -484,8 +651,9 @@ fn on_hostcall_dir_notify(cookie: u32, cpl: hypercall::HostCallCompletion) {
         return;
     }
 
-    let completion =
-        with_owner_ttbr0(req.owner_pid, || write_notify_record(req.out_ptr, req.out_len, action, &req.name_buf[..name_len]));
+    let completion = with_owner_ttbr0(req.owner_pid, || {
+        write_notify_record(req.out_ptr, req.out_len, action, &req.name_buf[..name_len])
+    });
     match completion {
         Some(Ok(written)) => complete_pending_notify(&req, status::SUCCESS, written as u64, true),
         Some(Err(st)) => complete_pending_notify(&req, st, 0, true),
@@ -535,6 +703,26 @@ fn on_hostcall_file_write(cookie: u32, cpl: hypercall::HostCallCompletion) {
     complete_pending_file_io(&req, status::SUCCESS, cpl.value0);
 }
 
+fn on_hostcall_host_ioctl(cookie: u32, cpl: hypercall::HostCallCompletion) {
+    let req_ptr = async_state_mut().pending_host_ioctl.get_ptr(cookie);
+    if req_ptr.is_null() {
+        return;
+    }
+    let req = unsafe { *req_ptr };
+    let _ = async_state_mut().pending_host_ioctl.free(cookie);
+    if !crate::process::process_exists(req.owner_pid) {
+        return;
+    }
+
+    let host_result = if cpl.host_result < 0 {
+        hc::HC_INVALID
+    } else {
+        cpl.host_result as u64
+    };
+    let st = hostcall::map_host_result_to_status(host_result);
+    complete_pending_host_ioctl(&req, st, host_result, cpl.value0, cpl.request_id);
+}
+
 fn find_pending_dir_notify_id_by_request(request_id: u64) -> u32 {
     let mut found = 0u32;
     async_state_mut()
@@ -559,6 +747,18 @@ fn find_pending_file_io_id_by_request(request_id: u64) -> u32 {
     found
 }
 
+fn find_pending_host_ioctl_id_by_request(request_id: u64) -> u32 {
+    let mut found = 0u32;
+    async_state_mut()
+        .pending_host_ioctl
+        .for_each_live_ptr(|id, ptr| unsafe {
+            if found == 0 && (*ptr).request_id == request_id {
+                found = id;
+            }
+        });
+    found
+}
+
 pub(crate) fn dispatch_async_hostcall_completion(cpl: hypercall::HostCallCompletion) -> bool {
     if cpl.request_id == 0 {
         return false;
@@ -571,7 +771,12 @@ pub(crate) fn dispatch_async_hostcall_completion(cpl: hypercall::HostCallComplet
 
     let io_cookie = find_pending_file_io_id_by_request(cpl.request_id);
     if io_cookie == 0 {
-        return false;
+        let ioctl_cookie = find_pending_host_ioctl_id_by_request(cpl.request_id);
+        if ioctl_cookie == 0 {
+            return false;
+        }
+        on_hostcall_host_ioctl(ioctl_cookie, cpl);
+        return true;
     }
     let req_ptr = async_state_mut().pending_file_io.get_ptr(io_cookie);
     if req_ptr.is_null() {
@@ -622,17 +827,26 @@ pub(crate) fn handle_create_file(frame: &mut SvcFrame) {
             return;
         }
     };
-    let fd = hypercall::host_open(path, map_open_flags(access, disposition));
-    if fd == u64::MAX {
-        write_iosb(iosb_ptr, status::OBJECT_NAME_NOT_FOUND, 0);
-        frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
-        return;
-    }
+    let fd = if eq_ascii_ci(path, WINEMU_HOST_DEVICE_PATH)
+        || eq_ascii_ci(path, WINEMU_HOST_DEVICE_PATH_NORMALIZED)
+    {
+        HOST_PSEUDO_FD_WINEMU_HOST
+    } else {
+        let v = hypercall::host_open(path, map_open_flags(access, disposition));
+        if v == u64::MAX {
+            write_iosb(iosb_ptr, status::OBJECT_NAME_NOT_FOUND, 0);
+            frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
+            return;
+        }
+        v
+    };
     let owner_pid = crate::process::current_pid();
     let idx = match file_alloc(owner_pid, fd, &path_buf[..path_len]) {
         Some(v) => v,
         None => {
-            hypercall::host_close(fd);
+            if fd != HOST_PSEUDO_FD_WINEMU_HOST {
+                hypercall::host_close(fd);
+            }
             write_iosb(iosb_ptr, status::NO_MEMORY, 0);
             frame.x[0] = status::NO_MEMORY as u64;
             return;
@@ -1124,7 +1338,8 @@ pub(crate) fn handle_notify_change_directory_file(frame: &mut SvcFrame) {
     };
 
     if event_handle == 0 {
-        let st = hostcall::wait_current_for_request(request_id, sync::WaitDeadline::Infinite);
+        let st =
+            hostcall::wait_current_for_request_pending(request_id, sync::WaitDeadline::Infinite);
         frame.x[0] = st as u64;
         return;
     }
@@ -1170,17 +1385,162 @@ pub(crate) fn handle_query_attributes_file(frame: &mut SvcFrame) {
 
 // x0=FileHandle, x4=*IoStatusBlock
 pub(crate) fn handle_device_io_control_file(frame: &mut SvcFrame) {
+    let owner_pid = crate::process::current_pid();
     let file_handle = frame.x[0];
+    let event_handle = frame.x[1];
     let iosb_ptr = frame.x[4] as *mut IoStatusBlock;
+    let io_control_code = frame.x[5] as u32;
+    let input_ptr = frame.x[6] as *const u8;
+    let input_len = frame.x[7] as usize;
+    let output_ptr = unsafe { (frame.sp_el0 as *const u64).read_volatile() as *mut u8 };
+    let output_len = unsafe { (frame.sp_el0 as *const u64).add(1).read_volatile() as usize };
 
-    if file_handle_to_host_fd(file_handle).is_none() {
+    if event_handle != 0
+        && sync::handle_type_by_owner(event_handle, owner_pid) != sync::HANDLE_TYPE_EVENT
+    {
         write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     }
 
-    write_iosb(iosb_ptr, status::NOT_IMPLEMENTED, 0);
-    frame.x[0] = status::NOT_IMPLEMENTED as u64;
+    let Some(host_fd) = file_handle_to_host_fd(file_handle) else {
+        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+
+    if host_fd != HOST_PSEUDO_FD_WINEMU_HOST {
+        write_iosb(iosb_ptr, status::NOT_IMPLEMENTED, 0);
+        frame.x[0] = status::NOT_IMPLEMENTED as u64;
+        return;
+    }
+
+    match io_control_code {
+        IOCTL_WINEMU_HOST_PING => {
+            if !output_ptr.is_null() && output_len >= core::mem::size_of::<u32>() {
+                unsafe {
+                    (output_ptr as *mut u32).write_volatile(0x5745_4D55); // "WEMU"
+                }
+                write_iosb(
+                    iosb_ptr,
+                    status::SUCCESS,
+                    core::mem::size_of::<u32>() as u64,
+                );
+            } else {
+                write_iosb(iosb_ptr, status::SUCCESS, 0);
+            }
+            if event_handle != 0 {
+                let _ = sync::event_set_by_handle_for_pid(owner_pid, event_handle);
+            }
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        IOCTL_WINEMU_HOSTCALL_SYNC => {
+            if input_ptr.is_null() || input_len < core::mem::size_of::<WinEmuHostcallRequest>() {
+                write_iosb(iosb_ptr, status::INVALID_PARAMETER, 0);
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            }
+            if output_ptr.is_null() || output_len < core::mem::size_of::<WinEmuHostcallResponse>() {
+                write_iosb(iosb_ptr, status::BUFFER_TOO_SMALL, 0);
+                frame.x[0] = status::BUFFER_TOO_SMALL as u64;
+                return;
+            }
+            let req =
+                unsafe { core::ptr::read_unaligned(input_ptr as *const WinEmuHostcallRequest) };
+            if req.version != WINEMU_IOCTL_PACKET_VERSION {
+                write_iosb(iosb_ptr, status::INVALID_PARAMETER, 0);
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            }
+            let file_idx = sync::handle_idx_by_owner(file_handle, owner_pid);
+            if file_idx == 0 {
+                write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+                frame.x[0] = status::INVALID_HANDLE as u64;
+                return;
+            }
+
+            let waiter_tid = if event_handle == 0 {
+                crate::sched::current_tid()
+            } else {
+                0
+            };
+            let submit = hostcall::submit_tracked(
+                owner_pid,
+                waiter_tid,
+                hostcall::SubmitArgs {
+                    opcode: req.opcode,
+                    flags: req.flags,
+                    arg0: req.arg0,
+                    arg1: req.arg1,
+                    arg2: req.arg2,
+                    arg3: req.arg3,
+                    user_tag: req.user_tag,
+                },
+            );
+            let submit = match submit {
+                Ok(v) => v,
+                Err(st) => {
+                    write_iosb(iosb_ptr, st, 0);
+                    frame.x[0] = st as u64;
+                    return;
+                }
+            };
+
+            match submit {
+                hostcall::SubmitOutcome::Completed(done) => {
+                    let resp = WinEmuHostcallResponse {
+                        host_result: done.host_result,
+                        aux: done.value0,
+                        request_id: 0,
+                    };
+                    unsafe {
+                        core::ptr::write_unaligned(output_ptr as *mut WinEmuHostcallResponse, resp);
+                    }
+                    write_iosb(
+                        iosb_ptr,
+                        status::SUCCESS,
+                        core::mem::size_of::<WinEmuHostcallResponse>() as u64,
+                    );
+                    frame.x[0] = status::SUCCESS as u64;
+                }
+                hostcall::SubmitOutcome::Pending { request_id } => {
+                    let pending = PendingHostIoctl {
+                        owner_pid,
+                        file_idx,
+                        waiter_tid,
+                        event_handle,
+                        iosb_ptr,
+                        out_ptr: output_ptr,
+                        out_len: output_len,
+                        request_id,
+                    };
+                    let st = queue_pending_host_ioctl(pending);
+                    if st != status::SUCCESS {
+                        let _ = hypercall::hostcall_cancel(request_id);
+                        let _ = hostcall::unregister_pending_request(request_id);
+                        write_iosb(iosb_ptr, st, 0);
+                        frame.x[0] = st as u64;
+                        return;
+                    }
+
+                    if event_handle == 0 {
+                        let st = hostcall::wait_current_for_request_pending(
+                            request_id,
+                            sync::WaitDeadline::Infinite,
+                        );
+                        frame.x[0] = st as u64;
+                    } else {
+                        write_iosb(iosb_ptr, STATUS_PENDING, 0);
+                        frame.x[0] = STATUS_PENDING as u64;
+                    }
+                }
+            }
+        }
+        _ => {
+            write_iosb(iosb_ptr, status::NOT_IMPLEMENTED, 0);
+            frame.x[0] = status::NOT_IMPLEMENTED as u64;
+        }
+    }
 }
 
 // x0=FileHandle, x4=*IoStatusBlock
@@ -1297,6 +1657,7 @@ pub(crate) fn close_file_idx(idx: u32) {
     if let Some(owner_pid) = file_owner_pid(idx) {
         cancel_pending_dir_notify_for_file(owner_pid, idx);
         cancel_pending_file_io_for_file(owner_pid, idx);
+        cancel_pending_host_ioctl_for_file(owner_pid, idx);
     }
     file_free(idx);
 }

@@ -1,11 +1,7 @@
 use super::*;
 
 pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
-    crate::log::debug_u64(0xD101_0001);
-    crate::log::debug_u64(tid as u64);
-    crate::log::debug_u64(deadline);
     if tid == 0 || !thread_exists(tid) {
-        crate::log::debug_u64(0xD101_E001);
         return false;
     }
     let old_handle = with_thread_mut(tid, |t| {
@@ -22,7 +18,6 @@ pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
         if old_handle.is_valid() {
             let _ = timer::cancel_task(old_handle);
         }
-        crate::log::debug_u64(0xD101_0002);
         return true;
     }
 
@@ -32,9 +27,6 @@ pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
                 t.wait_timer_task_id = handle.id;
                 t.wait_timer_generation = handle.generation;
             });
-            crate::log::debug_u64(0xD101_0003);
-            crate::log::debug_u64(handle.id as u64);
-            crate::log::debug_u64(handle.generation as u64);
             return true;
         }
         let _ = timer::cancel_task(old_handle);
@@ -45,9 +37,6 @@ pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
             t.wait_timer_task_id = handle.id;
             t.wait_timer_generation = handle.generation;
         });
-        crate::log::debug_u64(0xD101_0004);
-        crate::log::debug_u64(handle.id as u64);
-        crate::log::debug_u64(handle.generation as u64);
         return true;
     }
 
@@ -56,7 +45,6 @@ pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
         t.wait_timer_task_id = 0;
         t.wait_timer_generation = 0;
     });
-    crate::log::debug_u64(0xD101_E002);
     false
 }
 
@@ -73,7 +61,12 @@ fn clear_wait_tracking_fields(thread: &mut KThread) {
 }
 
 #[inline(always)]
-fn set_wait_tracking_fields(thread: &mut KThread, wait_kind: u8, wait_handles: &[u64], pending_result: u32) {
+fn set_wait_tracking_fields(
+    thread: &mut KThread,
+    wait_kind: u8,
+    wait_handles: &[u64],
+    pending_result: u32,
+) {
     let handle_count = wait_handles.len().min(MAX_WAIT_HANDLES);
     thread.wait_result = pending_result;
     thread.wait_kind = wait_kind;
@@ -211,8 +204,13 @@ pub(crate) fn end_wait_locked(tid: u32, result: u32) -> bool {
         set_thread_in_kernel_locked(tid, false);
     }
     let suspended = with_thread(tid, |t| t.suspend_count != 0);
+    let wake_to_running = !suspended && tid == current_tid();
     if suspended {
         set_thread_state_locked(tid, ThreadState::Suspended);
+    } else if wake_to_running {
+        // If wait completion is polled by the same kernel continuation, keep
+        // the thread as Running to avoid transient Ready->Running repair.
+        set_thread_state_locked(tid, ThreadState::Running);
     } else {
         set_thread_state_locked(tid, ThreadState::Ready);
     }
@@ -274,51 +272,6 @@ pub fn block_current_and_resched(
         return st;
     }
     status::SUCCESS
-}
-pub fn current_wait_result() -> u32 {
-    let cur = current_tid();
-    if cur == 0 || !thread_exists(cur) {
-        return status::INVALID_PARAMETER;
-    }
-    loop {
-        let mut now = 0u64;
-        let mut next_deadline = 0u64;
-        let mut resolved = None;
-        {
-            let _guard = ScopedSchedulerLock::new();
-            let (state, result) = with_thread(cur, |t| (t.state, t.wait_result));
-            if state != ThreadState::Waiting {
-                // Keep scheduler state coherent if wait completed without
-                // switching away from current kernel continuation.
-                if state == ThreadState::Ready {
-                    set_thread_state_locked(cur, ThreadState::Running);
-                }
-                resolved = Some(result);
-            } else {
-                now = now_ticks();
-                let _ = check_timeouts(now);
-                let (state2, result2) = with_thread(cur, |t| (t.state, t.wait_result));
-                if state2 != ThreadState::Waiting {
-                    if state2 == ThreadState::Ready {
-                        set_thread_state_locked(cur, ThreadState::Running);
-                    }
-                    resolved = Some(result2);
-                } else {
-                    next_deadline = next_wait_deadline_locked();
-                }
-            }
-        }
-
-        if let Some(result) = resolved {
-            if result == 0x0000_0103 {
-                return status::INVALID_PARAMETER;
-            }
-            return result;
-        }
-
-        crate::hostcall::pump_completions();
-        crate::timer::idle_wait_until_deadline_100ns(now, next_deadline);
-    }
 }
 
 /// Timeout dispatch hot path.

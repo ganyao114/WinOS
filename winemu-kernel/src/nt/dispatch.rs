@@ -3,17 +3,16 @@
 // 若需要线程切换，直接修改 SvcFrame 中的寄存器，ERET 后进入新线程。
 
 use crate::hypercall;
-use core::sync::atomic::{AtomicU32, Ordering};
 use crate::sched::{
     charge_current_runtime_locked, check_timeouts, consume_pending_reschedule_locked,
-    current_slice_remaining_100ns, current_tid, next_wait_deadline_locked,
-    now_ticks, register_thread0, rotate_current_on_quantum_expire_locked, sched_lock_acquire,
-    sched_lock_release, schedule, set_current_in_kernel, set_thread_in_kernel,
-    set_vcpu_idle_locked, switch_kernel_continuation, thread_exists, vcpu_id, with_thread, with_thread_mut,
-    has_kernel_continuation,
-    ThreadState,
+    current_slice_remaining_100ns, current_tid, has_kernel_continuation, next_wait_deadline_locked,
+    now_ticks, record_schedule_event_trap, register_thread0,
+    rotate_current_on_quantum_expire_locked, sched_lock_acquire, sched_lock_release, schedule,
+    set_current_in_kernel, set_thread_in_kernel, set_vcpu_idle_locked, thread_exists, vcpu_id,
+    with_thread, with_thread_mut, ThreadState,
 };
 use crate::timer;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::constants::{
     EL0_FAULT_ELR_TAG, EL0_FAULT_ESR_TAG, EL0_FAULT_FAR_TAG, EL0_FAULT_SPSR_TAG, EL1_FAULT_ELR_TAG,
@@ -22,8 +21,7 @@ use super::constants::{
 };
 use super::sysno;
 use super::{
-    file, memory, object, process, registry, section, sync, system, thread, token, win32k,
-    SvcFrame,
+    file, memory, object, process, registry, section, sync, system, thread, token, win32k, SvcFrame,
 };
 
 static SYSCALL_ERR_TRACE_BUDGET: AtomicU32 = AtomicU32::new(512);
@@ -228,6 +226,7 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
         // only run schedule() when a committed reschedule request exists, or
         // timer logic produced runnable-state change.
         if pending_resched || quantum_expired || timeout_woke || from == 0 || cur_not_running {
+            record_schedule_event_trap();
             let (from_sched, to) = schedule(vid, now, quantum_100ns);
             if to != 0 {
                 set_vcpu_idle_locked(vid, false);
@@ -242,22 +241,23 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                         crate::sched::set_thread_in_kernel_locked(to, false);
                         to_in_kernel = false;
                     }
-                    if cur_not_running && with_thread(from_sched, |t| t.state == ThreadState::Terminated) {
+                    if cur_not_running
+                        && with_thread(from_sched, |t| t.state == ThreadState::Terminated)
+                    {
                         crate::sched::set_thread_in_kernel_locked(from_sched, false);
                     }
                     if to_has_kctx {
                         save_ctx_for(from_sched, frame);
                         let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
                         sched_lock_release();
-                        crate::process::switch_to_thread_process(to);
-                        timer::schedule_running_slice_100ns(now, next_deadline, slice_remaining);
-                        let switched = unsafe { switch_kernel_continuation(from_sched, to) };
-                        if !switched {
-                            panic!(
-                                "sched: trap direct-kctx switch failed from={} to={}",
-                                from_sched, to
-                            );
-                        }
+                        crate::sched::execute_kernel_continuation_switch(
+                            from_sched,
+                            to,
+                            now,
+                            next_deadline,
+                            slice_remaining,
+                            "trap",
+                        );
                         from = current_tid();
                         continue;
                     }
@@ -289,10 +289,9 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                 if from_sched == 0 {
                     // We were idling; current frame no longer belongs to a runnable thread.
                     restore_ctx_to_frame(to, frame);
-                } else if from_sched == to && cur_not_running {
-                    // Current thread left Running earlier in this trap (e.g. wait -> Ready
-                    // via completion before trap-exit scheduling). Frame may still carry
-                    // stale syscall return regs; reload from thread ctx.
+                } else if from_sched == to && (cur_not_running || pending_resched || timeout_woke) {
+                    // Same-thread continuation may still need frame refresh when wait/completion
+                    // updated thread context x0 under scheduler lock but we did not context-switch.
                     restore_ctx_to_frame(to, frame);
                 }
                 let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
@@ -317,8 +316,8 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
             sched_lock_release();
 
             if crate::sched::all_threads_done() {
-                let code = crate::process::process_exit_status(crate::process::current_pid())
-                    .unwrap_or(0);
+                let code =
+                    crate::process::process_exit_status(crate::process::current_pid()).unwrap_or(0);
                 hypercall::process_exit(code);
             }
             timer::idle_wait_until_deadline_100ns(now, next_deadline);

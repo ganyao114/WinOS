@@ -10,11 +10,11 @@ use core::ptr::null_mut;
 use winemu_shared::status;
 
 use super::{
-    begin_wait_locked, boost_thread_priority_locked, cancel_wait_locked, clear_wait_tracking_locked,
-    current_tid, end_wait_locked, ensure_current_wait_preconditions_locked, prepare_wait_tracking_locked,
-    sched_lock_acquire, sched_lock_release, set_thread_priority_locked, set_thread_state_locked, thread_count,
-    thread_exists, with_thread, with_thread_mut, ScopedSchedulerLock, ThreadState, MAX_WAIT_HANDLES,
-    WAIT_KIND_DELAY, WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY, WAIT_KIND_SINGLE,
+    boost_thread_priority_locked, cancel_wait_locked, clear_wait_tracking_locked, current_tid,
+    end_wait_locked, prepare_wait_locked, sched_lock_acquire, sched_lock_release,
+    set_thread_priority_locked, set_thread_state_locked, thread_count, thread_exists, with_thread,
+    with_thread_mut, ScopedSchedulerLock, ThreadState, MAX_WAIT_HANDLES, WAIT_KIND_DELAY,
+    WAIT_KIND_MULTI_ALL, WAIT_KIND_MULTI_ANY, WAIT_KIND_SINGLE,
 };
 
 // ── NTSTATUS 常量 ─────────────────────────────────────────────
