@@ -104,7 +104,8 @@ fn trace_cpp_exception_type_name(pid: u32, throw_info: u64, image_base: u64) {
             crate::log::debug_print("\n");
             if (1..=32).contains(&count) {
                 for i in 0..count {
-                    let ct_rva = read_user_u32(pid, cta.saturating_add(4 + (i as u64) * 4)).unwrap_or(0);
+                    let ct_rva =
+                        read_user_u32(pid, cta.saturating_add(4 + (i as u64) * 4)).unwrap_or(0);
                     let ct = image_rel_or_abs(image_base, ct_rva);
                     if ct == 0 {
                         continue;
@@ -121,8 +122,7 @@ fn trace_cpp_exception_type_name(pid: u32, throw_info: u64, image_base: u64) {
                     }
                     for off in [16u64, 8, 24, 0, 32] {
                         let mut buf = [0u8; EXCEPTION_NAME_MAX];
-                        let Some(len) =
-                            read_user_ascii_cstr(pid, td.saturating_add(off), &mut buf)
+                        let Some(len) = read_user_ascii_cstr(pid, td.saturating_add(off), &mut buf)
                         else {
                             continue;
                         };
@@ -174,9 +174,13 @@ pub(crate) fn handle_query_information_process(frame: &mut SvcFrame) {
     let buf_len = frame.x[3] as usize;
     let ret_len = frame.x[4] as *mut u32;
 
-    frame.x[0] =
-        crate::process::query_information_process(process_handle, info_class, buf, buf_len, ret_len)
-            as u64;
+    frame.x[0] = crate::process::query_information_process(
+        process_handle,
+        info_class,
+        buf,
+        buf_len,
+        ret_len,
+    ) as u64;
 }
 
 pub(crate) fn should_dispatch_set_information_process(frame: &SvcFrame) -> bool {
@@ -222,7 +226,8 @@ pub(crate) fn handle_open_process(frame: &mut SvcFrame) {
         return;
     }
 
-    let Some(meta) = super::kobject::object_type_meta(crate::sched::sync::HANDLE_TYPE_PROCESS) else {
+    let Some(meta) = super::kobject::object_type_meta(crate::sched::sync::HANDLE_TYPE_PROCESS)
+    else {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     };
@@ -252,7 +257,8 @@ pub(crate) fn handle_create_process(frame: &mut SvcFrame) {
     let flags = frame.x[4] as u32;
     let section_handle = frame.x[5];
 
-    let Some(meta) = super::kobject::object_type_meta(crate::sched::sync::HANDLE_TYPE_PROCESS) else {
+    let Some(meta) = super::kobject::object_type_meta(crate::sched::sync::HANDLE_TYPE_PROCESS)
+    else {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     };

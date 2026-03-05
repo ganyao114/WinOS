@@ -48,7 +48,7 @@ impl Vm for HvfVm {
         Ok(())
     }
 
-    fn create_vcpu(&self, _id: u32) -> Result<Box<dyn Vcpu>> {
-        Ok(Box::new(HvfVcpu::new()?))
+    fn create_vcpu(&self, id: u32) -> Result<Box<dyn Vcpu>> {
+        Ok(Box::new(HvfVcpu::new(id)?))
     }
 }

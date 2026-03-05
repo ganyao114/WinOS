@@ -18,8 +18,8 @@
 
 use core::arch::global_asm;
 
-// Dedicated SVC stack in .bss — lives well below __heap_start,
-// so it never overlaps with exe/dll images allocated from the heap.
+// Legacy bootstrap SVC stack in .bss. Normal EL0 trap paths should run on
+// the current thread's EL1 stack (SP_EL1) to avoid cross-vCPU stack aliasing.
 global_asm!(
     ".bss",
     ".balign 16",
@@ -37,54 +37,45 @@ global_asm!(
     ".balign 2048",
     ".global __exception_vectors",
     "__exception_vectors:",
-
     // ── Slot 0: Current EL SP_EL0 Sync (128 bytes) ──────────
     "b __el1_sync",
     ".balign 128",
-
     // ── Slot 1: Current EL SP_EL0 IRQ ───────────────────────
     "b __timer_irq_el1",
     ".balign 128",
-
     // ── Slot 2: Current EL SP_EL0 FIQ ───────────────────────
     "b .",
     ".balign 128",
-
     // ── Slot 3: Current EL SP_EL0 SError ────────────────────
     "b .",
     ".balign 128",
-
     // ── Slot 4: Current EL SP_EL1 Sync (kernel fault) ───────
     "b __el1_sync",
     ".balign 128",
-
     // ── Slot 5: Current EL SP_EL1 IRQ ───────────────────────
     "b __timer_irq_el1",
     ".balign 128",
-
     // ── Slot 6: Current EL SP_EL1 FIQ ───────────────────────
     "b .",
     ".balign 128",
-
     // ── Slot 7: Current EL SP_EL1 SError ────────────────────
     "b .",
     ".balign 128",
-
     // ── Slot 8: Lower EL AArch64 Sync ────────────────────────
     // Save x9 first, then use it for dispatch. x10 is NOT touched here.
     // Do NOT use TPIDR_EL1 here: scheduler stores vcpu_id/tid in TPIDR_EL1.
-    "msr tpidrro_el0, x9",        // save user x9 before clobbering
+    "msr tpidrro_el0, x9", // save user x9 before clobbering
     "mrs x9, esr_el1",
-    "lsr x9, x9, #26",            // EC = bits[31:26]
-    "cmp x9, #0x15",              // EC=0x15 → SVC from AArch64
+    "lsr x9, x9, #26", // EC = bits[31:26]
+    "cmp x9, #0x15",   // EC=0x15 → SVC from AArch64
     "b.ne 90f",
     "b __el0_svc",
     "90:",
-    "cmp x9, #0x24",              // EC=0x24 → Data Abort from lower EL
+    "cmp x9, #0x24", // EC=0x24 → Data Abort from lower EL
     "b.ne 91f",
     "b __el0_da",
     "91:",
-    "cmp x9, #0x20",              // EC=0x20 → Instruction Abort from lower EL
+    "cmp x9, #0x20", // EC=0x20 → Instruction Abort from lower EL
     "b.ne 92f",
     "b __el0_da",
     "92:",
@@ -97,19 +88,15 @@ global_asm!(
     "b.eq 93f",
     "b __el0_undef",
     ".balign 128",
-
     // ── Slot 9: Lower EL AArch64 IRQ ────────────────────────
     "b __timer_irq_el0",
     ".balign 128",
-
     // ── Slot 10: Lower EL AArch64 FIQ ───────────────────────
     "b .",
     ".balign 128",
-
     // ── Slot 11: Lower EL AArch64 SError ────────────────────
     "b .",
     ".balign 128",
-
     // ── Slot 12-15: Lower EL AArch32 ────────────────────────
     "b .",
     ".balign 128",
@@ -119,22 +106,18 @@ global_asm!(
     ".balign 128",
     "b .",
     ".balign 128",
-
     // ════════════════════════════════════════════════════════════
     // Out-of-line handlers (no 128-byte limit)
     // ════════════════════════════════════════════════════════════
 
     // ── Sync exception from EL1 (kernel fault) ────────────────
     "__el1_sync:",
-    "ldr x9, =__svc_stack_top",
-    "mov sp, x9",
     "stp x29, x30, [sp, #-16]!",
     "mrs x0, far_el1",
     "mrs x1, esr_el1",
     "mrs x2, elr_el1",
     "bl el1_sync_fault",
     "b .",
-
     // ── SVC from EL0 ───────────────────────────────────────────
     // Build SvcFrame on SVC stack and call guest EL1 dispatcher.
     // x9 was saved into tpidrro_el0 by Slot 8 dispatch above.
@@ -142,8 +125,6 @@ global_asm!(
     // Preserve user x16/x17 before borrowing them as scratch.
     "mov x9, x17",
     "mov x17, x16",
-    "ldr x16, =__svc_stack_top",
-    "mov sp, x16",
     "sub sp, sp, #0x120",
     // Save x0-x30 (SvcFrame.x[0..31))
     "stp x0,  x1,  [sp, #0x000]",
@@ -172,7 +153,7 @@ global_asm!(
     "str x16, [sp, #0x108]",
     "mrs x16, tpidr_el0",
     "str x16, [sp, #0x110]",
-    "str x8,  [sp, #0x118]",      // x8_orig syscall tag
+    "str x8,  [sp, #0x118]", // x8_orig syscall tag
     // Restore original user x9 from tpidrro_el0 shadow into frame.x[9].
     "mrs x16, tpidrro_el0",
     "str x16, [sp, #0x048]",
@@ -215,7 +196,6 @@ global_asm!(
     "ldr x30,      [x28, #0x0f0]",
     "ldp x28, x29, [x28, #0x0e0]",
     "eret",
-
     // ── Data Abort / Instruction Abort from EL0 ────────────────
     // x9 was already saved to tpidrro_el0 by Slot 8 dispatch above.
     // Preserve full EL0 register context so demand-paging retries are transparent.
@@ -223,8 +203,6 @@ global_asm!(
     // Preserve user x16/x17 before borrowing them as scratch.
     "mov x9, x17",
     "mov x17, x16",
-    "ldr x16, =__svc_stack_top",
-    "mov sp, x16",
     "sub sp, sp, #0x110",
     // Save x0-x30 (x31 is SP; not part of GPR save set).
     "stp x0,  x1,  [sp, #0x000]",
@@ -296,18 +274,14 @@ global_asm!(
     "add x16, x16, #4",
     "str x16, [sp, #0x0f8]",
     "b 95b",
-
     // ── Unknown sync from EL0 (fatal) ─────────────────────────
     "__el0_undef:",
-    "ldr x16, =__svc_stack_top",
-    "mov sp, x16",
     "mrs x0, far_el1",
     "mrs x1, esr_el1",
     "mrs x2, elr_el1",
     "mov x3, xzr",
     "bl el0_page_fault",
     "b .",
-
     // ── EC=0x00 compat skip path ──────────────────────────────
     "93:",
     "__el0_undef_skip:",

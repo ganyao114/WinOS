@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod pe;
+pub mod win32k_sysno;
 
 /// Hypercall ABI — 所有编号和参数约定的唯一来源
 /// 同时被 winemu-kernel (bare-metal) 和 winemu-core (host) 使用
@@ -24,10 +25,6 @@ pub mod nr {
     pub const PROCESS_CREATE: u64 = 0x0010;
     /// args: [exit_code, 0, 0, 0, 0, 0]
     pub const PROCESS_EXIT: u64 = 0x0011;
-    /// args: [entry_va, stack_va, arg_x0, teb_gva, 0, 0]
-    pub const THREAD_CREATE: u64 = 0x0012;
-    /// args: [exit_code, 0, 0, 0, 0, 0]
-    pub const THREAD_EXIT: u64 = 0x0013;
 
     // ── DLL 加载: 0x0300 ─────────────────────────────────────
     /// args: [name_gpa, name_len, dst_gpa(0=query), dst_size, 0, 0]
@@ -197,6 +194,10 @@ pub mod nr {
     /// args: [dst_gpa, dst_len, flags(bit0=reset_after_read), 0, 0, 0]
     /// returns: 实际写入字节数
     pub const HOSTCALL_QUERY_STATS: u64 = 0x0825;
+    /// 查询 VMM 调度唤醒统计快照
+    /// args: [dst_gpa, dst_len, flags(bit0=reset_after_read), 0, 0, 0]
+    /// returns: 实际写入字节数
+    pub const HOSTCALL_QUERY_SCHED_WAKE_STATS: u64 = 0x0826;
 }
 
 pub mod hostcall {
@@ -227,6 +228,42 @@ pub mod hostcall {
     pub const OP_NOTIFY_DIR: u64 = 7;
     pub const OP_MMAP: u64 = 8;
     pub const OP_MUNMAP: u64 = 9;
+    pub const OP_WIN32K_CALL: u64 = 10;
+
+    pub const WIN32K_CALL_PACKET_VERSION: u32 = 1;
+    pub const WIN32K_CALL_MAX_ARGS: usize = 16;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Win32kCallPacket {
+        pub version: u32,
+        pub table: u32,
+        pub syscall_nr: u32,
+        pub arg_count: u32,
+        pub owner_pid: u32,
+        pub owner_tid: u32,
+        pub reserved0: u32,
+        pub reserved1: u32,
+        pub args: [u64; WIN32K_CALL_MAX_ARGS],
+    }
+
+    impl Win32kCallPacket {
+        pub const fn new() -> Self {
+            Self {
+                version: WIN32K_CALL_PACKET_VERSION,
+                table: 0,
+                syscall_nr: 0,
+                arg_count: 0,
+                owner_pid: 0,
+                owner_tid: 0,
+                reserved0: 0,
+                reserved1: 0,
+                args: [0; WIN32K_CALL_MAX_ARGS],
+            }
+        }
+    }
+
+    pub const WIN32K_CALL_PACKET_SIZE: usize = core::mem::size_of::<Win32kCallPacket>();
 
     // HostCallCpl binary layout size (u64 + i32 + u32 + u64 + u64 + u64)
     pub const CPL_SIZE: usize = 40;
@@ -236,6 +273,8 @@ pub mod hostcall {
     pub const STATS_VERSION: u64 = 1;
     pub const STATS_HEADER_SIZE: usize = 9 * core::mem::size_of::<u64>();
     pub const STATS_OP_SIZE: usize = 7 * core::mem::size_of::<u64>();
+    pub const SCHED_WAKE_STATS_VERSION: u64 = 1;
+    pub const SCHED_WAKE_STATS_SIZE: usize = 11 * core::mem::size_of::<u64>();
 
     // EXT_BUF payload layout for HOSTCALL_SUBMIT:
     // [u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 user_tag]

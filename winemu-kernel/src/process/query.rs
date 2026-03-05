@@ -27,11 +27,7 @@ pub fn query_information_process(
         26 => query_wow64_information(buf, buf_len, ret_len),
         27 => query_image_file_name(buf, buf_len, ret_len),
         _ => {
-            crate::kwarn!(
-                "nt: qip unsupported class={:#x} pid={:#x}",
-                info_class,
-                pid
-            );
+            crate::kwarn!("nt: qip unsupported class={:#x} pid={:#x}", info_class, pid);
             status::INVALID_PARAMETER
         }
     }
@@ -55,9 +51,9 @@ fn query_basic(pid: u32, buf: *mut u8, buf_len: usize, ret_len: *mut u32) -> u32
         return status::INFO_LENGTH_MISMATCH;
     }
 
-    let Some((exit_status, peb_va, parent_pid)) = with_process(pid, |p| {
-        (p.exit_status, p.peb_va, p.parent_pid)
-    }) else {
+    let Some((exit_status, peb_va, parent_pid)) =
+        with_process(pid, |p| (p.exit_status, p.peb_va, p.parent_pid))
+    else {
         return status::INVALID_HANDLE;
     };
 

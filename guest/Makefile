@@ -1,6 +1,6 @@
 include common.mk
 
-DLLS := ntdll win32u
+DLLS := ntdll win32u msvcrt
 TEST_EXE_DIR := ../tests/guest
 EXES := \
 	$(TEST_EXE_DIR)/hello_win \

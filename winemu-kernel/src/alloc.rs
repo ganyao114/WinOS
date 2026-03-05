@@ -36,7 +36,11 @@ pub fn init() {
 
 pub fn alloc(size: usize, align: usize) -> Option<*mut u8> {
     let ptr = crate::mm::kmalloc::alloc(size, align);
-    if ptr.is_null() { None } else { Some(ptr) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
 }
 
 pub fn dealloc(ptr: *mut u8) {
@@ -49,5 +53,9 @@ pub fn heap_end() -> u64 {
 
 pub fn alloc_zeroed(size: usize, align: usize) -> Option<*mut u8> {
     let ptr = crate::mm::kmalloc::alloc_zeroed(size, align);
-    if ptr.is_null() { None } else { Some(ptr) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
 }

@@ -27,15 +27,11 @@ pub fn set_information_process(
 
     match info_class {
         PROCESS_INFO_CLASS_ACCESS_TOKEN => set_access_token(pid, info, info_len),
-        PROCESS_INFO_CLASS_DEFAULT_HARD_ERROR_MODE => {
-            set_u32_field(pid, info, info_len)
-        }
+        PROCESS_INFO_CLASS_DEFAULT_HARD_ERROR_MODE => set_u32_field(pid, info, info_len),
         PROCESS_INFO_CLASS_PRIORITY_CLASS => set_priority_class(pid, info, info_len),
         PROCESS_INFO_CLASS_AFFINITY_MASK => set_affinity_mask(pid, info, info_len),
         PROCESS_INFO_CLASS_PRIORITY_BOOST => set_u32_field(pid, info, info_len),
-        PROCESS_INFO_CLASS_BREAK_ON_TERMINATION => {
-            set_u32_field(pid, info, info_len)
-        }
+        PROCESS_INFO_CLASS_BREAK_ON_TERMINATION => set_u32_field(pid, info, info_len),
         PROCESS_INFO_CLASS_DEBUG_FLAGS => set_u32_field(pid, info, info_len),
         PROCESS_INFO_CLASS_EXECUTE_FLAGS => set_u32_field(pid, info, info_len),
         PROCESS_INFO_CLASS_INSTRUMENTATION_CALLBACK => {
@@ -49,11 +45,7 @@ pub fn set_information_process(
     }
 }
 
-fn set_u32_field(
-    pid: u32,
-    info: *const u8,
-    info_len: usize,
-) -> u32 {
+fn set_u32_field(pid: u32, info: *const u8, info_len: usize) -> u32 {
     let _ = pid;
     if info.is_null() || info_len != core::mem::size_of::<u32>() {
         return status::INVALID_PARAMETER;

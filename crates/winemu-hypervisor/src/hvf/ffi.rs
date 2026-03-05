@@ -1,10 +1,13 @@
 #![allow(non_camel_case_types, dead_code)]
 
+use std::ffi::c_void;
+
 pub type hv_return_t = i32;
 pub type hv_vcpuid_t = u64;
 pub type hv_memory_flags_t = u64;
 pub type hv_reg_t = u32;
 pub type hv_sys_reg_t = u16;
+pub type hv_vm_config_t = *mut c_void;
 
 pub const HV_SUCCESS: hv_return_t = 0;
 pub const HV_EXIT_REASON_CANCELED: u32 = 0;
@@ -16,6 +19,7 @@ pub const HV_MEMORY_EXEC: hv_memory_flags_t = 1 << 2;
 pub const HV_INTERRUPT_TYPE_IRQ: u32 = 0;
 
 // ARM64 system register IDs (from <Hypervisor/hv_vcpu_types.h>)
+pub const HV_SYS_REG_MPIDR_EL1: u16 = 0xc005;
 pub const HV_SYS_REG_SCTLR_EL1: u16 = 0xc080;
 pub const HV_SYS_REG_TTBR0_EL1: u16 = 0xc100;
 pub const HV_SYS_REG_TTBR1_EL1: u16 = 0xc101;
@@ -53,6 +57,8 @@ pub struct mach_timebase_info_data_t {
 }
 
 extern "C" {
+    pub fn hv_vm_config_create() -> hv_vm_config_t;
+    pub fn hv_vm_get_max_vcpu_count(max_vcpu_count: *mut u32) -> hv_return_t;
     pub fn hv_vm_create(config: *mut std::ffi::c_void) -> hv_return_t;
     pub fn hv_vm_destroy() -> hv_return_t;
     pub fn hv_vm_map(uva: *mut u8, gpa: u64, size: usize, flags: hv_memory_flags_t) -> hv_return_t;

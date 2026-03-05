@@ -12,9 +12,20 @@ pub mod vcpu;
 use hypercall::HypercallManager;
 use memory::GuestMemory;
 use sched::Scheduler;
-use std::sync::{Arc, RwLock};
+use std::sync::{mpsc, Arc, RwLock};
 use winemu_core::{addr::Gpa, mem::MemProt, Result, WinemuError};
-use winemu_hypervisor::{Hypervisor, Vm, VmConfig};
+use winemu_hypervisor::{Hypervisor, Regs, Vm, VmConfig};
+
+#[cfg(target_arch = "aarch64")]
+const KERNEL_ENTRY_PC: u64 = 0x4000_0000;
+
+#[inline(always)]
+fn set_kernel_boot_entry_pc(regs: &mut Regs) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        regs.pc = KERNEL_ENTRY_PC;
+    }
+}
 
 pub struct Vmm {
     #[allow(dead_code)]
@@ -71,16 +82,10 @@ impl Vmm {
     }
 
     pub fn run(&mut self) -> Result<()> {
-        let mut vcpus = Vec::with_capacity(self.vcpu_count as usize);
-        for id in 0..self.vcpu_count {
-            let vcpu = self.vm.create_vcpu(id)?;
-            vcpus.push((id, vcpu));
-        }
-
-        if vcpus.len() == 1 {
-            let (id, vcpu) = vcpus.pop().unwrap();
+        if self.vcpu_count <= 1 {
+            let vcpu = self.vm.create_vcpu(0)?;
             vcpu::vcpu_thread(
-                id,
+                0,
                 vcpu,
                 Arc::clone(&self.hypercall_mgr),
                 Arc::clone(&self.sched),
@@ -89,39 +94,76 @@ impl Vmm {
             return Ok(());
         }
 
-        let mut joins = Vec::with_capacity(vcpus.len());
-        let mut main_vcpu: Option<Box<dyn winemu_hypervisor::Vcpu>> = None;
-        for (id, vcpu) in vcpus {
-            if id == 0 {
-                main_vcpu = Some(vcpu);
-                continue;
-            }
+        let vcpu0 = self.vm.create_vcpu(0)?;
+        let mut reset_regs = vcpu0.regs()?;
+        set_kernel_boot_entry_pc(&mut reset_regs);
+        let mut vcpu0 = vcpu0;
+        vcpu0.set_regs(&reset_regs)?;
+        let reset_special = vcpu0.special_regs()?;
+
+        let mut joins = Vec::with_capacity((self.vcpu_count - 1) as usize);
+        for id in 1..self.vcpu_count {
+            let vm = Arc::clone(&self.vm);
             let hc_mgr = Arc::clone(&self.hypercall_mgr);
             let sched = Arc::clone(&self.sched);
+            let reset_regs = reset_regs.clone();
+            let reset_special = reset_special.clone();
+            let (ready_tx, ready_rx) = mpsc::channel::<std::result::Result<(), String>>();
             let name = format!("winemu-vcpu-{id}");
             let handle = std::thread::Builder::new()
                 .name(name)
-                .spawn(move || {
+                .spawn(move || -> Result<()> {
+                    let mut vcpu = match vm.create_vcpu(id) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e.to_string()));
+                            return Err(e);
+                        }
+                    };
+                    if let Err(e) = vcpu.set_regs(&reset_regs) {
+                        let _ = ready_tx.send(Err(e.to_string()));
+                        return Err(e);
+                    }
+                    if let Err(e) = vcpu.set_special_regs(&reset_special) {
+                        let _ = ready_tx.send(Err(e.to_string()));
+                        return Err(e);
+                    }
+                    let _ = ready_tx.send(Ok(()));
                     vcpu::vcpu_thread(id, vcpu, hc_mgr, sched, false);
+                    Ok(())
                 })
                 .map_err(|e| WinemuError::Hypervisor(format!("spawn vcpu thread failed: {e}")))?;
+
+            match ready_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(msg)) => {
+                    return Err(WinemuError::Hypervisor(format!(
+                        "create vcpu{id} failed: {msg}"
+                    )));
+                }
+                Err(e) => {
+                    return Err(WinemuError::Hypervisor(format!(
+                        "vcpu{id} ready handshake failed: {e}"
+                    )));
+                }
+            }
+
             joins.push(handle);
         }
 
-        if let Some(vcpu0) = main_vcpu {
-            vcpu::vcpu_thread(
-                0,
-                vcpu0,
-                Arc::clone(&self.hypercall_mgr),
-                Arc::clone(&self.sched),
-                true,
-            );
-        }
+        vcpu::vcpu_thread(
+            0,
+            vcpu0,
+            Arc::clone(&self.hypercall_mgr),
+            Arc::clone(&self.sched),
+            true,
+        );
 
         for handle in joins {
-            handle
+            let thread_result = handle
                 .join()
                 .map_err(|_| WinemuError::Hypervisor("vcpu thread panicked".to_string()))?;
+            thread_result?;
         }
         Ok(())
     }

@@ -1,9 +1,9 @@
 // PE32+ 加载器 — Guest Kernel 内运行
 // 头部解析委托给 winemu_shared::pe，本模块只负责内存分配和加载
 
-use winemu_shared::pe::{self, PeHeaders, PeError};
 use crate::alloc;
 use crate::hypercall;
+use winemu_shared::pe::{self, PeError, PeHeaders};
 
 // ── 错误类型 ─────────────────────────────────────────────────
 
@@ -18,7 +18,9 @@ pub enum LdrError {
 }
 
 impl From<PeError> for LdrError {
-    fn from(e: PeError) -> Self { LdrError::Pe(e) }
+    fn from(e: PeError) -> Self {
+        LdrError::Pe(e)
+    }
 }
 
 pub type LdrResult<T> = Result<T, LdrError>;
@@ -26,8 +28,8 @@ pub type LdrResult<T> = Result<T, LdrError>;
 // ── 已加载镜像描述符 ─────────────────────────────────────────
 
 pub struct LoadedImage {
-    pub base:      u64,
-    pub size:      usize,
+    pub base: u64,
+    pub size: usize,
     pub entry_rva: u32,
 }
 
@@ -50,8 +52,7 @@ pub unsafe fn load_from_fd(
 ) -> LdrResult<LoadedImage> {
     // 1. 读取 PE 头部（4KB 足够覆盖 DOS + PE + section table）
     const HDR_BUF_SIZE: usize = 4096;
-    let hdr_buf = alloc::alloc_zeroed(HDR_BUF_SIZE, 16)
-        .ok_or(LdrError::AllocFailed)?;
+    let hdr_buf = alloc::alloc_zeroed(HDR_BUF_SIZE, 16).ok_or(LdrError::AllocFailed)?;
     let read_len = HDR_BUF_SIZE.min(file_size as usize);
     let got = hypercall::host_read(fd, hdr_buf, read_len, 0);
     if got == 0 {
@@ -69,8 +70,8 @@ pub unsafe fn load_from_fd(
     }
 
     // 3. 分配镜像内存
-    let buf = alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096)
-        .ok_or(LdrError::AllocFailed)?;
+    let buf =
+        alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096).ok_or(LdrError::AllocFailed)?;
     let load_base = buf as u64;
 
     // 4. 复制头部到镜像基址
@@ -108,8 +109,8 @@ pub unsafe fn load_from_fd(
     }
 
     Ok(LoadedImage {
-        base:      load_base,
-        size:      hdrs.size_of_image as usize,
+        base: load_base,
+        size: hdrs.size_of_image as usize,
         entry_rva: hdrs.entry_rva,
     })
 }
@@ -127,8 +128,8 @@ pub unsafe fn load(
         return Err(LdrError::NotArm64);
     }
 
-    let buf = alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096)
-        .ok_or(LdrError::AllocFailed)?;
+    let buf =
+        alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096).ok_or(LdrError::AllocFailed)?;
     crate::kdebug!("ldr: alloc ok");
     let load_base = buf as u64;
 
@@ -141,8 +142,8 @@ pub unsafe fn load(
     // 复制各 section
     for sec in hdrs.sections() {
         if sec.raw_size > 0 {
-            let src_off  = sec.raw_off as usize;
-            let dst_off  = sec.vaddr as usize;
+            let src_off = sec.raw_off as usize;
+            let dst_off = sec.vaddr as usize;
             let copy_len = (sec.raw_size as usize).min(sec.vsize as usize);
             if src_off + copy_len <= image.len() {
                 core::ptr::copy_nonoverlapping(
@@ -172,8 +173,8 @@ pub unsafe fn load(
     }
 
     Ok(LoadedImage {
-        base:      load_base,
-        size:      hdrs.size_of_image as usize,
+        base: load_base,
+        size: hdrs.size_of_image as usize,
         entry_rva: hdrs.entry_rva,
     })
 }
@@ -196,7 +197,8 @@ pub unsafe fn load_from_fd_unlinked(fd: u64, file_size: u64) -> LdrResult<Loaded
         return Err(LdrError::NotArm64);
     }
 
-    let buf = alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096).ok_or(LdrError::AllocFailed)?;
+    let buf =
+        alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096).ok_or(LdrError::AllocFailed)?;
     crate::kdebug!("ldr: alloc ok");
     let load_base = buf as u64;
 
@@ -240,7 +242,8 @@ pub unsafe fn load_unlinked(image: &[u8]) -> LdrResult<LoadedImage> {
         return Err(LdrError::NotArm64);
     }
 
-    let buf = alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096).ok_or(LdrError::AllocFailed)?;
+    let buf =
+        alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096).ok_or(LdrError::AllocFailed)?;
     crate::kdebug!("ldr: alloc ok");
     let load_base = buf as u64;
 
@@ -255,7 +258,11 @@ pub unsafe fn load_unlinked(image: &[u8]) -> LdrResult<LoadedImage> {
             let dst_off = sec.vaddr as usize;
             let copy_len = (sec.raw_size as usize).min(sec.vsize as usize);
             if src_off + copy_len <= image.len() {
-                core::ptr::copy_nonoverlapping(image.as_ptr().add(src_off), buf.add(dst_off), copy_len);
+                core::ptr::copy_nonoverlapping(
+                    image.as_ptr().add(src_off),
+                    buf.add(dst_off),
+                    copy_len,
+                );
             }
         }
     }
@@ -307,18 +314,23 @@ unsafe fn read_import_dir(image: *const u8) -> Option<(usize, usize)> {
 // ── 重定位 ───────────────────────────────────────────────────
 
 unsafe fn apply_relocations(
-    base: *mut u8, reloc_rva: usize, reloc_size: usize, delta: i64,
+    base: *mut u8,
+    reloc_rva: usize,
+    reloc_size: usize,
+    delta: i64,
 ) -> LdrResult<()> {
     let mut off = 0usize;
     while off + 8 <= reloc_size {
-        let blk        = base.add(reloc_rva + off);
-        let page_rva   = pe::ru32(blk) as usize;
+        let blk = base.add(reloc_rva + off);
+        let page_rva = pe::ru32(blk) as usize;
         let block_size = pe::ru32(blk.add(4)) as usize;
-        if block_size < 8 { break; }
+        if block_size < 8 {
+            break;
+        }
         let entries = (block_size - 8) / 2;
         for i in 0..entries {
-            let entry    = pe::ru16(blk.add(8 + i * 2));
-            let typ      = (entry >> 12) as u8;
+            let entry = pe::ru16(blk.add(8 + i * 2));
+            let typ = (entry >> 12) as u8;
             let page_off = (entry & 0x0FFF) as usize;
             match typ {
                 pe::REL_ABSOLUTE => {}
@@ -338,31 +350,40 @@ unsafe fn apply_relocations(
 // ── 导入 ─────────────────────────────────────────────────────
 
 unsafe fn apply_imports(
-    base: *mut u8, imp_rva: usize,
+    base: *mut u8,
+    imp_rva: usize,
     resolve: &impl Fn(&str, ImportRef) -> Option<u64>,
 ) -> LdrResult<()> {
     const ID_ORIG_FIRST_THUNK: usize = 0;
-    const ID_NAME_RVA:         usize = 12;
-    const ID_FIRST_THUNK:      usize = 16;
-    const ID_SIZE:             usize = 20;
+    const ID_NAME_RVA: usize = 12;
+    const ID_FIRST_THUNK: usize = 16;
+    const ID_SIZE: usize = 20;
 
     let mut desc_off = imp_rva;
     loop {
-        let desc     = base.add(desc_off);
+        let desc = base.add(desc_off);
         let name_rva = pe::ru32(desc.add(ID_NAME_RVA)) as usize;
-        if name_rva == 0 { break; }
+        if name_rva == 0 {
+            break;
+        }
 
         let dll_name = cstr(base.add(name_rva));
-        let iat_rva  = pe::ru32(desc.add(ID_FIRST_THUNK)) as usize;
-        let oft_rva  = {
+        let iat_rva = pe::ru32(desc.add(ID_FIRST_THUNK)) as usize;
+        let oft_rva = {
             let v = pe::ru32(desc.add(ID_ORIG_FIRST_THUNK)) as usize;
-            if v != 0 { v } else { iat_rva }
+            if v != 0 {
+                v
+            } else {
+                iat_rva
+            }
         };
 
         let mut slot = 0usize;
         loop {
             let thunk = pe::ru64(base.add(oft_rva + slot * 8));
-            if thunk == 0 { break; }
+            if thunk == 0 {
+                break;
+            }
             let iref = if thunk & (1u64 << 63) != 0 {
                 ImportRef::Ordinal((thunk & 0xFFFF) as u16)
             } else {
@@ -411,7 +432,9 @@ unsafe fn apply_imports(
                     crate::log::debug_print(" -> ");
                     crate::log::debug_u64(addr);
                     crate::log::debug_print(" slot=");
-                    crate::log::debug_u64((base as u64).saturating_add(iat_rva as u64 + (slot as u64) * 8));
+                    crate::log::debug_u64(
+                        (base as u64).saturating_add(iat_rva as u64 + (slot as u64) * 8),
+                    );
                     crate::log::debug_print("\n");
                 }
                 if dll_name.eq_ignore_ascii_case("kernel32.dll")
@@ -484,6 +507,8 @@ fn should_remap_kernel32_to_ntdll(fn_name: &str) -> bool {
 
 unsafe fn cstr<'a>(p: *const u8) -> &'a str {
     let mut len = 0;
-    while *p.add(len) != 0 { len += 1; }
+    while *p.add(len) != 0 {
+        len += 1;
+    }
     core::str::from_utf8_unchecked(core::slice::from_raw_parts(p, len))
 }

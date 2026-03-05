@@ -567,7 +567,8 @@ impl AllocState {
             self.cache_remove_partial(cache_idx, pidx);
         }
         self.stats.small_allocs = self.stats.small_allocs.saturating_add(1);
-        self.small_alloc_by_cache[cache_idx] = self.small_alloc_by_cache[cache_idx].saturating_add(1);
+        self.small_alloc_by_cache[cache_idx] =
+            self.small_alloc_by_cache[cache_idx].saturating_add(1);
         obj_ptr
     }
 
@@ -793,7 +794,8 @@ impl AllocState {
         let mut total = 0usize;
         let mut order = 0usize;
         while order < NUM_ORDERS {
-            total = total.saturating_add((self.count_free_blocks_for_order(order) as usize) << order);
+            total =
+                total.saturating_add((self.count_free_blocks_for_order(order) as usize) << order);
             order += 1;
         }
         total
@@ -1219,7 +1221,8 @@ impl KmallocManager {
         let mut victim_pages = 0usize;
         let mut i = 1usize;
         while i < MAX_ARENAS {
-            if self.metas[i].active && self.metas[i].dynamic && self.arenas[i].is_completely_free() {
+            if self.metas[i].active && self.metas[i].dynamic && self.arenas[i].is_completely_free()
+            {
                 let pages = self.metas[i].pages;
                 if pages > victim_pages {
                     victim = Some(i);
@@ -1507,7 +1510,9 @@ impl KmallocManager {
             .saturating_add(self.direct_alloc_failures);
         out.free_calls = out.free_calls.saturating_add(self.direct_free_count);
         out.large_allocs = out.large_allocs.saturating_add(self.direct_alloc_count);
-        out.alloc_failures = out.alloc_failures.saturating_add(self.direct_alloc_failures);
+        out.alloc_failures = out
+            .alloc_failures
+            .saturating_add(self.direct_alloc_failures);
         out
     }
 
@@ -1549,23 +1554,36 @@ impl KmallocManager {
                 let s = self.arenas[i].snapshot();
                 out.stats.alloc_calls = out.stats.alloc_calls.saturating_add(s.stats.alloc_calls);
                 out.stats.free_calls = out.stats.free_calls.saturating_add(s.stats.free_calls);
-                out.stats.small_allocs = out.stats.small_allocs.saturating_add(s.stats.small_allocs);
-                out.stats.large_allocs = out.stats.large_allocs.saturating_add(s.stats.large_allocs);
-                out.stats.alloc_failures =
-                    out.stats.alloc_failures.saturating_add(s.stats.alloc_failures);
-                out.stats.invalid_frees = out.stats.invalid_frees.saturating_add(s.stats.invalid_frees);
-                out.alloc_fail_precheck =
-                    out.alloc_fail_precheck.saturating_add(s.alloc_fail_precheck);
-                out.alloc_fail_small_oom =
-                    out.alloc_fail_small_oom.saturating_add(s.alloc_fail_small_oom);
-                out.alloc_fail_large_oom =
-                    out.alloc_fail_large_oom.saturating_add(s.alloc_fail_large_oom);
-                out.alloc_fail_corruption =
-                    out.alloc_fail_corruption.saturating_add(s.alloc_fail_corruption);
-                out.invalid_free_bad_ptr =
-                    out.invalid_free_bad_ptr.saturating_add(s.invalid_free_bad_ptr);
-                out.invalid_free_double =
-                    out.invalid_free_double.saturating_add(s.invalid_free_double);
+                out.stats.small_allocs =
+                    out.stats.small_allocs.saturating_add(s.stats.small_allocs);
+                out.stats.large_allocs =
+                    out.stats.large_allocs.saturating_add(s.stats.large_allocs);
+                out.stats.alloc_failures = out
+                    .stats
+                    .alloc_failures
+                    .saturating_add(s.stats.alloc_failures);
+                out.stats.invalid_frees = out
+                    .stats
+                    .invalid_frees
+                    .saturating_add(s.stats.invalid_frees);
+                out.alloc_fail_precheck = out
+                    .alloc_fail_precheck
+                    .saturating_add(s.alloc_fail_precheck);
+                out.alloc_fail_small_oom = out
+                    .alloc_fail_small_oom
+                    .saturating_add(s.alloc_fail_small_oom);
+                out.alloc_fail_large_oom = out
+                    .alloc_fail_large_oom
+                    .saturating_add(s.alloc_fail_large_oom);
+                out.alloc_fail_corruption = out
+                    .alloc_fail_corruption
+                    .saturating_add(s.alloc_fail_corruption);
+                out.invalid_free_bad_ptr = out
+                    .invalid_free_bad_ptr
+                    .saturating_add(s.invalid_free_bad_ptr);
+                out.invalid_free_double = out
+                    .invalid_free_double
+                    .saturating_add(s.invalid_free_double);
                 out.free_pages_total = out.free_pages_total.saturating_add(s.free_pages_total);
                 if s.largest_free_order > out.largest_free_order {
                     out.largest_free_order = s.largest_free_order;
@@ -1577,8 +1595,8 @@ impl KmallocManager {
                         out.small_alloc_by_cache[c].saturating_add(s.small_alloc_by_cache[c]);
                     out.small_free_by_cache[c] =
                         out.small_free_by_cache[c].saturating_add(s.small_free_by_cache[c]);
-                    out.partial_slabs_by_cache[c] = out.partial_slabs_by_cache[c]
-                        .saturating_add(s.partial_slabs_by_cache[c]);
+                    out.partial_slabs_by_cache[c] =
+                        out.partial_slabs_by_cache[c].saturating_add(s.partial_slabs_by_cache[c]);
                     out.full_slabs_by_cache[c] =
                         out.full_slabs_by_cache[c].saturating_add(s.full_slabs_by_cache[c]);
                     c += 1;
@@ -1606,7 +1624,10 @@ impl KmallocManager {
             .saturating_add(self.direct_alloc_count)
             .saturating_add(self.direct_alloc_failures);
         out.stats.free_calls = out.stats.free_calls.saturating_add(self.direct_free_count);
-        out.stats.large_allocs = out.stats.large_allocs.saturating_add(self.direct_alloc_count);
+        out.stats.large_allocs = out
+            .stats
+            .large_allocs
+            .saturating_add(self.direct_alloc_count);
         out.stats.alloc_failures = out
             .stats
             .alloc_failures

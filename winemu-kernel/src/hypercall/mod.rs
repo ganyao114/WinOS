@@ -5,7 +5,8 @@ use winemu_shared::nr;
 
 pub use crate::log::{logf, LogLevel};
 pub use hostcall::{
-    hostcall_cancel, hostcall_poll_batch, hostcall_setup, hostcall_submit_tagged,
+    hostcall_cancel, hostcall_poll_batch, hostcall_query_sched_wake_stats, hostcall_setup,
+    hostcall_submit_tagged,
     HostCallCompletion,
 };
 
@@ -56,17 +57,25 @@ fn hostcall_sync(opcode: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> (u6
     }
 }
 
-/// KERNEL_READY — 通知 VMM 内核已就绪，传入 PE 入口点、栈、TEB、heap_start
-/// 返回 Thread 0 的 tid
-pub fn kernel_ready(entry_va: u64, stack_va: u64, teb_gva: u64, heap_start: u64) -> u64 {
+/// KERNEL_READY — 通知 VMM 内核已就绪，传入 PE 入口点、栈、TEB、heap_start。
+/// x5/x6 预留；当前固定传 0。
+/// 返回值仅用于诊断（当前实现固定为 0）。
+pub fn kernel_ready(
+    entry_va: u64,
+    stack_va: u64,
+    teb_gva: u64,
+    heap_start: u64,
+    reserved0: u64,
+    reserved1: u64,
+) -> u64 {
     hypercall6(
         nr::KERNEL_READY,
         entry_va,
         stack_va,
         teb_gva,
         heap_start,
-        0,
-        0,
+        reserved0,
+        reserved1,
     )
 }
 
@@ -76,17 +85,6 @@ pub fn debug_print(msg: &str) {
 
 pub fn process_exit(code: u32) -> ! {
     hypercall(nr::PROCESS_EXIT, code as u64, 0, 0);
-    loop {
-        crate::arch::cpu::wait_for_interrupt();
-    }
-}
-
-pub fn thread_create(entry_va: u64, stack_va: u64, arg: u64, teb_gva: u64) -> u64 {
-    hypercall6(nr::THREAD_CREATE, entry_va, stack_va, arg, teb_gva, 0, 0)
-}
-
-pub fn thread_exit(code: u32) -> ! {
-    hypercall(nr::THREAD_EXIT, code as u64, 0, 0);
     loop {
         crate::arch::cpu::wait_for_interrupt();
     }

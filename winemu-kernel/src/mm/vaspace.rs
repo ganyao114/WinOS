@@ -10,12 +10,12 @@ const MAX_VMAS: usize = 256;
 pub struct VmProt(pub u32);
 
 impl VmProt {
-    pub const READ:  VmProt = VmProt(0x01);
+    pub const READ: VmProt = VmProt(0x01);
     pub const WRITE: VmProt = VmProt(0x02);
-    pub const EXEC:  VmProt = VmProt(0x04);
-    pub const RW:    VmProt = VmProt(0x03);
-    pub const RX:    VmProt = VmProt(0x05);
-    pub const RWX:   VmProt = VmProt(0x07);
+    pub const EXEC: VmProt = VmProt(0x04);
+    pub const RW: VmProt = VmProt(0x03);
+    pub const RX: VmProt = VmProt(0x05);
+    pub const RWX: VmProt = VmProt(0x07);
 
     pub fn contains(self, other: VmProt) -> bool {
         (self.0 & other.0) == other.0
@@ -57,7 +57,8 @@ impl VaSpace {
     pub const fn new() -> Self {
         Self {
             vmas: [Vma {
-                base: 0, size: 0,
+                base: 0,
+                size: 0,
                 prot: VmProt(0),
                 vma_type: VmaType::Private,
             }; MAX_VMAS],
@@ -111,25 +112,39 @@ impl VaSpace {
     /// Allocate a VA region. hint=0 → first-fit search.
     /// Returns the base VA on success.
     pub fn allocate(
-        &mut self, hint: u64, size: u64,
-        prot: VmProt, vma_type: VmaType,
+        &mut self,
+        hint: u64,
+        size: u64,
+        prot: VmProt,
+        vma_type: VmaType,
     ) -> Option<u64> {
         let size = page_align_up(size);
-        if size == 0 { return None; }
+        if size == 0 {
+            return None;
+        }
 
         let base = if hint != 0 {
             let hint = page_align_down(hint);
             if hint < self.alloc_base || hint + size > self.alloc_limit {
                 return None;
             }
-            if self.overlaps(hint, size) { return None; }
+            if self.overlaps(hint, size) {
+                return None;
+            }
             hint
         } else {
             self.find_gap(size)?
         };
 
-        let vma = Vma { base, size, prot, vma_type };
-        if !self.insert_sorted(vma) { return None; }
+        let vma = Vma {
+            base,
+            size,
+            prot,
+            vma_type,
+        };
+        if !self.insert_sorted(vma) {
+            return None;
+        }
         Some(base)
     }
 
@@ -180,7 +195,9 @@ impl VaSpace {
         let mut cursor = self.alloc_base;
         for i in 0..self.count {
             let v = &self.vmas[i];
-            if v.base + v.size <= cursor { continue; }
+            if v.base + v.size <= cursor {
+                continue;
+            }
             if v.base >= cursor + size {
                 return Some(cursor);
             }
@@ -195,7 +212,11 @@ impl VaSpace {
 }
 
 #[inline(always)]
-fn page_align_up(v: u64) -> u64 { (v + 0xFFF) & !0xFFF }
+fn page_align_up(v: u64) -> u64 {
+    (v + 0xFFF) & !0xFFF
+}
 
 #[inline(always)]
-fn page_align_down(v: u64) -> u64 { v & !0xFFF }
+fn page_align_down(v: u64) -> u64 {
+    v & !0xFFF
+}

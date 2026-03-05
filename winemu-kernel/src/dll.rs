@@ -178,7 +178,11 @@ fn open_dll_file(dll_name: &str) -> u64 {
     u64::MAX
 }
 
-fn load_mapped_dll(fd: u64, file_size: u64, dll_name: &str) -> Result<ldr::LoadedImage, ldr::LdrError> {
+fn load_mapped_dll(
+    fd: u64,
+    file_size: u64,
+    dll_name: &str,
+) -> Result<ldr::LoadedImage, ldr::LdrError> {
     let map_base = hypercall::host_mmap_untracked(fd, 0, file_size, 0x02);
     let loaded = if map_base == 0 || map_base < GUEST_RAM_BASE {
         if map_base != 0 {
@@ -186,7 +190,8 @@ fn load_mapped_dll(fd: u64, file_size: u64, dll_name: &str) -> Result<ldr::Loade
         }
         unsafe { ldr::load_from_fd_unlinked(fd, file_size) }
     } else {
-        let image = unsafe { core::slice::from_raw_parts(map_base as *const u8, file_size as usize) };
+        let image =
+            unsafe { core::slice::from_raw_parts(map_base as *const u8, file_size as usize) };
         let out = unsafe { ldr::load_unlinked(image) };
         let _ = hypercall::host_munmap(map_base, file_size);
         out
@@ -218,7 +223,11 @@ fn load_mapped_dll(fd: u64, file_size: u64, dll_name: &str) -> Result<ldr::Loade
         }
     }
 
-    let linked = unsafe { ldr::link_imports(loaded.base, |dep_name, dep_imp| resolve_import(dep_name, dep_imp)) };
+    let linked = unsafe {
+        ldr::link_imports(loaded.base, |dep_name, dep_imp| {
+            resolve_import(dep_name, dep_imp)
+        })
+    };
     if linked.is_err() {
         forget_loaded(dll_name);
         return linked.map(|_| loaded);
@@ -283,9 +292,10 @@ fn apply_runtime_compat_bootstrap(dll_name: &str, base: u64, size: u64) {
         const KB_LOCALE_TABLE_PTR: u64 = 0x13F950;
         let slot_va = base.saturating_add(ALT_IAT_RTL_OPEN_CROSS);
         if slot_va >= base && slot_va.saturating_add(8) <= base.saturating_add(size) {
-            if let Some(addr) =
-                resolve_import("ntdll.dll", ImportRef::Name("RtlOpenCrossProcessEmulatorWorkConnection"))
-            {
+            if let Some(addr) = resolve_import(
+                "ntdll.dll",
+                ImportRef::Name("RtlOpenCrossProcessEmulatorWorkConnection"),
+            ) {
                 unsafe {
                     (slot_va as *mut u64).write_volatile(addr);
                 }
@@ -513,7 +523,13 @@ fn read_export_dir(base: u64) -> Option<(usize, usize, usize, usize, usize, u64,
     }
 }
 
-fn resolve_export_target(base: u64, fn_rva: u32, exp_rva: u32, exp_size: u32, depth: u8) -> Option<u64> {
+fn resolve_export_target(
+    base: u64,
+    fn_rva: u32,
+    exp_rva: u32,
+    exp_size: u32,
+    depth: u8,
+) -> Option<u64> {
     let fn_rva_u64 = fn_rva as u64;
     let exp_lo = exp_rva as u64;
     let exp_hi = exp_lo.saturating_add(exp_size as u64);

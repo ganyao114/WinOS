@@ -1,8 +1,12 @@
 use super::hypercall::{HypercallManager, HypercallResult};
-use super::sched::{SchedResult, Scheduler, ThreadContext, ThreadId};
+use super::sched::Scheduler;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use winemu_hypervisor::{types::VmExit, Vcpu};
+
+const HOSTCALL_MAIN_BUDGET: usize = 32;
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 pub fn vcpu_thread(
     vcpu_id: u32,
@@ -11,262 +15,163 @@ pub fn vcpu_thread(
     sched: Arc<Scheduler>,
     main_executor: bool,
 ) {
-    const HOSTCALL_MAIN_BUDGET: usize = 32;
-    // ── Phase 1: 直接运行 Guest Kernel，直到 KERNEL_READY ────────
-    // 内核不是调度线程，用 ThreadId(0) 作为占位符
-    let kernel_tid = ThreadId(0);
-    'kernel: loop {
-        if main_executor {
-            let _ = hc_mgr.pump_hostcall_main_thread(HOSTCALL_MAIN_BUDGET);
-        }
-        let exit = match vcpu.run() {
-            Ok(e) => e,
-            Err(e) => {
-                log::error!("vcpu{} kernel run error: {:?}", vcpu_id, e);
-                return;
-            }
-        };
-        match exit {
-            VmExit::Wfi => {
-                let _ = vcpu.advance_pc(4);
-                if let Some(wait) = bounded_wfi_wait(vcpu.as_ref()) {
-                    std::thread::park_timeout(wait);
-                }
-                continue 'kernel;
-            }
-            VmExit::Timer => {
-                // Phase 1 should not arm timers; ignore defensively.
-                continue 'kernel;
-            }
-            VmExit::Hypercall { nr, args } => {
-                let is_ready = nr == winemu_shared::nr::KERNEL_READY;
-                let result = hc_mgr.dispatch(nr, args, kernel_tid);
-                match result {
-                    HypercallResult::Sync(ret) => {
-                        set_x0(&mut *vcpu, ret);
-                        // HVF auto-advances PC past hvc — do NOT call advance_pc
-                    }
-                    HypercallResult::Sync2 { x0, x1 } => {
-                        set_x0_x1(&mut *vcpu, x0, x1);
-                    }
-                    HypercallResult::Sched(SchedResult::Exit(code)) => {
-                        log::info!("vcpu{} kernel exited: code={}", vcpu_id, code);
-                        return;
-                    }
-                    HypercallResult::Sched(_) => {
-                        // HVF auto-advances PC
-                    }
-                }
-                if is_ready {
-                    break 'kernel;
-                }
-            }
-            VmExit::Halt | VmExit::Shutdown => {
-                log::info!("vcpu{} kernel halted in phase 1", vcpu_id);
-                return;
-            }
-            exit => {
-                if let Ok(r) = vcpu.regs() {
-                    log::warn!(
-                        "vcpu{} phase1 unhandled vmexit: {:?} pc={:#x} pstate={:#x} sp={:#x}",
-                        vcpu_id,
-                        exit,
-                        r.pc,
-                        r.pstate,
-                        r.sp
-                    );
-                } else {
-                    log::warn!("vcpu{} phase1 unhandled vmexit: {:?}", vcpu_id, exit);
-                }
-                return;
-            }
-        }
-    }
-
-    log::info!("vcpu{} kernel ready — entering scheduler loop", vcpu_id);
-
-    // ── Phase 2: 调度循环，运行 Guest 用户线程 ───────────────────
     sched.register_vcpu_thread(vcpu_id);
-    let mut current: Option<ThreadId> = None;
     let mut external_irq_asserted = false;
 
-    'run: loop {
-        if main_executor {
-            let _ = hc_mgr.pump_hostcall_main_thread(HOSTCALL_MAIN_BUDGET);
-        }
-        if sched.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+    loop {
+        pump_hostcall_main_thread(hc_mgr.as_ref(), main_executor);
+
+        if sched.shutdown.load(Ordering::Acquire) {
             log::info!("vcpu{} all threads terminated — shutting down", vcpu_id);
-            break 'run;
-        }
-        if current.is_none() {
-            current = sched.pop_ready();
-            if current.is_none() {
-                sched.set_vcpu_idle(vcpu_id, true);
-                std::thread::park_timeout(Duration::from_millis(1));
-                sched.set_vcpu_idle(vcpu_id, false);
-                sched.check_timeouts();
-                continue;
-            }
-        }
-        sched.set_vcpu_idle(vcpu_id, false);
-        let tid = current.unwrap();
-
-        let ctx = match sched.take_ctx(tid) {
-            Some(c) => c,
-            None => {
-                current = None;
-                continue;
-            }
-        };
-        restore_ctx(&mut *vcpu, &ctx);
-
-        if !external_irq_asserted && sched.take_external_irq_request() {
-            if let Err(e) = vcpu.set_pending_irq(true) {
-                log::warn!("vcpu{} set_pending_irq(true) failed: {:?}", vcpu_id, e);
-            } else {
-                external_irq_asserted = true;
-            }
+            break;
         }
 
-        let exit = match vcpu.run() {
-            Ok(e) => e,
-            Err(e) => {
-                log::error!("vcpu{} run error: {:?}", vcpu_id, e);
-                break;
-            }
-        };
-
-        let clear_external_irq = external_irq_asserted
-            && matches!(
-                exit,
-                VmExit::Hypercall { .. } | VmExit::Halt | VmExit::Shutdown
-            );
-        if clear_external_irq {
-            if let Err(e) = vcpu.set_pending_irq(false) {
-                log::warn!("vcpu{} set_pending_irq(false) failed: {:?}", vcpu_id, e);
-            }
-            external_irq_asserted = false;
-        }
-
-        match exit {
-            VmExit::Wfi => {
-                // HVF traps WFI/WFE as a synchronous exit. Emulate completion.
-                let _ = vcpu.advance_pc(4);
-                if let Some(wait) = bounded_wfi_wait(vcpu.as_ref()) {
-                    sched.set_vcpu_idle(vcpu_id, true);
-                    std::thread::park_timeout(wait);
-                    sched.set_vcpu_idle(vcpu_id, false);
-                }
-                let ctx = save_ctx(&mut *vcpu);
-                sched.save_ctx(tid, ctx);
-                continue 'run;
-            }
-            VmExit::Timer => {
-                // Timer IRQ is already marked pending in HVF backend.
-                // Save current guest context first, otherwise next loop would
-                // restore a stale context and lose the pending-IRQ return point.
-                let ctx = save_ctx(&mut *vcpu);
-                sched.save_ctx(tid, ctx);
-                // Resume guest so EL1 IRQ vector can run and wake the scheduler.
-                continue 'run;
-            }
-            VmExit::Hypercall { nr, args } => {
-                let result = hc_mgr.dispatch(nr, args, tid);
-                match result {
-                    HypercallResult::Sync(ret) | HypercallResult::Sched(SchedResult::Sync(ret)) => {
-                        set_x0(&mut *vcpu, ret);
-                        let ctx = save_ctx(&mut *vcpu);
-                        sched.save_ctx(tid, ctx);
-                    }
-                    HypercallResult::Sync2 { x0, x1 } => {
-                        set_x0_x1(&mut *vcpu, x0, x1);
-                        let ctx = save_ctx(&mut *vcpu);
-                        sched.save_ctx(tid, ctx);
-                    }
-                    HypercallResult::Sched(SchedResult::Block(req)) => {
-                        let ctx = save_ctx(&mut *vcpu);
-                        sched.save_ctx(tid, ctx);
-                        sched.set_waiting(tid, req);
-                        current = None;
-                    }
-                    HypercallResult::Sched(SchedResult::Yield) => {
-                        let ctx = save_ctx(&mut *vcpu);
-                        sched.save_ctx(tid, ctx);
-                        sched.push_ready(tid);
-                        current = None;
-                    }
-                    HypercallResult::Sched(SchedResult::Exit(code)) => {
-                        let ctx = save_ctx(&mut *vcpu);
-                        sched.save_ctx(tid, ctx);
-                        sched.terminate(tid, code);
-                        current = None;
-                    }
-                }
-            }
-            VmExit::Halt | VmExit::Shutdown => {
-                log::info!("vcpu{} halted", vcpu_id);
-                break;
-            }
-            exit => {
-                if let Ok(r) = vcpu.regs() {
-                    log::warn!(
-                        "vcpu{} unhandled vmexit: {:?} pc={:#x} pstate={:#x} sp={:#x}",
-                        vcpu_id,
-                        exit,
-                        r.pc,
-                        r.pstate,
-                        r.sp
-                    );
-                } else {
-                    log::warn!("vcpu{} unhandled vmexit: {:?}", vcpu_id, exit);
-                }
-                let _ = vcpu.advance_pc(4);
-                let ctx = save_ctx(&mut *vcpu);
-                sched.save_ctx(tid, ctx);
-            }
-        }
-    }
-}
-
-// ── 寄存器辅助 ───────────────────────────────────────────────
-
-fn restore_ctx(vcpu: &mut dyn Vcpu, ctx: &ThreadContext) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let mut regs = vcpu.regs().unwrap();
-        regs.x[..31].copy_from_slice(&ctx.gpr[..31]);
-        regs.sp = ctx.gpr[31];
-        regs.pc = ctx.gpr[32];
-        regs.pstate = ctx.pstate;
-        vcpu.set_regs(&regs).unwrap();
-        // Verify SP was set correctly
-        let check = vcpu.regs().unwrap();
-        log::debug!(
-            "restore_ctx: pc={:#x} sp={:#x} pstate={:#x} (wanted sp={:#x})",
-            check.pc,
-            check.sp,
-            check.pstate,
-            ctx.gpr[31]
+        maybe_assert_external_irq(
+            vcpu_id,
+            &mut *vcpu,
+            sched.as_ref(),
+            &mut external_irq_asserted,
         );
-        if ctx.fp_dirty {
-            // TODO: vcpu FP register API (Phase 3)
+
+        let Some(exit) = run_vcpu_once(vcpu_id, &mut *vcpu, sched.as_ref()) else {
+            break;
+        };
+
+        maybe_clear_external_irq(vcpu_id, &mut *vcpu, &exit, &mut external_irq_asserted);
+
+        if !handle_vmexit(vcpu_id, &mut *vcpu, hc_mgr.as_ref(), sched.as_ref(), exit) {
+            break;
         }
     }
 }
 
-fn save_ctx(vcpu: &mut dyn Vcpu) -> ThreadContext {
-    let mut ctx = ThreadContext::default();
-    #[cfg(target_arch = "aarch64")]
-    {
-        let regs = vcpu.regs().unwrap();
-        ctx.gpr[..31].copy_from_slice(&regs.x[..31]);
-        ctx.gpr[31] = regs.sp;
-        ctx.gpr[32] = regs.pc;
-        ctx.pstate = regs.pstate as u64;
-        // FP 延迟保存：暂不保存（Phase 3 加 fp_dirty 检测）
-        ctx.fp_dirty = false;
+fn handle_vmexit(
+    vcpu_id: u32,
+    vcpu: &mut dyn Vcpu,
+    hc_mgr: &HypercallManager,
+    sched: &Scheduler,
+    exit: VmExit,
+) -> bool {
+    match exit {
+        VmExit::Wfi => {
+            let _ = vcpu.advance_pc(4);
+            let wait = bounded_wfi_wait(vcpu).unwrap_or(IDLE_POLL_INTERVAL);
+            wait_while_idle(sched, vcpu_id, wait);
+            true
+        }
+        VmExit::Timer => true,
+        VmExit::Hypercall { nr, args } => {
+            let result = hc_mgr.dispatch(nr, args);
+            if let Some(code) = apply_hypercall_result_to_regs(vcpu, result) {
+                log::info!("vcpu{} exited: code={}", vcpu_id, code);
+                return false;
+            }
+            true
+        }
+        VmExit::Halt | VmExit::Shutdown => {
+            log::info!("vcpu{} halted", vcpu_id);
+            false
+        }
+        other => {
+            log_unhandled_vmexit(vcpu_id, vcpu, &other);
+            if vcpu_id == 0 {
+                return false;
+            }
+            let _ = vcpu.advance_pc(4);
+            true
+        }
     }
-    ctx
+}
+
+fn run_vcpu_once(vcpu_id: u32, vcpu: &mut dyn Vcpu, sched: &Scheduler) -> Option<VmExit> {
+    match vcpu.run() {
+        Ok(e) => Some(e),
+        Err(e) => {
+            let err_text = format!("{:?}", e);
+            let canceled = err_text.contains("canceled");
+            if sched.shutdown.load(Ordering::Acquire) || canceled {
+                log::debug!("vcpu{} run canceled on shutdown: {}", vcpu_id, err_text);
+            } else {
+                log::error!("vcpu{} run error: {}", vcpu_id, err_text);
+            }
+            None
+        }
+    }
+}
+
+fn pump_hostcall_main_thread(hc_mgr: &HypercallManager, main_executor: bool) {
+    if main_executor {
+        let _ = hc_mgr.pump_hostcall_main_thread(HOSTCALL_MAIN_BUDGET);
+    }
+}
+
+fn wait_while_idle(sched: &Scheduler, vcpu_id: u32, timeout: Duration) {
+    sched.set_vcpu_idle(vcpu_id, true);
+    sched.wait_for_wakeup(timeout);
+    sched.set_vcpu_idle(vcpu_id, false);
+}
+
+fn maybe_assert_external_irq(
+    vcpu_id: u32,
+    vcpu: &mut dyn Vcpu,
+    sched: &Scheduler,
+    external_irq_asserted: &mut bool,
+) {
+    if !*external_irq_asserted && sched.take_external_irq_request(vcpu_id) {
+        if let Err(e) = vcpu.set_pending_irq(true) {
+            log::warn!("vcpu{} set_pending_irq(true) failed: {:?}", vcpu_id, e);
+        } else {
+            *external_irq_asserted = true;
+        }
+    }
+}
+
+fn maybe_clear_external_irq(
+    vcpu_id: u32,
+    vcpu: &mut dyn Vcpu,
+    exit: &VmExit,
+    external_irq_asserted: &mut bool,
+) {
+    let should_clear = *external_irq_asserted
+        && matches!(
+            exit,
+            VmExit::Hypercall { .. } | VmExit::Halt | VmExit::Shutdown
+        );
+    if should_clear {
+        if let Err(e) = vcpu.set_pending_irq(false) {
+            log::warn!("vcpu{} set_pending_irq(false) failed: {:?}", vcpu_id, e);
+        }
+        *external_irq_asserted = false;
+    }
+}
+
+fn apply_hypercall_result_to_regs(vcpu: &mut dyn Vcpu, result: HypercallResult) -> Option<u32> {
+    match result {
+        HypercallResult::Sync(ret) => {
+            set_x0(vcpu, ret);
+            None
+        }
+        HypercallResult::Sync2 { x0, x1 } => {
+            set_x0_x1(vcpu, x0, x1);
+            None
+        }
+        HypercallResult::Exit(code) => Some(code),
+    }
+}
+
+fn log_unhandled_vmexit(vcpu_id: u32, vcpu: &dyn Vcpu, exit: &VmExit) {
+    if let Ok(r) = vcpu.regs() {
+        log::warn!(
+            "vcpu{} unhandled vmexit: {:?} pc={:#x} pstate={:#x} sp={:#x}",
+            vcpu_id,
+            exit,
+            r.pc,
+            r.pstate,
+            r.sp
+        );
+    } else {
+        log::warn!("vcpu{} unhandled vmexit: {:?}", vcpu_id, exit);
+    }
 }
 
 fn set_x0(vcpu: &mut dyn Vcpu, val: u64) {

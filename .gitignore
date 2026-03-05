@@ -6,3 +6,8 @@ winemu-kernel.bin
 # Generated guest runtime artifacts (build via `make -C guest`).
 guest/sysroot/**
 !guest/sysroot/.gitkeep
+guest/win32u/generated/**
+!guest/win32u/generated/.gitkeep
+guest/msvcrt/generated/**
+!guest/msvcrt/generated/.gitkeep
+scripts/__pycache__/

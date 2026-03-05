@@ -2,8 +2,7 @@ use crate::file_io::FileTable;
 use crate::host_file::HostFileTable;
 use crate::hostcall::HostCallBroker;
 use crate::memory::GuestMemory;
-use crate::sched::sync::{EventObj, MutexObj, SemaphoreObj, SyncHandle, SyncObject};
-use crate::sched::{SchedResult, Scheduler, ThreadId};
+use crate::sched::Scheduler;
 use crate::section::SectionTable;
 use crate::vaspace::VaSpace;
 use std::sync::{Arc, Mutex, RwLock};
@@ -129,10 +128,32 @@ fn encode_hostcall_stats(snap: &crate::hostcall::HostCallStatsSnapshot, dst_cap:
     out
 }
 
+fn encode_sched_wake_stats(snap: &crate::sched::SchedulerWakeStats, dst_cap: usize) -> Vec<u8> {
+    if dst_cap < hc::SCHED_WAKE_STATS_SIZE {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if !append_u64_le(&mut out, hc::SCHED_WAKE_STATS_VERSION)
+        || !append_u64_le(&mut out, snap.kick_requests)
+        || !append_u64_le(&mut out, snap.kick_coalesced)
+        || !append_u64_le(&mut out, snap.external_irq_requests)
+        || !append_u64_le(&mut out, snap.external_irq_coalesced)
+        || !append_u64_le(&mut out, snap.external_irq_taken)
+        || !append_u64_le(&mut out, snap.unpark_mask_calls)
+        || !append_u64_le(&mut out, snap.unpark_any_calls)
+        || !append_u64_le(&mut out, snap.unpark_thread_wakes)
+        || !append_u64_le(&mut out, snap.pending_external_irq_mask as u64)
+        || !append_u64_le(&mut out, snap.idle_vcpu_mask as u64)
+    {
+        return Vec::new();
+    }
+    out
+}
+
 pub enum HypercallResult {
     Sync(u64),
     Sync2 { x0: u64, x1: u64 },
-    Sched(SchedResult),
+    Exit(u32),
 }
 
 pub struct HypercallManager {
@@ -150,6 +171,27 @@ pub struct HypercallManager {
 }
 
 impl HypercallManager {
+    #[cfg(target_os = "macos")]
+    fn force_exit_all_vcpus(&self) {
+        use winemu_hypervisor::hvf::ffi;
+
+        let count = self.sched.vcpu_count as usize;
+        if count == 0 {
+            return;
+        }
+        let mut ids = Vec::with_capacity(count);
+        for id in 0..count {
+            ids.push(id as ffi::hv_vcpuid_t);
+        }
+        let ret = unsafe { ffi::hv_vcpus_exit(ids.as_mut_ptr(), ids.len() as u32) };
+        if ret != ffi::HV_SUCCESS {
+            log::warn!("PROCESS_EXIT: hv_vcpus_exit failed ret={:#x}", ret);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn force_exit_all_vcpus(&self) {}
+
     pub fn new(
         _syscall_table_toml: String,
         memory: Arc<RwLock<GuestMemory>>,
@@ -185,10 +227,11 @@ impl HypercallManager {
         }
     }
 
-    pub fn dispatch(&self, hypercall_nr: u64, args: [u64; 6], tid: ThreadId) -> HypercallResult {
+    pub fn dispatch(&self, hypercall_nr: u64, args: [u64; 6]) -> HypercallResult {
         match hypercall_nr {
             nr::KERNEL_READY => {
                 // args[0] = entry_va, args[1] = stack_va, args[2] = teb_gva, args[3] = heap_start
+                // args[4], args[5] are reserved and ignored.
                 let entry_va = args[0];
                 let stack_va = args[1];
                 let teb_gva = args[2];
@@ -205,37 +248,7 @@ impl HypercallManager {
                 if heap_start != 0 {
                     self.vaspace.lock().unwrap().set_base(heap_start);
                 }
-
-                if entry_va == 0 {
-                    // 内核就绪但无 EXE，等待（Phase 3 改为接收 EXE 路径）
-                    return HypercallResult::Sync(0);
-                }
-
-                // 读取 PEB VA（TEB+0x60，参考 winemu-shared::teb::PEB）
-                let peb_va = {
-                    let mem = self.memory.read().unwrap();
-                    let peb_off = winemu_shared::teb::PEB as u64;
-                    let bytes = mem.read_bytes(winemu_core::addr::Gpa(teb_gva + peb_off), 8);
-                    u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))
-                };
-
-                // 构建 Thread 0 上下文（参考 Wine signal_arm64.c call_init_thunk）
-                // pc  = entry_va（Phase 3 改为 RtlUserThreadStart）
-                // sp  = stack_va（teb->Tib.StackBase）
-                // x0  = entry_va（RtlUserThreadStart 的第一个参数）
-                // x1  = peb_va（arg）
-                // x18 = teb_va（ARM64 thread register）
-                let tid = self.sched.alloc_tid();
-                let mut ctx = crate::sched::ThreadContext::default();
-                ctx.gpr[32] = entry_va; // pc
-                ctx.gpr[31] = stack_va; // sp
-                ctx.gpr[0] = entry_va; // x0 = entry
-                ctx.gpr[1] = peb_va; // x1 = peb
-                ctx.gpr[18] = teb_gva; // x18 = teb (ARM64 thread register)
-                ctx.pstate = 0x0; // EL0t
-                self.sched.spawn(tid, ctx, teb_gva);
-                log::info!("Thread 0 created: tid={} entry={:#x}", tid.0, entry_va);
-                HypercallResult::Sync(tid.0 as u64)
+                HypercallResult::Sync(0)
             }
             nr::DEBUG_PRINT => {
                 // args[0] = GPA of string, args[1] = length
@@ -277,7 +290,7 @@ impl HypercallManager {
                 }
             }
             nr::KICK_VCPU_MASK => {
-                self.sched.unpark_vcpu_mask(args[0] as u32);
+                self.sched.kick_vcpu_mask(args[0] as u32);
                 HypercallResult::Sync(0)
             }
             nr::LOAD_DLL_IMAGE | nr::GET_PROC_ADDRESS => HypercallResult::Sync(u64::MAX),
@@ -289,39 +302,24 @@ impl HypercallManager {
             nr::PROCESS_EXIT => {
                 let code = args[0] as u32;
                 log::info!("PROCESS_EXIT: code={}", code);
-                // Terminate the calling thread; vCPU loop will drain remaining threads
-                HypercallResult::Sched(SchedResult::Exit(code))
-            }
-            nr::THREAD_CREATE => {
-                // args[0] = entry_va, args[1] = stack_va
-                // args[2] = arg (passed in x0), args[3] = teb_gva
-                let entry_va = args[0];
-                let stack_va = args[1];
-                let arg = args[2];
-                let teb_gva = args[3];
-                if entry_va == 0 {
-                    return HypercallResult::Sync(u64::MAX);
-                }
-                let new_tid = self.sched.alloc_tid();
-                let mut ctx = crate::sched::ThreadContext::default();
-                ctx.gpr[32] = entry_va;
-                ctx.gpr[31] = stack_va;
-                ctx.gpr[0] = arg;
-                ctx.pstate = 0x0; // EL0t
-                self.sched.spawn(new_tid, ctx, teb_gva);
-                log::debug!(
-                    "THREAD_CREATE: tid={} entry={:#x} stack={:#x}",
-                    new_tid.0,
-                    entry_va,
-                    stack_va
+                let wake = self.sched.wake_stats_snapshot();
+                log::info!(
+                    "SCHED_WAKE_STATS: kick_req={} kick_coalesced={} ext_req={} ext_coalesced={} ext_taken={} unpark_mask={} unpark_any={} wake_threads={} pending_mask={:#x} idle_mask={:#x}",
+                    wake.kick_requests,
+                    wake.kick_coalesced,
+                    wake.external_irq_requests,
+                    wake.external_irq_coalesced,
+                    wake.external_irq_taken,
+                    wake.unpark_mask_calls,
+                    wake.unpark_any_calls,
+                    wake.unpark_thread_wakes,
+                    wake.pending_external_irq_mask,
+                    wake.idle_vcpu_mask
                 );
-                HypercallResult::Sync(new_tid.0 as u64)
-            }
-            nr::THREAD_EXIT => {
-                // args[0] = exit code
-                let code = args[0] as u32;
-                log::debug!("THREAD_EXIT: tid={} code={}", tid.0, code);
-                HypercallResult::Sched(SchedResult::Exit(code))
+                // Process exit terminates all remaining guest execution.
+                self.sched.request_shutdown();
+                self.force_exit_all_vcpus();
+                HypercallResult::Exit(code)
             }
             nr::NT_ALLOC_VIRTUAL => {
                 // args[0] = hint VA (0 = any), args[1] = size, args[2] = prot
@@ -535,148 +533,22 @@ impl HypercallManager {
                 );
                 HypercallResult::Sync((status << 32) | size)
             }
-            // ── NT 同步对象 ──────────────────────────────────
-            nr::NT_CREATE_EVENT => {
-                // args[0] = manual_reset (1=manual, 0=auto), args[1] = initial_state
-                let manual = args[0] != 0;
-                let initial = args[1] != 0;
-                let h = self.sched.alloc_handle();
-                self.sched
-                    .insert_object(h, SyncObject::Event(EventObj::new(manual, initial)));
-                log::debug!(
-                    "NT_CREATE_EVENT: handle={} manual={} initial={}",
-                    h.0,
-                    manual,
-                    initial
-                );
-                HypercallResult::Sync(h.0 as u64)
+            // Legacy VMM-side NT sync object path is disabled; guest kernel owns
+            // synchronization semantics now.
+            nr::NT_CREATE_EVENT
+            | nr::NT_SET_EVENT
+            | nr::NT_RESET_EVENT
+            | nr::NT_CREATE_MUTEX
+            | nr::NT_RELEASE_MUTEX
+            | nr::NT_CREATE_SEMAPHORE
+            | nr::NT_RELEASE_SEMAPHORE
+            | nr::NT_WAIT_SINGLE
+            | nr::NT_WAIT_MULTIPLE
+            | nr::NT_CLOSE_HANDLE
+            | nr::NT_YIELD_EXECUTION => {
+                log::warn!("legacy NT sync hypercall disabled: nr={:#x}", hypercall_nr);
+                HypercallResult::Sync(status::NOT_IMPLEMENTED as u64)
             }
-            nr::NT_SET_EVENT => {
-                let h = SyncHandle(args[0] as u32);
-                let shard = Scheduler::object_shard_pub(h);
-                let woken = {
-                    let mut objects = self.sched.objects[shard].lock().unwrap();
-                    match objects.get_mut(&h) {
-                        Some(SyncObject::Event(e)) => e.set(),
-                        _ => return HypercallResult::Sync(0xC000_0008),
-                    }
-                };
-                log::debug!("NT_SET_EVENT: handle={} woke={}", h.0, woken.len());
-                self.sched.wake_waiters(woken);
-                HypercallResult::Sync(0)
-            }
-            nr::NT_RESET_EVENT => {
-                let h = SyncHandle(args[0] as u32);
-                let shard = Scheduler::object_shard_pub(h);
-                let mut objects = self.sched.objects[shard].lock().unwrap();
-                match objects.get_mut(&h) {
-                    Some(SyncObject::Event(e)) => {
-                        e.reset();
-                        HypercallResult::Sync(0)
-                    }
-                    _ => HypercallResult::Sync(0xC000_0008),
-                }
-            }
-            nr::NT_CREATE_MUTEX => {
-                // args[0] = initial_owner (1 = caller owns it)
-                let owner = if args[0] != 0 { Some(tid) } else { None };
-                let h = self.sched.alloc_handle();
-                self.sched
-                    .insert_object(h, SyncObject::Mutex(MutexObj::new(owner)));
-                log::debug!("NT_CREATE_MUTEX: handle={} owner={:?}", h.0, owner);
-                HypercallResult::Sync(h.0 as u64)
-            }
-            nr::NT_RELEASE_MUTEX => {
-                let h = SyncHandle(args[0] as u32);
-                let shard = Scheduler::object_shard_pub(h);
-                let result = {
-                    let mut objects = self.sched.objects[shard].lock().unwrap();
-                    match objects.get_mut(&h) {
-                        Some(SyncObject::Mutex(m)) => m.release(tid),
-                        _ => return HypercallResult::Sync(0xC000_0008),
-                    }
-                };
-                match result {
-                    Ok(Some(next_tid)) => {
-                        self.sched.wake_waiters(vec![next_tid]);
-                        HypercallResult::Sync(0)
-                    }
-                    Ok(None) => HypercallResult::Sync(0),
-                    Err(status) => HypercallResult::Sync(status),
-                }
-            }
-            nr::NT_CREATE_SEMAPHORE => {
-                // args[0] = initial_count, args[1] = maximum_count
-                let initial = args[0] as i64;
-                let maximum = args[1] as i64;
-                let h = self.sched.alloc_handle();
-                self.sched.insert_object(
-                    h,
-                    SyncObject::Semaphore(SemaphoreObj::new(initial, maximum)),
-                );
-                log::debug!(
-                    "NT_CREATE_SEMAPHORE: handle={} initial={} max={}",
-                    h.0,
-                    initial,
-                    maximum
-                );
-                HypercallResult::Sync(h.0 as u64)
-            }
-            nr::NT_RELEASE_SEMAPHORE => {
-                // args[0] = handle, args[1] = release_count
-                let h = SyncHandle(args[0] as u32);
-                let n = args[1] as i64;
-                let shard = Scheduler::object_shard_pub(h);
-                let result = {
-                    let mut objects = self.sched.objects[shard].lock().unwrap();
-                    match objects.get_mut(&h) {
-                        Some(SyncObject::Semaphore(s)) => s.release(n),
-                        _ => return HypercallResult::Sync(0xC000_0008),
-                    }
-                };
-                match result {
-                    Ok(woken) => {
-                        self.sched.wake_waiters(woken);
-                        HypercallResult::Sync(0)
-                    }
-                    Err(status) => HypercallResult::Sync(status),
-                }
-            }
-            nr::NT_WAIT_SINGLE => {
-                // args[0] = handle, args[1] = timeout_100ns (i64 cast)
-                let h = SyncHandle(args[0] as u32);
-                let timeout = args[1] as i64;
-                HypercallResult::Sched(self.sched.wait_single(tid, h, timeout))
-            }
-            nr::NT_WAIT_MULTIPLE => {
-                // args[0] = GPA of handle array, args[1] = count
-                // args[2] = wait_all, args[3] = timeout_100ns
-                let arr_gpa = winemu_core::addr::Gpa(args[0]);
-                let count = args[1] as usize;
-                let wait_all = args[2] != 0;
-                let timeout = args[3] as i64;
-                if count == 0 || count > 64 {
-                    return HypercallResult::Sync(0xC000_000D); // STATUS_INVALID_PARAMETER
-                }
-                let handles: Vec<SyncHandle> = {
-                    let mem = self.memory.read().unwrap();
-                    (0..count)
-                        .map(|i| {
-                            let gpa = winemu_core::addr::Gpa(arr_gpa.0 + i as u64 * 4);
-                            let bytes = mem.read_bytes(gpa, 4);
-                            let v = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                            SyncHandle(v)
-                        })
-                        .collect()
-                };
-                HypercallResult::Sched(self.sched.wait_multiple(tid, handles, wait_all, timeout))
-            }
-            nr::NT_CLOSE_HANDLE => {
-                let h = SyncHandle(args[0] as u32);
-                let ok = self.sched.close_handle(h);
-                HypercallResult::Sync(if ok { 0 } else { 0xC000_0008 })
-            }
-            nr::NT_YIELD_EXECUTION => HypercallResult::Sched(SchedResult::Yield),
             nr::ALLOC_PHYS_PAGES => {
                 let pages = args[0] as usize;
                 if pages == 0 {
@@ -902,6 +774,25 @@ impl HypercallManager {
                 mem.write_bytes(winemu_core::addr::Gpa(dst_gpa), &bytes);
                 if (flags & hc::STATS_RESET_AFTER_READ) != 0 {
                     self.hostcall.reset_stats();
+                }
+                HypercallResult::Sync(bytes.len() as u64)
+            }
+            nr::HOSTCALL_QUERY_SCHED_WAKE_STATS => {
+                let dst_gpa = args[0];
+                let dst_len = args[1] as usize;
+                let flags = args[2];
+                if dst_len < hc::SCHED_WAKE_STATS_SIZE {
+                    return HypercallResult::Sync(0);
+                }
+                let snap = self.sched.wake_stats_snapshot();
+                let bytes = encode_sched_wake_stats(&snap, dst_len);
+                if bytes.is_empty() {
+                    return HypercallResult::Sync(0);
+                }
+                let mut mem = self.memory.write().unwrap();
+                mem.write_bytes(winemu_core::addr::Gpa(dst_gpa), &bytes);
+                if (flags & hc::STATS_RESET_AFTER_READ) != 0 {
+                    self.sched.reset_wake_stats();
                 }
                 HypercallResult::Sync(bytes.len() as u64)
             }

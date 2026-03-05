@@ -39,7 +39,11 @@ pub fn flush_tlb_global() {
 }
 
 #[inline(always)]
-pub fn apply_translation_config(_memory_attrs: u64, _translation_control: u64, _user_table_root: u64) {
+pub fn apply_translation_config(
+    _memory_attrs: u64,
+    _translation_control: u64,
+    _user_table_root: u64,
+) {
     unsupported()
 }
 

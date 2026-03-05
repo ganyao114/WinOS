@@ -2,6 +2,7 @@
 pub mod kmalloc;
 pub mod phys;
 pub mod vaspace;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 #[repr(C, align(4096))]
 struct PageTable([u64; 512]);
@@ -9,6 +10,7 @@ struct PageTable([u64; 512]);
 static mut L0_TABLE: PageTable = PageTable([0u64; 512]);
 static mut L1_TABLE: PageTable = PageTable([0u64; 512]);
 static mut L2_TABLE: PageTable = PageTable([0u64; 512]);
+static MM_GLOBAL_READY: AtomicU32 = AtomicU32::new(0);
 
 pub fn bootstrap_user_tables() -> (*const u64, *const u64, *const u64) {
     unsafe {
@@ -32,12 +34,33 @@ pub fn switch_process_ttbr0(new_ttbr0: u64) {
     crate::arch::mmu::switch_user_table_root(new_ttbr0);
 }
 
+pub fn init_global_bootstrap() {
+    if MM_GLOBAL_READY.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    crate::kdebug!("mm::init_global_bootstrap: setup_mapping");
+    unsafe {
+        setup_kernel_mapping();
+    }
+    MM_GLOBAL_READY.store(1, Ordering::Release);
+    crate::kdebug!("mm::init_global_bootstrap: done");
+}
+
+pub fn init_per_cpu() {
+    if MM_GLOBAL_READY.load(Ordering::Acquire) == 0 {
+        crate::kwarn!("mm::init_per_cpu before global init, auto-bootstrap");
+        init_global_bootstrap();
+    }
+    crate::kdebug!("mm::init_per_cpu: enable_mmu");
+    unsafe {
+        enable_mmu();
+    }
+    crate::kdebug!("mm::init_per_cpu: done");
+}
+
 pub fn init() {
-    crate::kdebug!("mm::init: setup_mapping");
-    unsafe { setup_kernel_mapping(); }
-    crate::kdebug!("mm::init: enable_mmu");
-    unsafe { enable_mmu(); }
-    crate::kdebug!("mm::init: done");
+    init_global_bootstrap();
+    init_per_cpu();
 }
 
 unsafe fn setup_kernel_mapping() {
@@ -59,7 +82,7 @@ unsafe fn setup_kernel_mapping() {
     let guard_l2_idx = user_l2_start.saturating_sub(1);
     for i in 0..512usize {
         let block_addr = 0x4000_0000u64 + ((i as u64) << 21); // 2MB per L2 entry
-        // [1:0]=01 block, AttrIdx=0, SH=inner-shareable, AF=1
+                                                              // [1:0]=01 block, AttrIdx=0, SH=inner-shareable, AF=1
         let mut desc = block_addr | (1 << 10) | (0b11 << 8) | 0b01;
         if i != 0 && i != guard_l2_idx {
             desc |= 0b01 << 6; // AP=01: EL0+EL1 RW

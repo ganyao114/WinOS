@@ -53,8 +53,10 @@ fn ensure_user_range_access(pid: u32, addr: u64, size: usize, access: u8) -> boo
 }
 
 fn translate_user_va(pid: u32, va: u64, access: u8) -> Option<u64> {
-    crate::process::with_process(pid, |p| p.address_space.translate_user_va_for_access(va, access))
-        .flatten()
+    crate::process::with_process(pid, |p| {
+        p.address_space.translate_user_va_for_access(va, access)
+    })
+    .flatten()
 }
 
 fn copy_from_process_user(pid: u32, src_va: u64, dst: *mut u8, size: usize) -> bool {
@@ -95,7 +97,12 @@ fn read_user_u64(pid: u32, user_ptr: *const u64) -> Option<u64> {
     if user_ptr.is_null() {
         return None;
     }
-    if !ensure_user_range_access(pid, user_ptr as u64, core::mem::size_of::<u64>(), VM_ACCESS_READ) {
+    if !ensure_user_range_access(
+        pid,
+        user_ptr as u64,
+        core::mem::size_of::<u64>(),
+        VM_ACCESS_READ,
+    ) {
         return None;
     }
     let mut v = 0u64;
@@ -114,7 +121,12 @@ fn write_user_u64(pid: u32, user_ptr: *mut u64, value: u64) -> bool {
     if user_ptr.is_null() {
         return false;
     }
-    if !ensure_user_range_access(pid, user_ptr as u64, core::mem::size_of::<u64>(), VM_ACCESS_WRITE) {
+    if !ensure_user_range_access(
+        pid,
+        user_ptr as u64,
+        core::mem::size_of::<u64>(),
+        VM_ACCESS_WRITE,
+    ) {
         return false;
     }
     copy_to_process_user(
@@ -385,7 +397,12 @@ pub(crate) fn handle_read_virtual_memory(frame: &mut SvcFrame) {
 
     if size == 0 {
         if !out_len.is_null() {
-            if !ensure_user_range_access(caller_pid, out_len as u64, core::mem::size_of::<u64>(), VM_ACCESS_WRITE) {
+            if !ensure_user_range_access(
+                caller_pid,
+                out_len as u64,
+                core::mem::size_of::<u64>(),
+                VM_ACCESS_WRITE,
+            ) {
                 frame.x[0] = status::NOT_COMMITTED as u64;
                 return;
             }
@@ -452,7 +469,12 @@ pub(crate) fn handle_write_virtual_memory(frame: &mut SvcFrame) {
 
     if size == 0 {
         if !out_len.is_null() {
-            if !ensure_user_range_access(caller_pid, out_len as u64, core::mem::size_of::<u64>(), VM_ACCESS_WRITE) {
+            if !ensure_user_range_access(
+                caller_pid,
+                out_len as u64,
+                core::mem::size_of::<u64>(),
+                VM_ACCESS_WRITE,
+            ) {
                 frame.x[0] = status::NOT_COMMITTED as u64;
                 return;
             }

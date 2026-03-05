@@ -44,18 +44,56 @@ typedef struct {
 #define NT_CURRENT_PROCESS ((HANDLE)(uint64_t)-1)
 
 #define STATUS_SUCCESS 0x00000000U
+#define STATUS_PENDING 0x00000103U
 #define STATUS_NOT_IMPLEMENTED 0xC0000002U
 #define STATUS_INVALID_HANDLE 0xC0000008U
 #define STATUS_INVALID_PARAMETER 0xC000000DU
 #define STATUS_OBJECT_NAME_NOT_FOUND 0xC0000034U
 
 #define OBJ_CASE_INSENSITIVE 0x40U
+#define EVENT_ALL_ACCESS 0x001F0003U
+
+#define FILE_SHARE_READ 0x00000001U
+#define FILE_SHARE_WRITE 0x00000002U
+#define FILE_SHARE_DELETE 0x00000004U
+#define FILE_OPEN 0x00000001U
+
+#define IOCTL_WINEMU_HOST_PING 0x0022A000U
+#define IOCTL_WINEMU_HOSTCALL_SYNC 0x0022A004U
+#define WINEMU_PING_MAGIC 0x57454D55U
+
+#define HOSTCALL_FLAG_FORCE_ASYNC (1ull << 1)
+#define HOSTCALL_HC_OK 0ull
+#define HOSTCALL_OP_OPEN 1ull
+#define HOSTCALL_OP_CLOSE 4ull
+
+typedef struct {
+    uint32_t version;
+    uint32_t _reserved;
+    uint64_t opcode;
+    uint64_t flags;
+    uint64_t arg0;
+    uint64_t arg1;
+    uint64_t arg2;
+    uint64_t arg3;
+    uint64_t user_tag;
+} WINEMU_HOSTCALL_REQUEST;
+
+typedef struct {
+    uint64_t host_result;
+    uint64_t aux;
+    uint64_t request_id;
+} WINEMU_HOSTCALL_RESPONSE;
 
 __declspec(dllimport) NTSTATUS NtWriteFile(
     HANDLE file, HANDLE event, void* apc_routine, void* apc_ctx,
     IO_STATUS_BLOCK* iosb, const void* buf, ULONG len, uint64_t* byte_offset, ULONG* key);
 __declspec(dllimport) __attribute__((noreturn))
 void NtTerminateProcess(HANDLE process, NTSTATUS code);
+__declspec(dllimport) NTSTATUS NtCreateFile(
+    HANDLE* file_handle, ULONG desired_access, OBJECT_ATTRIBUTES* object_attributes,
+    IO_STATUS_BLOCK* io_status_block, uint64_t* allocation_size, ULONG file_attributes,
+    ULONG share_access, ULONG create_disposition, ULONG create_options, void* ea_buffer, ULONG ea_length);
 __declspec(dllimport) NTSTATUS NtQueryAttributesFile(
     OBJECT_ATTRIBUTES* object_attributes, FILE_BASIC_INFORMATION* file_information);
 __declspec(dllimport) NTSTATUS NtDeviceIoControlFile(
@@ -66,6 +104,10 @@ __declspec(dllimport) NTSTATUS NtFsControlFile(
     HANDLE file_handle, HANDLE event, void* apc_routine, void* apc_context,
     IO_STATUS_BLOCK* io_status_block, ULONG fs_control_code, void* input_buffer, ULONG input_buffer_length,
     void* output_buffer, ULONG output_buffer_length);
+__declspec(dllimport) NTSTATUS NtCreateEvent(
+    HANDLE* event_handle, ULONG desired_access, OBJECT_ATTRIBUTES* object_attributes, ULONG event_type, UCHAR initial_state);
+__declspec(dllimport) NTSTATUS NtWaitForSingleObject(HANDLE handle, UCHAR alertable, int64_t* timeout);
+__declspec(dllimport) NTSTATUS NtClose(HANDLE handle);
 
 static uint32_t g_pass = 0;
 static uint32_t g_fail = 0;
@@ -141,6 +183,14 @@ void mainCRTStartup(void) {
     OBJECT_ATTRIBUTES oa;
     UNICODE_STRING us;
     WCHAR path_buf[128];
+    HANDLE dev = 0;
+    HANDLE io_event = 0;
+    ULONG ping = 0;
+    uint64_t host_fd = 0;
+    char host_open_path[] = "guest/sysroot/hello_win.exe";
+    ULONG host_open_path_len = 0;
+    WINEMU_HOSTCALL_REQUEST hreq;
+    WINEMU_HOSTCALL_RESPONSE hresp;
 
     write_str("== syscall_file_control_test ==\r\n");
 
@@ -195,6 +245,167 @@ void mainCRTStartup(void) {
     check("NtFsControlFile(invalid) returns STATUS_INVALID_HANDLE", st == STATUS_INVALID_HANDLE);
     check("NtFsControlFile(invalid) IOSB status is STATUS_INVALID_HANDLE",
           (NTSTATUS)iosb.Status == STATUS_INVALID_HANDLE);
+
+    init_unicode(&us, path_buf, "\\Device\\WinEmuHost");
+    init_oa(&oa, &us);
+    iosb.Status = 0;
+    iosb.Information = 0;
+    st = NtCreateFile(
+        &dev,
+        0x0001U,
+        &oa,
+        &iosb,
+        0,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        0,
+        0,
+        0
+    );
+    check("NtCreateFile(\\\\Device\\\\WinEmuHost) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtCreateFile(\\\\Device\\\\WinEmuHost) returns valid handle", dev != 0);
+    if (st == STATUS_SUCCESS && dev != 0) {
+        while (host_open_path[host_open_path_len]) {
+            host_open_path_len++;
+        }
+
+        iosb.Status = 0;
+        iosb.Information = 0;
+        ping = 0;
+        st = NtDeviceIoControlFile(
+            dev, 0, 0, 0, &iosb, IOCTL_WINEMU_HOST_PING, 0, 0, &ping, (ULONG)sizeof(ping)
+        );
+        check("NtDeviceIoControlFile(WinEmuHost ping) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+        check("NtDeviceIoControlFile(WinEmuHost ping) IOSB status is STATUS_SUCCESS",
+              (NTSTATUS)iosb.Status == STATUS_SUCCESS);
+        check("NtDeviceIoControlFile(WinEmuHost ping) output magic matches", ping == WINEMU_PING_MAGIC);
+        check("NtDeviceIoControlFile(WinEmuHost ping) reports 4 bytes",
+              (ULONG)iosb.Information == (ULONG)sizeof(ping));
+
+        hreq.version = 1;
+        hreq._reserved = 0;
+        hreq.opcode = HOSTCALL_OP_OPEN;
+        hreq.flags = 0;
+        hreq.arg0 = (uint64_t)(uintptr_t)host_open_path;
+        hreq.arg1 = (uint64_t)host_open_path_len;
+        hreq.arg2 = 0;
+        hreq.arg3 = 0;
+        hreq.user_tag = 0;
+        hresp.host_result = 0;
+        hresp.aux = 0;
+        hresp.request_id = 0;
+        iosb.Status = 0;
+        iosb.Information = 0;
+        st = NtDeviceIoControlFile(
+            dev, 0, 0, 0, &iosb,
+            IOCTL_WINEMU_HOSTCALL_SYNC,
+            &hreq, (ULONG)sizeof(hreq),
+            &hresp, (ULONG)sizeof(hresp)
+        );
+        check("NtDeviceIoControlFile(hostcall sync open) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+        check("NtDeviceIoControlFile(hostcall sync open) IOSB status is STATUS_SUCCESS",
+              (NTSTATUS)iosb.Status == STATUS_SUCCESS);
+        check("NtDeviceIoControlFile(hostcall sync open) returns response size",
+              (ULONG)iosb.Information == (ULONG)sizeof(hresp));
+        check("NtDeviceIoControlFile(hostcall sync open) host_result is HC_OK",
+              hresp.host_result == HOSTCALL_HC_OK);
+        check("NtDeviceIoControlFile(hostcall sync open) returns host fd", hresp.aux != 0);
+        host_fd = hresp.aux;
+
+        if (host_fd != 0) {
+            hreq.opcode = HOSTCALL_OP_CLOSE;
+            hreq.flags = 0;
+            hreq.arg0 = host_fd;
+            hreq.arg1 = 0;
+            hreq.arg2 = 0;
+            hreq.arg3 = 0;
+            hresp.host_result = 0;
+            hresp.aux = 0;
+            hresp.request_id = 0;
+            iosb.Status = 0;
+            iosb.Information = 0;
+            st = NtDeviceIoControlFile(
+                dev, 0, 0, 0, &iosb,
+                IOCTL_WINEMU_HOSTCALL_SYNC,
+                &hreq, (ULONG)sizeof(hreq),
+                &hresp, (ULONG)sizeof(hresp)
+            );
+            check("NtDeviceIoControlFile(hostcall sync close) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+            check("NtDeviceIoControlFile(hostcall sync close) host_result is HC_OK",
+                  hresp.host_result == HOSTCALL_HC_OK);
+        }
+
+        st = NtCreateEvent(&io_event, EVENT_ALL_ACCESS, 0, 1, 0);
+        check("NtCreateEvent(async ioctl event) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+        if (st == STATUS_SUCCESS && io_event != 0) {
+            hreq.version = 1;
+            hreq._reserved = 0;
+            hreq.opcode = HOSTCALL_OP_OPEN;
+            hreq.flags = HOSTCALL_FLAG_FORCE_ASYNC;
+            hreq.arg0 = (uint64_t)(uintptr_t)host_open_path;
+            hreq.arg1 = (uint64_t)host_open_path_len;
+            hreq.arg2 = 0;
+            hreq.arg3 = 0;
+            hreq.user_tag = 0x11223344u;
+            hresp.host_result = 0;
+            hresp.aux = 0;
+            hresp.request_id = 0;
+            iosb.Status = 0;
+            iosb.Information = 0;
+            st = NtDeviceIoControlFile(
+                dev, io_event, 0, 0, &iosb,
+                IOCTL_WINEMU_HOSTCALL_SYNC,
+                &hreq, (ULONG)sizeof(hreq),
+                &hresp, (ULONG)sizeof(hresp)
+            );
+            check("NtDeviceIoControlFile(hostcall async open) returns STATUS_PENDING", st == STATUS_PENDING);
+            if (st == STATUS_PENDING) {
+                st = NtWaitForSingleObject(io_event, 0, 0);
+                check("NtWaitForSingleObject(async ioctl event) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+                check("NtDeviceIoControlFile(hostcall async open) IOSB status is STATUS_SUCCESS",
+                      (NTSTATUS)iosb.Status == STATUS_SUCCESS);
+                check("NtDeviceIoControlFile(hostcall async open) returns response size",
+                      (ULONG)iosb.Information == (ULONG)sizeof(hresp));
+                check("NtDeviceIoControlFile(hostcall async open) completion request_id is non-zero",
+                      hresp.request_id != 0);
+                check("NtDeviceIoControlFile(hostcall async open) host_result is HC_OK",
+                      hresp.host_result == HOSTCALL_HC_OK);
+                check("NtDeviceIoControlFile(hostcall async open) returns host fd", hresp.aux != 0);
+
+                host_fd = hresp.aux;
+                if (host_fd != 0) {
+                    hreq.opcode = HOSTCALL_OP_CLOSE;
+                    hreq.flags = 0;
+                    hreq.arg0 = host_fd;
+                    hreq.arg1 = 0;
+                    hreq.arg2 = 0;
+                    hreq.arg3 = 0;
+                    hresp.host_result = 0;
+                    hresp.aux = 0;
+                    hresp.request_id = 0;
+                    iosb.Status = 0;
+                    iosb.Information = 0;
+                    st = NtDeviceIoControlFile(
+                        dev, 0, 0, 0, &iosb,
+                        IOCTL_WINEMU_HOSTCALL_SYNC,
+                        &hreq, (ULONG)sizeof(hreq),
+                        &hresp, (ULONG)sizeof(hresp)
+                    );
+                    check("NtDeviceIoControlFile(hostcall async-close cleanup) returns STATUS_SUCCESS",
+                          st == STATUS_SUCCESS);
+                    check("NtDeviceIoControlFile(hostcall async-close cleanup) host_result is HC_OK",
+                          hresp.host_result == HOSTCALL_HC_OK);
+                }
+            }
+
+            st = NtClose(io_event);
+            check("NtClose(async ioctl event) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+        }
+
+        st = NtClose(dev);
+        check("NtClose(WinEmuHost handle) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    }
 
     write_str("syscall_file_control_test summary: pass=");
     write_u64_hex(g_pass);

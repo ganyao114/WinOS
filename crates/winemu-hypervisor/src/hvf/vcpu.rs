@@ -12,6 +12,7 @@ use winemu_core::{Result, WinemuError};
 
 pub struct HvfVcpu {
     id: hv_vcpuid_t,
+    logical_id: u32,
     exit: *const hv_vcpu_exit_t,
     vtimer: HvfVTimer,
     use_vtimer_exit: bool,
@@ -45,7 +46,7 @@ impl HvfVcpu {
         Some(mach_ticks_to_duration(remain_ticks))
     }
 
-    pub fn new() -> Result<Self> {
+    pub fn new(logical_id: u32) -> Result<Self> {
         let mut id: hv_vcpuid_t = 0;
         let mut exit: *const hv_vcpu_exit_t = std::ptr::null();
         let ret = unsafe { ffi::hv_vcpu_create(&mut id, &mut exit, std::ptr::null_mut()) };
@@ -57,6 +58,7 @@ impl HvfVcpu {
         }
         let mut vcpu = Self {
             id,
+            logical_id,
             exit,
             vtimer: HvfVTimer::new(),
             use_vtimer_exit: std::env::var("WINEMU_HVF_VTIMER_EXIT")
@@ -70,6 +72,11 @@ impl HvfVcpu {
 
     /// 初始化 vCPU 为 EL1h 模式，PC 指向 Guest Kernel 入口
     fn init_el1(&mut self) -> Result<()> {
+        // Program virtual MPIDR_EL1 affinity so guest can identify CPUs
+        // deterministically by vCPU creation order (Aff0=id).
+        let mpidr = (self.logical_id as u64) & 0xff;
+        self.set_sys_reg(ffi::HV_SYS_REG_MPIDR_EL1, mpidr)?;
+
         // PC = Guest Kernel 加载地址
         self.set_reg(ffi::HV_REG_PC, 0x4000_0000)?;
 

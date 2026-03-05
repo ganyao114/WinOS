@@ -12,6 +12,9 @@ pub(crate) const HOST_OPEN_READ: u64 = 0;
 pub(crate) const HOST_OPEN_WRITE: u64 = 1;
 pub(crate) const HOST_OPEN_RW: u64 = 2;
 pub(crate) const HOST_OPEN_CREATE: u64 = 3;
+pub(crate) const HOST_PSEUDO_FD_WINEMU_HOST: u64 = u64::MAX - 1;
+pub(crate) const WINEMU_HOST_DEVICE_PATH: &str = "\\Device\\WinEmuHost";
+pub(crate) const WINEMU_HOST_DEVICE_PATH_NORMALIZED: &str = "Device/WinEmuHost";
 
 pub(crate) const MEM_COMMIT: u32 = 0x1000;
 pub(crate) const MEM_RESERVE: u32 = 0x2000;

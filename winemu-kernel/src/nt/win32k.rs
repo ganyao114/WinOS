@@ -1,7 +1,10 @@
 use core::cell::UnsafeCell;
 
+use crate::hostcall;
 use crate::kobj::ObjectStore;
+use winemu_shared::hostcall as hc;
 use winemu_shared::status;
+use winemu_shared::win32k_sysno;
 
 use super::state::VM_ACCESS_READ;
 use super::SvcFrame;
@@ -51,9 +54,81 @@ fn validate_user_ptr(pid: u32, va: u64) -> bool {
     if va < crate::process::USER_ACCESS_BASE || va >= crate::process::USER_VA_LIMIT {
         return false;
     }
-    crate::process::with_process(pid, |p| p.address_space.translate_user_va_for_access(va, VM_ACCESS_READ))
-        .flatten()
-        .is_some()
+    crate::process::with_process(pid, |p| {
+        p.address_space
+            .translate_user_va_for_access(va, VM_ACCESS_READ)
+    })
+    .flatten()
+    .is_some()
+}
+
+fn read_user_u64(pid: u32, va: u64) -> Option<u64> {
+    if va < crate::process::USER_ACCESS_BASE || va >= crate::process::USER_VA_LIMIT {
+        return None;
+    }
+    let pa = crate::process::with_process(pid, |p| {
+        p.address_space
+            .translate_user_va_for_access(va, VM_ACCESS_READ)
+    })
+    .flatten()?;
+    Some(unsafe { (pa as *const u64).read_volatile() })
+}
+
+fn collect_win32k_args(pid: u32, frame: &SvcFrame) -> [u64; hc::WIN32K_CALL_MAX_ARGS] {
+    let mut out = [0u64; hc::WIN32K_CALL_MAX_ARGS];
+    let reg_count = core::cmp::min(8, hc::WIN32K_CALL_MAX_ARGS);
+    out[..reg_count].copy_from_slice(&frame.x[..reg_count]);
+    if hc::WIN32K_CALL_MAX_ARGS <= 8 {
+        return out;
+    }
+
+    let spill = hc::WIN32K_CALL_MAX_ARGS - 8;
+    let mut i = 0usize;
+    while i < spill {
+        let Some(spill_va) = frame.sp_el0.checked_add((i as u64) * 8) else {
+            break;
+        };
+        out[8 + i] = read_user_u64(pid, spill_va).unwrap_or(0);
+        i += 1;
+    }
+    out
+}
+
+fn dispatch_win32k_hostcall(frame: &SvcFrame, nr: u16, table: u8) -> u32 {
+    let owner_pid = crate::process::current_pid();
+    if owner_pid == 0 {
+        return status::INVALID_PARAMETER;
+    }
+    let mut packet = hc::Win32kCallPacket::new();
+    packet.table = table as u32;
+    packet.syscall_nr = nr as u32;
+    packet.arg_count = hc::WIN32K_CALL_MAX_ARGS as u32;
+    packet.owner_pid = owner_pid;
+    packet.owner_tid = crate::sched::current_tid();
+    packet.args = collect_win32k_args(owner_pid, frame);
+
+    let submit = hostcall::call_sync(
+        owner_pid,
+        hostcall::SubmitArgs {
+            opcode: hc::OP_WIN32K_CALL,
+            // TODO: switch to main-thread execution after host win32k runtime lands.
+            flags: 0,
+            arg0: (&packet as *const hc::Win32kCallPacket) as u64,
+            arg1: hc::WIN32K_CALL_PACKET_SIZE as u64,
+            arg2: 0,
+            arg3: 0,
+            user_tag: 0,
+        },
+    );
+    match submit {
+        Ok(done) => {
+            if done.host_result != hc::HC_OK {
+                return hostcall::map_host_result_to_status(done.host_result);
+            }
+            done.value0 as u32
+        }
+        Err(st) => st,
+    }
 }
 
 fn set_client_pfn_arrays(
@@ -126,4 +201,17 @@ pub(crate) fn handle_user_initialize_client_pfn_arrays(frame: &mut SvcFrame) {
     }
 
     frame.x[0] = status::SUCCESS as u64;
+}
+
+pub(crate) fn handle_win32k_syscall(frame: &mut SvcFrame, nr: u16, table: u8) {
+    match nr {
+        // NtUserInitializeClientPfnArrays
+        win32k_sysno::NT_USER_INITIALIZE_CLIENT_PFN_ARRAYS => {
+            handle_user_initialize_client_pfn_arrays(frame)
+        }
+        _ => {
+            let st = dispatch_win32k_hostcall(frame, nr, table);
+            frame.x[0] = st as u64;
+        }
+    }
 }

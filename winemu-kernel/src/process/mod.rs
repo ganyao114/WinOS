@@ -10,13 +10,15 @@ use core::cell::UnsafeCell;
 pub use handle::{current_pid, resolve_process_handle};
 pub use lifecycle::{
     create_process, init_boot_process, last_handle_closed, on_thread_created, on_thread_terminated,
-    open_process, process_accepts_new_threads, process_exists, process_signaled, switch_to_thread_process,
-    terminate_process, process_exit_status,
+    open_process, process_accepts_new_threads, process_exists, process_exit_status,
+    process_signaled, switch_to_thread_process, terminate_process,
 };
 pub use query::query_information_process;
 pub use set::set_information_process;
 
-pub(crate) use address_space::{ProcessAddressSpace, USER_ACCESS_BASE, USER_VA_BASE, USER_VA_LIMIT};
+pub(crate) use address_space::{
+    ProcessAddressSpace, USER_ACCESS_BASE, USER_VA_BASE, USER_VA_LIMIT,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -167,15 +169,10 @@ pub(crate) fn set_current_vcpu_pid(vcpu_id: usize, pid: u32) {
 
 pub(crate) fn current_vcpu_pid(vcpu_id: usize) -> u32 {
     if vcpu_id >= crate::sched::MAX_VCPUS {
-        return boot_pid();
+        return 0;
     }
     unsafe {
-        let pid = (*PROCESS_RUNTIME.current_pid_by_vcpu.get())[vcpu_id];
-        if pid != 0 {
-            pid
-        } else {
-            boot_pid()
-        }
+        (*PROCESS_RUNTIME.current_pid_by_vcpu.get())[vcpu_id]
     }
 }
 

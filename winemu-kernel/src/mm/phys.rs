@@ -28,7 +28,10 @@ struct PhysChunk {
 
 impl PhysChunk {
     const fn empty() -> Self {
-        Self { base_gpa: 0, bitmap: 0 }
+        Self {
+            base_gpa: 0,
+            bitmap: 0,
+        }
     }
 }
 
@@ -87,7 +90,9 @@ impl PhysAllocator {
         if n > CHUNK_PAGES {
             return self.alloc_pages_direct(n);
         }
-        if n == 1 { return self.alloc_page(); }
+        if n == 1 {
+            return self.alloc_page();
+        }
 
         if self.free_page_count < n + LOW_PAGES {
             self.grow();
@@ -103,7 +108,9 @@ impl PhysAllocator {
                     return Some(self.chunks[i].base_gpa + (bit as u64) * PAGE_SIZE);
                 }
             }
-            if attempt == 0 { self.grow(); }
+            if attempt == 0 {
+                self.grow();
+            }
         }
         None
     }
@@ -188,9 +195,13 @@ impl PhysAllocator {
 
     /// Request a new chunk from VMM via ALLOC_PHYS_PAGES hypercall.
     fn grow(&mut self) {
-        if self.chunk_count >= MAX_CHUNKS { return; }
+        if self.chunk_count >= MAX_CHUNKS {
+            return;
+        }
         let gpa = hypercall::alloc_phys_pages(CHUNK_PAGES as u64);
-        if gpa == 0 { return; }
+        if gpa == 0 {
+            return;
+        }
         let idx = self.chunk_count;
         self.chunks[idx] = PhysChunk {
             base_gpa: gpa,
@@ -229,7 +240,9 @@ impl PhysAllocator {
 
 /// Find `n` contiguous set bits in `bitmap`. Returns starting bit index.
 fn find_contiguous(bitmap: u64, n: usize, mask: u64) -> Option<u32> {
-    if n > 64 { return None; }
+    if n > 64 {
+        return None;
+    }
     let limit = 64 - n;
     for shift in 0..=limit {
         let test = mask << shift;

@@ -5,7 +5,7 @@ use crate::rust_alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::mem::{align_of, size_of};
 
-use super::common::align_up_4k;
+use super::common::{align_up_4k, HOST_PSEUDO_FD_WINEMU_HOST};
 use super::constants::PAGE_SIZE_4K;
 use winemu_shared::status;
 
@@ -800,7 +800,9 @@ pub(crate) fn file_free(idx: u32) {
         return;
     }
     unsafe {
-        hypercall::host_close((*ptr).host_fd);
+        if (*ptr).host_fd != HOST_PSEUDO_FD_WINEMU_HOST {
+            hypercall::host_close((*ptr).host_fd);
+        }
     }
     let _ = store.free(idx);
 }
@@ -999,8 +1001,10 @@ fn vm_range_access_valid(base: u64, size: u64) -> bool {
 }
 
 fn vm_translate_user_va(owner_pid: u32, va: u64, access: u8) -> Option<u64> {
-    crate::process::with_process(owner_pid, |p| p.address_space.translate_user_va_for_access(va, access))
-        .flatten()
+    crate::process::with_process(owner_pid, |p| {
+        p.address_space.translate_user_va_for_access(va, access)
+    })
+    .flatten()
 }
 
 fn vm_kind_from_vma_type(vma_type: VmaType) -> u8 {
@@ -1313,7 +1317,11 @@ fn vm_handle_cow_fault(
 
     if old_gpa != 0 {
         unsafe {
-            core::ptr::copy_nonoverlapping(old_gpa as *const u8, new_gpa as *mut u8, PAGE_SIZE_4K as usize);
+            core::ptr::copy_nonoverlapping(
+                old_gpa as *const u8,
+                new_gpa as *mut u8,
+                PAGE_SIZE_4K as usize,
+            );
         }
     } else {
         unsafe {

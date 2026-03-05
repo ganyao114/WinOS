@@ -2,9 +2,9 @@ use crate::sched::sync::{
     make_new_handle, thread_notify_terminated, HANDLE_TYPE_THREAD, STATUS_SUCCESS,
 };
 use crate::sched::{
-    create_user_thread, current_tid, resolve_thread_tid_from_handle,
-    resume_thread_by_handle, set_thread_base_priority_by_handle, suspend_thread_by_handle,
-    terminate_current_thread, terminate_thread_by_tid, thread_basic_info, CreateThreadError,
+    create_user_thread, current_tid, resolve_thread_tid_from_handle, resume_thread_by_handle,
+    set_thread_base_priority_by_handle, suspend_thread_by_handle, terminate_current_thread,
+    terminate_thread_by_tid, thread_basic_info, CreateThreadError,
 };
 use winemu_shared::status;
 
@@ -107,7 +107,14 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     }
-    let tid = match create_user_thread(target_pid, entry_va, arg, stack_size_arg, max_stack_size_arg, 8) {
+    let tid = match create_user_thread(
+        target_pid,
+        entry_va,
+        arg,
+        stack_size_arg,
+        max_stack_size_arg,
+        8,
+    ) {
         Ok(tid) => tid,
         Err(CreateThreadError::InvalidParameter) => {
             frame.x[0] = status::INVALID_PARAMETER as u64;

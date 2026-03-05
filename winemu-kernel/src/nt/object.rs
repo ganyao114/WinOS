@@ -69,7 +69,8 @@ pub(crate) fn handle_duplicate_object(frame: &mut SvcFrame) {
         return;
     };
 
-    let Some((src_htype, _src_idx)) = kobject::resolve_handle_target_for_pid(source_pid, src) else {
+    let Some((src_htype, _src_idx)) = kobject::resolve_handle_target_for_pid(source_pid, src)
+    else {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     };

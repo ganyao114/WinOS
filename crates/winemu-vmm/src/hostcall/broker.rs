@@ -11,6 +11,7 @@ use std::thread;
 use std::time::Duration;
 use winemu_core::addr::Gpa;
 use winemu_shared::hostcall as hc;
+use winemu_shared::status;
 
 const DEFAULT_IO_QUEUE_CAP: usize = 4096;
 const DEFAULT_MAIN_QUEUE_CAP: usize = 1024;
@@ -94,7 +95,7 @@ struct BrokerStats {
 impl BrokerStats {
     fn new() -> Self {
         let mut per_op = Vec::new();
-        let max_opcode = hc::OP_MUNMAP as usize;
+        let max_opcode = hc::OP_WIN32K_CALL as usize;
         if per_op.try_reserve(max_opcode + 1).is_ok() {
             for _ in 0..=max_opcode {
                 per_op.push(OpCounters::new());
@@ -401,6 +402,7 @@ fn is_supported_opcode(opcode: u64) -> bool {
             | hc::OP_NOTIFY_DIR
             | hc::OP_MMAP
             | hc::OP_MUNMAP
+            | hc::OP_WIN32K_CALL
     )
 }
 
@@ -605,7 +607,85 @@ fn execute_sync(
         hc::OP_NOTIFY_DIR => execute_notify_dir(inner, args),
         hc::OP_MMAP => execute_mmap(inner, args),
         hc::OP_MUNMAP => execute_munmap(inner, args),
+        hc::OP_WIN32K_CALL => execute_win32k_call(inner, args),
         _ => (hc::HC_INVALID, 0),
+    }
+}
+
+fn read_u32_le(bytes: &[u8], off: usize) -> Option<u32> {
+    let end = off.checked_add(4)?;
+    let src = bytes.get(off..end)?;
+    Some(u32::from_le_bytes([src[0], src[1], src[2], src[3]]))
+}
+
+fn read_u64_le(bytes: &[u8], off: usize) -> Option<u64> {
+    let end = off.checked_add(8)?;
+    let src = bytes.get(off..end)?;
+    Some(u64::from_le_bytes([
+        src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
+    ]))
+}
+
+fn execute_win32k_call(inner: &Arc<BrokerInner>, args: [u64; 4]) -> (u64, u64) {
+    let packet_gpa = args[0];
+    let packet_len = args[1] as usize;
+    if packet_len < hc::WIN32K_CALL_PACKET_SIZE || packet_len > 1024 {
+        return (hc::HC_INVALID, 0);
+    }
+
+    let bytes = {
+        let mem = inner.memory.read().unwrap();
+        mem.read_bytes(Gpa(packet_gpa), packet_len).to_vec()
+    };
+    if bytes.len() < hc::WIN32K_CALL_PACKET_SIZE {
+        return (hc::HC_INVALID, 0);
+    }
+
+    let version = match read_u32_le(&bytes, 0) {
+        Some(v) => v,
+        None => return (hc::HC_INVALID, 0),
+    };
+    let table = match read_u32_le(&bytes, 4) {
+        Some(v) => v,
+        None => return (hc::HC_INVALID, 0),
+    };
+    let syscall_nr = match read_u32_le(&bytes, 8) {
+        Some(v) => v,
+        None => return (hc::HC_INVALID, 0),
+    };
+    let arg_count = match read_u32_le(&bytes, 12) {
+        Some(v) => v as usize,
+        None => return (hc::HC_INVALID, 0),
+    };
+    let owner_pid = match read_u32_le(&bytes, 16) {
+        Some(v) => v,
+        None => return (hc::HC_INVALID, 0),
+    };
+    let owner_tid = match read_u32_le(&bytes, 20) {
+        Some(v) => v,
+        None => return (hc::HC_INVALID, 0),
+    };
+    if version != hc::WIN32K_CALL_PACKET_VERSION {
+        return (hc::HC_INVALID, 0);
+    }
+
+    let mut call_args = [0u64; hc::WIN32K_CALL_MAX_ARGS];
+    let mut i = 0usize;
+    while i < hc::WIN32K_CALL_MAX_ARGS {
+        let off = 32 + i * 8;
+        let Some(v) = read_u64_le(&bytes, off) else {
+            return (hc::HC_INVALID, 0);
+        };
+        call_args[i] = v;
+        i += 1;
+    }
+    let _effective_arg_count = core::cmp::min(arg_count, hc::WIN32K_CALL_MAX_ARGS);
+    let _ = (owner_pid, owner_tid, call_args);
+
+    // Phase-1 bridge landing: parse packet and route through a single opcode.
+    // Host win32k runtime is not wired yet, so keep semantic NTSTATUS explicit.
+    match (table, syscall_nr) {
+        _ => (hc::HC_OK, status::NOT_IMPLEMENTED as u64),
     }
 }
 
@@ -1287,6 +1367,41 @@ mod tests {
         assert_eq!(open.submit_async, 1);
         assert_eq!(open.complete_async, 1);
         assert_eq!(open.backpressure, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn win32k_call_bridge_returns_not_implemented_status() {
+        let root = temp_root();
+        let (broker, memory, _host_files, _) = test_setup(&root);
+        let pkt_ptr = memory.read().unwrap().base_gpa().0 + 0x30000;
+
+        let mut bytes = vec![0u8; hc::WIN32K_CALL_PACKET_SIZE];
+        bytes[0..4].copy_from_slice(&hc::WIN32K_CALL_PACKET_VERSION.to_le_bytes()); // version
+        bytes[4..8].copy_from_slice(&(1u32).to_le_bytes()); // table
+        bytes[8..12].copy_from_slice(
+            &(winemu_shared::win32k_sysno::NT_USER_INITIALIZE_CLIENT_PFN_ARRAYS as u32)
+                .to_le_bytes(),
+        ); // syscall nr
+        bytes[12..16].copy_from_slice(&(hc::WIN32K_CALL_MAX_ARGS as u32).to_le_bytes()); // arg_count
+        bytes[16..20].copy_from_slice(&(1u32).to_le_bytes()); // owner_pid
+        bytes[20..24].copy_from_slice(&(1u32).to_le_bytes()); // owner_tid
+        memory.write().unwrap().write_bytes(Gpa(pkt_ptr), &bytes);
+
+        let submit = broker.submit(
+            hc::OP_WIN32K_CALL,
+            0,
+            [pkt_ptr, hc::WIN32K_CALL_PACKET_SIZE as u64, 0, 0],
+            0,
+        );
+        match submit {
+            SubmitResult::Completed { host_result, aux } => {
+                assert_eq!(host_result, hc::HC_OK);
+                assert_eq!(aux as u32, status::NOT_IMPLEMENTED);
+            }
+            SubmitResult::Pending { .. } => panic!("win32k bridge should complete on sync path"),
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -1,5 +1,8 @@
 use crate::kobj::ObjectStore;
-use crate::rust_alloc::{string::{String, ToString}, vec::Vec};
+use crate::rust_alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 use crate::sched::sync::{self, make_new_handle, HANDLE_TYPE_KEY};
 use winemu_shared::status;
 use winereg::{
@@ -7,7 +10,9 @@ use winereg::{
     REG_MULTI_SZ, REG_QWORD, REG_SZ,
 };
 
-use super::path::{bytes_path_to_registry, normalize_registry_path, read_oa_path, read_unicode_direct};
+use super::path::{
+    bytes_path_to_registry, normalize_registry_path, read_oa_path, read_unicode_direct,
+};
 use super::SvcFrame;
 
 const MAX_PATH: usize = 256;
@@ -432,7 +437,11 @@ pub(crate) fn handle_query_value_key(frame: &mut SvcFrame) {
                 (out_ptr as *mut u32).write_volatile(0);
                 (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
                 (out_ptr.add(8) as *mut u32).write_volatile(value_name_wlen as u32);
-                core::ptr::copy_nonoverlapping(value_name_w.as_ptr(), out_ptr.add(12), value_name_wlen);
+                core::ptr::copy_nonoverlapping(
+                    value_name_w.as_ptr(),
+                    out_ptr.add(12),
+                    value_name_wlen,
+                );
                 frame.x[0] = status::SUCCESS as u64;
             }
             1 => {
@@ -447,7 +456,11 @@ pub(crate) fn handle_query_value_key(frame: &mut SvcFrame) {
                 (out_ptr.add(8) as *mut u32).write_volatile((20 + value_name_wlen) as u32);
                 (out_ptr.add(12) as *mut u32).write_volatile(value_data_len as u32);
                 (out_ptr.add(16) as *mut u32).write_volatile(value_name_wlen as u32);
-                core::ptr::copy_nonoverlapping(value_name_w.as_ptr(), out_ptr.add(20), value_name_wlen);
+                core::ptr::copy_nonoverlapping(
+                    value_name_w.as_ptr(),
+                    out_ptr.add(20),
+                    value_name_wlen,
+                );
                 if value_data_len != 0 {
                     core::ptr::copy_nonoverlapping(
                         value_data.as_ptr(),
@@ -468,7 +481,11 @@ pub(crate) fn handle_query_value_key(frame: &mut SvcFrame) {
                 (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
                 (out_ptr.add(8) as *mut u32).write_volatile(value_data_len as u32);
                 if value_data_len != 0 {
-                    core::ptr::copy_nonoverlapping(value_data.as_ptr(), out_ptr.add(12), value_data_len);
+                    core::ptr::copy_nonoverlapping(
+                        value_data.as_ptr(),
+                        out_ptr.add(12),
+                        value_data_len,
+                    );
                 }
                 frame.x[0] = status::SUCCESS as u64;
             }
@@ -690,7 +707,11 @@ pub(crate) fn handle_enumerate_value_key(frame: &mut SvcFrame) {
                 (out_ptr as *mut u32).write_volatile(0);
                 (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
                 (out_ptr.add(8) as *mut u32).write_volatile(value_name_wlen as u32);
-                core::ptr::copy_nonoverlapping(value_name_w.as_ptr(), out_ptr.add(12), value_name_wlen);
+                core::ptr::copy_nonoverlapping(
+                    value_name_w.as_ptr(),
+                    out_ptr.add(12),
+                    value_name_wlen,
+                );
                 frame.x[0] = status::SUCCESS as u64;
             }
             1 => {
@@ -705,7 +726,11 @@ pub(crate) fn handle_enumerate_value_key(frame: &mut SvcFrame) {
                 (out_ptr.add(8) as *mut u32).write_volatile((20 + value_name_wlen) as u32);
                 (out_ptr.add(12) as *mut u32).write_volatile(value_data_len as u32);
                 (out_ptr.add(16) as *mut u32).write_volatile(value_name_wlen as u32);
-                core::ptr::copy_nonoverlapping(value_name_w.as_ptr(), out_ptr.add(20), value_name_wlen);
+                core::ptr::copy_nonoverlapping(
+                    value_name_w.as_ptr(),
+                    out_ptr.add(20),
+                    value_name_wlen,
+                );
                 if value_data_len != 0 {
                     core::ptr::copy_nonoverlapping(
                         value_data.as_ptr(),
@@ -726,7 +751,11 @@ pub(crate) fn handle_enumerate_value_key(frame: &mut SvcFrame) {
                 (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
                 (out_ptr.add(8) as *mut u32).write_volatile(value_data_len as u32);
                 if value_data_len != 0 {
-                    core::ptr::copy_nonoverlapping(value_data.as_ptr(), out_ptr.add(12), value_data_len);
+                    core::ptr::copy_nonoverlapping(
+                        value_data.as_ptr(),
+                        out_ptr.add(12),
+                        value_data_len,
+                    );
                 }
                 frame.x[0] = status::SUCCESS as u64;
             }

@@ -297,6 +297,10 @@ pub fn terminate_thread_by_tid(tid: u32) -> bool {
         return false;
     }
     sched_lock_acquire();
+    if with_thread(tid, |t| t.is_idle_thread) {
+        sched_lock_release();
+        return false;
+    }
     let cur_tid = current_tid();
     let (state, pid, stack_base, teb_va, kstack_base) =
         with_thread(tid, |t| (t.state, t.pid, t.stack_base, t.teb_va, t.kstack_base));
