@@ -359,6 +359,10 @@ fn enter_bootstrap_thread_dispatch(vcpu_id: usize) -> ! {
 }
 
 fn enter_secondary_idle_loop(vcpu_id: usize) -> ! {
+    if cfg!(feature = "sched-secondary-round") {
+        enter_secondary_idle_loop_round(vcpu_id);
+    }
+
     let vid = vcpu_id.min(MAX_VCPUS - 1);
 
     set_current_cpu_thread(vid, 0);
@@ -374,6 +378,70 @@ fn enter_secondary_idle_loop(vcpu_id: usize) -> ! {
         sched_lock_release();
         crate::hostcall::pump_completions();
         timer::idle_wait_until_deadline_100ns(now_100ns, next_deadline_100ns);
+    }
+}
+
+fn enter_secondary_idle_loop_round(vcpu_id: usize) -> ! {
+    let vid = vcpu_id.min(MAX_VCPUS - 1);
+    let quantum_100ns = timer::DEFAULT_TIMESLICE_100NS.max(1);
+
+    set_current_cpu_thread(vid, 0);
+    set_vcpu_kernel_sp(vid, default_kernel_stack_top());
+
+    loop {
+        crate::hostcall::pump_completions();
+        sched_lock_acquire();
+        match scheduler_round_locked(vid, 0, quantum_100ns) {
+            SchedulerRoundAction::RunThread {
+                now_100ns,
+                next_deadline_100ns,
+                slice_remaining_100ns,
+                to_tid,
+                ..
+            } => {
+                if !has_kernel_continuation(to_tid) {
+                    with_thread_mut(to_tid, |t| t.last_vcpu_hint = 0);
+                    set_thread_state_locked(to_tid, ThreadState::Ready);
+                    unsafe {
+                        (*SCHED.vcpus.get())[vid].current_tid = 0;
+                    }
+                    set_current_cpu_thread(vid, 0);
+                    set_vcpu_kernel_sp(vid, default_kernel_stack_top());
+                    set_vcpu_idle_locked(vid, true);
+                    sched_lock_release();
+                    timer::idle_wait_until_deadline_100ns(now_100ns, next_deadline_100ns);
+                    continue;
+                }
+                sched_lock_release();
+                run_selected_thread_noreturn(
+                    to_tid,
+                    now_100ns,
+                    next_deadline_100ns,
+                    slice_remaining_100ns,
+                )
+            }
+            SchedulerRoundAction::IdleWait {
+                now_100ns,
+                next_deadline_100ns,
+                ..
+            } => {
+                set_vcpu_idle_locked(vid, true);
+                sched_lock_release();
+                timer::idle_wait_until_deadline_100ns(now_100ns, next_deadline_100ns);
+            }
+            SchedulerRoundAction::ContinueCurrent {
+                now_100ns,
+                next_deadline_100ns,
+                slice_remaining_100ns,
+            } => {
+                sched_lock_release();
+                timer::schedule_running_slice_100ns(
+                    now_100ns,
+                    next_deadline_100ns,
+                    slice_remaining_100ns,
+                );
+            }
+        }
     }
 }
 
