@@ -6,6 +6,7 @@ KERNEL_DIR="$ROOT_DIR/winemu-kernel"
 TARGET_TRIPLE="aarch64-unknown-none"
 KERNEL_ELF="$KERNEL_DIR/target/$TARGET_TRIPLE/release/winemu-kernel"
 KERNEL_BIN="$ROOT_DIR/winemu-kernel.bin"
+KERNEL_FEATURES="${WINEMU_KERNEL_FEATURES:-}"
 
 if command -v rust-objcopy >/dev/null 2>&1; then
   OBJCOPY_BIN="rust-objcopy"
@@ -19,10 +20,15 @@ else
   exit 1
 fi
 
-echo "[build] cargo build --release --target $TARGET_TRIPLE (winemu-kernel)"
+BUILD_ARGS=(--release --target "$TARGET_TRIPLE")
+if [[ -n "$KERNEL_FEATURES" ]]; then
+  BUILD_ARGS+=(--features "$KERNEL_FEATURES")
+fi
+
+echo "[build] cargo build ${BUILD_ARGS[*]} (winemu-kernel)"
 (
   cd "$KERNEL_DIR"
-  cargo build --release --target "$TARGET_TRIPLE"
+  cargo build "${BUILD_ARGS[@]}"
 )
 
 if [[ ! -f "$KERNEL_ELF" ]]; then
