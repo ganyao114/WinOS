@@ -360,7 +360,7 @@ fn enter_bootstrap_thread_dispatch(vcpu_id: usize) -> ! {
 
 fn enter_secondary_idle_loop(vcpu_id: usize) -> ! {
     if cfg!(feature = "sched-secondary-round") {
-        enter_secondary_idle_loop_round(vcpu_id);
+        enter_core_scheduler_round_loop(vcpu_id, 0, false);
     }
 
     let vid = vcpu_id.min(MAX_VCPUS - 1);
@@ -381,66 +381,151 @@ fn enter_secondary_idle_loop(vcpu_id: usize) -> ! {
     }
 }
 
-fn enter_secondary_idle_loop_round(vcpu_id: usize) -> ! {
+fn enter_core_scheduler_round_loop(
+    vcpu_id: usize,
+    from_tid_hint: u32,
+    allow_user_entry_fallback: bool,
+) -> ! {
     let vid = vcpu_id.min(MAX_VCPUS - 1);
     let quantum_100ns = timer::DEFAULT_TIMESLICE_100NS.max(1);
 
-    set_current_cpu_thread(vid, 0);
-    set_vcpu_kernel_sp(vid, default_kernel_stack_top());
+    // Stage alignment: secondary-style round loop keeps old invariant and
+    // only consumes runnable kernel continuations.
+    if !allow_user_entry_fallback {
+        set_current_cpu_thread(vid, 0);
+        set_vcpu_kernel_sp(vid, default_kernel_stack_top());
+
+        loop {
+            let now_100ns;
+            let next_deadline_100ns;
+            let mut to_tid = 0u32;
+            let mut slice_remaining_100ns = quantum_100ns;
+
+            crate::hostcall::pump_completions();
+            sched_lock_acquire();
+            now_100ns = now_ticks();
+            set_vcpu_idle_locked(vid, false);
+            let _ = consume_pending_reschedule_locked(vid);
+            let _ = check_timeouts(now_100ns);
+            next_deadline_100ns = next_wait_deadline_locked();
+
+            if ready_highest_priority_kernel_continuation_locked(vid).is_some() {
+                let picked = pick_ready_kernel_continuation_locked(vid);
+                if picked != 0 {
+                    set_thread_state_locked(picked, ThreadState::Running);
+                    with_thread_mut(picked, |t| {
+                        if t.slice_remaining_100ns == 0 {
+                            t.slice_remaining_100ns = quantum_100ns;
+                        }
+                        t.last_start_100ns = now_100ns;
+                        t.last_vcpu_hint = vid as u8;
+                    });
+                    unsafe {
+                        (*SCHED.vcpus.get())[vid].current_tid = picked;
+                    }
+                    set_current_cpu_thread(vid, picked);
+                    set_vcpu_kernel_sp_for_tid(vid, picked);
+                    slice_remaining_100ns = current_slice_remaining_100ns(vid, quantum_100ns);
+                    to_tid = picked;
+                }
+            }
+
+            if to_tid == 0 {
+                set_vcpu_idle_locked(vid, true);
+                sched_lock_release();
+                timer::idle_wait_until_deadline_100ns(now_100ns, next_deadline_100ns);
+                continue;
+            }
+
+            sched_lock_release();
+            run_selected_thread_noreturn(
+                to_tid,
+                now_100ns,
+                next_deadline_100ns,
+                slice_remaining_100ns,
+            )
+        }
+    }
+
+    let mut from_tid = from_tid_hint;
+
+    if from_tid != 0 && thread_exists(from_tid) {
+        set_current_cpu_thread(vid, from_tid);
+        set_vcpu_kernel_sp_for_tid(vid, from_tid);
+    } else {
+        from_tid = 0;
+        set_current_cpu_thread(vid, 0);
+        set_vcpu_kernel_sp(vid, default_kernel_stack_top());
+    }
 
     loop {
-        let now_100ns;
-        let next_deadline_100ns;
-        let mut to_tid = 0u32;
-        let mut slice_remaining_100ns = quantum_100ns;
-
         crate::hostcall::pump_completions();
         sched_lock_acquire();
-        now_100ns = now_ticks();
-        set_vcpu_idle_locked(vid, false);
-        let _ = consume_pending_reschedule_locked(vid);
-        let _ = check_timeouts(now_100ns);
-        next_deadline_100ns = next_wait_deadline_locked();
-
-        if ready_highest_priority_kernel_continuation_locked(vid).is_some() {
-            let picked = pick_ready_kernel_continuation_locked(vid);
-            if picked != 0 {
-                set_thread_state_locked(picked, ThreadState::Running);
-                with_thread_mut(picked, |t| {
-                    if t.slice_remaining_100ns == 0 {
-                        t.slice_remaining_100ns = quantum_100ns;
-                    }
-                    t.last_start_100ns = now_100ns;
-                    t.last_vcpu_hint = vid as u8;
-                });
-                unsafe {
-                    (*SCHED.vcpus.get())[vid].current_tid = picked;
+        match scheduler_round_locked(vid, from_tid, quantum_100ns) {
+            SchedulerRoundAction::RunThread {
+                now_100ns,
+                next_deadline_100ns,
+                slice_remaining_100ns,
+                to_tid,
+                ..
+            } => {
+                sched_lock_release();
+                run_selected_thread_noreturn(
+                    to_tid,
+                    now_100ns,
+                    next_deadline_100ns,
+                    slice_remaining_100ns,
+                )
+            }
+            SchedulerRoundAction::ContinueCurrent {
+                now_100ns,
+                next_deadline_100ns,
+                slice_remaining_100ns,
+            } => {
+                let to_tid = if from_tid != 0 && thread_exists(from_tid) {
+                    from_tid
+                } else {
+                    current_tid()
+                };
+                if to_tid == 0 || !thread_exists(to_tid) {
+                    from_tid = 0;
+                    set_vcpu_idle_locked(vid, true);
+                    sched_lock_release();
+                    timer::idle_wait_until_deadline_100ns(now_100ns, next_deadline_100ns);
+                    continue;
                 }
-                set_current_cpu_thread(vid, picked);
-                set_vcpu_kernel_sp_for_tid(vid, picked);
-                slice_remaining_100ns = current_slice_remaining_100ns(vid, quantum_100ns);
-                to_tid = picked;
+                sched_lock_release();
+                run_selected_thread_noreturn(
+                    to_tid,
+                    now_100ns,
+                    next_deadline_100ns,
+                    slice_remaining_100ns,
+                )
+            }
+            SchedulerRoundAction::IdleWait {
+                now_100ns,
+                next_deadline_100ns,
+                ..
+            } => {
+                from_tid = 0;
+                set_vcpu_idle_locked(vid, true);
+                sched_lock_release();
+                timer::idle_wait_until_deadline_100ns(now_100ns, next_deadline_100ns);
+                continue;
             }
         }
-
-        if to_tid == 0 {
-            set_vcpu_idle_locked(vid, true);
-            sched_lock_release();
-            timer::idle_wait_until_deadline_100ns(now_100ns, next_deadline_100ns);
-            continue;
-        }
-
-        sched_lock_release();
-        run_selected_thread_noreturn(
-            to_tid,
-            now_100ns,
-            next_deadline_100ns,
-            slice_remaining_100ns,
-        )
     }
 }
 
 pub fn enter_core_scheduler_entry(vcpu_id: usize) -> ! {
+    if cfg!(feature = "sched-secondary-round") {
+        let cur = current_tid();
+        if cur != 0 && thread_exists(cur) {
+            enter_core_scheduler_round_loop(vcpu_id, cur, true);
+        }
+        enter_core_scheduler_round_loop(vcpu_id, 0, false);
+    }
+
     let cur = current_tid();
     if cur != 0 && thread_exists(cur) {
         enter_bootstrap_thread_dispatch(vcpu_id)
