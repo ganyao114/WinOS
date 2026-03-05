@@ -1,6 +1,6 @@
 use super::{
-    commit_deferred_scheduling_locked, prepare_unlock_edge_kernel_switch_locked,
-    switch_kernel_continuation, vcpu_id, SCHED,
+    commit_and_collect_unlock_edge_decision_locked, execute_kernel_continuation_switch,
+    record_schedule_event_unlock_edge, vcpu_id, SCHED,
 };
 
 // 可重入；底层用原子自旋锁保护多 vCPU 并发。
@@ -90,9 +90,9 @@ fn sched_lock_release_impl() {
         }
         *count -= 1;
         if *count == 0 {
-            commit_deferred_scheduling_locked();
-            unlock_switch = prepare_unlock_edge_kernel_switch_locked(vid);
-            wake_idle_mask = super::consume_idle_wakeup_mask_locked();
+            let decision = commit_and_collect_unlock_edge_decision_locked(vid);
+            unlock_switch = decision.unlock_kernel_switch;
+            wake_idle_mask = decision.wake_idle_mask;
             *SCHED.lock_owner.get() = 0;
             spinlock_release();
         }
@@ -101,19 +101,15 @@ fn sched_lock_release_impl() {
         crate::hypercall::kick_vcpu_mask(wake_idle_mask);
     }
     if let Some(sw) = unlock_switch {
-        crate::process::switch_to_thread_process(sw.to_tid);
-        crate::timer::schedule_running_slice_100ns(
+        record_schedule_event_unlock_edge();
+        execute_kernel_continuation_switch(
+            sw.from_tid,
+            sw.to_tid,
             sw.now_100ns,
             sw.next_deadline_100ns,
             sw.slice_remaining_100ns,
+            "unlock-edge",
         );
-        let switched = unsafe { switch_kernel_continuation(sw.from_tid, sw.to_tid) };
-        if !switched {
-            panic!(
-                "sched: unlock-edge kernel continuation switch failed from={} to={}",
-                sw.from_tid, sw.to_tid
-            );
-        }
     }
 }
 

@@ -142,25 +142,22 @@ pub extern "C" fn el1_sync_fault(far: u64, esr: u64, elr: u64) -> ! {
         insn_p1 = unsafe { (elr.wrapping_add(4) as *const u32).read_volatile() as u64 };
         insn_p2 = unsafe { (elr.wrapping_add(8) as *const u32).read_volatile() as u64 };
     }
-    crate::log::debug_print("KERNEL_FAULT: FAR=");
-    crate::log::debug_u64(far);
-    crate::log::debug_print(" ESR=");
-    crate::log::debug_u64(esr);
-    crate::log::debug_print(" ELR=");
-    crate::log::debug_u64(elr);
-    crate::log::debug_print(" INSN=");
-    crate::log::debug_u64(insn);
-    crate::log::debug_print(" WIN=");
-    crate::log::debug_u64(insn_m2);
-    crate::log::debug_print(",");
-    crate::log::debug_u64(insn_m1);
-    crate::log::debug_print(",");
-    crate::log::debug_u64(insn);
-    crate::log::debug_print(",");
-    crate::log::debug_u64(insn_p1);
-    crate::log::debug_print(",");
-    crate::log::debug_u64(insn_p2);
-    crate::log::debug_print("\n");
+    let vid = crate::sched::vcpu_id();
+    let tid = crate::sched::current_tid();
+    crate::kerror!(
+        "KERNEL_FAULT far={:#x} esr={:#x} elr={:#x} insn={:#x} win=[{:#x},{:#x},{:#x},{:#x},{:#x}] vcpu={} tid={}",
+        far,
+        esr,
+        elr,
+        insn,
+        insn_m2,
+        insn_m1,
+        insn,
+        insn_p1,
+        insn_p2,
+        vid,
+        tid
+    );
     hypercall::process_exit(0xE1)
 }
 
@@ -339,8 +336,9 @@ pub extern "C" fn kernel_main() -> ! {
         hypercall::process_exit(1);
     }
     let now = sched::now_ticks();
+    sched::sched_lock_acquire();
+    sched::set_thread_state_locked(thread0_tid, sched::ThreadState::Running);
     sched::with_thread_mut(thread0_tid, |t| {
-        t.state = sched::ThreadState::Running;
         t.ctx.pc = start_thunk_va;
         t.ctx.sp = teb_peb.stack_base;
         t.ctx.x[0] = app_entry_va;
@@ -352,6 +350,7 @@ pub extern "C" fn kernel_main() -> ! {
         t.last_start_100ns = now;
         t.in_kernel = false;
     });
+    sched::sched_lock_release();
     process::switch_to_thread_process(thread0_tid);
 
     // Release secondary CPUs from early boot hold loop only after thread0
