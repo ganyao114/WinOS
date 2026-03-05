@@ -116,6 +116,7 @@ pub struct KThread {
     pub kstack_base: u64,
     pub kstack_size: u64,
     pub in_kernel: bool,
+    pub is_idle_thread: bool,
 
     pub ctx: ThreadContext,
     pub kctx: KernelContext,
@@ -158,6 +159,7 @@ impl KThread {
             kstack_base: 0,
             kstack_size: 0,
             in_kernel: false,
+            is_idle_thread: false,
             ctx: ThreadContext {
                 x: [0u64; 31],
                 sp: 0,
@@ -215,6 +217,7 @@ impl KThread {
         self.kstack_base = kstack_base;
         self.kstack_size = kstack_size;
         self.in_kernel = false;
+        self.is_idle_thread = false;
         self.ctx = ThreadContext::default();
         self.kctx = KernelContext::default();
         self.last_vcpu_hint = VCPU_HINT_NONE;
@@ -245,11 +248,36 @@ impl KThread {
         self.kstack_base = kstack_base;
         self.kstack_size = kstack_size;
         self.in_kernel = false;
+        self.is_idle_thread = false;
         self.ctx = ThreadContext::default();
         self.kctx = KernelContext::default();
         self.last_vcpu_hint = VCPU_HINT_NONE;
         self.affinity_mask = all_vcpu_affinity_mask();
         self.ctx.tpidr = teb_va;
+    }
+
+    fn init_idle_thread(&mut self, tid: u32, vcpu_id: usize, kstack_base: u64, kstack_size: u64) {
+        self.state = ThreadState::Running;
+        self.priority = 0;
+        self.base_priority = 0;
+        self.suspend_count = 0;
+        self.tid = tid;
+        self.pid = 0;
+        self.teb_va = 0;
+        self.stack_base = 0;
+        self.stack_size = 0;
+        self.kstack_base = kstack_base;
+        self.kstack_size = kstack_size;
+        self.in_kernel = true;
+        self.is_idle_thread = true;
+        self.ctx = ThreadContext::default();
+        self.kctx = KernelContext::default();
+        self.last_vcpu_hint = vcpu_id as u8;
+        self.affinity_mask = if vcpu_id < 32 {
+            1u32 << vcpu_id
+        } else {
+            all_vcpu_affinity_mask()
+        };
     }
 
     pub fn basic_info_record(&self) -> [u8; THREAD_BASIC_INFORMATION_SIZE] {
@@ -502,6 +530,7 @@ pub struct Scheduler {
     threads: UnsafeCell<Option<ObjectStore<KThread>>>,
     priority_queue: UnsafeCell<KPriorityQueue>,
     vcpus: UnsafeCell<[KScheduler; MAX_VCPUS]>,
+    idle_tid_by_vcpu: UnsafeCell<[u32; MAX_VCPUS]>,
     pending_reschedule_mask: UnsafeCell<u32>,
     reschedule_mask: UnsafeCell<u32>,
     idle_vcpu_mask: UnsafeCell<u32>,
@@ -524,6 +553,7 @@ pub static SCHED: Scheduler = Scheduler {
     threads: UnsafeCell::new(None),
     priority_queue: UnsafeCell::new(KPriorityQueue::new()),
     vcpus: UnsafeCell::new([const { KScheduler::new() }; MAX_VCPUS]),
+    idle_tid_by_vcpu: UnsafeCell::new([0; MAX_VCPUS]),
     pending_reschedule_mask: UnsafeCell::new(0),
     reschedule_mask: UnsafeCell::new(0),
     idle_vcpu_mask: UnsafeCell::new(0),

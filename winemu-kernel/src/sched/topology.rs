@@ -8,85 +8,184 @@ fn vcpu_bit(vid: usize) -> u32 {
 }
 
 #[inline(always)]
+fn thread_affinity_mask_locked(tid: u32) -> u32 {
+    with_thread(tid, |t| t.affinity_mask & all_vcpu_affinity_mask())
+}
+
+#[inline(always)]
+fn thread_can_run_on_vcpu_locked(tid: u32, vid: usize) -> bool {
+    if tid == 0 || !thread_exists(tid) || vid >= MAX_VCPUS {
+        return false;
+    }
+    (thread_affinity_mask_locked(tid) & vcpu_bit(vid)) != 0
+}
+
+#[inline(always)]
+fn first_vcpu_from_mask(mask: u32) -> usize {
+    for vid in 0..MAX_VCPUS {
+        if (mask & vcpu_bit(vid)) != 0 {
+            return vid;
+        }
+    }
+    vcpu_id().min(MAX_VCPUS - 1)
+}
+
+#[inline(always)]
 fn ready_target_vcpu_hint(tid: u32) -> Option<usize> {
     let hint = with_thread(tid, |t| t.last_vcpu_hint as usize);
-    if hint < MAX_VCPUS {
-        Some(hint)
-    } else {
-        None
+    if hint >= MAX_VCPUS || hint == VCPU_HINT_NONE as usize {
+        return None;
     }
+    if !thread_can_run_on_vcpu_locked(tid, hint) {
+        return None;
+    }
+    if (online_vcpu_mask_locked() & vcpu_bit(hint)) == 0 {
+        return None;
+    }
+    Some(hint)
+}
+
+#[inline(always)]
+fn online_vcpu_mask_locked() -> u32 {
+    unsafe {
+        let mask = *SCHED.online_vcpu_mask.get();
+        if mask != 0 {
+            mask
+        } else {
+            vcpu_bit(vcpu_id().min(MAX_VCPUS - 1))
+        }
+    }
+}
+
+fn choose_enqueue_vcpu_locked(affinity_mask: u32) -> usize {
+    unsafe {
+        let online = online_vcpu_mask_locked() & affinity_mask;
+        if online == 0 {
+            return first_vcpu_from_mask(affinity_mask);
+        }
+
+        let rr = (*SCHED.enqueue_rr.get() as usize).min(MAX_VCPUS - 1);
+        let idle = *SCHED.idle_vcpu_mask.get() & online;
+
+        let mut pick = None;
+        if idle != 0 {
+            for off in 0..MAX_VCPUS {
+                let vid = (rr + off) % MAX_VCPUS;
+                let bit = vcpu_bit(vid);
+                if (idle & bit) != 0 {
+                    pick = Some(vid);
+                    break;
+                }
+            }
+        }
+        if pick.is_none() {
+            for off in 0..MAX_VCPUS {
+                let vid = (rr + off) % MAX_VCPUS;
+                let bit = vcpu_bit(vid);
+                if (online & bit) != 0 {
+                    pick = Some(vid);
+                    break;
+                }
+            }
+        }
+
+        let chosen = pick.unwrap_or(0);
+        *SCHED.enqueue_rr.get() = ((chosen + 1) % MAX_VCPUS) as u8;
+        chosen
+    }
+}
+
+#[inline(always)]
+fn choose_enqueue_vcpu_for_tid_locked(tid: u32) -> usize {
+    let mut affinity_mask = thread_affinity_mask_locked(tid);
+    if affinity_mask == 0 {
+        affinity_mask = all_vcpu_affinity_mask();
+    }
+    choose_enqueue_vcpu_locked(affinity_mask)
 }
 
 fn ready_push_tid_locked(tid: u32) {
     unsafe {
-        if let Some(vid) = ready_target_vcpu_hint(tid) {
-            with_thread_mut(tid, |t| (*SCHED.ready_local.get())[vid].push(t));
-        } else {
-            with_thread_mut(tid, |t| (*SCHED.ready_global.get()).push(t));
-        }
+        let target_vid = ready_target_vcpu_hint(tid).unwrap_or_else(|| choose_enqueue_vcpu_for_tid_locked(tid));
+        with_thread_mut(tid, |t| {
+            t.last_vcpu_hint = target_vid as u8;
+            (*SCHED.priority_queue.get()).ready.push(t);
+        });
     }
 }
 
 fn ready_remove_tid_locked(tid: u32) {
     unsafe {
-        (*SCHED.ready_global.get()).remove(tid);
-        for vid in 0..MAX_VCPUS {
-            (*SCHED.ready_local.get())[vid].remove(tid);
-        }
+        (*SCHED.priority_queue.get()).ready.remove(tid);
     }
 }
 
-fn ready_highest_priority_locked() -> Option<u8> {
+#[inline(always)]
+fn ready_tid_matches_scheduled_locked(tid: u32, vcpu_id: usize) -> bool {
+    ready_target_vcpu_hint(tid) == Some(vcpu_id)
+}
+
+#[inline(always)]
+fn ready_tid_matches_suggested_locked(tid: u32, vcpu_id: usize) -> bool {
+    if ready_tid_matches_scheduled_locked(tid, vcpu_id) {
+        return false;
+    }
+    thread_can_run_on_vcpu_locked(tid, vcpu_id)
+}
+
+pub(crate) fn ready_highest_priority_scheduled_locked(vcpu_id: usize) -> Option<u8> {
     unsafe {
-        let mut highest = (*SCHED.ready_global.get()).highest_priority();
-        for vid in 0..MAX_VCPUS {
-            let cand = (*SCHED.ready_local.get())[vid].highest_priority();
-            if cand.is_some() && (highest.is_none() || cand > highest) {
-                highest = cand;
-            }
-        }
-        highest
+        (*SCHED.priority_queue.get())
+            .ready
+            .highest_priority_matching(|tid| ready_tid_matches_scheduled_locked(tid, vcpu_id))
+    }
+}
+
+pub(crate) fn ready_highest_priority_suggested_locked(vcpu_id: usize) -> Option<u8> {
+    unsafe {
+        (*SCHED.priority_queue.get())
+            .ready
+            .highest_priority_matching(|tid| ready_tid_matches_suggested_locked(tid, vcpu_id))
+    }
+}
+
+pub(crate) fn ready_highest_priority_kernel_continuation_locked(vcpu_id: usize) -> Option<u8> {
+    unsafe {
+        (*SCHED.priority_queue.get())
+            .ready
+            .highest_priority_matching(|tid| {
+                let state_ok = thread_exists(tid) && with_thread(tid, |t| t.state == ThreadState::Ready);
+                if !state_ok || !has_kernel_continuation(tid) {
+                    return false;
+                }
+                ready_tid_matches_scheduled_locked(tid, vcpu_id)
+                    || ready_tid_matches_suggested_locked(tid, vcpu_id)
+            })
+    }
+}
+
+fn ready_pop_scheduled_front_for_vcpu_locked(vcpu_id: usize) -> u32 {
+    unsafe {
+        (*SCHED.priority_queue.get())
+            .ready
+            .pop_highest_matching(|tid| ready_tid_matches_scheduled_locked(tid, vcpu_id))
+    }
+}
+
+fn ready_pop_suggested_for_vcpu_locked(vcpu_id: usize) -> u32 {
+    unsafe {
+        (*SCHED.priority_queue.get())
+            .ready
+            .pop_highest_matching(|tid| ready_tid_matches_suggested_locked(tid, vcpu_id))
     }
 }
 
 fn ready_pop_for_vcpu_locked(vcpu_id: usize) -> u32 {
-    unsafe {
-        let local = &mut (*SCHED.ready_local.get())[vcpu_id];
-        let local_prio = local.highest_priority();
-        let global_prio = (*SCHED.ready_global.get()).highest_priority();
-        let mut donor_vid = None;
-        let mut donor_prio = None;
-        for off in 1..=MAX_VCPUS {
-            let vid = (vcpu_id + off) % MAX_VCPUS;
-            let p = (*SCHED.ready_local.get())[vid].highest_priority();
-            if p.is_some() && (donor_prio.is_none() || p > donor_prio) {
-                donor_prio = p;
-                donor_vid = Some(vid);
-            }
-        }
-
-        let mut best = local_prio;
-        if global_prio.is_some() && (best.is_none() || global_prio > best) {
-            best = global_prio;
-        }
-        if donor_prio.is_some() && (best.is_none() || donor_prio > best) {
-            best = donor_prio;
-        }
-        let Some(best_prio) = best else {
-            return 0;
-        };
-
-        if local_prio == Some(best_prio) {
-            return local.pop_highest_prefer_vcpu(vcpu_id);
-        }
-        if global_prio == Some(best_prio) {
-            return (*SCHED.ready_global.get()).pop_highest_prefer_vcpu(vcpu_id);
-        }
-        if let Some(vid) = donor_vid {
-            return (*SCHED.ready_local.get())[vid].pop_highest_prefer_vcpu(vcpu_id);
-        }
-        0
+    let scheduled_tid = ready_pop_scheduled_front_for_vcpu_locked(vcpu_id);
+    if scheduled_tid != 0 {
+        return scheduled_tid;
     }
+    ready_pop_suggested_for_vcpu_locked(vcpu_id)
 }
 
 pub(crate) fn mark_vcpu_needs_scheduling_locked(vid: usize) {
@@ -95,6 +194,15 @@ pub(crate) fn mark_vcpu_needs_scheduling_locked(vid: usize) {
     }
     unsafe {
         (*SCHED.vcpus.get())[vid].needs_scheduling = true;
+    }
+}
+
+pub(crate) fn mark_vcpu_online_locked(vid: usize) {
+    if vid >= MAX_VCPUS {
+        return;
+    }
+    unsafe {
+        *SCHED.online_vcpu_mask.get() |= vcpu_bit(vid);
     }
 }
 
@@ -228,6 +336,25 @@ pub(crate) struct UnlockEdgeKernelSwitch {
     pub slice_remaining_100ns: u64,
 }
 
+pub(crate) struct ReschedDecision {
+    pub wake_idle_mask: u32,
+    pub unlock_kernel_switch: Option<UnlockEdgeKernelSwitch>,
+}
+
+pub(crate) fn commit_and_collect_unlock_edge_decision_locked(vid: usize) -> ReschedDecision {
+    debug_assert!(
+        sched_lock_held_by_current_vcpu(),
+        "commit_and_collect_unlock_edge_decision_locked requires sched lock"
+    );
+    commit_deferred_scheduling_locked();
+    let unlock_kernel_switch = prepare_unlock_edge_kernel_switch_locked(vid);
+    let wake_idle_mask = consume_idle_wakeup_mask_locked();
+    ReschedDecision {
+        wake_idle_mask,
+        unlock_kernel_switch,
+    }
+}
+
 fn local_reschedule_pending_locked(vid: usize) -> bool {
     debug_assert!(
         sched_lock_held_by_current_vcpu(),
@@ -246,6 +373,9 @@ fn pick_ready_kernel_continuation_locked(vcpu_id: usize) -> u32 {
         let tid = ready_pop_for_vcpu_locked(vcpu_id);
         if tid == 0 {
             break;
+        }
+        if !thread_exists(tid) || with_thread(tid, |t| t.state != ThreadState::Ready) {
+            continue;
         }
         if has_kernel_continuation(tid) {
             picked = tid;
@@ -331,6 +461,10 @@ pub(crate) fn sched_lock_held_by_current_vcpu() -> bool {
 
 // 调度状态变迁的唯一入口（调用者必须持有 sched lock）。
 pub(crate) fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
+    debug_assert!(
+        sched_lock_held_by_current_vcpu(),
+        "set_thread_state_locked requires sched lock"
+    );
     if tid == 0 || !thread_exists(tid) {
         return;
     }

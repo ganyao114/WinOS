@@ -1,6 +1,6 @@
 use core::arch::global_asm;
 
-use crate::sched::KernelContext;
+use crate::sched::{KernelContext, ThreadContext};
 
 global_asm!(
     ".section .text.context,\"ax\"",
@@ -38,11 +38,66 @@ global_asm!(
     "mov sp, x9",
     "mov x0, #1",
     "ret",
+    ".global __winemu_enter_kernel_context",
+    "__winemu_enter_kernel_context:",
+    // x0 = ctx (*const KernelContext)
+    "ldp x19, x20, [x0, #0x00]",
+    "ldp x21, x22, [x0, #0x10]",
+    "ldp x23, x24, [x0, #0x20]",
+    "ldp x25, x26, [x0, #0x30]",
+    "ldp x27, x28, [x0, #0x40]",
+    "ldp x29, x30, [x0, #0x50]",
+    "ldr x9, [x0, #0x60]",
+    "mov sp, x9",
+    "mov x0, #1",
+    "ret",
+    ".global __winemu_enter_user_thread_context",
+    "__winemu_enter_user_thread_context:",
+    // x0 = ctx (*const ThreadContext)
+    // Keep ctx pointer in x20 until all loads finish; restore x20 last.
+    "mov x20, x0",
+    // Program EL0 return state first.
+    "ldr x9, [x20, #0x0f8]", // sp
+    "msr sp_el0, x9",
+    "ldr x9, [x20, #0x100]", // pc
+    "msr elr_el1, x9",
+    "ldr x9, [x20, #0x108]", // pstate
+    "msr spsr_el1, x9",
+    "ldr x9, [x20, #0x110]", // tpidr
+    "msr tpidr_el0, x9",
+    // Restore x0-x19 (skip x20 for now).
+    "ldp x0,  x1,  [x20, #0x00]",
+    "ldp x2,  x3,  [x20, #0x10]",
+    "ldp x4,  x5,  [x20, #0x20]",
+    "ldp x6,  x7,  [x20, #0x30]",
+    "ldp x8,  x9,  [x20, #0x40]",
+    "ldp x10, x11, [x20, #0x50]",
+    "ldp x12, x13, [x20, #0x60]",
+    "ldp x14, x15, [x20, #0x70]",
+    "ldp x16, x17, [x20, #0x80]",
+    "ldr x18, [x20, #0x90]",
+    "ldr x19, [x20, #0x98]",
+    // Restore x21-x30.
+    "ldr x21, [x20, #0xA8]",
+    "ldr x22, [x20, #0xB0]",
+    "ldr x23, [x20, #0xB8]",
+    "ldr x24, [x20, #0xC0]",
+    "ldr x25, [x20, #0xC8]",
+    "ldr x26, [x20, #0xD0]",
+    "ldr x27, [x20, #0xD8]",
+    "ldr x28, [x20, #0xE0]",
+    "ldr x29, [x20, #0xE8]",
+    "ldr x30, [x20, #0xF0]",
+    // Restore x20 last because it carries ctx pointer.
+    "ldr x20, [x20, #0xA0]",
+    "eret",
 );
 
 unsafe extern "C" {
     fn __winemu_kernel_context_save(ctx: *mut KernelContext) -> u64;
     fn __winemu_kernel_context_switch(from: *mut KernelContext, to: *const KernelContext);
+    fn __winemu_enter_kernel_context(ctx: *const KernelContext) -> !;
+    fn __winemu_enter_user_thread_context(ctx: *const ThreadContext) -> !;
 }
 
 #[inline(always)]
@@ -53,4 +108,14 @@ pub unsafe fn save_kernel_context(ctx: *mut KernelContext) -> u64 {
 #[inline(always)]
 pub unsafe fn switch_kernel_context(from: *mut KernelContext, to: *const KernelContext) {
     __winemu_kernel_context_switch(from, to);
+}
+
+#[inline(always)]
+pub unsafe fn enter_kernel_context(ctx: *const KernelContext) -> ! {
+    __winemu_enter_kernel_context(ctx)
+}
+
+#[inline(always)]
+pub unsafe fn enter_user_thread_context(ctx: *const ThreadContext) -> ! {
+    __winemu_enter_user_thread_context(ctx)
 }

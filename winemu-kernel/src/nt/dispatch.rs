@@ -4,12 +4,9 @@
 
 use crate::hypercall;
 use crate::sched::{
-    charge_current_runtime_locked, check_timeouts, consume_pending_reschedule_locked,
-    current_slice_remaining_100ns, current_tid, has_kernel_continuation, next_wait_deadline_locked,
-    now_ticks, record_schedule_event_trap, register_thread0,
-    rotate_current_on_quantum_expire_locked, sched_lock_acquire, sched_lock_release, schedule,
-    set_current_in_kernel, set_thread_in_kernel, set_vcpu_idle_locked, thread_exists, vcpu_id,
-    with_thread, with_thread_mut, ThreadState,
+    current_tid, has_kernel_continuation, record_schedule_event_trap, register_thread0,
+    sched_lock_acquire, sched_lock_release, set_current_in_kernel, set_thread_in_kernel,
+    set_vcpu_idle_locked, vcpu_id, with_thread, with_thread_mut, ThreadState,
 };
 use crate::timer;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -208,28 +205,36 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
         if drain_hostcall {
             crate::hostcall::pump_completions();
         }
-        let now = now_ticks();
         sched_lock_acquire();
-        set_vcpu_idle_locked(vid, false);
-        let pending_resched = consume_pending_reschedule_locked(vid);
-        let quantum_expired = charge_current_runtime_locked(vid, now, quantum_100ns);
-        if quantum_expired {
-            rotate_current_on_quantum_expire_locked(vid, quantum_100ns);
-        }
-        let cur_not_running = from != 0
-            && thread_exists(from)
-            && with_thread(from, |t| t.state != ThreadState::Running);
-        let timeout_woke = check_timeouts(now);
-        let next_deadline = next_wait_deadline_locked();
-
-        // Defer scheduling decision to the unlock boundary:
-        // only run schedule() when a committed reschedule request exists, or
-        // timer logic produced runnable-state change.
-        if pending_resched || quantum_expired || timeout_woke || from == 0 || cur_not_running {
-            record_schedule_event_trap();
-            let (from_sched, to) = schedule(vid, now, quantum_100ns);
-            if to != 0 {
-                set_vcpu_idle_locked(vid, false);
+        match crate::sched::scheduler_round_locked(vid, from, quantum_100ns) {
+            crate::sched::SchedulerRoundAction::ContinueCurrent {
+                now_100ns,
+                next_deadline_100ns,
+                slice_remaining_100ns,
+            } => {
+                sched_lock_release();
+                let cur = current_tid();
+                if cur != 0 {
+                    set_thread_in_kernel(cur, false);
+                }
+                timer::schedule_running_slice_100ns(
+                    now_100ns,
+                    next_deadline_100ns,
+                    slice_remaining_100ns,
+                );
+                return false;
+            }
+            crate::sched::SchedulerRoundAction::RunThread {
+                now_100ns,
+                next_deadline_100ns,
+                slice_remaining_100ns,
+                from_tid: from_sched,
+                to_tid: to,
+                pending_resched,
+                timeout_woke,
+                cur_not_running,
+            } => {
+                record_schedule_event_trap();
                 if from_sched != 0 && from_sched != to {
                     let to_has_kctx = has_kernel_continuation(to);
                     let mut to_in_kernel = with_thread(to, |t| t.in_kernel);
@@ -248,14 +253,13 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                     }
                     if to_has_kctx {
                         save_ctx_for(from_sched, frame);
-                        let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
                         sched_lock_release();
                         crate::sched::execute_kernel_continuation_switch(
                             from_sched,
                             to,
-                            now,
-                            next_deadline,
-                            slice_remaining,
+                            now_100ns,
+                            next_deadline_100ns,
+                            slice_remaining_100ns,
                             "trap",
                         );
                         from = current_tid();
@@ -272,7 +276,6 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                     crate::process::switch_to_thread_process(to);
                     save_ctx_for(from_sched, frame);
                     restore_ctx_to_frame(to, frame);
-                    let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
                     sched_lock_release();
                     // If trap-exit chooses EL0 frame-restore (instead of direct-kctx),
                     // the preempted running thread will resume from EL0 next time.
@@ -282,7 +285,11 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                         set_thread_in_kernel(from_sched, false);
                     }
                     set_thread_in_kernel(to, false);
-                    timer::schedule_running_slice_100ns(now, next_deadline, slice_remaining);
+                    timer::schedule_running_slice_100ns(
+                        now_100ns,
+                        next_deadline_100ns,
+                        slice_remaining_100ns,
+                    );
                     return true;
                 }
                 crate::process::switch_to_thread_process(to);
@@ -294,44 +301,48 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                     // updated thread context x0 under scheduler lock but we did not context-switch.
                     restore_ctx_to_frame(to, frame);
                 }
-                let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
                 sched_lock_release();
                 set_thread_in_kernel(to, false);
-                timer::schedule_running_slice_100ns(now, next_deadline, slice_remaining);
+                timer::schedule_running_slice_100ns(
+                    now_100ns,
+                    next_deadline_100ns,
+                    slice_remaining_100ns,
+                );
                 return from_sched != to;
             }
+            crate::sched::SchedulerRoundAction::IdleWait {
+                now_100ns,
+                next_deadline_100ns,
+                from_tid: from_sched,
+            } => {
+                record_schedule_event_trap();
+                if !allow_idle_wait {
+                    sched_lock_release();
+                    timer::schedule_running_slice_100ns(
+                        now_100ns,
+                        next_deadline_100ns,
+                        quantum_100ns,
+                    );
+                    return false;
+                }
 
-            if !allow_idle_wait {
+                // No runnable thread. Persist current frame once before sleeping.
+                if from_sched != 0 {
+                    save_ctx_for(from_sched, frame);
+                    from = 0;
+                }
+                set_vcpu_idle_locked(vid, true);
                 sched_lock_release();
-                timer::schedule_running_slice_100ns(now, next_deadline, quantum_100ns);
-                return false;
-            }
 
-            // No runnable thread. Persist current frame once before sleeping.
-            if from_sched != 0 {
-                save_ctx_for(from_sched, frame);
-                from = 0;
+                if crate::sched::all_threads_done() {
+                    let code =
+                        crate::process::process_exit_status(crate::process::current_pid()).unwrap_or(0);
+                    hypercall::process_exit(code);
+                }
+                timer::idle_wait_until_deadline_100ns(now_100ns, next_deadline_100ns);
+                continue;
             }
-            set_vcpu_idle_locked(vid, true);
-            sched_lock_release();
-
-            if crate::sched::all_threads_done() {
-                let code =
-                    crate::process::process_exit_status(crate::process::current_pid()).unwrap_or(0);
-                hypercall::process_exit(code);
-            }
-            timer::idle_wait_until_deadline_100ns(now, next_deadline);
-            continue;
         }
-
-        let slice_remaining = current_slice_remaining_100ns(vid, quantum_100ns);
-        sched_lock_release();
-        let cur = current_tid();
-        if cur != 0 {
-            set_thread_in_kernel(cur, false);
-        }
-        timer::schedule_running_slice_100ns(now, next_deadline, slice_remaining);
-        return false;
     }
 }
 

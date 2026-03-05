@@ -181,4 +181,14 @@ impl super::contract::ContextBackend for ArchBackend {
     ) {
         context::switch_kernel_context(from, to);
     }
+
+    #[inline(always)]
+    unsafe fn enter_kernel_context(ctx: *const crate::sched::KernelContext) -> ! {
+        context::enter_kernel_context(ctx)
+    }
+
+    #[inline(always)]
+    unsafe fn enter_user_thread_context(ctx: *const crate::sched::ThreadContext) -> ! {
+        context::enter_user_thread_context(ctx)
+    }
 }

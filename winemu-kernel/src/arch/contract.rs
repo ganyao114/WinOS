@@ -1,5 +1,5 @@
 use crate::nt::SvcFrame;
-use crate::sched::KernelContext;
+use crate::sched::{KernelContext, ThreadContext};
 
 pub trait CpuBackend {
     fn cpu_local_read() -> u64;
@@ -59,6 +59,14 @@ pub trait ContextBackend {
     // Safety: pointers must refer to valid KernelContext objects that live
     // across switches.
     unsafe fn switch_kernel_context(from: *mut KernelContext, to: *const KernelContext);
+
+    // Enter an EL1 kernel continuation directly without saving current context.
+    // Safety: ctx must point to a live continuation context prepared by scheduler.
+    unsafe fn enter_kernel_context(ctx: *const KernelContext) -> !;
+
+    // Restore full EL0 register state from ThreadContext and return to EL0.
+    // Safety: ctx must point to a live thread context owned by scheduler state.
+    unsafe fn enter_user_thread_context(ctx: *const ThreadContext) -> !;
 }
 
 pub trait KernelArchBackend:

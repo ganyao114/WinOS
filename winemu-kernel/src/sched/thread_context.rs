@@ -222,8 +222,9 @@ pub(crate) fn ensure_user_entry_continuation_locked(tid: u32) -> bool {
         t.in_kernel = true;
         t.kctx = KernelContext::default();
         t.kctx.sp_el1 = sp_top;
-        t.kctx.x19_x30[11] = thread_user_entry_continuation as usize as u64; // x30
-        t.kctx.lr_el1 = thread_user_entry_continuation as usize as u64;
+        let cont = thread_user_entry_continuation as *const () as usize as u64;
+        t.kctx.x19_x30[11] = cont; // x30
+        t.kctx.lr_el1 = cont;
     });
     true
 }
@@ -281,6 +282,24 @@ pub unsafe fn switch_kernel_continuation(from_tid: u32, to_tid: u32) -> bool {
         crate::arch::context::switch_kernel_context(from_kctx, to_kctx);
     }
     true
+}
+
+pub unsafe fn enter_kernel_continuation_noreturn(tid: u32) -> ! {
+    if tid == 0 || !thread_exists(tid) {
+        panic!("sched: invalid tid for kernel continuation enter tid={}", tid);
+    }
+    if !has_kernel_continuation(tid) {
+        panic!(
+            "sched: missing kernel continuation for direct enter tid={}",
+            tid
+        );
+    }
+    let ptr = thread_ptr(tid);
+    if ptr.is_null() {
+        panic!("sched: null thread pointer for direct kernel enter tid={}", tid);
+    }
+    let kctx_ptr = core::ptr::addr_of!((*ptr).kctx);
+    crate::arch::context::enter_kernel_context(kctx_ptr)
 }
 
 pub fn set_thread_in_kernel(tid: u32, in_kernel: bool) {
