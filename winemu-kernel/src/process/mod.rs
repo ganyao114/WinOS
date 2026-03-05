@@ -1,4 +1,3 @@
-mod address_space;
 mod handle;
 mod lifecycle;
 mod query;
@@ -16,7 +15,7 @@ pub use lifecycle::{
 pub use query::query_information_process;
 pub use set::set_information_process;
 
-pub(crate) use address_space::{
+pub(crate) use crate::mm::address_space::{
     ProcessAddressSpace, USER_ACCESS_BASE, USER_VA_BASE, USER_VA_LIMIT,
 };
 
@@ -41,6 +40,7 @@ pub struct KProcess {
     pub create_time_100ns: u64,
     pub waiters: crate::sched::sync::WaitQueue, // waiters on this process handle termination
     pub address_space: ProcessAddressSpace,
+    pub vm: crate::mm::vaspace::ProcessVmManager,
 }
 
 impl KProcess {
@@ -52,6 +52,8 @@ impl KProcess {
         address_space: ProcessAddressSpace,
         create_time_100ns: u64,
     ) -> Self {
+        use crate::mm::vaspace::ProcessVmManager;
+        use crate::process::{USER_VA_BASE, USER_VA_LIMIT};
         Self {
             pid,
             parent_pid,
@@ -64,6 +66,7 @@ impl KProcess {
             create_time_100ns,
             waiters: crate::sched::sync::WaitQueue::new(),
             address_space,
+            vm: ProcessVmManager::new(USER_VA_BASE, USER_VA_LIMIT),
         }
     }
 }

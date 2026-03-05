@@ -1,9 +1,8 @@
 use winemu_shared::status;
 
-use super::address_space::ProcessAddressSpace;
 use super::{
     alloc_process, boot_pid, free_process, set_boot_pid, set_current_vcpu_pid, with_process,
-    with_process_mut, ProcessState,
+    with_process_mut, ProcessAddressSpace, ProcessState,
 };
 
 pub fn process_exists(pid: u32) -> bool {
