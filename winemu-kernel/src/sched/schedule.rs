@@ -56,6 +56,21 @@ pub(crate) fn execute_kernel_continuation_switch(
     }
 }
 
+fn run_selected_thread_noreturn(
+    to_tid: u32,
+    now_100ns: u64,
+    next_deadline_100ns: u64,
+    slice_remaining_100ns: u64,
+) -> ! {
+    crate::process::switch_to_thread_process(to_tid);
+    timer::schedule_running_slice_100ns(now_100ns, next_deadline_100ns, slice_remaining_100ns);
+    if has_kernel_continuation(to_tid) {
+        unsafe { enter_kernel_continuation_noreturn(to_tid) }
+    }
+    set_thread_in_kernel(to_tid, false);
+    unsafe { enter_user_thread_noreturn(to_tid) }
+}
+
 pub(crate) enum SchedulerRoundAction {
     ContinueCurrent {
         now_100ns: u64,
@@ -340,10 +355,7 @@ fn enter_bootstrap_thread_dispatch(vcpu_id: usize) -> ! {
     slice_remaining_100ns = current_slice_remaining_100ns(vid, quantum_100ns);
     sched_lock_release();
 
-    crate::process::switch_to_thread_process(tid);
-    timer::schedule_running_slice_100ns(now_100ns, next_deadline_100ns, slice_remaining_100ns);
-    set_thread_in_kernel(tid, false);
-    unsafe { enter_user_thread_noreturn(tid) }
+    run_selected_thread_noreturn(tid, now_100ns, next_deadline_100ns, slice_remaining_100ns)
 }
 
 fn enter_secondary_idle_loop(vcpu_id: usize) -> ! {
@@ -368,7 +380,7 @@ fn enter_secondary_idle_loop(vcpu_id: usize) -> ! {
 pub fn enter_core_scheduler_entry(vcpu_id: usize) -> ! {
     let cur = current_tid();
     if cur != 0 && thread_exists(cur) {
-        return enter_bootstrap_thread_dispatch(vcpu_id);
+        enter_bootstrap_thread_dispatch(vcpu_id)
     }
     enter_secondary_idle_loop(vcpu_id)
 }
