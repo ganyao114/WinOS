@@ -1,29 +1,35 @@
-// VaSpace — 虚拟地址空间管理器
-// 管理 VMA (Virtual Memory Area) 列表，支持分配/释放/查询/保护属性修改
-// no_std 环境，使用固定大小数组
+/// ProcessVmManager — 每进程虚拟地址空间管理器
+///
+/// 基于 AreaSet<VmArea> 提供：
+///   - O(log n) 地址查找
+///   - 自动 split/merge（支持 VirtualProtect 跨区边界）
+///   - NT 完整语义：Reserve / Commit / Decommit / Release / Protect / Guard / COW
 
-/// 最大 VMA 数量
-const MAX_VMAS: usize = 256;
+use crate::mm::areaset::{AreaEntry, AreaSeg, AreaSet};
+use crate::mm::range::Range;
+use crate::mm::vm_area::{VmArea, VmKind, PAGE_SIZE};
+use crate::process::ProcessAddressSpace;
+use crate::rust_alloc::vec::Vec;
+use winemu_shared::status;
 
-/// 保护属性
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct VmProt(pub u32);
+// ─── NT 常量 ─────────────────────────────────────────────────────────────────
 
-impl VmProt {
-    pub const READ: VmProt = VmProt(0x01);
-    pub const WRITE: VmProt = VmProt(0x02);
-    pub const EXEC: VmProt = VmProt(0x04);
-    pub const RW: VmProt = VmProt(0x03);
-    pub const RX: VmProt = VmProt(0x05);
-    pub const RWX: VmProt = VmProt(0x07);
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const MEM_FREE: u32 = 0x1_0000;
+const MEM_PRIVATE_TYPE: u32 = 0x0002_0000;
+const MEM_MAPPED_TYPE: u32 = 0x0004_0000;
+const MEM_IMAGE_TYPE: u32 = 0x0100_0000;
 
-    pub fn contains(self, other: VmProt) -> bool {
-        (self.0 & other.0) == other.0
-    }
-}
+const PAGE_GUARD: u32 = 0x100;
+const PAGE_WRITECOPY: u32 = 0x08;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
 
-/// VMA 用途类型
-#[derive(Clone, Copy, PartialEq, Eq)]
+// ─── VmaType（向后兼容公共接口）──────────────────────────────────────────────
+
+/// VMA 用途类型（保留原名供外部调用方使用）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VmaType {
     Kernel,
     ExeImage,
@@ -35,188 +41,938 @@ pub enum VmaType {
     PageTable,
 }
 
-/// Virtual Memory Area
+pub(crate) fn vm_kind_from_vma_type(t: VmaType) -> VmKind {
+    match t {
+        VmaType::Private
+        | VmaType::Kernel
+        | VmaType::ExeImage
+        | VmaType::DllImage
+        | VmaType::PageTable => VmKind::Private,
+        VmaType::Section | VmaType::FileMapped => VmKind::Section,
+        VmaType::ThreadStack => VmKind::ThreadStack,
+    }
+}
+
+// ─── VmQueryInfo ─────────────────────────────────────────────────────────────
+
 #[derive(Clone, Copy)]
-pub struct Vma {
-    pub base: u64,
-    pub size: u64,
-    pub prot: VmProt,
-    pub vma_type: VmaType,
+pub(crate) struct VmQueryInfo {
+    pub(crate) base: u64,
+    pub(crate) size: u64,
+    pub(crate) allocation_base: u64,
+    pub(crate) allocation_prot: u32,
+    pub(crate) prot: u32,
+    pub(crate) state: u32,
+    pub(crate) mem_type: u32,
 }
 
-pub struct VaSpace {
-    vmas: [Vma; MAX_VMAS],
-    count: usize,
-    /// Allocatable region start
-    alloc_base: u64,
-    /// Allocatable region end
-    alloc_limit: u64,
+// ─── NT 保护属性工具 ──────────────────────────────────────────────────────────
+
+pub(crate) fn vm_sanitize_nt_prot(prot: u32) -> u32 {
+    let base = prot & 0xFF;
+    let sanitized = match base {
+        PAGE_EXECUTE_READWRITE => 0x20, // 降为 PAGE_EXECUTE_READ
+        0 => 0x04,                      // 默认 PAGE_READWRITE
+        _ => base,
+    };
+    (prot & !0xFF) | sanitized
 }
 
-impl VaSpace {
-    pub const fn new() -> Self {
-        Self {
-            vmas: [Vma {
-                base: 0,
-                size: 0,
-                prot: VmProt(0),
-                vma_type: VmaType::Private,
-            }; MAX_VMAS],
-            count: 0,
-            alloc_base: 0,
-            alloc_limit: 0,
-        }
+pub(crate) fn vm_decode_nt_prot(prot: u32) -> (bool, bool, bool) {
+    match prot & 0xFF {
+        0x01 => (false, false, false), // PAGE_NOACCESS
+        0x02 => (true, false, false),  // PAGE_READONLY
+        0x04 => (true, true, false),   // PAGE_READWRITE
+        0x08 => (true, false, false),  // PAGE_WRITECOPY → RO until COW
+        0x10 => (false, false, true),  // PAGE_EXECUTE
+        0x20 => (true, false, true),   // PAGE_EXECUTE_READ
+        0x40 | 0x80 => (true, false, true), // W^X: RX
+        _ => (true, true, false),
     }
+}
 
-    /// Initialize with the allocatable VA range
-    pub fn init(&mut self, base: u64, limit: u64) {
-        self.alloc_base = base;
-        self.alloc_limit = limit;
+pub(crate) fn vm_access_allowed(prot: u32, access: u8) -> bool {
+    use crate::nt::state::{VM_ACCESS_EXEC, VM_ACCESS_READ, VM_ACCESS_WRITE};
+    if access == VM_ACCESS_WRITE && vm_is_copy_on_write_prot(prot) {
+        return true;
     }
+    let (read, write, exec) = vm_decode_nt_prot(prot);
+    match access {
+        VM_ACCESS_READ => read,
+        VM_ACCESS_WRITE => write,
+        VM_ACCESS_EXEC => exec,
+        _ => false,
+    }
+}
 
-    /// Insert a VMA at the correct sorted position (by base).
-    /// Returns true on success, false if full.
-    fn insert_sorted(&mut self, vma: Vma) -> bool {
-        if self.count >= MAX_VMAS {
-            return false;
-        }
-        // Find insertion point
-        let mut pos = self.count;
-        for i in 0..self.count {
-            if self.vmas[i].base > vma.base {
-                pos = i;
-                break;
+pub(crate) fn vm_is_copy_on_write_prot(prot: u32) -> bool {
+    matches!(prot & 0xFF, PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)
+}
+
+fn vm_promote_cow_prot(prot: u32) -> u32 {
+    match prot & 0xFF {
+        PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY => (prot & !0xFF) | 0x04,
+        _ => prot,
+    }
+}
+
+fn vm_region_mem_type(area: &VmArea) -> u32 {
+    match area.kind {
+        VmKind::Section => {
+            if area.section_is_image {
+                MEM_IMAGE_TYPE
+            } else {
+                MEM_MAPPED_TYPE
             }
         }
-        // Shift right
-        let mut i = self.count;
-        while i > pos {
-            self.vmas[i] = self.vmas[i - 1];
-            i -= 1;
+        _ => MEM_PRIVATE_TYPE,
+    }
+}
+
+// ─── 按页填充 section 数据 ────────────────────────────────────────────────────
+
+fn vm_fill_section_page(area: &VmArea, idx: usize, gpa: u64) -> bool {
+    if !area.section_file_backed {
+        return true;
+    }
+    let page_off = (idx as u64) * PAGE_SIZE;
+    if page_off >= area.section_view_size {
+        return true;
+    }
+    let remain = area.section_view_size - page_off;
+    let read_len = PAGE_SIZE.min(remain) as usize;
+    let file_off = area.section_file_offset.saturating_add(page_off);
+    let read =
+        crate::hypercall::host_read(area.section_file_fd, gpa as *mut u8, read_len, file_off);
+    if read < read_len {
+        unsafe {
+            core::ptr::write_bytes((gpa as *mut u8).add(read), 0, read_len - read);
         }
-        self.vmas[pos] = vma;
-        self.count += 1;
-        true
+    }
+    true
+}
+
+// ─── ProcessVmManager ────────────────────────────────────────────────────────
+
+pub struct ProcessVmManager {
+    areas: AreaSet<VmArea>,
+}
+
+impl ProcessVmManager {
+    pub fn new(base: u64, limit: u64) -> Self {
+        Self {
+            areas: AreaSet::new(base, limit.saturating_sub(base)),
+        }
     }
 
-    /// Remove VMA at index, shift left
-    fn remove_at(&mut self, idx: usize) -> Vma {
-        let vma = self.vmas[idx];
-        for i in idx..self.count - 1 {
-            self.vmas[i] = self.vmas[i + 1];
+    // ── 地址查找 ─────────────────────────────────────────────────────────────
+
+    pub fn find_free_va(&self, hint: u64, size: u64) -> Option<u64> {
+        if hint != 0 {
+            let base = hint & !(PAGE_SIZE - 1);
+            let ar = self.areas.range;
+            if base < ar.start || base.saturating_add(size) > ar.end() {
+                return None;
+            }
+            let gap = self.areas.find_gap(base);
+            if !gap.ok() {
+                return None;
+            }
+            let gr = gap.range();
+            if gr.start <= base && gr.end() >= base + size {
+                return Some(base);
+            }
+            return None;
         }
-        self.count -= 1;
-        vma
+        let mut gap = self.areas.first_gap();
+        while gap.ok() {
+            let gr = gap.range();
+            if gr.len >= size {
+                return Some(gr.start);
+            }
+            gap = gap.next_gap();
+        }
+        None
     }
 
-    /// Allocate a VA region. hint=0 → first-fit search.
-    /// Returns the base VA on success.
-    pub fn allocate(
+    pub fn find_seg_at(&self, addr: u64) -> AreaSeg<VmArea> {
+        self.areas.find_seg(addr)
+    }
+
+    pub fn find_seg_by_base(&self, base: u64) -> AreaSeg<VmArea> {
+        let seg = self.areas.find_seg(base);
+        if seg.ok() && seg.range().start == base {
+            seg
+        } else {
+            AreaSeg(AreaEntry::new_dummy(0))
+        }
+    }
+
+    // ── 保留 ─────────────────────────────────────────────────────────────────
+
+    fn reserve_at(
+        &mut self,
+        base: u64,
+        size: u64,
+        prot: u32,
+        kind: VmKind,
+    ) -> Option<AreaSeg<VmArea>> {
+        let gap = self.areas.find_gap(base);
+        if !gap.ok() {
+            return None;
+        }
+        let gr = gap.range();
+        if gr.start > base || gr.end() < base + size {
+            return None;
+        }
+        let page_count = (size / PAGE_SIZE) as usize;
+        let area = VmArea::new_reserved(base, page_count, prot, kind)?;
+        let r = Range::new(base, size);
+        Some(self.areas.insert_without_merging(&gap, &r, area))
+    }
+
+    pub fn find_and_reserve(
         &mut self,
         hint: u64,
         size: u64,
-        prot: VmProt,
-        vma_type: VmaType,
+        prot: u32,
+        kind: VmKind,
     ) -> Option<u64> {
-        let size = page_align_up(size);
-        if size == 0 {
-            return None;
-        }
-
-        let base = if hint != 0 {
-            let hint = page_align_down(hint);
-            if hint < self.alloc_base || hint + size > self.alloc_limit {
-                return None;
-            }
-            if self.overlaps(hint, size) {
-                return None;
-            }
-            hint
-        } else {
-            self.find_gap(size)?
-        };
-
-        let vma = Vma {
-            base,
-            size,
-            prot,
-            vma_type,
-        };
-        if !self.insert_sorted(vma) {
-            return None;
-        }
+        let base = self.find_free_va(hint, size)?;
+        self.reserve_at(base, size, prot, kind)?;
         Some(base)
     }
 
-    /// Free a VMA by its base address.
-    pub fn free(&mut self, base: u64) -> Option<Vma> {
-        for i in 0..self.count {
-            if self.vmas[i].base == base {
-                return Some(self.remove_at(i));
+    // ── 提交 ─────────────────────────────────────────────────────────────────
+
+    pub fn commit_pages(
+        &mut self,
+        aspace: &mut ProcessAddressSpace,
+        pid: u32,
+        base: u64,
+        size: u64,
+        prot: u32,
+        eager: bool,
+    ) -> bool {
+        let _ = pid;
+        let seg = self.areas.find_seg(base);
+        if !seg.ok() {
+            return false;
+        }
+        let r = seg.range();
+        if base < r.start || base.saturating_add(size) > r.end() {
+            return false;
+        }
+        let start_idx = ((base - r.start) / PAGE_SIZE) as usize;
+        let page_count = (size / PAGE_SIZE) as usize;
+        let total_pages = (r.len / PAGE_SIZE) as usize;
+
+        for i in 0..page_count {
+            let idx = start_idx + i;
+            let va = r.start + (idx as u64) * PAGE_SIZE;
+            {
+                let area = seg.value_mut();
+                if idx < area.prot_pages.len() {
+                    area.prot_pages[idx] = prot;
+                }
+                area.set_page_committed(idx, true);
+            }
+            if eager {
+                let gpa = seg.value().phys_pages.get(idx).copied().unwrap_or(0);
+                if gpa == 0 {
+                    if !self.map_new_page_at(aspace, &seg, idx, va, prot) {
+                        for rb in start_idx..idx {
+                            let rb_va = r.start + (rb as u64) * PAGE_SIZE;
+                            self.unmap_free_page_at(aspace, &seg, rb, rb_va);
+                            seg.value_mut().set_page_committed(rb, false);
+                        }
+                        return false;
+                    }
+                } else {
+                    let _ = aspace.protect_user_range(va, PAGE_SIZE, prot);
+                }
             }
         }
-        None
+        if start_idx == 0 && page_count == total_pages {
+            seg.value_mut().default_prot = prot;
+        }
+        true
     }
 
-    /// Change protection on a region matching base.
-    pub fn protect(&mut self, base: u64, new_prot: VmProt) -> bool {
-        for i in 0..self.count {
-            if self.vmas[i].base == base {
-                self.vmas[i].prot = new_prot;
-                return true;
-            }
+    // ── 去提交 ───────────────────────────────────────────────────────────────
+
+    pub fn decommit_pages(
+        &mut self,
+        aspace: &mut ProcessAddressSpace,
+        pid: u32,
+        base: u64,
+        size: u64,
+    ) -> bool {
+        let _ = pid;
+        let seg = self.areas.find_seg(base);
+        if !seg.ok() {
+            return false;
         }
-        false
+        let r = seg.range();
+        if base < r.start || base.saturating_add(size) > r.end() {
+            return false;
+        }
+        let start_idx = ((base - r.start) / PAGE_SIZE) as usize;
+        let page_count = (size / PAGE_SIZE) as usize;
+        for i in 0..page_count {
+            let idx = start_idx + i;
+            let va = r.start + (idx as u64) * PAGE_SIZE;
+            self.unmap_free_page_at(aspace, &seg, idx, va);
+            seg.value_mut().set_page_committed(idx, false);
+        }
+        true
     }
 
-    /// Find the VMA containing `addr`.
-    pub fn find_vma(&self, addr: u64) -> Option<&Vma> {
-        for i in 0..self.count {
-            let v = &self.vmas[i];
-            if addr >= v.base && addr < v.base + v.size {
-                return Some(v);
+    // ── 释放 ─────────────────────────────────────────────────────────────────
+
+    pub fn release_at_base(
+        &mut self,
+        aspace: &mut ProcessAddressSpace,
+        pid: u32,
+        base: u64,
+        kind_filter: Option<VmKind>,
+    ) -> bool {
+        let _ = pid;
+        let first_seg = self.areas.find_seg(base);
+        if !first_seg.ok() || first_seg.range().start != base {
+            return false;
+        }
+        if let Some(kf) = kind_filter {
+            if first_seg.value().kind != kf {
+                return false;
             }
         }
-        None
+        let alloc_base = first_seg.value().alloc_base;
+        if alloc_base != base {
+            return false;
+        }
+        // 计算整个 alloc 单元的 end
+        let mut end = first_seg.range().end();
+        let mut cur = first_seg.next_seg();
+        while cur.ok() {
+            if cur.value().alloc_base != alloc_base || cur.range().start != end {
+                break;
+            }
+            end = cur.range().end();
+            cur = cur.next_seg();
+        }
+        let r = Range::new(base, end - base);
+        self.release_range_internal(aspace, &r);
+        true
     }
 
-    fn overlaps(&self, base: u64, size: u64) -> bool {
-        let end = base + size;
-        for i in 0..self.count {
-            let v = &self.vmas[i];
-            if base < v.base + v.size && end > v.base {
-                return true;
-            }
+    pub fn release_region(&mut self, aspace: &mut ProcessAddressSpace, pid: u32, base: u64) -> bool {
+        let _ = pid;
+        let seg = self.areas.find_seg(base);
+        if !seg.ok() || seg.range().start != base {
+            return false;
         }
-        false
+        let r = seg.range();
+        self.release_range_internal(aspace, &r);
+        true
     }
 
-    fn find_gap(&self, size: u64) -> Option<u64> {
-        let mut cursor = self.alloc_base;
-        for i in 0..self.count {
-            let v = &self.vmas[i];
-            if v.base + v.size <= cursor {
-                continue;
-            }
-            if v.base >= cursor + size {
-                return Some(cursor);
-            }
-            cursor = v.base + v.size;
+    // ── VirtualProtect ────────────────────────────────────────────────────────
+
+    pub fn protect_range(
+        &mut self,
+        aspace: &mut ProcessAddressSpace,
+        pid: u32,
+        base: u64,
+        size: u64,
+        new_prot: u32,
+    ) -> Result<u32, u32> {
+        let _ = pid;
+        let seg = self.areas.find_seg(base);
+        if !seg.ok() {
+            return Err(status::INVALID_PARAMETER);
         }
-        if cursor + size <= self.alloc_limit {
-            Some(cursor)
+        let r = seg.range();
+        if base < r.start || base.saturating_add(size) > r.end() {
+            return Err(status::INVALID_PARAMETER);
+        }
+        // 隔离出 [base, base+size) 这段
+        let iso_r = Range::new(base, size);
+        let iso = self.areas.isolate(&seg, &iso_r);
+        let page_count = (iso.range().len / PAGE_SIZE) as usize;
+
+        // 快照旧保护（用于回滚）
+        let mut old_prots: Vec<u32> = Vec::new();
+        if old_prots.try_reserve(page_count).is_err() {
+            return Err(status::NO_MEMORY);
+        }
+        for i in 0..page_count {
+            let pv = iso.value().prot_pages.get(i).copied().unwrap_or(iso.value().default_prot);
+            old_prots.push(pv);
+        }
+        let old_first = old_prots.first().copied().unwrap_or(0);
+
+        for i in 0..page_count {
+            let va = iso.range().start + (i as u64) * PAGE_SIZE;
+            if !iso.value().is_page_committed(i) {
+                self.rollback_prot(aspace, &iso, 0, i, &old_prots);
+                return Err(status::NOT_COMMITTED);
+            }
+            if old_prots[i] != new_prot {
+                {
+                    let area = iso.value_mut();
+                    if i < area.prot_pages.len() {
+                        area.prot_pages[i] = new_prot;
+                    }
+                }
+                let gpa = iso.value().phys_pages.get(i).copied().unwrap_or(0);
+                if gpa != 0 && !aspace.protect_user_range(va, PAGE_SIZE, new_prot) {
+                    self.rollback_prot(aspace, &iso, 0, i, &old_prots);
+                    return Err(status::INVALID_PARAMETER);
+                }
+            }
+        }
+        iso.value_mut().default_prot = new_prot;
+        self.areas.merge_adjacent(&iso_r);
+        Ok(old_first)
+    }
+
+    // ── 缺页处理 ─────────────────────────────────────────────────────────────
+
+    pub fn handle_page_fault(
+        &mut self,
+        aspace: &mut ProcessAddressSpace,
+        pid: u32,
+        fault_va: u64,
+        access: u8,
+    ) -> bool {
+        let _ = pid;
+        let page_va = fault_va & !(PAGE_SIZE - 1);
+        let seg = self.areas.find_seg(page_va);
+        if !seg.ok() {
+            return false;
+        }
+        let r = seg.range();
+        let idx = ((page_va - r.start) / PAGE_SIZE) as usize;
+        if !seg.value().is_page_committed(idx) {
+            return false;
+        }
+
+        let raw_prot = {
+            let a = seg.value();
+            vm_sanitize_nt_prot(a.prot_pages.get(idx).copied().unwrap_or(a.default_prot))
+        };
+        let had_guard = (raw_prot & PAGE_GUARD) != 0;
+        let prot = if had_guard {
+            let a = seg.value_mut();
+            if idx < a.prot_pages.len() {
+                a.prot_pages[idx] &= !PAGE_GUARD;
+            }
+            raw_prot & !PAGE_GUARD
         } else {
-            None
+            raw_prot
+        };
+
+        if access == crate::nt::state::VM_ACCESS_WRITE && vm_is_copy_on_write_prot(prot) {
+            return self.handle_cow_fault(aspace, &seg, idx, page_va, prot);
+        }
+        if !vm_access_allowed(prot, access) {
+            return false;
+        }
+
+        let gpa = seg.value().phys_pages.get(idx).copied().unwrap_or(0);
+        if gpa != 0 {
+            let mapped = aspace.map_user_range(page_va, gpa, PAGE_SIZE, prot);
+            if mapped && had_guard && seg.value().kind == VmKind::ThreadStack {
+                self.on_thread_stack_guard_hit(aspace, pid, &seg, idx, page_va);
+            }
+            return mapped;
+        }
+
+        let Some(new_gpa) = crate::mm::phys::alloc_pages(1) else {
+            return false;
+        };
+        unsafe {
+            core::ptr::write_bytes(new_gpa as *mut u8, 0, PAGE_SIZE as usize);
+        }
+        if seg.value().kind == VmKind::Section
+            && !vm_fill_section_page(seg.value(), idx, new_gpa)
+        {
+            crate::mm::phys::free_pages(new_gpa, 1);
+            return false;
+        }
+        if !aspace.map_user_range(page_va, new_gpa, PAGE_SIZE, prot) {
+            crate::mm::phys::free_pages(new_gpa, 1);
+            return false;
+        }
+        crate::nt::state::vm_phys_page_add_ref(new_gpa);
+        {
+            let a = seg.value_mut();
+            if idx < a.phys_pages.len() {
+                a.phys_pages[idx] = new_gpa;
+            }
+        }
+        if had_guard && seg.value().kind == VmKind::ThreadStack {
+            self.on_thread_stack_guard_hit(aspace, pid, &seg, idx, page_va);
+        }
+        true
+    }
+
+    // ── VirtualQuery ─────────────────────────────────────────────────────────
+
+    pub fn query(&self, addr: u64) -> Option<VmQueryInfo> {
+        let page_addr = addr & !(PAGE_SIZE - 1);
+        let user_access_base = crate::process::USER_ACCESS_BASE;
+        let user_va_base = crate::process::USER_VA_BASE;
+        let user_va_limit = crate::process::USER_VA_LIMIT;
+
+        if page_addr < user_access_base || page_addr >= user_va_limit {
+            return None;
+        }
+
+        let seg = self.areas.find_seg(page_addr);
+        if seg.ok() {
+            let r = seg.range();
+            let area = seg.value();
+            let idx = ((page_addr - r.start) / PAGE_SIZE) as usize;
+            if idx >= area.page_count() {
+                return None;
+            }
+            let committed = area.is_page_committed(idx);
+            let prot = area.prot_pages.get(idx).copied().unwrap_or(area.default_prot);
+            let state = if committed { MEM_COMMIT } else { MEM_RESERVE };
+
+            let mut start = idx;
+            while start > 0 {
+                let prev = start - 1;
+                let pc = area.is_page_committed(prev);
+                if pc != committed {
+                    break;
+                }
+                if committed {
+                    let pp = area.prot_pages.get(prev).copied().unwrap_or(area.default_prot);
+                    if pp != prot {
+                        break;
+                    }
+                }
+                start = prev;
+            }
+            let mut end = idx + 1;
+            while end < area.page_count() {
+                let nc = area.is_page_committed(end);
+                if nc != committed {
+                    break;
+                }
+                if committed {
+                    let np = area.prot_pages.get(end).copied().unwrap_or(area.default_prot);
+                    if np != prot {
+                        break;
+                    }
+                }
+                end += 1;
+            }
+            return Some(VmQueryInfo {
+                base: r.start + (start as u64) * PAGE_SIZE,
+                size: ((end - start) as u64) * PAGE_SIZE,
+                allocation_base: area.alloc_base,
+                allocation_prot: area.default_prot,
+                prot: if committed { prot } else { 0 },
+                state,
+                mem_type: vm_region_mem_type(area),
+            });
+        }
+
+        // addr 在空洞中
+        if page_addr < user_va_base {
+            return None;
+        }
+        let gap = self.areas.find_gap(page_addr);
+        if !gap.ok() {
+            return None;
+        }
+        let gr = gap.range();
+        if page_addr < gr.start || page_addr >= gr.end() {
+            return None;
+        }
+        Some(VmQueryInfo {
+            base: gr.start,
+            size: gr.len,
+            allocation_base: 0,
+            allocation_prot: 0,
+            prot: 0,
+            state: MEM_FREE,
+            mem_type: 0,
+        })
+    }
+
+    // ── 文件映射 ─────────────────────────────────────────────────────────────
+
+    pub fn track_file_mapping(
+        &mut self,
+        pid: u32,
+        base: u64,
+        size: u64,
+        prot: u32,
+    ) -> bool {
+        let prot = vm_sanitize_nt_prot(prot);
+        // 已有同 base 的区域
+        let existing = self.areas.find_seg(base);
+        if existing.ok() && existing.range().start == base {
+            let area = existing.value_mut();
+            if !area.owns_phys_pages
+                && area.page_count() == (size / PAGE_SIZE) as usize
+            {
+                area.default_prot = prot;
+                for p in area.prot_pages.iter_mut() {
+                    *p = prot;
+                }
+                return true;
+            }
+            return false;
+        }
+
+        let page_count = (size / PAGE_SIZE) as usize;
+        let area = match VmArea::new_file_mapping(base, page_count, prot, size) {
+            Some(a) => a,
+            None => return false,
+        };
+        let gap = self.areas.find_gap(base);
+        if !gap.ok() {
+            return false;
+        }
+        let gr = gap.range();
+        if gr.start > base || gr.end() < base + size {
+            return false;
+        }
+        let r = Range::new(base, size);
+        let seg = self.areas.insert_without_merging(&gap, &r, area);
+
+        // 从当前页表翻译 GPA
+        for i in 0..page_count {
+            let va = base + (i as u64) * PAGE_SIZE;
+            let gpa = crate::process::with_process(pid, |p| {
+                p.address_space
+                    .translate_user_va_for_access(va, crate::nt::state::VM_ACCESS_READ)
+            })
+            .flatten()
+            .map(|pa| pa & !(PAGE_SIZE - 1))
+            .unwrap_or(0);
+            if gpa == 0 {
+                let _ = self.areas.remove(&seg);
+                return false;
+            }
+            {
+                let a = seg.value_mut();
+                if i < a.phys_pages.len() {
+                    a.phys_pages[i] = gpa;
+                    a.prot_pages[i] = prot;
+                }
+                a.set_page_committed(i, true);
+            }
+        }
+        true
+    }
+
+    pub fn collect_file_mappings(&self) -> Vec<(u64, u64, u32)> {
+        let mut out = Vec::new();
+        let mut seg = self.areas.first_seg();
+        while seg.ok() {
+            if !seg.value().owns_phys_pages {
+                let r = seg.range();
+                let prot = seg.value().default_prot;
+                let _ = out.try_reserve(1);
+                out.push((r.start, r.len, prot));
+            }
+            seg = seg.next_seg();
+        }
+        out
+    }
+
+    // ── Section 元信息 ────────────────────────────────────────────────────────
+
+    pub fn set_section_backing(
+        &mut self,
+        base: u64,
+        file_fd: Option<u64>,
+        file_offset: u64,
+        view_size: u64,
+        is_image: bool,
+    ) -> bool {
+        let seg = self.areas.find_seg(base);
+        if !seg.ok() || seg.range().start != base {
+            return false;
+        }
+        if seg.value().kind != VmKind::Section {
+            return false;
+        }
+        let area = seg.value_mut();
+        area.section_file_backed = file_fd.is_some();
+        area.section_file_fd = file_fd.unwrap_or(0);
+        area.section_file_offset = file_offset;
+        area.section_view_size = view_size.min(area.page_count() as u64 * PAGE_SIZE);
+        area.section_is_image = is_image;
+        true
+    }
+
+    // ── 整区保护 ─────────────────────────────────────────────────────────────
+
+    pub fn set_region_prot_all(
+        &mut self,
+        aspace: &mut ProcessAddressSpace,
+        pid: u32,
+        base: u64,
+        prot: u32,
+    ) -> bool {
+        let _ = pid;
+        let seg = self.areas.find_seg(base);
+        if !seg.ok() || seg.range().start != base {
+            return false;
+        }
+        let r = seg.range();
+        let prot = vm_sanitize_nt_prot(prot);
+        {
+            let area = seg.value_mut();
+            area.default_prot = prot;
+            for p in area.prot_pages.iter_mut() {
+                *p = prot;
+            }
+        }
+        let page_count = (r.len / PAGE_SIZE) as usize;
+        for i in 0..page_count {
+            let gpa = seg.value().phys_pages.get(i).copied().unwrap_or(0);
+            if gpa != 0 {
+                let va = r.start + (i as u64) * PAGE_SIZE;
+                if !aspace.protect_user_range(va, PAGE_SIZE, prot) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    // ── Guard 页 ─────────────────────────────────────────────────────────────
+
+    pub fn make_guard_page(
+        &mut self,
+        aspace: &mut ProcessAddressSpace,
+        pid: u32,
+        page_va: u64,
+    ) -> bool {
+        let _ = pid;
+        let page_va = page_va & !(PAGE_SIZE - 1);
+        let seg = self.areas.find_seg(page_va);
+        if !seg.ok() {
+            return false;
+        }
+        let r = seg.range();
+        let idx = ((page_va - r.start) / PAGE_SIZE) as usize;
+        if !seg.value().is_page_committed(idx) {
+            return false;
+        }
+        let _ = aspace.unmap_user_range(page_va, PAGE_SIZE);
+        let area = seg.value_mut();
+        if idx < area.prot_pages.len() {
+            let base_prot = vm_sanitize_nt_prot(area.prot_pages[idx]) & !PAGE_GUARD;
+            area.prot_pages[idx] = base_prot | PAGE_GUARD;
+        }
+        true
+    }
+
+    // ── 清理 ─────────────────────────────────────────────────────────────────
+
+    pub fn cleanup_all(&mut self, aspace: &mut ProcessAddressSpace) {
+        let r = self.areas.range;
+        self.release_range_internal(aspace, &r);
+    }
+
+    // ─── 内部辅助 ────────────────────────────────────────────────────────────
+
+    fn release_range_internal(&mut self, aspace: &mut ProcessAddressSpace, r: &Range) {
+        let (seg, mut gap) = self.areas.find(r.start);
+        if seg.ok() {
+            let iso = self.areas.isolate(&seg, r);
+            self.free_seg_pages(aspace, &iso);
+            gap = self.areas.remove(&iso);
+        }
+        let mut next = gap.next_seg();
+        while next.ok() && next.range().start < r.end() {
+            let iso = self.areas.isolate(&next, r);
+            self.free_seg_pages(aspace, &iso);
+            gap = self.areas.remove(&iso);
+            next = gap.next_seg();
         }
     }
-}
 
-#[inline(always)]
-fn page_align_up(v: u64) -> u64 {
-    (v + 0xFFF) & !0xFFF
-}
+    fn free_seg_pages(&self, aspace: &mut ProcessAddressSpace, seg: &AreaSeg<VmArea>) {
+        let r = seg.range();
+        let owns = seg.value().owns_phys_pages;
+        let page_count = seg.value().page_count();
+        for i in 0..page_count {
+            let va = r.start + (i as u64) * PAGE_SIZE;
+            let gpa = seg.value().phys_pages.get(i).copied().unwrap_or(0);
+            if gpa != 0 {
+                let _ = aspace.unmap_user_range(va, PAGE_SIZE);
+                if owns {
+                    crate::nt::state::vm_phys_page_release(gpa);
+                }
+            }
+        }
+    }
 
-#[inline(always)]
-fn page_align_down(v: u64) -> u64 {
-    v & !0xFFF
+    fn map_new_page_at(
+        &self,
+        aspace: &mut ProcessAddressSpace,
+        seg: &AreaSeg<VmArea>,
+        idx: usize,
+        va: u64,
+        prot: u32,
+    ) -> bool {
+        let Some(gpa) = crate::mm::phys::alloc_pages(1) else {
+            return false;
+        };
+        unsafe {
+            core::ptr::write_bytes(gpa as *mut u8, 0, PAGE_SIZE as usize);
+        }
+        if !aspace.map_user_range(va, gpa, PAGE_SIZE, prot) {
+            crate::mm::phys::free_pages(gpa, 1);
+            return false;
+        }
+        crate::nt::state::vm_phys_page_add_ref(gpa);
+        let area = seg.value_mut();
+        if idx < area.phys_pages.len() {
+            area.phys_pages[idx] = gpa;
+        }
+        true
+    }
+
+    fn unmap_free_page_at(
+        &self,
+        aspace: &mut ProcessAddressSpace,
+        seg: &AreaSeg<VmArea>,
+        idx: usize,
+        va: u64,
+    ) {
+        let gpa = seg.value().phys_pages.get(idx).copied().unwrap_or(0);
+        if gpa == 0 {
+            return;
+        }
+        let _ = aspace.unmap_user_range(va, PAGE_SIZE);
+        if seg.value().owns_phys_pages {
+            crate::nt::state::vm_phys_page_release(gpa);
+        }
+        let area = seg.value_mut();
+        if idx < area.phys_pages.len() {
+            area.phys_pages[idx] = 0;
+        }
+    }
+
+    fn rollback_prot(
+        &self,
+        aspace: &mut ProcessAddressSpace,
+        seg: &AreaSeg<VmArea>,
+        start: usize,
+        end: usize,
+        old_prots: &[u32],
+    ) {
+        let r = seg.range();
+        for i in start..=end {
+            if i >= old_prots.len() {
+                break;
+            }
+            {
+                let area = seg.value_mut();
+                if i < area.prot_pages.len() {
+                    area.prot_pages[i] = old_prots[i];
+                }
+            }
+            let gpa = seg.value().phys_pages.get(i).copied().unwrap_or(0);
+            if gpa != 0 {
+                let va = r.start + (i as u64) * PAGE_SIZE;
+                let _ = aspace.protect_user_range(va, PAGE_SIZE, old_prots[i]);
+            }
+        }
+    }
+
+    fn handle_cow_fault(
+        &mut self,
+        aspace: &mut ProcessAddressSpace,
+        seg: &AreaSeg<VmArea>,
+        idx: usize,
+        page_va: u64,
+        prot: u32,
+    ) -> bool {
+        let old_gpa = seg.value().phys_pages.get(idx).copied().unwrap_or(0);
+        let Some(new_gpa) = crate::mm::phys::alloc_pages(1) else {
+            return false;
+        };
+        if old_gpa != 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    old_gpa as *const u8,
+                    new_gpa as *mut u8,
+                    PAGE_SIZE as usize,
+                );
+            }
+        } else {
+            unsafe {
+                core::ptr::write_bytes(new_gpa as *mut u8, 0, PAGE_SIZE as usize);
+            }
+            if seg.value().kind == VmKind::Section
+                && !vm_fill_section_page(seg.value(), idx, new_gpa)
+            {
+                crate::mm::phys::free_pages(new_gpa, 1);
+                return false;
+            }
+        }
+        let promoted = vm_promote_cow_prot(prot);
+        if !aspace.map_user_range(page_va, new_gpa, PAGE_SIZE, promoted) {
+            crate::mm::phys::free_pages(new_gpa, 1);
+            return false;
+        }
+        crate::nt::state::vm_phys_page_add_ref(new_gpa);
+        if old_gpa != 0 {
+            crate::nt::state::vm_phys_page_release(old_gpa);
+        }
+        {
+            let a = seg.value_mut();
+            if idx < a.phys_pages.len() {
+                a.phys_pages[idx] = new_gpa;
+            }
+            if idx < a.prot_pages.len() {
+                a.prot_pages[idx] = promoted;
+            }
+        }
+        true
+    }
+
+    fn on_thread_stack_guard_hit(
+        &mut self,
+        aspace: &mut ProcessAddressSpace,
+        pid: u32,
+        seg: &AreaSeg<VmArea>,
+        idx: usize,
+        page_va: u64,
+    ) {
+        crate::nt::state::vm_update_current_thread_stack_limit(pid, page_va);
+        if idx == 0 {
+            return;
+        }
+        let next_idx = idx - 1;
+        if !seg.value().is_page_committed(next_idx) {
+            return;
+        }
+        let next_va = seg.range().start + (next_idx as u64) * PAGE_SIZE;
+        let next_prot = {
+            let a = seg.value();
+            let p = a.prot_pages.get(next_idx).copied().unwrap_or(a.default_prot);
+            vm_sanitize_nt_prot(p) & !PAGE_GUARD
+        };
+        {
+            let a = seg.value_mut();
+            if next_idx < a.prot_pages.len() {
+                a.prot_pages[next_idx] = next_prot | PAGE_GUARD;
+            }
+        }
+        let _ = aspace.unmap_user_range(next_va, PAGE_SIZE);
+    }
 }
