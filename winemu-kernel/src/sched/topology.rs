@@ -419,6 +419,11 @@ pub(crate) fn prepare_unlock_edge_kernel_switch_locked(
     }
 
     let _ = consume_pending_reschedule_locked(vid);
+    // Mark from_tid as in-kernel so that after switch_kernel_continuation saves
+    // its kctx, has_kernel_continuation() will return true when it is next scheduled.
+    with_thread_mut(from_tid, |t| {
+        t.in_kernel = true;
+    });
     set_thread_state_locked(to_tid, ThreadState::Running);
     with_thread_mut(to_tid, |t| {
         if t.slice_remaining_100ns == 0 {
@@ -468,6 +473,21 @@ pub(crate) fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
     if tid == 0 || !thread_exists(tid) {
         return;
     }
+
+    // Idle threads never participate in the ready queue.
+    // Allow state transitions (Running ↔ Ready) for bookkeeping but skip
+    // queue push/pop and cross-vCPU reschedule marking.
+    if with_thread(tid, |t| t.is_idle_thread) {
+        with_thread_mut(tid, |t| {
+            t.state = new_state;
+            if new_state != ThreadState::Running {
+                t.last_start_100ns = 0;
+            }
+            t.sched_next = 0;
+        });
+        return;
+    }
+
     let old_state = with_thread(tid, |t| t.state);
     if old_state == new_state {
         return;
