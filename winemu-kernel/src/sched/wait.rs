@@ -1,4 +1,12 @@
-use super::*;
+use crate::timer::{self, TimerTaskHandle, TimerTaskKind};
+use winemu_shared::status;
+use super::types::{KThread, ThreadState, WAIT_KIND_NONE, WAIT_KIND_DELAY, MAX_WAIT_HANDLES};
+use super::types::{DYNAMIC_BOOST_DELTA, DYNAMIC_BOOST_MAX};
+use super::thread_store::{thread_exists, with_thread, with_thread_mut};
+use super::cpu::current_tid;
+use super::lock::{sched_lock_acquire, sched_lock_release, sched_lock_held_by_current_vcpu, ScopedSchedulerLock};
+use super::context::{has_kernel_continuation, set_thread_in_kernel_locked};
+use super::topology::set_thread_state_locked;
 
 pub(crate) fn set_wait_deadline_locked(tid: u32, deadline: u64) -> bool {
     if tid == 0 || !thread_exists(tid) {

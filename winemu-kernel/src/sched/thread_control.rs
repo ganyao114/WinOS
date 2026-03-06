@@ -1,4 +1,15 @@
-use super::*;
+use winemu_shared::status;
+use crate::nt::constants::{PSEUDO_CURRENT_THREAD, PSEUDO_CURRENT_THREAD_ALT};
+use super::types::ThreadState;
+use super::thread_store::{thread_exists, with_thread, with_thread_mut};
+use super::cpu::{current_tid, set_current_cpu_thread};
+use super::lock::{sched_lock_acquire, sched_lock_release};
+use super::topology::{
+    set_thread_state_locked, ready_remove_tid_locked, ready_push_tid_locked,
+    ready_target_vcpu_hint, mark_reschedule_targeted_locked,
+};
+use super::global::SCHED;
+use super::sync;
 
 // ── 优先级辅助（调用者必须持有 sched lock）──────────────────────
 

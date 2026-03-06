@@ -1,5 +1,36 @@
 // ── 调度核心 ──────────────────────────────────────────────────
 
+use crate::timer;
+use super::types::{KThread, ThreadState, MAX_VCPUS};
+use super::global::SCHED;
+use super::thread_store::{thread_exists, with_thread, with_thread_mut, thread_store_mut};
+use super::cpu::{current_tid, vcpu_id, set_current_cpu_thread};
+use super::lock::{sched_lock_acquire, sched_lock_release, sched_lock_held_by_current_vcpu};
+use super::topology::{
+    set_thread_state_locked, set_vcpu_idle_locked, mark_vcpu_online_locked,
+    ready_pop_for_vcpu_locked, ready_highest_priority_scheduled_locked,
+    ready_highest_priority_suggested_locked, ready_highest_priority_kernel_continuation_locked,
+    consume_pending_reschedule_locked,
+};
+use super::topology::pick_ready_kernel_continuation_locked;
+use super::context::{
+    has_kernel_continuation, set_thread_in_kernel, enter_kernel_continuation_noreturn,
+    enter_user_thread_noreturn, set_vcpu_kernel_sp, set_vcpu_kernel_sp_for_tid,
+    switch_kernel_continuation, setup_idle_thread_continuation_locked,
+};
+use super::wait::{now_ticks, check_timeouts, next_wait_deadline_locked, end_wait_locked};
+use super::thread_control::{
+    charge_current_runtime_locked, rotate_current_on_quantum_expire_locked,
+    current_slice_remaining_100ns,
+};
+use super::threads::{
+    alloc_kernel_stack, free_kernel_stack, terminate_thread_by_tid, thread_pid,
+};
+
+fn default_kernel_stack_top() -> u64 {
+    crate::arch::vectors::default_kernel_stack_top()
+}
+
 #[inline(always)]
 fn running_on_other_vcpu_locked(tid: u32, self_vcpu: usize) -> bool {
     unsafe {
@@ -148,7 +179,7 @@ pub(crate) fn scheduler_round_locked(
 }
 
 /// 选取下一个线程并切换（在 trap 路径持锁调用）
-/// 返回 (from_tid, to_tid)；若无需切换则 from == to；to == 0 表示 WFI idle
+/// 返回 (from_tid, to_tid)；若无需切换则 from == to；to == 0 表示 WFI idle（无 idle 线程时的兜底）
 pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32) {
     unsafe {
         mark_vcpu_online_locked(vcpu_id);
@@ -159,12 +190,11 @@ pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32
             set_current_cpu_thread(vcpu_id, 0);
             cur_tid = 0;
         }
+        let idle_tid = (*SCHED.idle_tid_by_vcpu.get())[vcpu_id];
         let cur_running = cur_tid != 0 && with_thread(cur_tid, |t| t.state == ThreadState::Running);
 
-        // Strict priority preemption:
-        // keep current running thread unless there exists a higher-priority ready thread
-        // in this core's scheduled front, or (when empty) in suggested migration view.
-        if cur_running {
+        // Strict priority preemption — skip for idle thread so any real thread preempts it.
+        if cur_running && cur_tid != idle_tid {
             let cur_prio = with_thread(cur_tid, |t| t.priority);
             match next_ready_priority_for_vcpu_locked(vcpu_id) {
                 None => return (cur_tid, cur_tid),
@@ -198,11 +228,49 @@ pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32
         }
 
         if next_tid == 0 {
-            // No ready threads — if current thread is still Running, keep it
-            if cur_running {
+            // No ready threads — if current thread is still Running (and not idle), keep it.
+            if cur_running && cur_tid != idle_tid {
                 return (cur_tid, cur_tid);
             }
-            // No runnable threads at all → WFI
+            // Idle thread is already cur_running — stay on it.
+            if cur_running && cur_tid == idle_tid {
+                return (cur_tid, cur_tid);
+            }
+            // No runnable real thread — fall back to this vCPU's idle thread.
+            if idle_tid != 0 && thread_exists(idle_tid) {
+                if idle_tid != cur_tid {
+                    if cur_running {
+                        // cur_tid is not idle but not Running anymore: handled by state machine
+                        let cur_state = with_thread(cur_tid, |t| t.state);
+                        if cur_state == ThreadState::Running {
+                            set_thread_state_locked(cur_tid, ThreadState::Ready);
+                        }
+                    }
+                    set_thread_state_locked(idle_tid, ThreadState::Running);
+                    with_thread_mut(idle_tid, |t| {
+                        if t.slice_remaining_100ns == 0 {
+                            t.slice_remaining_100ns = quantum_100ns.max(1);
+                        }
+                        t.last_start_100ns = now_100ns;
+                        t.last_vcpu_hint = vcpu_id as u8;
+                    });
+                    vcpu.current_tid = idle_tid;
+                    set_current_cpu_thread(vcpu_id, idle_tid);
+                    set_vcpu_kernel_sp_for_tid(vcpu_id, idle_tid);
+                    return (cur_tid, idle_tid);
+                } else {
+                    // idle is already cur_tid but not Running state → set Running
+                    set_thread_state_locked(idle_tid, ThreadState::Running);
+                    with_thread_mut(idle_tid, |t| {
+                        if t.slice_remaining_100ns == 0 {
+                            t.slice_remaining_100ns = quantum_100ns.max(1);
+                        }
+                        t.last_start_100ns = now_100ns;
+                    });
+                    return (cur_tid, cur_tid);
+                }
+            }
+            // No idle thread registered (early boot or registration failed) → WFI
             vcpu.current_tid = 0;
             set_current_cpu_thread(vcpu_id, 0);
             set_vcpu_kernel_sp(vcpu_id, default_kernel_stack_top());
@@ -223,6 +291,8 @@ pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32
             }
             let cur_state = with_thread(cur_tid, |t| t.state);
             if cur_state == ThreadState::Running {
+                // For idle thread preempted by a real thread: set_thread_state_locked
+                // skips queue ops (is_idle_thread guard in topology.rs), so this is safe.
                 set_thread_state_locked(cur_tid, ThreadState::Ready);
             }
         }
@@ -246,8 +316,13 @@ pub fn schedule(vcpu_id: usize, now_100ns: u64, quantum_100ns: u64) -> (u32, u32
 /// 唤醒指定线程
 pub fn wake(tid: u32, result: u32) {
     sched_lock_acquire();
-    let _ = end_wait_locked(tid, result);
+    let woke = end_wait_locked(tid, result);
     sched_lock_release();
+    // Signal idle vCPUs sleeping in WFE so they pick up the newly-ready
+    // thread without waiting for their own timer deadline.
+    if woke {
+        crate::arch::cpu::send_event();
+    }
 }
 
 /// Put the current running thread back to ready queue.
@@ -518,19 +593,16 @@ fn enter_core_scheduler_round_loop(
 }
 
 pub fn enter_core_scheduler_entry(vcpu_id: usize) -> ! {
-    if cfg!(feature = "sched-secondary-round") {
-        let cur = current_tid();
-        if cur != 0 && thread_exists(cur) {
-            enter_core_scheduler_round_loop(vcpu_id, cur, true);
-        }
-        enter_core_scheduler_round_loop(vcpu_id, 0, false);
-    }
-
+    // 主次核统一走完整 round loop：
+    //   - 有 current_tid（主核/已绑定线程）：以 cur 为 hint，allow_user_entry_fallback=true
+    //   - 无 current_tid（次核冷启动）：from_tid=0，scheduler_round_locked 从就绪队列选线程
+    // 消除 sched-secondary-round feature flag，主次核共用同一调度路径，
+    // 均可运行任意就绪线程（有 kernel continuation 或 EL0 user entry）。
     let cur = current_tid();
     if cur != 0 && thread_exists(cur) {
-        enter_bootstrap_thread_dispatch(vcpu_id)
+        enter_core_scheduler_round_loop(vcpu_id, cur, true)
     }
-    enter_secondary_idle_loop(vcpu_id)
+    enter_core_scheduler_round_loop(vcpu_id, 0, true)
 }
 
 /// Returns true if all allocated threads are Terminated or Free (process can exit).
@@ -554,4 +626,75 @@ pub fn all_threads_done() -> bool {
         });
         all_done
     }
+}
+
+// ── Idle 线程 ────────────────────────────────────────────────
+
+/// 每个 vCPU 的 idle 线程入口（EL1 内核态永久循环）。
+/// 选策略：pump completions → 检查 all_threads_done → 尝试 schedule() 取就绪真实线程 → WFI。
+/// 切换到真实线程时使用 run_selected_thread_noreturn（单向进入），
+/// idle 线程本身总是从 kstack_top 重新启动（kctx 始终指向函数入口）。
+pub(crate) extern "C" fn idle_thread_fn() -> ! {
+    loop {
+        crate::hostcall::pump_completions();
+
+        if all_threads_done() {
+            let code =
+                crate::process::process_exit_status(crate::process::current_pid()).unwrap_or(0);
+            crate::hypercall::process_exit(code);
+        }
+
+        let vid = vcpu_id();
+        let quantum = timer::DEFAULT_TIMESLICE_100NS;
+        let now = now_ticks();
+
+        sched_lock_acquire();
+        check_timeouts(now);
+        let (_, to) = schedule(vid, now, quantum);
+        let next_deadline = next_wait_deadline_locked();
+
+        if to != 0 && to != current_tid() {
+            // 真实线程就绪：单向进入（idle 线程 kctx 保持不变，下次从头重新执行）
+            let slice = current_slice_remaining_100ns(vid, quantum);
+            sched_lock_release();
+            run_selected_thread_noreturn(to, now, next_deadline, slice);
+        }
+
+        set_vcpu_idle_locked(vid, true);
+        sched_lock_release();
+        timer::idle_wait_until_deadline_100ns(now, next_deadline);
+    }
+}
+
+/// 为指定 vCPU 注册 idle 线程。
+/// 分配独立内核栈，初始化 KThread（is_idle_thread=true），
+/// 设置 kctx 指向 idle_thread_fn，写入 idle_tid_by_vcpu 映射。
+pub fn register_idle_thread_for_vcpu(vcpu_id: usize) -> bool {
+    let vid = vcpu_id.min(MAX_VCPUS - 1);
+    // 幂等：已注册则直接返回。
+    let already = unsafe { (*SCHED.idle_tid_by_vcpu.get())[vid] };
+    if already != 0 {
+        return true;
+    }
+    let Some((kstack_base, kstack_size)) = alloc_kernel_stack() else {
+        return false;
+    };
+    sched_lock_acquire();
+    let tid = thread_store_mut().alloc_with(|id| {
+        let mut t = KThread::zeroed();
+        t.init_idle_thread(id, vid, kstack_base, kstack_size);
+        t
+    });
+    let Some(tid) = tid else {
+        sched_lock_release();
+        free_kernel_stack(kstack_base);
+        return false;
+    };
+    setup_idle_thread_continuation_locked(tid);
+    unsafe {
+        (*SCHED.idle_tid_by_vcpu.get())[vid] = tid;
+    }
+    sched_lock_release();
+    crate::kinfo!("sched: idle thread registered vcpu={} tid={}", vid, tid);
+    true
 }

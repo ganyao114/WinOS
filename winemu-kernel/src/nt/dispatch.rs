@@ -243,13 +243,13 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                     if cur_not_running && to_in_kernel && !to_has_kctx {
                         // No kernel continuation means this target can only be resumed
                         // through EL0 frame restore; normalize stale in-kernel marker.
-                        crate::sched::set_thread_in_kernel_locked(to, false);
+                        crate::sched::context::set_thread_in_kernel_locked(to, false);
                         to_in_kernel = false;
                     }
                     if cur_not_running
                         && with_thread(from_sched, |t| t.state == ThreadState::Terminated)
                     {
-                        crate::sched::set_thread_in_kernel_locked(from_sched, false);
+                        crate::sched::context::set_thread_in_kernel_locked(from_sched, false);
                     }
                     if to_has_kctx {
                         save_ctx_for(from_sched, frame);
@@ -295,6 +295,11 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                 crate::process::switch_to_thread_process(to);
                 if from_sched == 0 {
                     // We were idling; current frame no longer belongs to a runnable thread.
+                    // Guard: idle thread has no EL0 context — enter its kernel continuation directly.
+                    if with_thread(to, |t| t.is_idle_thread) {
+                        sched_lock_release();
+                        unsafe { crate::sched::enter_kernel_continuation_noreturn(to) }
+                    }
                     restore_ctx_to_frame(to, frame);
                 } else if from_sched == to && (cur_not_running || pending_resched || timeout_woke) {
                     // Same-thread continuation may still need frame refresh when wait/completion

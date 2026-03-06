@@ -1,3 +1,21 @@
+use crate::mm::vaspace::VmaType;
+use crate::nt::constants::{
+    DEFAULT_THREAD_STACK_COMMIT, DEFAULT_THREAD_STACK_RESERVE, PAGE_SIZE_4K,
+    THREAD_STACK_ALIGN, THREAD_BASIC_INFORMATION_SIZE,
+};
+use crate::nt::state::{vm_alloc_region_typed, vm_free_region, vm_handle_page_fault, vm_make_guard_page, VM_ACCESS_WRITE};
+use crate::rust_alloc::vec::Vec;
+use winemu_shared::teb as teb_layout;
+use winemu_shared::status;
+use super::types::{KThread, KernelContext, ThreadState, KERNEL_STACK_SIZE, WAIT_KIND_NONE};
+use super::global::SCHED;
+use super::global::DEFERRED_KSTACK_CAP;
+use super::thread_store::{thread_exists, with_thread, with_thread_mut, thread_store_mut};
+use super::cpu::current_tid;
+use super::lock::{sched_lock_acquire, sched_lock_release, sched_lock_held_by_current_vcpu};
+use super::topology::set_thread_state_locked;
+use super::context::{ensure_user_entry_continuation_locked, current_thread_kernel_stack_base};
+
 // ── 线程创建 ──────────────────────────────────────────────────
 
 /// 分配新 TID，初始化 KThread，加入就绪队列
@@ -34,6 +52,10 @@ pub fn spawn(
         })
         .unwrap_or(0);
     if tid != 0 {
+        // 先在内核态设置入口 continuation（kctx.lr = thread_user_entry_continuation）
+        // 保证调度器 unlock-edge 路径和次级 vCPU 都能选到此线程，
+        // 也满足"线程入口：先内核入口 → 用户态"设计目标。
+        ensure_user_entry_continuation_locked(tid);
         set_thread_state_locked(tid, ThreadState::Ready);
     }
     sched_lock_release();
@@ -56,13 +78,13 @@ fn normalize_stack_size(max_stack_size_arg: u64) -> u64 {
 }
 
 #[inline(always)]
-fn alloc_kernel_stack() -> Option<(u64, u64)> {
+pub(crate) fn alloc_kernel_stack() -> Option<(u64, u64)> {
     let ptr = crate::alloc::alloc_zeroed(KERNEL_STACK_SIZE, 16)?;
     Some((ptr as u64, KERNEL_STACK_SIZE as u64))
 }
 
 #[inline(always)]
-fn free_kernel_stack(base: u64) {
+pub(crate) fn free_kernel_stack(base: u64) {
     if base != 0 {
         crate::alloc::dealloc(base as *mut u8);
     }

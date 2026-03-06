@@ -50,6 +50,7 @@ pub extern "C" fn kernel_secondary_main() -> ! {
     };
     #[cfg(target_arch = "aarch64")]
     crate::kdebug!("secondary: mpidr={:#x} vid={}", mpidr, vid);
+    sched::register_idle_thread_for_vcpu(vid);
     sched::enter_core_scheduler_entry(vid)
 }
 
@@ -359,6 +360,7 @@ pub extern "C" fn kernel_main() -> ! {
 
     let vid = sched::vcpu_id().min(sched::MAX_VCPUS - 1);
     crate::kinfo!("kernel: thread0 tid={} enter bootstrap dispatch", thread0_tid);
+    sched::register_idle_thread_for_vcpu(vid);
     sched::enter_core_scheduler_entry(vid)
 }
 

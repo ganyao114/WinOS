@@ -1,10 +1,8 @@
-use super::{
-    commit_and_collect_unlock_edge_decision_locked, execute_kernel_continuation_switch,
-    record_schedule_event_unlock_edge, vcpu_id, SCHED,
-};
+// sched/lock.rs — KSchedulerLock RAII + 可重入自旋锁
+// unlock edge 在 Drop 时触发：commit deferred scheduling + kernel switch
 
-// 可重入；底层用原子自旋锁保护多 vCPU 并发。
-// lock_owner 存 vcpu_id+1（0 = 未持有）。
+use super::global::SCHED;
+use super::cpu::{vcpu_id};
 
 fn spinlock_acquire() {
     crate::arch::spin::lock_word(SCHED.spinlock.get());
@@ -14,17 +12,20 @@ fn spinlock_release() {
     crate::arch::spin::unlock_word(SCHED.spinlock.get());
 }
 
-pub struct ScopedSchedulerLock {
+// ── RAII guard ────────────────────────────────────────────────
+
+pub struct KSchedulerLock {
     held: bool,
 }
 
-impl ScopedSchedulerLock {
+impl KSchedulerLock {
     #[inline(always)]
-    pub fn new() -> Self {
+    pub fn acquire() -> Self {
         sched_lock_acquire();
         Self { held: true }
     }
 
+    /// 提前手动释放（消耗 self，不触发 Drop 的二次释放）
     #[inline(always)]
     pub fn unlock(mut self) {
         if self.held {
@@ -34,7 +35,7 @@ impl ScopedSchedulerLock {
     }
 }
 
-impl Drop for ScopedSchedulerLock {
+impl Drop for KSchedulerLock {
     fn drop(&mut self) {
         if self.held {
             self.held = false;
@@ -42,6 +43,19 @@ impl Drop for ScopedSchedulerLock {
         }
     }
 }
+
+// 旧名称兼容别名
+pub type ScopedSchedulerLock = KSchedulerLock;
+
+impl KSchedulerLock {
+    /// 旧接口兼容：ScopedSchedulerLock::new()
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self::acquire()
+    }
+}
+
+// ── 底层 acquire / release ────────────────────────────────────
 
 pub fn sched_lock_acquire() {
     let vid = vcpu_id();
@@ -64,10 +78,6 @@ pub fn sched_lock_acquire() {
 }
 
 pub fn sched_lock_release() {
-    sched_lock_release_impl();
-}
-
-fn sched_lock_release_impl() {
     let mut wake_idle_mask = 0u32;
     let mut unlock_switch = None;
     unsafe {
@@ -90,7 +100,8 @@ fn sched_lock_release_impl() {
         }
         *count -= 1;
         if *count == 0 {
-            let decision = commit_and_collect_unlock_edge_decision_locked(vid);
+            let decision =
+                super::topology::commit_and_collect_unlock_edge_decision_locked(vid);
             unlock_switch = decision.unlock_kernel_switch;
             wake_idle_mask = decision.wake_idle_mask;
             *SCHED.lock_owner.get() = 0;
@@ -101,8 +112,8 @@ fn sched_lock_release_impl() {
         crate::hypercall::kick_vcpu_mask(wake_idle_mask);
     }
     if let Some(sw) = unlock_switch {
-        record_schedule_event_unlock_edge();
-        execute_kernel_continuation_switch(
+        super::topology::record_schedule_event_unlock_edge();
+        super::context::execute_kernel_continuation_switch(
             sw.from_tid,
             sw.to_tid,
             sw.now_100ns,
