@@ -1,8 +1,9 @@
 use core::mem::size_of;
 
 use crate::sched::sync::{
-    close_handle_info, close_handle_info_for_pid, duplicate_handle_between, STATUS_SUCCESS,
+    close_handle_info, close_handle_info_for_pid, duplicate_handle_between,
 };
+use crate::sched::wait::STATUS_SUCCESS;
 use winemu_shared::status;
 
 use super::common::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};

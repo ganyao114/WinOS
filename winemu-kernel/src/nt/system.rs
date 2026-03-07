@@ -3,7 +3,7 @@ use core::mem::size_of;
 use winemu_shared::hostcall as hc;
 use winemu_shared::status;
 
-use crate::sched::sync::WaitDeadline;
+use crate::sched::types::WaitDeadline;
 
 use super::constants::PAGE_SIZE_4K;
 use super::SvcFrame;
@@ -290,12 +290,12 @@ fn parse_delay_timeout(raw: i64) -> WaitDeadline {
         return WaitDeadline::Immediate;
     }
     if raw < 0 {
-        return WaitDeadline::DeadlineTicks(crate::sched::deadline_after_100ns(raw.unsigned_abs()));
+        return crate::sched::deadline_after_100ns(raw);
     }
 
     let now = crate::hypercall::query_system_time_100ns() as i64;
     if raw <= now {
         return WaitDeadline::Immediate;
     }
-    WaitDeadline::DeadlineTicks(crate::sched::deadline_after_100ns((raw - now) as u64))
+    crate::sched::deadline_after_100ns(raw - now)
 }

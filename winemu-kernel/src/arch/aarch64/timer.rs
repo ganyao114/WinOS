@@ -5,10 +5,10 @@ extern "C" fn timer_irq_el1_dispatch() {
     crate::hostcall::pump_completions();
     // Wake threads whose wait deadlines have expired.  This keeps timeout
     // wakeups prompt even when the IRQ fires during non-WFE EL1 execution.
-    let now = crate::sched::now_ticks();
-    crate::sched::sched_lock_acquire();
-    let woke = crate::sched::check_timeouts(now);
-    crate::sched::sched_lock_release();
+    let woke = {
+        let _lock = crate::sched::KSchedulerLock::lock();
+        crate::sched::check_wait_timeouts_locked() > 0
+    };
     // Signal sibling idle vCPUs so they notice the newly-ready threads
     // without waiting for their own timer deadline.
     if woke {

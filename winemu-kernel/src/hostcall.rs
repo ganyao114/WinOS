@@ -2,7 +2,7 @@ use crate::hypercall;
 use crate::kobj::ObjectStore;
 use crate::rust_alloc::vec::Vec;
 use crate::sched;
-use crate::sched::sync::WaitDeadline;
+use crate::sched::WaitDeadline;
 use winemu_shared::hostcall as hc;
 use winemu_shared::status;
 
@@ -122,79 +122,26 @@ pub fn call_sync(owner_pid: u32, args: SubmitArgs) -> Result<SubmitDone, u32> {
                 let _ = hypercall::hostcall_cancel(request_id);
                 return Err(status::NO_MEMORY);
             }
-            let wait_st = wait_current_for_request_pending(request_id, WaitDeadline::Infinite);
-            if wait_st != STATUS_PENDING {
-                return Err(wait_st);
-            }
-            wait_for_sync_completion(request_id, cur_tid)
-        }
-    }
-}
-
-fn wait_for_sync_completion(request_id: u64, waiter_tid: u32) -> Result<SubmitDone, u32> {
-    if request_id == 0 || waiter_tid == 0 {
-        return Err(status::INVALID_PARAMETER);
-    }
-    loop {
-        if let Some(done) = take_sync_completion(request_id) {
-            let mapped = map_host_result_to_status(done.host_result);
-            if mapped != status::SUCCESS {
-                return Err(mapped);
-            }
-            return Ok(done);
-        }
-
-        let mut resolved = None;
-        let mut now = 0u64;
-        let mut next_deadline = 0u64;
-        {
-            let _guard = sched::ScopedSchedulerLock::new();
-            if !sched::thread_exists(waiter_tid) {
-                return Err(status::INVALID_PARAMETER);
-            }
-            let (state, result) = sched::with_thread(waiter_tid, |t| (t.state, t.wait_result));
-            if state != sched::ThreadState::Waiting {
-                resolved = Some(result);
-            } else {
-                now = sched::now_ticks();
-                let _ = sched::check_timeouts(now);
-                let (state2, result2) =
-                    sched::with_thread(waiter_tid, |t| (t.state, t.wait_result));
-                if state2 != sched::ThreadState::Waiting {
-                    resolved = Some(result2);
-                } else {
-                    next_deadline = sched::next_wait_deadline_locked();
+            // Block current thread; unlock-edge fires on SchedLockAndSleep drop.
+            // Thread resumes here after pump_completions → sched::wake().
+            wait_current_for_request_pending(request_id, WaitDeadline::Infinite);
+            // Read the completion stored by pump_completions.
+            if let Some(done) = take_sync_completion(request_id) {
+                let mapped = map_host_result_to_status(done.host_result);
+                if mapped != status::SUCCESS {
+                    return Err(mapped);
                 }
-            }
-        }
-
-        if let Some(result) = resolved {
-            if result != status::SUCCESS {
+                Ok(done)
+            } else {
                 cleanup_request(request_id, true);
-                return Err(result);
+                let wake_result = sched::with_thread(cur_tid, |t| t.wait.result)
+                    .unwrap_or(status::INVALID_PARAMETER);
+                Err(wake_result)
             }
-            let Some(done) = take_sync_completion(request_id) else {
-                cleanup_request(request_id, true);
-                return Err(status::INVALID_PARAMETER);
-            };
-            let mapped = map_host_result_to_status(done.host_result);
-            if mapped != status::SUCCESS {
-                return Err(mapped);
-            }
-            return Ok(done);
         }
-
-        pump_completions();
-        if let Some(done) = take_sync_completion(request_id) {
-            let mapped = map_host_result_to_status(done.host_result);
-            if mapped != status::SUCCESS {
-                return Err(mapped);
-            }
-            return Ok(done);
-        }
-        crate::timer::idle_wait_until_deadline_100ns(now, next_deadline);
     }
 }
+
 
 pub fn register_request(
     owner_pid: u32,
@@ -361,12 +308,6 @@ fn sync_done_remove_by_request(request_id: u64) -> Option<SyncCompletion> {
     None
 }
 
-fn wait_deadline_ticks(timeout: WaitDeadline) -> u64 {
-    match timeout {
-        WaitDeadline::Infinite | WaitDeadline::Immediate => 0,
-        WaitDeadline::DeadlineTicks(t) => t,
-    }
-}
 
 pub fn wait_current_for_request_pending(request_id: u64, timeout: WaitDeadline) -> u32 {
     let cur = sched::current_tid();
@@ -377,17 +318,18 @@ pub fn wait_current_for_request_pending(request_id: u64, timeout: WaitDeadline) 
         cleanup_request(request_id, true);
         return status::TIMEOUT;
     }
-    let deadline = wait_deadline_ticks(timeout);
-    let st = sched::block_current_and_resched(
-        sched::WAIT_KIND_HOSTCALL,
-        core::slice::from_ref(&request_id),
-        deadline,
-        STATUS_PENDING,
-    );
-    if st != status::SUCCESS {
-        cleanup_request(request_id, true);
-        return st;
+    let deadline = match timeout {
+        WaitDeadline::Infinite => WaitDeadline::Infinite,
+        WaitDeadline::Immediate => WaitDeadline::Immediate,
+        WaitDeadline::DeadlineTicks(t) => WaitDeadline::DeadlineTicks(t),
+    };
+    {
+        let _slp = sched::lock::SchedLockAndSleep::new();
+        sched::with_thread_mut(cur, |t| t.wait.kind = sched::WAIT_KIND_HOSTCALL);
+        sched::block_thread_locked(cur, deadline);
+        // _slp drops here → flush_unlock_edge → thread switches out
     }
+    // Thread resumes here after pump_completions calls sched::wake()
     STATUS_PENDING
 }
 

@@ -39,7 +39,7 @@ pub extern "C" fn kernel_secondary_main() -> ! {
     // MMU/system control registers are per-CPU; secondary CPUs need local MMU
     // init before touching scheduler global state under virtual addresses.
     mm::init_per_cpu();
-    let vid = sched::vcpu_id().min(sched::MAX_VCPUS - 1);
+    let vid = (sched::vcpu_id() as usize).min(sched::MAX_VCPUS - 1);
     #[cfg(target_arch = "aarch64")]
     let mpidr = {
         let v: u64;
@@ -50,7 +50,7 @@ pub extern "C" fn kernel_secondary_main() -> ! {
     };
     #[cfg(target_arch = "aarch64")]
     crate::kdebug!("secondary: mpidr={:#x} vid={}", mpidr, vid);
-    sched::register_idle_thread_for_vcpu(vid);
+    sched::register_idle_thread_for_vcpu(vid as u32);
     sched::enter_core_scheduler_entry(vid)
 }
 
@@ -213,11 +213,25 @@ pub extern "C" fn kernel_main() -> ! {
         crate::kerror!("kernel: bootstrap process init failed");
         hypercall::process_exit(1);
     }
-    if !sched::register_thread0(0) {
-        crate::kerror!("kernel: bootstrap thread0 init failed");
-        hypercall::process_exit(1);
+    // Register thread0 (the boot thread) with the scheduler.
+    {
+        let _lock = sched::KSchedulerLock::lock();
+        let vid = (sched::vcpu_id() as usize).min(sched::MAX_VCPUS - 1) as u32;
+        let params = sched::UserThreadParams {
+            pid: 0,
+            entry: 0,
+            stack_base: 0,
+            stack_size: 0,
+            teb_va: 0,
+            arg: 0,
+            priority: 8,
+        };
+        let tid = sched::create_user_thread_locked(params)
+            .expect("kernel: thread0 alloc failed");
+        sched::set_vcpu_current_thread(vid as usize, tid);
+        sched::set_current_tid(tid);
+        sched::set_thread_in_kernel_locked(tid, true);
     }
-    sched::set_current_in_kernel(true);
 
     hostcall::init();
     if hypercall::hostcall_setup() != winemu_shared::hostcall::HC_OK {
@@ -300,7 +314,12 @@ pub extern "C" fn kernel_main() -> ! {
         crate::kerror!("kernel: boot process update failed");
         hypercall::process_exit(1);
     }
-    sched::set_current_thread_teb(teb_peb.teb_va);
+    // Update thread0's TEB VA.
+    {
+        let tid = sched::current_tid();
+        let _lock = sched::KSchedulerLock::lock();
+        sched::with_thread_mut(tid, |t| t.teb_va = teb_peb.teb_va);
+    }
 
     // ── 4. 通知 VMM 内核已就绪 + 内核侧直入首用户线程 ───────────
     let app_entry_va = loaded.base + loaded.entry_rva as u64;
@@ -336,31 +355,32 @@ pub extern "C" fn kernel_main() -> ! {
         crate::kerror!("kernel: thread0 missing");
         hypercall::process_exit(1);
     }
-    let now = sched::now_ticks();
-    sched::sched_lock_acquire();
-    sched::set_thread_state_locked(thread0_tid, sched::ThreadState::Running);
-    sched::with_thread_mut(thread0_tid, |t| {
-        t.ctx.pc = start_thunk_va;
-        t.ctx.sp = teb_peb.stack_base;
-        t.ctx.x[0] = app_entry_va;
-        t.ctx.x[1] = teb_peb.peb_va;
-        t.ctx.x[18] = teb_peb.teb_va;
-        t.ctx.tpidr = teb_peb.teb_va;
-        t.ctx.pstate = 0;
-        t.slice_remaining_100ns = timer::DEFAULT_TIMESLICE_100NS;
-        t.last_start_100ns = now;
-        t.in_kernel = false;
-    });
-    sched::sched_lock_release();
+    let now = sched::current_ticks();
+    {
+        let _lock = sched::KSchedulerLock::lock();
+        sched::set_thread_state_locked(thread0_tid, sched::ThreadState::Running);
+        sched::with_thread_mut(thread0_tid, |t| {
+            t.ctx.pc = start_thunk_va;
+            t.ctx.sp = teb_peb.stack_base;
+            t.ctx.x[0] = app_entry_va;
+            t.ctx.x[1] = teb_peb.peb_va;
+            t.ctx.x[18] = teb_peb.teb_va;
+            t.ctx.tpidr = teb_peb.teb_va;
+            t.ctx.pstate = 0;
+            t.slice_remaining_100ns = timer::DEFAULT_TIMESLICE_100NS;
+            t.last_start_100ns = now;
+            t.in_kernel = false;
+        });
+    }
     process::switch_to_thread_process(thread0_tid);
 
     // Release secondary CPUs from early boot hold loop only after thread0
     // bootstrap context is fully committed.
     set_primary_boot_ready();
 
-    let vid = sched::vcpu_id().min(sched::MAX_VCPUS - 1);
+    let vid = (sched::vcpu_id() as usize).min(sched::MAX_VCPUS - 1);
     crate::kinfo!("kernel: thread0 tid={} enter bootstrap dispatch", thread0_tid);
-    sched::register_idle_thread_for_vcpu(vid);
+    sched::register_idle_thread_for_vcpu(vid as u32);
     sched::enter_core_scheduler_entry(vid)
 }
 

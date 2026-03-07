@@ -190,6 +190,20 @@ fn close_key(idx: u32) -> u32 {
     }
 }
 
+pub(crate) fn handle_to_tid(handle: u64) -> Option<u32> {
+    let pid = crate::process::current_pid();
+    let htype = sync::handle_type_by_owner(handle, pid);
+    if htype != HANDLE_TYPE_THREAD {
+        return None;
+    }
+    let idx = sync::handle_idx_by_owner(handle, pid);
+    if idx == 0 { None } else { Some(idx) }
+}
+
+pub(crate) fn make_thread_handle(tid: u32) -> u64 {
+    sync::encode_handle(HANDLE_TYPE_THREAD, tid)
+}
+
 pub(crate) fn ops_for_type(htype: u64) -> Option<&'static KObjectOps> {
     match htype {
         HANDLE_TYPE_PROCESS => Some(&PROCESS_OPS),

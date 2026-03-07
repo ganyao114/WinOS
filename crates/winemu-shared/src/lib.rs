@@ -312,6 +312,7 @@ pub mod status {
     pub const THREAD_IS_TERMINATING: u32 = 0xC000_004B;
     pub const CANCELLED: u32 = 0xC000_0120;
     pub const NOT_IMPLEMENTED: u32 = 0xC000_0002;
+    pub const STILL_ACTIVE: u32 = 0x0000_0103; // STATUS_PENDING — thread still running
 }
 
 /// NT TEB 字段偏移（64-bit，参考 Wine winternl.h + signal_arm64.c）

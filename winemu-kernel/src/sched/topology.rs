@@ -2,6 +2,7 @@
 //
 // All functions require the scheduler lock to be held.
 
+use core::sync::atomic::Ordering;
 use crate::sched::cpu::{cpu_local, vcpu_id};
 use crate::sched::global::{SCHED, with_thread, with_thread_mut};
 use crate::sched::types::{KThread, ThreadState, MAX_VCPUS};
@@ -44,8 +45,8 @@ pub fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
     if new_state == ThreadState::Ready {
         let priority = with_thread(tid, |t| t.priority).unwrap_or(8);
         let queue = unsafe { SCHED.queue_raw_mut() };
-        let store = unsafe { SCHED.threads_raw_mut() };
-        queue.push_with_store(tid, priority, &mut |id| store.get_mut(id));
+        let store = unsafe { SCHED.threads_raw_mut() } as *mut crate::sched::thread_store::ThreadStore;
+        queue.push_with_store(tid, priority, &mut |id| unsafe { (*store).get_mut(id) });
 
         // Signal a vCPU that might be idle.
         hint_reschedule_any_idle();

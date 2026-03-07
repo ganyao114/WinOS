@@ -211,6 +211,30 @@ pub fn wait_for_multiple_objects(
     }
 }
 
+// ── Delay / sleep ─────────────────────────────────────────────────────────────
+
+/// Block the current thread for the given deadline (NtDelayExecution).
+pub fn delay_current_thread_sync(deadline: WaitDeadline) -> u32 {
+    use crate::sched::wait::block_thread_delay_locked;
+    use crate::sched::lock::SchedLockAndSleep;
+    let tid = current_tid();
+    if tid == 0 || deadline == WaitDeadline::Immediate {
+        return STATUS_SUCCESS;
+    }
+    {
+        let _slp = SchedLockAndSleep::new();
+        block_thread_delay_locked(tid, deadline);
+        // _slp drops here → unlock-edge → thread switches out
+    }
+    // Thread resumes here after deadline expires or APC
+    with_thread(tid, |t| t.wait.result).unwrap_or(STATUS_SUCCESS)
+}
+
+/// Set an event by handle on behalf of a specific PID (async I/O completion).
+pub fn event_set_by_handle_for_pid(_owner_pid: u32, handle: u64) -> u32 {
+    set_event(handle)
+}
+
 // ── Close ─────────────────────────────────────────────────────────────────────
 
 pub fn close_handle(handle: u64) -> u32 {

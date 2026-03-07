@@ -156,3 +156,25 @@ pub fn free_terminated_threads_locked() {
         store.free(to_free[i]);
     }
 }
+
+/// Collect all TIDs belonging to `pid`. Returns a Vec of TIDs.
+pub fn thread_ids_by_pid(pid: u32) -> crate::rust_alloc::vec::Vec<u32> {
+    let store = unsafe { SCHED.threads_raw() };
+    let mut out = crate::rust_alloc::vec::Vec::new();
+    store.for_each(|tid, t| {
+        if t.pid == pid {
+            out.push(tid);
+        }
+    });
+    out
+}
+
+/// Terminate a thread by TID. Returns true if the thread was found and terminated.
+pub fn terminate_thread_by_tid(tid: u32) -> bool {
+    let _lock = crate::sched::lock::KSchedulerLock::lock();
+    if !with_thread(tid, |t| t.state != ThreadState::Terminated).unwrap_or(false) {
+        return false;
+    }
+    terminate_thread_locked(tid);
+    true
+}

@@ -537,3 +537,22 @@ fn write_utf16(buf: &mut [u8], off: &mut usize, s: &str, base_va: u64) -> u64 {
 fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
 }
+
+/// Allocate a minimal TEB page for a new thread in `pid`.
+/// Returns the TEB VA on success, or None on OOM.
+pub fn alloc_teb(pid: u32) -> Option<u64> {
+    use winemu_shared::teb as teb_off;
+    let teb_va = crate::nt::state::vm_alloc_region_typed(
+        pid,
+        0,
+        teb_off::SIZE as u64,
+        0x04,
+        VmaType::Private,
+    )?;
+    // Write TEB.Self pointer
+    let buf = unsafe {
+        core::slice::from_raw_parts_mut(teb_va as *mut u8, teb_off::SIZE)
+    };
+    wu64(buf, teb_off::SELF, teb_va);
+    Some(teb_va)
+}

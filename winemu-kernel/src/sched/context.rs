@@ -10,22 +10,41 @@
 use crate::sched::global::with_thread_mut;
 use crate::sched::types::KERNEL_STACK_SIZE;
 
-// ── Assembly stubs (defined in arch/aarch64/context.rs) ──────────────────────
+// ── Context-switch wrappers ───────────────────────────────────────────────────
 
-extern "C" {
-    /// Save callee-saved regs of `from` kctx, restore `to` kctx.
-    /// Signature: fn(from_kctx: *mut KernelContext, to_kctx: *const KernelContext) -> !
-    pub fn __sched_switch_kernel_context(from: *mut u8, to: *const u8) -> !;
+/// Save `from` kctx, restore `to` kctx. Does not return.
+#[inline(always)]
+pub unsafe fn __sched_switch_kernel_context(from: *mut u8, to: *const u8) -> ! {
+    use crate::arch::context::switch_kernel_context;
+    use crate::sched::types::KernelContext;
+    switch_kernel_context(from as *mut KernelContext, to as *const KernelContext);
+    core::hint::unreachable_unchecked()
+}
 
-    /// Enter EL0 from a fresh kernel stack (no saved kctx to restore).
-    /// Restores ThreadContext and ERETs to EL0.
-    pub fn __sched_enter_user_thread(ctx: *const u8) -> !;
+/// Enter EL0 from a fresh kernel stack. Does not return.
+#[inline(always)]
+pub unsafe fn __sched_enter_user_thread(ctx: *const u8) -> ! {
+    use crate::arch::context::enter_user_thread_context;
+    use crate::sched::types::ThreadContext;
+    enter_user_thread_context(ctx as *const ThreadContext)
+}
 
-    /// Entry point for new threads — called via kctx.lr after context switch.
-    pub fn thread_user_entry_continuation() -> !;
+/// Entry point for new user threads — called via kctx.lr after context switch.
+#[no_mangle]
+pub unsafe extern "C" fn thread_user_entry_continuation() -> ! {
+    let tid = crate::sched::cpu::current_tid();
+    let ctx_ptr = crate::sched::global::with_thread(tid, |t| {
+        &t.ctx as *const crate::sched::types::ThreadContext as usize
+    }).unwrap_or(0) as *const u8;
+    __sched_enter_user_thread(ctx_ptr)
+}
 
-    /// Entry point for idle threads.
-    pub fn idle_thread_fn() -> !;
+/// Entry point for idle threads — EL1 loop.
+#[no_mangle]
+pub unsafe extern "C" fn idle_thread_fn() -> ! {
+    loop {
+        crate::arch::cpu::wait_for_event();
+    }
 }
 
 // ── Continuation setup ────────────────────────────────────────────────────────

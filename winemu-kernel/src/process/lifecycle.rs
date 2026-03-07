@@ -103,9 +103,9 @@ pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> R
     }
 
     let Some(handle) = crate::sched::sync::make_new_handle_for_pid(
-        parent_pid,
         crate::sched::sync::HANDLE_TYPE_PROCESS,
         pid,
+        parent_pid,
     )
     else {
         crate::log::debug_u64(0xC502_E007);
@@ -184,14 +184,15 @@ pub fn last_handle_closed(pid: u32) {
 }
 
 pub fn switch_to_thread_process(tid: u32) {
-    let Some(pid) = crate::sched::thread_pid(tid) else {
+    let pid = crate::sched::thread_pid(tid);
+    if pid == 0 {
         return;
-    };
+    }
     let Some(ttbr0) = with_process(pid, |p| p.address_space.ttbr0()) else {
         return;
     };
 
-    let vid = crate::sched::vcpu_id().min(crate::sched::MAX_VCPUS - 1);
+    let vid = (crate::sched::vcpu_id() as usize).min(crate::sched::MAX_VCPUS - 1);
     let cur_pid = super::current_vcpu_pid(vid);
     if cur_pid == pid {
         return;

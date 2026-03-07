@@ -169,7 +169,7 @@ pub(crate) fn vm_update_current_thread_stack_limit(owner_pid: u32, new_limit: u6
     if tid == 0 || !crate::sched::thread_exists(tid) {
         return;
     }
-    let teb_va = crate::sched::with_thread(tid, |t| if t.pid == owner_pid { t.teb_va } else { 0 });
+    let teb_va = crate::sched::with_thread(tid, |t| if t.pid == owner_pid { t.teb_va } else { 0 }).unwrap_or(0);
     if teb_va == 0 {
         return;
     }
@@ -182,6 +182,14 @@ pub(crate) fn vm_update_current_thread_stack_limit(owner_pid: u32, new_limit: u6
 
 pub(crate) fn vm_alloc_region(owner_pid: u32, size: u64, prot: u32) -> Option<u64> {
     vm_alloc_region_typed(owner_pid, 0, size, prot, VmaType::Private)
+}
+
+/// Allocate a user-mode thread stack of `size` bytes. Returns the stack base
+/// (high address, i.e. top of stack) on success.
+pub(crate) fn vm_alloc_stack(owner_pid: u32, size: u64) -> Option<u64> {
+    let size = size.max(0x10_0000);
+    let base = vm_alloc_region_typed(owner_pid, 0, size, 0x04, VmaType::ThreadStack)?;
+    Some(base + size)
 }
 
 pub(crate) fn vm_alloc_region_typed(

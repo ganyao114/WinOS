@@ -81,16 +81,18 @@ pub use thread_control::{
 pub use threads::{
     spawn_locked, create_user_thread_locked, register_idle_thread_for_vcpu,
     exit_thread_locked, free_terminated_threads_locked, UserThreadParams,
+    thread_ids_by_pid, terminate_thread_by_tid,
 };
 
 // Scheduler core
 pub use schedule::{
-    scheduler_round_locked, run_selected_thread_noreturn,
-    schedule_noreturn_locked, schedule_from_trap,
-    enter_core_scheduler_entry, idle_thread_fn_impl,
+    scheduler_round_locked, SchedulerRoundAction,
+    execute_kernel_continuation_switch,
     flush_unlock_edge, reschedule_current_core,
     enable_scheduling, update_highest_priority_threads,
     enter_kernel_continuation_noreturn,
+    next_wait_deadline_locked,
+    schedule_noreturn_locked, enter_core_scheduler_entry,
 };
 
 // Sync objects
@@ -103,3 +105,63 @@ pub use sync::{
     wait_for_single_object, wait_for_multiple_objects,
     close_handle,
 };
+
+// ── Convenience helpers ───────────────────────────────────────────────────────
+
+/// Wake a waiting thread with the given result code.
+/// Convenience wrapper around unblock_thread_locked (requires sched lock).
+#[inline]
+pub fn wake(tid: u32, result: u32) {
+    unblock_thread_locked(tid, result);
+}
+
+/// Compute an absolute deadline from a relative timeout in 100ns units.
+/// Negative = relative, positive = absolute (Windows convention).
+#[inline]
+pub fn deadline_after_100ns(timeout_100ns: i64) -> WaitDeadline {
+    timeout_to_deadline(timeout_100ns)
+}
+
+/// Yield the current thread: move it back to Ready so others can run.
+/// Must be called with the scheduler lock held.
+pub fn yield_current_thread_locked() {
+    let tid = current_tid();
+    if tid != 0 {
+        set_thread_state_locked(tid, ThreadState::Ready);
+    }
+}
+
+/// Get the PID of a thread.
+pub fn thread_pid(tid: u32) -> u32 {
+    with_thread(tid, |t| t.pid).unwrap_or(0)
+}
+
+
+/// Block the current thread and yield to the scheduler.
+/// Returns STATUS_PENDING if successfully blocked.
+/// Requires sched lock to be held on entry; releases it internally via
+/// the caller's lock guard.
+pub fn block_current_and_resched(
+    wait_kind: u8,
+    _handles: &[u64],
+    deadline_ticks: u64,
+    _pending_status: u32,
+) -> u32 {
+    let tid = current_tid();
+    if tid == 0 {
+        return winemu_shared::status::INVALID_PARAMETER;
+    }
+    let deadline = if deadline_ticks == 0 {
+        WaitDeadline::Infinite
+    } else {
+        WaitDeadline::DeadlineTicks(deadline_ticks)
+    };
+    with_thread_mut(tid, |t| {
+        t.wait.kind = wait_kind;
+    });
+    block_thread_locked(tid, deadline);
+    STATUS_PENDING
+}
+
+/// WAIT_KIND constant for hostcall waits.
+pub const WAIT_KIND_HOSTCALL: u8 = 4;

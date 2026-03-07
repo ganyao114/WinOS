@@ -188,7 +188,7 @@ fn peek_next_thread_for_vcpu(vid: u32) -> u32 {
     let queue = unsafe { SCHED.queue_raw_mut() };
     let store = unsafe { SCHED.threads_raw() };
     queue.peek_highest_matching(
-        &|id| store.get_ptr(id),
+        &|id| store.get_ptr(id).map(|p| p as *const _),
         &|t| !t.is_idle_thread && (t.affinity_mask & (1u32 << vid)) != 0,
     )
 }
@@ -343,5 +343,66 @@ pub fn reschedule_current_core(vid: usize) {
         unsafe { enter_kernel_continuation_noreturn(to_tid) }
     } else {
         execute_kernel_continuation_switch(from_tid, to_tid, 0, u64::MAX, 0, "unlock-edge");
+    }
+}
+
+// ── schedule_noreturn_locked ──────────────────────────────────────────────────
+
+/// Called by exit_thread_locked after marking the thread Terminated.
+/// Picks the next thread and switches to it. Does not return.
+/// Caller must hold the scheduler lock.
+pub fn schedule_noreturn_locked(from_tid: u32) -> ! {
+    let vid = vcpu_id() as usize;
+    use crate::sched::topology::set_vcpu_current_thread;
+
+    let to_tid = pick_next_thread_locked(vid as u32);
+    let idle_tid = unsafe { SCHED.vcpu_raw(vid) }.idle_tid;
+    let target = if to_tid != 0 { to_tid } else if idle_tid != 0 { idle_tid } else {
+        panic!("schedule_noreturn_locked: no thread to run");
+    };
+
+    set_vcpu_current_thread(vid, target);
+    set_current_tid(target);
+    with_thread_mut(target, |t| t.state = ThreadState::Running);
+
+    if from_tid != 0 && from_tid != target {
+        let to_kctx = with_thread(target, |t| &t.kctx as *const KernelContext as usize)
+            .unwrap_or(0) as *const u8;
+        let from_kctx = with_thread_mut(from_tid, |t| &mut t.kctx as *mut KernelContext as usize)
+            .unwrap_or(0) as *mut u8;
+        crate::sched::lock::KSchedulerLock::release_raw(vid);
+        unsafe { crate::sched::context::__sched_switch_kernel_context(from_kctx, to_kctx) }
+    } else {
+        unsafe { enter_kernel_continuation_noreturn(target) }
+    }
+}
+
+// ── enter_core_scheduler_entry ────────────────────────────────────────────────
+
+/// Main scheduler entry point for a vCPU.
+/// Called once per vCPU after boot setup. Does not return.
+pub fn enter_core_scheduler_entry(vid: usize) -> ! {
+    use crate::sched::topology::set_vcpu_current_thread;
+    use crate::sched::lock::SCHED_LOCK;
+
+    loop {
+        SCHED_LOCK.acquire();
+        drain_deferred_kstacks();
+        let _ = check_wait_timeouts_locked();
+        free_terminated_threads_locked();
+
+        let to_tid = pick_next_thread_locked(vid as u32);
+        let idle_tid = unsafe { SCHED.vcpu_raw(vid) }.idle_tid;
+        let target = if to_tid != 0 { to_tid } else if idle_tid != 0 { idle_tid } else {
+            crate::sched::lock::KSchedulerLock::release_raw(vid);
+            crate::arch::cpu::wait_for_event();
+            continue;
+        };
+
+        set_vcpu_current_thread(vid, target);
+        set_current_tid(target);
+        with_thread_mut(target, |t| t.state = ThreadState::Running);
+
+        unsafe { enter_kernel_continuation_noreturn(target) }
     }
 }

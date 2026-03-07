@@ -43,11 +43,11 @@ impl KReadyQueue {
 
     /// Full push that also patches the previous tail's sched_next.
     /// `get_mut` is a closure that returns &mut KThread for a given tid.
-    pub fn push_with_store(
+    pub fn push_with_store<'a>(
         &mut self,
         tid: u32,
         priority: u8,
-        get_mut: &mut impl FnMut(u32) -> Option<&mut KThread>,
+        get_mut: &mut impl FnMut(u32) -> Option<&'a mut KThread>,
     ) {
         let p = priority as usize;
         if let Some(t) = get_mut(tid) {

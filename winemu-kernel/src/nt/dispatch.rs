@@ -4,9 +4,10 @@
 
 use crate::hypercall;
 use crate::sched::{
-    current_tid, has_kernel_continuation, record_schedule_event_trap, register_thread0,
-    sched_lock_acquire, sched_lock_release, set_current_in_kernel, set_thread_in_kernel,
-    set_vcpu_idle_locked, vcpu_id, with_thread, with_thread_mut, ThreadState,
+    current_tid, drain_deferred_kstacks, set_thread_in_kernel_locked,
+    vcpu_id, with_thread, with_thread_mut, ThreadState,
+    KSchedulerLock, SCHED_LOCK, SchedulerRoundAction, scheduler_round_locked,
+    execute_kernel_continuation_switch, enter_kernel_continuation_noreturn,
 };
 use crate::timer;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -24,18 +25,18 @@ use super::{
 static SYSCALL_ERR_TRACE_BUDGET: AtomicU32 = AtomicU32::new(512);
 
 #[no_mangle]
-pub extern "C" fn svc_migrate_frame_to_thread_stack(frame_ptr: u64, frame_size: u64) -> u64 {
-    crate::sched::migrate_svc_frame_to_current_kstack(frame_ptr as *mut u8, frame_size as usize)
-        as u64
+pub extern "C" fn svc_migrate_frame_to_thread_stack(_frame_ptr: u64, _frame_size: u64) -> u64 {
+    // Frame migration is handled by the kernel stack setup; no-op here.
+    _frame_ptr
 }
 
 #[no_mangle]
 pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
-    if current_tid() == 0 {
-        let _ = register_thread0(frame.tpidr);
+    let cur = current_tid();
+    if cur != 0 {
+        set_thread_in_kernel_locked(cur, true);
     }
-    set_current_in_kernel(true);
-    crate::sched::reclaim_deferred_kernel_stacks();
+    drain_deferred_kstacks();
 
     let tag = frame.x8_orig;
     let nr = (tag & SVC_TAG_NR_MASK) as u16;
@@ -205,17 +206,17 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
         if drain_hostcall {
             crate::hostcall::pump_completions();
         }
-        sched_lock_acquire();
-        match crate::sched::scheduler_round_locked(vid, from, quantum_100ns) {
-            crate::sched::SchedulerRoundAction::ContinueCurrent {
+        SCHED_LOCK.acquire();
+        match scheduler_round_locked(vid, from, quantum_100ns) {
+            SchedulerRoundAction::ContinueCurrent {
                 now_100ns,
                 next_deadline_100ns,
                 slice_remaining_100ns,
             } => {
-                sched_lock_release();
+                crate::sched::lock::KSchedulerLock::release_raw(vid as usize);
                 let cur = current_tid();
                 if cur != 0 {
-                    set_thread_in_kernel(cur, false);
+                    set_thread_in_kernel_locked(cur, false);
                 }
                 timer::schedule_running_slice_100ns(
                     now_100ns,
@@ -224,7 +225,7 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                 );
                 return false;
             }
-            crate::sched::SchedulerRoundAction::RunThread {
+            SchedulerRoundAction::RunThread {
                 now_100ns,
                 next_deadline_100ns,
                 slice_remaining_100ns,
@@ -234,27 +235,21 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                 timeout_woke,
                 cur_not_running,
             } => {
-                record_schedule_event_trap();
                 if from_sched != 0 && from_sched != to {
-                    let to_has_kctx = has_kernel_continuation(to);
-                    let mut to_in_kernel = with_thread(to, |t| t.in_kernel);
-                    // Tighten direct-kctx only for true kernel-thread targets:
-                    // first-run/user-resume targets still use EL0 frame restore.
+                    let to_has_kctx = with_thread(to, |t| t.kctx.has_continuation()).unwrap_or(false);
+                    let mut to_in_kernel = with_thread(to, |t| t.in_kernel).unwrap_or(false);
                     if cur_not_running && to_in_kernel && !to_has_kctx {
-                        // No kernel continuation means this target can only be resumed
-                        // through EL0 frame restore; normalize stale in-kernel marker.
-                        crate::sched::context::set_thread_in_kernel_locked(to, false);
+                        set_thread_in_kernel_locked(to, false);
                         to_in_kernel = false;
                     }
                     if cur_not_running
-                        && with_thread(from_sched, |t| t.state == ThreadState::Terminated)
+                        && with_thread(from_sched, |t| t.state == ThreadState::Terminated).unwrap_or(false)
                     {
-                        crate::sched::context::set_thread_in_kernel_locked(from_sched, false);
+                        set_thread_in_kernel_locked(from_sched, false);
                     }
                     if to_has_kctx {
                         save_ctx_for(from_sched, frame);
-                        sched_lock_release();
-                        crate::sched::execute_kernel_continuation_switch(
+                        execute_kernel_continuation_switch(
                             from_sched,
                             to,
                             now_100ns,
@@ -271,20 +266,14 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                             from_sched, to
                         );
                     }
-                    // Fallback is limited to EL0 frame restore scheduling
-                    // (new thread first run or user-mode resume).
                     crate::process::switch_to_thread_process(to);
                     save_ctx_for(from_sched, frame);
                     restore_ctx_to_frame(to, frame);
-                    sched_lock_release();
-                    // If trap-exit chooses EL0 frame-restore (instead of direct-kctx),
-                    // the preempted running thread will resume from EL0 next time.
-                    // Clear its in-kernel marker to avoid stale "in_kernel=true but
-                    // no continuation" state.
+                    crate::sched::lock::KSchedulerLock::release_raw(vid as usize);
                     if !cur_not_running {
-                        set_thread_in_kernel(from_sched, false);
+                        set_thread_in_kernel_locked(from_sched, false);
                     }
-                    set_thread_in_kernel(to, false);
+                    set_thread_in_kernel_locked(to, false);
                     timer::schedule_running_slice_100ns(
                         now_100ns,
                         next_deadline_100ns,
@@ -294,20 +283,15 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                 }
                 crate::process::switch_to_thread_process(to);
                 if from_sched == 0 {
-                    // We were idling; current frame no longer belongs to a runnable thread.
-                    // Guard: idle thread has no EL0 context — enter its kernel continuation directly.
-                    if with_thread(to, |t| t.is_idle_thread) {
-                        sched_lock_release();
-                        unsafe { crate::sched::enter_kernel_continuation_noreturn(to) }
+                    if with_thread(to, |t| t.is_idle_thread).unwrap_or(false) {
+                        unsafe { enter_kernel_continuation_noreturn(to) }
                     }
                     restore_ctx_to_frame(to, frame);
                 } else if from_sched == to && (cur_not_running || pending_resched || timeout_woke) {
-                    // Same-thread continuation may still need frame refresh when wait/completion
-                    // updated thread context x0 under scheduler lock but we did not context-switch.
                     restore_ctx_to_frame(to, frame);
                 }
-                sched_lock_release();
-                set_thread_in_kernel(to, false);
+                crate::sched::lock::KSchedulerLock::release_raw(vid as usize);
+                set_thread_in_kernel_locked(to, false);
                 timer::schedule_running_slice_100ns(
                     now_100ns,
                     next_deadline_100ns,
@@ -315,14 +299,13 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                 );
                 return from_sched != to;
             }
-            crate::sched::SchedulerRoundAction::IdleWait {
+            SchedulerRoundAction::IdleWait {
                 now_100ns,
                 next_deadline_100ns,
                 from_tid: from_sched,
             } => {
-                record_schedule_event_trap();
                 if !allow_idle_wait {
-                    sched_lock_release();
+                    crate::sched::lock::KSchedulerLock::release_raw(vid as usize);
                     timer::schedule_running_slice_100ns(
                         now_100ns,
                         next_deadline_100ns,
@@ -330,15 +313,11 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                     );
                     return false;
                 }
-
-                // No runnable thread. Persist current frame once before sleeping.
                 if from_sched != 0 {
                     save_ctx_for(from_sched, frame);
                     from = 0;
                 }
-                set_vcpu_idle_locked(vid, true);
-                sched_lock_release();
-
+                crate::sched::lock::KSchedulerLock::release_raw(vid as usize);
                 if crate::sched::all_threads_done() {
                     let code =
                         crate::process::process_exit_status(crate::process::current_pid()).unwrap_or(0);
@@ -353,8 +332,11 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
 
 #[no_mangle]
 pub extern "C" fn timer_irq_dispatch(frame: &mut SvcFrame) {
-    set_current_in_kernel(true);
-    crate::sched::reclaim_deferred_kernel_stacks();
+    let cur = current_tid();
+    if cur != 0 {
+        set_thread_in_kernel_locked(cur, true);
+    }
+    drain_deferred_kstacks();
     let _ = schedule_from_trap(frame, false, true);
 }
 

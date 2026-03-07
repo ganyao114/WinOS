@@ -1,10 +1,9 @@
-use crate::sched::sync::{
-    make_new_handle, thread_notify_terminated, HANDLE_TYPE_THREAD, STATUS_SUCCESS,
-};
 use crate::sched::{
-    create_user_thread, current_tid, resolve_thread_tid_from_handle, resume_thread_by_handle,
-    set_thread_base_priority_by_handle, suspend_thread_by_handle, terminate_current_thread,
-    terminate_thread_by_tid, thread_basic_info, CreateThreadError,
+    self, current_tid, with_thread, with_thread_mut,
+    create_user_thread_locked, terminate_thread_locked,
+    suspend_thread_locked, resume_thread_locked,
+    set_thread_priority_locked, ThreadState,
+    KSchedulerLock, thread_exists,
 };
 use winemu_shared::status;
 
@@ -13,7 +12,155 @@ use super::constants::{
 };
 use super::SvcFrame;
 
-// x1=ThreadInformationClass, x2=Buffer, x3=BufferLength, x4=*ReturnLength
+// ── Handle type constant ──────────────────────────────────────────────────────
+
+pub const HANDLE_TYPE_THREAD: u8 = 3;
+
+// ── Error type ────────────────────────────────────────────────────────────────
+
+pub enum CreateThreadError {
+    InvalidParameter,
+    NoMemory,
+}
+
+// ── Thread handle resolution ──────────────────────────────────────────────────
+
+/// Resolve a thread handle to a TID.
+/// Handle value 0xFFFF_FFFF_FFFF_FFFF (-1) = current thread pseudo-handle.
+pub fn resolve_thread_tid_from_handle(handle: u64) -> Option<u32> {
+    if handle == u64::MAX {
+        let tid = current_tid();
+        if tid != 0 { Some(tid) } else { None }
+    } else {
+        let tid = crate::nt::kobject::handle_to_tid(handle)?;
+        if thread_exists(tid) { Some(tid) } else { None }
+    }
+}
+
+// ── Thread basic info ─────────────────────────────────────────────────────────
+
+/// Returns a THREAD_BASIC_INFORMATION blob (64 bytes) for the given TID.
+pub fn thread_basic_info(tid: u32) -> Option<[u8; THREAD_BASIC_INFORMATION_SIZE]> {
+    let _lock = KSchedulerLock::lock();
+    let (state, pid, prio) = with_thread(tid, |t| (t.state, t.pid, t.priority))?;
+    let exit_status: u32 = if state == ThreadState::Terminated { 0 } else { status::STILL_ACTIVE };
+    let mut buf = [0u8; THREAD_BASIC_INFORMATION_SIZE];
+    // THREAD_BASIC_INFORMATION layout (Windows):
+    // +0x00  NTSTATUS ExitStatus          (4 bytes)
+    // +0x04  pad                          (4 bytes)
+    // +0x08  PVOID    TebBaseAddress      (8 bytes)
+    // +0x10  CLIENT_ID (UniqueProcess+UniqueThread) (16 bytes)
+    // +0x20  KAFFINITY AffinityMask       (8 bytes)
+    // +0x28  LONG     Priority            (4 bytes)
+    // +0x2C  LONG     BasePriority        (4 bytes)
+    // Total = 0x30 = 48 bytes
+    let teb = with_thread(tid, |t| t.teb_va).unwrap_or(0);
+    buf[0..4].copy_from_slice(&exit_status.to_le_bytes());
+    buf[8..16].copy_from_slice(&teb.to_le_bytes());
+    buf[16..24].copy_from_slice(&(pid as u64).to_le_bytes());
+    buf[24..32].copy_from_slice(&(tid as u64).to_le_bytes());
+    buf[32..40].copy_from_slice(&1u64.to_le_bytes()); // affinity
+    buf[40..44].copy_from_slice(&(prio as i32).to_le_bytes());
+    buf[44..48].copy_from_slice(&(prio as i32).to_le_bytes());
+    Some(buf)
+}
+
+// ── create_user_thread ────────────────────────────────────────────────────────
+
+pub fn create_user_thread(
+    pid: u32,
+    entry_va: u64,
+    arg: u64,
+    stack_size: u64,
+    _max_stack_size: u64,
+    priority: u8,
+) -> Result<u32, CreateThreadError> {
+    // Allocate user stack via VM.
+    let stack_base = crate::nt::state::vm_alloc_stack(pid, stack_size)
+        .ok_or(CreateThreadError::NoMemory)?;
+    let teb_va = crate::teb::alloc_teb(pid).unwrap_or(0);
+    let _lock = KSchedulerLock::lock();
+    let params = sched::UserThreadParams {
+        pid,
+        entry: entry_va,
+        arg,
+        stack_base,
+        stack_size,
+        teb_va,
+        priority,
+    };
+    create_user_thread_locked(params).ok_or(CreateThreadError::NoMemory)
+}
+
+// ── terminate_current_thread ──────────────────────────────────────────────────
+
+pub fn terminate_current_thread() {
+    let tid = current_tid();
+    if tid == 0 { return; }
+    let _lock = KSchedulerLock::lock();
+    terminate_thread_locked(tid);
+}
+
+// ── terminate_thread_by_tid ───────────────────────────────────────────────────
+
+pub fn terminate_thread_by_tid(tid: u32) -> Result<(), u32> {
+    if tid == 0 { return Err(status::INVALID_PARAMETER); }
+    let _lock = KSchedulerLock::lock();
+    if !thread_exists(tid) { return Err(status::INVALID_HANDLE); }
+    terminate_thread_locked(tid);
+    Ok(())
+}
+
+// ── suspend / resume by handle ────────────────────────────────────────────────
+
+pub fn suspend_thread_by_handle(handle: u64) -> Result<u32, u32> {
+    let tid = resolve_thread_tid_from_handle(handle)
+        .ok_or(status::INVALID_HANDLE)?;
+    let _lock = KSchedulerLock::lock();
+    let prev = with_thread(tid, |t| t.suspend_count).unwrap_or(0);
+    suspend_thread_locked(tid);
+    Ok(prev)
+}
+
+pub fn resume_thread_by_handle(handle: u64) -> Result<u32, u32> {
+    let tid = resolve_thread_tid_from_handle(handle)
+        .ok_or(status::INVALID_HANDLE)?;
+    let _lock = KSchedulerLock::lock();
+    let prev = with_thread(tid, |t| t.suspend_count).unwrap_or(0);
+    resume_thread_locked(tid);
+    Ok(prev)
+}
+
+// ── set_thread_base_priority_by_handle ───────────────────────────────────────
+
+pub fn set_thread_base_priority_by_handle(handle: u64, prio: i32) -> u32 {
+    let Some(tid) = resolve_thread_tid_from_handle(handle) else {
+        return status::INVALID_HANDLE;
+    };
+    let p = prio.clamp(0, 31) as u8;
+    let _lock = KSchedulerLock::lock();
+    set_thread_priority_locked(tid, p);
+    status::SUCCESS
+}
+
+// ── yield ─────────────────────────────────────────────────────────────────────
+
+pub fn yield_current_thread() {
+    let tid = current_tid();
+    if tid == 0 { return; }
+    let _lock = KSchedulerLock::lock();
+    sched::set_thread_state_locked(tid, ThreadState::Ready);
+}
+
+// ── thread_notify_terminated ──────────────────────────────────────────────────
+
+pub fn thread_notify_terminated(_tid: u32) {
+    // Signal any waiters on this thread's termination event.
+    // Currently a no-op; sync objects handle this via wait_for_single_object.
+}
+
+// ── Syscall handlers ──────────────────────────────────────────────────────────
+
 pub(crate) fn handle_query_information_thread(frame: &mut SvcFrame) {
     let thread_handle = frame.x[0];
     let info_class = frame.x[1] as u32;
@@ -52,14 +199,12 @@ pub(crate) fn handle_query_information_thread(frame: &mut SvcFrame) {
 }
 
 pub(crate) fn handle_set_information_thread(frame: &mut SvcFrame) {
-    // x0=ThreadHandle, x1=ThreadInformationClass, x2=ThreadInformation, x3=Length
     let thread_handle = frame.x[0];
     let info_class = frame.x[1] as u32;
     let info_ptr = frame.x[2] as *const u8;
     let info_len = frame.x[3] as usize;
 
     if info_class != THREAD_INFO_CLASS_PRIORITY && info_class != THREAD_INFO_CLASS_BASE_PRIORITY {
-        // Keep compatibility with previous behavior: unhandled classes are no-op success.
         frame.x[0] = status::SUCCESS as u64;
         return;
     }
@@ -74,12 +219,10 @@ pub(crate) fn handle_set_information_thread(frame: &mut SvcFrame) {
 }
 
 pub(crate) fn handle_yield(frame: &mut SvcFrame) {
-    crate::sched::yield_current_thread();
-    frame.x[0] = STATUS_SUCCESS as u64;
+    yield_current_thread();
+    frame.x[0] = status::SUCCESS as u64;
 }
 
-// x0=ThreadHandle*(out), x4=StartRoutine, x5=Argument, x6=CreateFlags
-// stack[0]=StackSize, stack[1]=MaxStackSize, stack[2]=AttributeList
 pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
     let out_ptr = frame.x[0] as *mut u64;
     let desired_access = frame.x[1] as u32;
@@ -89,15 +232,6 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
     let create_flags = frame.x[6] as u32;
     let stack_size_arg = unsafe { (frame.sp_el0 as *const u64).read_volatile() };
     let max_stack_size_arg = unsafe { (frame.sp_el0 as *const u64).add(1).read_volatile() };
-
-    let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_THREAD) else {
-        frame.x[0] = status::INVALID_HANDLE as u64;
-        return;
-    };
-    if (desired_access & !meta.valid_access_mask) != 0 {
-        frame.x[0] = status::ACCESS_DENIED as u64;
-        return;
-    }
 
     let Some(target_pid) = crate::process::resolve_process_handle(process_handle) else {
         frame.x[0] = status::INVALID_HANDLE as u64;
@@ -125,27 +259,21 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
             return;
         }
     };
-    let Some(handle) = make_new_handle(HANDLE_TYPE_THREAD, tid) else {
-        let _ = terminate_thread_by_tid(tid);
-        thread_notify_terminated(tid);
-        frame.x[0] = status::NO_MEMORY as u64;
-        return;
-    };
+    let handle = crate::nt::kobject::make_thread_handle(tid);
     if !out_ptr.is_null() {
         unsafe { out_ptr.write_volatile(handle) };
     }
-    let _ = create_flags;
-    frame.x[0] = STATUS_SUCCESS as u64;
+    let _ = (desired_access, create_flags);
+    frame.x[0] = status::SUCCESS as u64;
 }
 
 pub(crate) fn handle_terminate_thread(frame: &mut SvcFrame) {
     let cur = current_tid();
     terminate_current_thread();
     thread_notify_terminated(cur);
-    frame.x[0] = STATUS_SUCCESS as u64;
+    frame.x[0] = status::SUCCESS as u64;
 }
 
-// x0=ThreadHandle, x1=*PreviousSuspendCount(opt)
 pub(crate) fn handle_suspend_thread(frame: &mut SvcFrame) {
     let thread_handle = frame.x[0];
     let prev_ptr = frame.x[1] as *mut u32;
@@ -160,7 +288,6 @@ pub(crate) fn handle_suspend_thread(frame: &mut SvcFrame) {
     }
 }
 
-// x0=ThreadHandle, x1=*PreviousSuspendCount(opt)
 pub(crate) fn handle_resume_thread(frame: &mut SvcFrame) {
     let thread_handle = frame.x[0];
     let prev_ptr = frame.x[1] as *mut u32;

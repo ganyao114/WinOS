@@ -1339,7 +1339,7 @@ pub(crate) fn handle_notify_change_directory_file(frame: &mut SvcFrame) {
 
     if event_handle == 0 {
         let st =
-            hostcall::wait_current_for_request_pending(request_id, sync::WaitDeadline::Infinite);
+            hostcall::wait_current_for_request_pending(request_id, crate::sched::WaitDeadline::Infinite);
         frame.x[0] = st as u64;
         return;
     }
@@ -1526,7 +1526,7 @@ pub(crate) fn handle_device_io_control_file(frame: &mut SvcFrame) {
                     if event_handle == 0 {
                         let st = hostcall::wait_current_for_request_pending(
                             request_id,
-                            sync::WaitDeadline::Infinite,
+                            crate::sched::WaitDeadline::Infinite,
                         );
                         frame.x[0] = st as u64;
                     } else {
