@@ -1,131 +1,190 @@
-// sched/lock.rs — KSchedulerLock RAII + 可重入自旋锁
-// unlock edge 在 Drop 时触发：commit deferred scheduling + kernel switch
+// sched/lock.rs — KSchedulerLock: yuzu-style deferred-update scheduler lock
+//
+// Mirrors the KAbstractSchedulerLock pattern:
+//   - Outer spinlock guards all scheduler state.
+//   - Lock count is per-vCPU (reentrant on same vCPU).
+//   - On final unlock, runs deferred topology updates then checks reschedule.
 
-use super::global::SCHED;
-use super::cpu::{vcpu_id};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use crate::sched::cpu::{cpu_local, vcpu_id};
 
-fn spinlock_acquire() {
-    crate::arch::spin::lock_word(SCHED.spinlock.get());
+// ── Raw spinlock ──────────────────────────────────────────────────────────────
+
+pub struct SchedSpinlock {
+    locked: AtomicBool,
 }
 
-fn spinlock_release() {
-    crate::arch::spin::unlock_word(SCHED.spinlock.get());
+impl SchedSpinlock {
+    pub const fn new() -> Self {
+        Self { locked: AtomicBool::new(false) }
+    }
+
+    #[inline]
+    pub fn acquire(&self) {
+        loop {
+            if self.locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+            while self.locked.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    #[inline]
+    pub fn release(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::Relaxed)
+    }
 }
 
-// ── RAII guard ────────────────────────────────────────────────
+// ── Global scheduler spinlock ─────────────────────────────────────────────────
 
+pub static SCHED_LOCK: SchedSpinlock = SchedSpinlock::new();
+
+// Per-vCPU lock depth (not in KCpuLocal to avoid circular dep at static init).
+static LOCK_DEPTH: [AtomicU32; 8] = [
+    AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0),
+];
+
+// ── KSchedulerLock RAII guard ─────────────────────────────────────────────────
+
+/// RAII guard that holds the scheduler spinlock.
+/// On drop, runs deferred topology updates and triggers reschedule if needed.
 pub struct KSchedulerLock {
-    held: bool,
+    vid: usize,
 }
 
 impl KSchedulerLock {
-    #[inline(always)]
-    pub fn acquire() -> Self {
-        sched_lock_acquire();
-        Self { held: true }
+    /// Acquire the scheduler lock. Reentrant on the same vCPU.
+    #[inline]
+    pub fn lock() -> Self {
+        let vid = vcpu_id() as usize;
+        let depth = LOCK_DEPTH[vid].fetch_add(1, Ordering::Relaxed);
+        if depth == 0 {
+            SCHED_LOCK.acquire();
+        }
+        Self { vid }
     }
 
-    /// 提前手动释放（消耗 self，不触发 Drop 的二次释放）
-    #[inline(always)]
-    pub fn unlock(mut self) {
-        if self.held {
-            self.held = false;
-            sched_lock_release();
+    /// Lock without going through cpu_local (safe during early init before
+    /// TPIDR_EL1 is set up — uses vid=0).
+    #[inline]
+    pub fn lock_vid0() -> Self {
+        let depth = LOCK_DEPTH[0].fetch_add(1, Ordering::Relaxed);
+        if depth == 0 {
+            SCHED_LOCK.acquire();
+        }
+        Self { vid: 0 }
+    }
+
+    /// Returns true if the scheduler lock is currently held by this vCPU.
+    #[inline]
+    pub fn is_held() -> bool {
+        let vid = vcpu_id() as usize;
+        LOCK_DEPTH[vid].load(Ordering::Relaxed) > 0
+    }
+
+    /// Manually release without running deferred work (used in context switch
+    /// paths where we transfer ownership to the new thread).
+    #[inline]
+    pub fn release_raw(vid: usize) {
+        let depth = LOCK_DEPTH[vid].fetch_sub(1, Ordering::Relaxed);
+        if depth == 1 {
+            SCHED_LOCK.release();
         }
     }
 }
 
 impl Drop for KSchedulerLock {
     fn drop(&mut self) {
-        if self.held {
-            self.held = false;
-            sched_lock_release();
+        let depth = LOCK_DEPTH[self.vid].fetch_sub(1, Ordering::Relaxed);
+        if depth == 1 {
+            // Final unlock — mirrors Atmosphere's KAbstractSchedulerLock::Unlock():
+            //   1. flush_unlock_edge: run scheduler round + UpdateHighestPriorityThreads
+            //      → returns bitmask of cores needing reschedule.
+            //   2. Release the spinlock.
+            //   3. enable_scheduling: IPI other cores, switch current core inline.
+            let cores_mask = crate::sched::schedule::flush_unlock_edge(self.vid);
+            SCHED_LOCK.release();
+            crate::sched::schedule::enable_scheduling(cores_mask, self.vid);
         }
     }
 }
 
-// 旧名称兼容别名
-pub type ScopedSchedulerLock = KSchedulerLock;
+// ── Scoped lock helper ────────────────────────────────────────────────────────
 
-impl KSchedulerLock {
-    /// 旧接口兼容：ScopedSchedulerLock::new()
-    #[inline(always)]
+/// Run `f` with the scheduler lock held. Returns the result of `f`.
+#[inline]
+pub fn with_sched_lock<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = KSchedulerLock::lock();
+    f()
+}
+
+/// Run `f` with the scheduler lock held (vid=0 variant for early init).
+#[inline]
+pub fn with_sched_lock_vid0<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = KSchedulerLock::lock_vid0();
+    f()
+}
+
+// ── SchedLockAndSleep ─────────────────────────────────────────────────────────
+
+/// RAII equivalent of Atmosphere's KScopedSchedulerLockAndSleep.
+///
+/// Acquires the scheduler lock on construction.  On drop:
+///   1. If not cancelled and a deadline was set, the timer is already registered
+///      via `block_thread_locked`'s `wait.deadline` field — no extra action needed.
+///   2. The inner `KSchedulerLock` drops, triggering `flush_unlock_edge` +
+///      `reschedule_current_core`, which performs the actual context switch.
+///
+/// Usage pattern (syscall handler):
+/// ```ignore
+/// let result = {
+///     let mut slp = SchedLockAndSleep::new(tid, deadline);
+///     if obj.is_signaled() { slp.cancel(); STATUS_SUCCESS }
+///     else if deadline == WaitDeadline::Immediate { slp.cancel(); STATUS_TIMEOUT }
+///     else {
+///         obj.enqueue_waiter(tid);
+///         block_thread_locked(tid, deadline);
+///         STATUS_PENDING   // slp drops here → unlock-edge → thread switches out
+///     }
+/// };
+/// // Thread resumes here after being unblocked.
+/// if result == STATUS_PENDING {
+///     with_thread(tid, |t| t.wait.result).unwrap_or(STATUS_TIMEOUT)
+/// } else { result }
+/// ```
+pub struct SchedLockAndSleep {
+    _guard:    KSchedulerLock,
+    cancelled: bool,
+}
+
+impl SchedLockAndSleep {
+    #[inline]
     pub fn new() -> Self {
-        Self::acquire()
+        Self { _guard: KSchedulerLock::lock(), cancelled: false }
     }
-}
 
-// ── 底层 acquire / release ────────────────────────────────────
+    /// Cancel the sleep — the lock will still be released on drop, but
+    /// `flush_unlock_edge` will see no state change and skip the switch.
+    #[inline]
+    pub fn cancel(&mut self) {
+        self.cancelled = true;
+    }
 
-pub fn sched_lock_acquire() {
-    let vid = vcpu_id();
-    let owner_key = (vid as u32) + 1;
-    unsafe {
-        let owner = SCHED.lock_owner.get();
-        let count = SCHED.lock_count.get();
-        if *owner == owner_key && *count > 0 {
-            *count += 1;
-            return;
-        }
-        debug_assert!(
-            !crate::timer::timer_lock_held_by_current_vcpu(),
-            "lock order violation: acquire sched lock before timer lock"
-        );
-        spinlock_acquire();
-        *owner = owner_key;
-        *count = 1;
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
-}
-
-pub fn sched_lock_release() {
-    let mut wake_idle_mask = 0u32;
-    let mut unlock_switch = None;
-    unsafe {
-        let vid = vcpu_id();
-        let owner_key = (vid as u32) + 1;
-        let owner = SCHED.lock_owner.get();
-        let count = SCHED.lock_count.get();
-        if *owner != owner_key {
-            debug_assert!(
-                *owner == owner_key,
-                "sched_lock_release by non-owner vcpu={} owner={}",
-                vid,
-                *owner
-            );
-            return;
-        }
-        if *count == 0 {
-            debug_assert!(*count != 0, "sched_lock_release with zero depth");
-            return;
-        }
-        *count -= 1;
-        if *count == 0 {
-            let decision =
-                super::topology::commit_and_collect_unlock_edge_decision_locked(vid);
-            unlock_switch = decision.unlock_kernel_switch;
-            wake_idle_mask = decision.wake_idle_mask;
-            *SCHED.lock_owner.get() = 0;
-            spinlock_release();
-        }
-    }
-    if wake_idle_mask != 0 {
-        crate::hypercall::kick_vcpu_mask(wake_idle_mask);
-    }
-    if let Some(sw) = unlock_switch {
-        super::topology::record_schedule_event_unlock_edge();
-        super::context::execute_kernel_continuation_switch(
-            sw.from_tid,
-            sw.to_tid,
-            sw.now_100ns,
-            sw.next_deadline_100ns,
-            sw.slice_remaining_100ns,
-            "unlock-edge",
-        );
-    }
-}
-
-#[inline(always)]
-pub fn sched_lock_held_by_current_vcpu() -> bool {
-    let owner_key = (vcpu_id() as u32) + 1;
-    unsafe { *SCHED.lock_owner.get() == owner_key && *SCHED.lock_count.get() != 0 }
 }

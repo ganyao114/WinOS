@@ -1,61 +1,105 @@
-// sched/mod.rs — 调度器根模块
+// sched/mod.rs — Scheduler module: pub use exports
 
-pub mod sync;
 pub mod types;
-pub mod global;
-pub mod queue;
 pub mod thread_store;
+pub mod global;
 pub mod cpu;
 pub mod lock;
-pub mod context;
+pub mod queue;
 pub mod topology;
+pub mod context;
 pub mod wait;
 pub mod thread_control;
 pub mod threads;
 pub mod schedule;
+pub mod sync;
 
-// ── 重新导出公共 API ──────────────────────────────────────────
+// ── Re-exports ────────────────────────────────────────────────────────────────
 
+// Types
 pub use types::{
-    KernelContext, ThreadContext, ThreadState,
-    MAX_VCPUS, MAX_WAIT_HANDLES, WAIT_KIND_HOSTCALL,
+    ThreadState, ThreadContext, KernelContext, KThread, WaitState, WaitDeadline,
+    alloc_tid, MAX_VCPUS, KERNEL_STACK_SIZE,
+    WAIT_KIND_NONE, WAIT_KIND_SINGLE, WAIT_KIND_MULTIPLE, WAIT_KIND_DELAY,
 };
 
-pub use thread_store::{thread_exists, with_thread, with_thread_mut};
+// Global scheduler
+pub use global::{
+    SCHED, init_scheduler, with_thread, with_thread_mut, thread_exists,
+    KGlobalScheduler, KVcpuState,
+};
 
-pub use cpu::{current_tid, vcpu_id};
+// Per-vCPU TLS
+pub use cpu::{
+    init_cpu_local, cpu_local, vcpu_id, current_tid, set_current_tid,
+    set_needs_reschedule, take_needs_reschedule,
+};
 
-pub use lock::{sched_lock_acquire, sched_lock_release, ScopedSchedulerLock};
+// Scheduler lock
+pub use lock::{
+    KSchedulerLock, SchedSpinlock, SCHED_LOCK,
+    with_sched_lock, with_sched_lock_vid0,
+    SchedLockAndSleep,
+};
 
+// Ready queue
+pub use queue::KReadyQueue;
+
+// Topology / state transitions
+pub use topology::{
+    set_thread_state_locked, request_reschedule_self, request_reschedule_vcpu,
+    hint_reschedule_any_idle, thread_can_run_on, pick_vcpu_for_thread,
+    set_vcpu_current_thread, get_vcpu_current_thread,
+    any_thread_running, all_threads_done,
+};
+
+// Context switch
 pub use context::{
-    has_kernel_continuation, set_thread_in_kernel, set_current_in_kernel,
-    migrate_svc_frame_to_current_kstack, execute_kernel_continuation_switch,
+    ensure_user_entry_continuation_locked, setup_idle_thread_continuation_locked,
+    set_thread_in_kernel_locked, alloc_kstack, free_kstack,
+    defer_kstack_free, drain_deferred_kstacks,
+};
+
+// Wait / unblock
+pub use wait::{
+    block_thread_locked, block_thread_delay_locked,
+    unblock_thread_locked, timeout_thread_locked,
+    check_wait_timeouts_locked, current_ticks, timeout_to_deadline,
+    STATUS_SUCCESS, STATUS_PENDING, STATUS_TIMEOUT,
+    STATUS_ABANDONED_WAIT_0, STATUS_USER_APC,
+};
+
+// Thread control
+pub use thread_control::{
+    set_thread_priority_locked, boost_thread_priority_locked,
+    decay_priority_boost_locked, suspend_thread_locked, resume_thread_locked,
+    terminate_thread_locked, reset_quantum_locked, consume_quantum_locked,
+    DEFAULT_QUANTUM_100NS,
+};
+
+// Thread lifecycle
+pub use threads::{
+    spawn_locked, create_user_thread_locked, register_idle_thread_for_vcpu,
+    exit_thread_locked, free_terminated_threads_locked, UserThreadParams,
+};
+
+// Scheduler core
+pub use schedule::{
+    scheduler_round_locked, run_selected_thread_noreturn,
+    schedule_noreturn_locked, schedule_from_trap,
+    enter_core_scheduler_entry, idle_thread_fn_impl,
+    flush_unlock_edge, reschedule_current_core,
+    enable_scheduling, update_highest_priority_threads,
     enter_kernel_continuation_noreturn,
 };
 
-// pub(crate) re-exports used by dispatch.rs and other nt/ callers
-pub(crate) use topology::{
-    set_thread_state_locked, set_vcpu_idle_locked,
-    record_schedule_event_trap,
-};
-pub(crate) use wait::next_wait_deadline_locked;
-pub(crate) use schedule::{SchedulerRoundAction, scheduler_round_locked};
-
-pub use wait::{block_current_and_resched, check_timeouts, deadline_after_100ns, now_ticks};
-
-pub use thread_control::{
-    resolve_thread_tid_from_handle, resume_thread_by_handle,
-    set_thread_base_priority_by_handle, suspend_thread_by_handle,
-};
-
-pub use threads::{
-    create_user_thread, terminate_thread_by_tid,
-    thread_basic_info, thread_pid, thread_ids_by_pid,
-    reclaim_deferred_kernel_stacks, CreateThreadError,
-};
-
-pub use self::schedule::{
-    wake, yield_current_thread, terminate_current_thread,
-    register_thread0, set_current_thread_teb,
-    enter_core_scheduler_entry, all_threads_done, register_idle_thread_for_vcpu,
+// Sync objects
+pub use sync::{
+    WaitQueue, KEvent, KMutex, KSemaphore, SyncObject,
+    init_sync_state,
+    create_event, set_event, reset_event,
+    create_mutex, release_mutex,
+    create_semaphore, release_semaphore,
+    wait_for_single_object, wait_for_multiple_objects,
+    close_handle,
 };

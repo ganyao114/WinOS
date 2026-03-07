@@ -1,170 +1,102 @@
-// ── 等待队列（slab 节点池，按优先级排序）───────────────────────
+// sched/sync/wait_queue.rs — Priority-sorted intrusive wait queue
+//
+// Uses KThread::wait.wait_next as the intrusive link (TID-based, no raw ptrs).
+// Sorted by priority (ascending = highest priority first).
 
-struct WaitQueueNode {
-    tid: u32,
-    next: *mut WaitQueueNode,
-}
-
-fn wait_queue_alloc_node(tid: u32, next: *mut WaitQueueNode) -> *mut WaitQueueNode {
-    if tid == 0 {
-        return null_mut();
-    }
-    let pool_slot = wait_queue_pool_mut();
-    if pool_slot.is_none() {
-        *pool_slot = Some(SlabPool::new());
-    }
-    let Some(ptr) = pool_slot.as_mut().unwrap().alloc_slot() else {
-        return null_mut();
-    };
-    unsafe {
-        ptr.write(WaitQueueNode { tid, next });
-    }
-    ptr
-}
-
-fn wait_queue_free_node(node: *mut WaitQueueNode) {
-    if node.is_null() {
-        return;
-    }
-    let Some(pool) = wait_queue_pool_mut().as_mut() else {
-        return;
-    };
-    unsafe {
-        core::ptr::drop_in_place(node);
-        pool.free_slot(node);
-    }
-}
-
-#[inline]
-fn waiter_priority(tid: u32) -> u8 {
-    if tid == 0 || !thread_exists(tid) {
-        0
-    } else {
-        with_thread(tid, |t| t.priority)
-    }
-}
+use crate::sched::global::{with_thread, with_thread_mut};
+use crate::sched::wait::unblock_thread_locked;
+use crate::sched::wait::STATUS_SUCCESS;
 
 pub struct WaitQueue {
-    head: *mut WaitQueueNode,
-    len: usize,
+    /// Head TID of the priority-sorted list (0 = empty).
+    head: u32,
+    len:  usize,
 }
 
 impl WaitQueue {
     pub const fn new() -> Self {
-        Self {
-            head: null_mut(),
-            len: 0,
-        }
+        Self { head: 0, len: 0 }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.head == 0
     }
 
     pub fn len(&self) -> usize {
         self.len
     }
 
-    pub fn enqueue(&mut self, tid: u32) -> bool {
-        if tid == 0 {
-            return false;
-        }
-        let prio = waiter_priority(tid);
-        let mut prev: *mut WaitQueueNode = null_mut();
-        let mut cur = self.head;
-        while !cur.is_null() {
-            let cur_tid = unsafe { (*cur).tid };
-            if cur_tid == tid {
-                return true;
-            }
-            let cur_prio = waiter_priority(cur_tid);
-            if prio > cur_prio {
-                break;
+    /// Insert `tid` in priority order (highest priority = lowest number = front).
+    pub fn enqueue(&mut self, tid: u32) {
+        let prio = with_thread(tid, |t| t.priority).unwrap_or(31);
+
+        // Find insertion point.
+        let mut prev = 0u32;
+        let mut cur  = self.head;
+        while cur != 0 {
+            let cur_prio = with_thread(cur, |t| t.priority).unwrap_or(31);
+            if prio < cur_prio {
+                break; // insert before cur
             }
             prev = cur;
-            cur = unsafe { (*cur).next };
+            cur  = with_thread(cur, |t| t.wait.wait_next).unwrap_or(0);
         }
 
-        let node = wait_queue_alloc_node(tid, cur);
-        if node.is_null() {
-            return false;
-        }
-        if prev.is_null() {
-            self.head = node;
+        // Link tid → cur.
+        with_thread_mut(tid, |t| t.wait.wait_next = cur);
+
+        if prev == 0 {
+            self.head = tid;
         } else {
-            unsafe {
-                (*prev).next = node;
-            }
+            with_thread_mut(prev, |t| t.wait.wait_next = tid);
         }
-        self.len = self.len.saturating_add(1);
-        true
+        self.len += 1;
     }
 
-    pub fn dequeue_waiting(&mut self) -> u32 {
-        while !self.head.is_null() {
-            let node = self.head;
-            let tid = unsafe { (*node).tid };
-            self.head = unsafe { (*node).next };
-            wait_queue_free_node(node);
-            if self.len != 0 {
-                self.len -= 1;
-            }
-            if tid != 0
-                && thread_exists(tid)
-                && with_thread(tid, |t| t.state == ThreadState::Waiting)
-            {
-                return tid;
-            }
+    /// Remove and return the highest-priority (front) TID.
+    pub fn dequeue_highest(&mut self) -> Option<u32> {
+        if self.head == 0 {
+            return None;
         }
-        0
+        let tid  = self.head;
+        let next = with_thread(tid, |t| t.wait.wait_next).unwrap_or(0);
+        with_thread_mut(tid, |t| t.wait.wait_next = 0);
+        self.head = next;
+        self.len  = self.len.saturating_sub(1);
+        Some(tid)
     }
 
-    pub fn remove(&mut self, tid: u32) {
-        if tid == 0 || self.head.is_null() {
-            return;
-        }
-        let mut prev: *mut WaitQueueNode = null_mut();
-        let mut cur = self.head;
-        while !cur.is_null() {
-            let cur_tid = unsafe { (*cur).tid };
-            let next = unsafe { (*cur).next };
-            if cur_tid == tid {
-                if prev.is_null() {
+    /// Remove a specific TID from the queue. Returns true if found.
+    pub fn remove(&mut self, tid: u32) -> bool {
+        let mut prev = 0u32;
+        let mut cur  = self.head;
+        while cur != 0 {
+            let next = with_thread(cur, |t| t.wait.wait_next).unwrap_or(0);
+            if cur == tid {
+                if prev == 0 {
                     self.head = next;
                 } else {
-                    unsafe {
-                        (*prev).next = next;
-                    }
+                    with_thread_mut(prev, |t| t.wait.wait_next = next);
                 }
-                wait_queue_free_node(cur);
-                if self.len != 0 {
-                    self.len -= 1;
-                }
-                return;
+                with_thread_mut(tid, |t| t.wait.wait_next = 0);
+                self.len = self.len.saturating_sub(1);
+                return true;
             }
             prev = cur;
-            cur = next;
+            cur  = next;
+        }
+        false
+    }
+
+    /// Wake all waiters with STATUS_SUCCESS.
+    pub fn wake_all(&mut self) {
+        while let Some(tid) = self.dequeue_highest() {
+            unblock_thread_locked(tid, STATUS_SUCCESS);
         }
     }
 
-    pub fn highest_waiting_priority(&self) -> Option<u8> {
-        let mut best: Option<u8> = None;
-        let mut cur = self.head;
-        while !cur.is_null() {
-            let tid = unsafe { (*cur).tid };
-            if tid != 0 && thread_exists(tid) {
-                let prio = with_thread(tid, |t| {
-                    if t.state == ThreadState::Waiting {
-                        Some(t.priority)
-                    } else {
-                        None
-                    }
-                });
-                if let Some(p) = prio {
-                    best = match best {
-                        Some(cur_best) if cur_best >= p => Some(cur_best),
-                        _ => Some(p),
-                    };
-                }
-            }
-            cur = unsafe { (*cur).next };
-        }
-        best
+    /// Peek at the highest-priority waiter's priority, if any.
+    pub fn highest_priority(&self) -> Option<u8> {
+        with_thread(self.head, |t| t.priority)
     }
 }

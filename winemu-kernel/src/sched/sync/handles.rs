@@ -1,415 +1,218 @@
-// ── HandleTable ───────────────────────────────────────────────
-// Handle encoding: bits[31:28] = type, bits[27:0] = handle slot id
-// 保持在低 32 bit，兼容用户态把 HANDLE 临时存到 u32 的场景。
+// sched/sync/handles.rs — NT-level sync handle operations
+//
+// These are called from nt/sync.rs syscall handlers.
+// All functions require the scheduler lock to be held.
 
-pub const HANDLE_TYPE_EVENT: u64 = 1;
-pub const HANDLE_TYPE_MUTEX: u64 = 2;
-pub const HANDLE_TYPE_SEMAPHORE: u64 = 3;
-pub const HANDLE_TYPE_THREAD: u64 = 4;
-pub const HANDLE_TYPE_FILE: u64 = 5;
-pub const HANDLE_TYPE_SECTION: u64 = 6;
-pub const HANDLE_TYPE_KEY: u64 = 7;
-pub const HANDLE_TYPE_PROCESS: u64 = 8;
-pub const HANDLE_TYPE_TOKEN: u64 = 9;
+use crate::sched::sync::primitives_api::{KEvent, KMutex, KSemaphore};
+use crate::sched::sync::state::{sync_alloc, sync_free, sync_get, sync_get_mut, SyncObject};
+use crate::sched::types::WaitDeadline;
+use crate::sched::wait::{STATUS_SUCCESS, STATUS_TIMEOUT, STATUS_PENDING};
+use crate::sched::cpu::current_tid;
+use crate::sched::lock::SchedLockAndSleep;
+use crate::sched::global::with_thread;
 
-#[derive(Clone, Copy)]
-struct HandleEntry {
-    key: u32,
-    owner_pid: u32,
+pub const STATUS_INVALID_HANDLE:    u32 = 0xC000_0008;
+pub const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+
+// ── Event ─────────────────────────────────────────────────────────────────────
+
+pub fn create_event(auto_reset: bool, initial_state: bool) -> Option<u64> {
+    sync_alloc(SyncObject::Event(KEvent::new(auto_reset, initial_state)))
 }
 
-#[derive(Clone, Copy)]
-struct ObjectRef {
-    key: u32,
-    refs: u32,
+pub fn set_event(handle: u64) -> u32 {
+    match sync_get_mut(handle) {
+        Some(SyncObject::Event(e)) => { e.signal(); STATUS_SUCCESS }
+        Some(_) => STATUS_OBJECT_TYPE_MISMATCH,
+        None    => STATUS_INVALID_HANDLE,
+    }
 }
 
-#[derive(Clone, Copy, Default)]
-pub struct ObjectTypeStats {
-    pub object_count: u32,
-    pub handle_count: u32,
+pub fn reset_event(handle: u64) -> u32 {
+    match sync_get_mut(handle) {
+        Some(SyncObject::Event(e)) => { e.clear(); STATUS_SUCCESS }
+        Some(_) => STATUS_OBJECT_TYPE_MISMATCH,
+        None    => STATUS_INVALID_HANDLE,
+    }
 }
 
-#[derive(Clone, Copy)]
-pub struct HandleCloseInfo {
-    pub htype: u64,
-    pub obj_idx: u32,
-    pub destroy_object: bool,
+pub fn query_event(handle: u64) -> (u32, bool) {
+    match sync_get(handle) {
+        Some(SyncObject::Event(e)) => (STATUS_SUCCESS, e.is_signaled()),
+        Some(_) => (STATUS_OBJECT_TYPE_MISMATCH, false),
+        None    => (STATUS_INVALID_HANDLE, false),
+    }
 }
 
-pub fn make_handle(htype: u64, idx: u32) -> u64 {
-    ((htype & HANDLE_TYPE_MASK) << HANDLE_SLOT_BITS) | ((idx as u64) & HANDLE_SLOT_MASK)
+// ── Mutex ─────────────────────────────────────────────────────────────────────
+
+pub fn create_mutex(initial_owner: bool) -> Option<u64> {
+    let mut m = KMutex::new();
+    if initial_owner {
+        let tid = current_tid();
+        m.owner_tid  = tid;
+        m.recursion  = 1;
+    }
+    sync_alloc(SyncObject::Mutex(m))
 }
 
-#[inline]
-fn key_type(key: u32) -> u64 {
-    ((key as u64) >> HANDLE_SLOT_BITS) & HANDLE_TYPE_MASK
+pub fn release_mutex(handle: u64) -> u32 {
+    let tid = current_tid();
+    match sync_get_mut(handle) {
+        Some(SyncObject::Mutex(m)) => m.release(tid),
+        Some(_) => STATUS_OBJECT_TYPE_MISMATCH,
+        None    => STATUS_INVALID_HANDLE,
+    }
 }
 
-#[inline]
-fn key_idx(key: u32) -> u32 {
-    key & (HANDLE_SLOT_MASK as u32)
+// ── Semaphore ─────────────────────────────────────────────────────────────────
+
+pub fn create_semaphore(initial: i32, maximum: i32) -> Option<u64> {
+    sync_alloc(SyncObject::Semaphore(KSemaphore::new(initial, maximum)))
 }
 
-fn handles_store_mut() -> &'static mut ObjectStore<HandleEntry> {
-    unsafe {
-        let slot = &mut *SYNC_STATE.handles.get();
-        if slot.is_none() {
-            *slot = Some(ObjectStore::new());
+pub fn release_semaphore(handle: u64, count: i32) -> (u32, i32) {
+    match sync_get_mut(handle) {
+        Some(SyncObject::Semaphore(s)) => {
+            let prev = s.count;
+            let status = s.release(count);
+            (status, prev)
         }
-        slot.as_mut().unwrap()
+        Some(_) => (STATUS_OBJECT_TYPE_MISMATCH, 0),
+        None    => (STATUS_INVALID_HANDLE, 0),
     }
 }
 
-fn refs_mut() -> &'static mut Vec<ObjectRef> {
-    unsafe {
-        let slot = &mut *SYNC_STATE.refs.get();
-        if slot.is_none() {
-            *slot = Some(Vec::new());
+// ── Wait ──────────────────────────────────────────────────────────────────────
+
+/// Wait on a single handle. Returns NTSTATUS.
+///
+/// Uses SchedLockAndSleep: acquires the scheduler lock, checks/enqueues,
+/// then drops the lock (triggering unlock-edge context switch if needed).
+/// After the thread is unblocked, reads wait.result for the final status.
+pub fn wait_for_single_object(handle: u64, deadline: WaitDeadline) -> u32 {
+    let tid = current_tid();
+    let status = {
+        let mut slp = SchedLockAndSleep::new();
+        let result = match sync_get_mut(handle) {
+            Some(SyncObject::Event(e))     => e.wait(tid, deadline),
+            Some(SyncObject::Mutex(m))     => m.acquire(tid, deadline),
+            Some(SyncObject::Semaphore(s)) => s.wait(tid, deadline),
+            None => { slp.cancel(); STATUS_INVALID_HANDLE }
+        };
+        if result != STATUS_PENDING {
+            slp.cancel();
         }
-        slot.as_mut().unwrap()
-    }
-}
-
-fn ref_inc(key: u32) -> bool {
-    let refs = refs_mut();
-    let mut i = 0usize;
-    while i < refs.len() {
-        if refs[i].key == key {
-            refs[i].refs = refs[i].refs.saturating_add(1);
-            return true;
-        }
-        i += 1;
-    }
-    if refs.try_reserve(1).is_err() {
-        return false;
-    }
-    refs.push(ObjectRef { key, refs: 1 });
-    true
-}
-
-fn ref_dec_is_last(key: u32) -> bool {
-    let refs = refs_mut();
-    let mut i = 0usize;
-    while i < refs.len() {
-        if refs[i].key == key {
-            if refs[i].refs > 1 {
-                refs[i].refs -= 1;
-                return false;
-            }
-            refs.swap_remove(i);
-            return true;
-        }
-        i += 1;
-    }
-    true
-}
-
-fn current_handle_owner_pid() -> u32 {
-    let pid = crate::process::current_pid();
-    if pid != 0 {
-        pid
-    } else {
-        crate::process::boot_pid()
-    }
-}
-
-fn alloc_handle_instance_for_key(key: u32, owner_pid: u32) -> Option<u64> {
-    if owner_pid == 0 {
-        return None;
-    }
-    if key_type(key) == 0 || key_idx(key) == 0 {
-        return None;
-    }
-    if !ref_inc(key) {
-        return None;
-    }
-    let id = match handles_store_mut().alloc_with(|_| HandleEntry { key, owner_pid }) {
-        Some(v) => v,
-        None => {
-            let _ = ref_dec_is_last(key);
-            return None;
-        }
+        result
+        // slp drops here → if not cancelled, unlock-edge fires → thread switches out
     };
-    Some(make_handle(key_type(key), id))
-}
-
-fn resolve_user_handle_for_pid(h: u64, owner_pid: u32) -> Option<(u32, u64, u32, u32)> {
-    if owner_pid == 0 {
-        return None;
-    }
-    let htype = (h >> HANDLE_SLOT_BITS) & HANDLE_TYPE_MASK;
-    if htype == 0 {
-        return None;
-    }
-    let hid = (h & HANDLE_SLOT_MASK) as u32;
-    let ptr = handles_store_mut().get_ptr(hid);
-    if ptr.is_null() {
-        return None;
-    }
-    let entry = unsafe { *ptr };
-    if entry.owner_pid != owner_pid {
-        return None;
-    }
-    if key_type(entry.key) != htype {
-        return None;
-    }
-    Some((hid, htype, key_idx(entry.key), entry.key))
-}
-
-fn resolve_user_handle(h: u64) -> Option<(u32, u64, u32, u32)> {
-    resolve_user_handle_for_pid(h, current_handle_owner_pid())
-}
-
-fn decode_object_key(h: u64) -> Option<u32> {
-    let key = h as u32;
-    if key_type(key) == 0 || key_idx(key) == 0 {
-        return None;
-    }
-    Some(key)
-}
-
-fn resolve_handle_key_for_pid(h: u64, owner_pid: u32) -> Option<u32> {
-    resolve_user_handle_for_pid(h, owner_pid).map(|(_hid, _htype, _idx, key)| key)
-}
-
-fn resolve_handle_key_for_pid_or_object_key(h: u64, owner_pid: u32) -> Option<u32> {
-    resolve_handle_key_for_pid(h, owner_pid).or_else(|| decode_object_key(h))
-}
-
-fn handles_same_object_for_pid(a: u64, b: u64, owner_pid: u32) -> bool {
-    match (
-        resolve_handle_key_for_pid(a, owner_pid),
-        resolve_handle_key_for_pid_or_object_key(b, owner_pid),
-    ) {
-        (Some(ka), Some(kb)) => ka == kb,
-        _ => false,
-    }
-}
-
-fn handle_type_for_pid(h: u64, owner_pid: u32) -> u64 {
-    if let Some((_hid, htype, _idx, _key)) = resolve_user_handle_for_pid(h, owner_pid) {
-        htype
+    if status == STATUS_PENDING {
+        // Thread was unblocked; read the result written by unblock_thread_locked.
+        with_thread(tid, |t| t.wait.result).unwrap_or(STATUS_TIMEOUT)
     } else {
-        0
+        status
     }
 }
 
-fn handle_idx_for_pid(h: u64, owner_pid: u32) -> u32 {
-    if let Some((_hid, _htype, idx, _key)) = resolve_user_handle_for_pid(h, owner_pid) {
-        idx
-    } else {
-        0
-    }
-}
+/// Wait on multiple handles (WaitAny / WaitAll). Returns NTSTATUS.
+pub fn wait_for_multiple_objects(
+    handles: &[u64],
+    wait_all: bool,
+    deadline: WaitDeadline,
+) -> u32 {
+    const STATUS_WAIT_0: u32 = 0x0000_0000;
+    let tid = current_tid();
 
-pub fn handle_type(h: u64) -> u64 {
-    if let Some((_hid, htype, _idx, _key)) = resolve_user_handle(h) {
-        htype
-    } else {
-        0
-    }
-}
+    let status = {
+        let mut slp = SchedLockAndSleep::new();
 
-pub fn handle_idx(h: u64) -> u32 {
-    if let Some((_hid, _htype, idx, _key)) = resolve_user_handle(h) {
-        idx
-    } else {
-        0
-    }
-}
-
-pub fn handle_type_by_owner(h: u64, owner_pid: u32) -> u64 {
-    handle_type_for_pid(h, owner_pid)
-}
-
-pub fn handle_idx_by_owner(h: u64, owner_pid: u32) -> u32 {
-    handle_idx_for_pid(h, owner_pid)
-}
-
-fn resolve_handle_idx_by_type(h: u64, expected_type: u64) -> Option<u32> {
-    if handle_type(h) != expected_type {
-        return None;
-    }
-    let idx = handle_idx(h);
-    if idx == 0 {
-        return None;
-    }
-    Some(idx)
-}
-
-fn resolve_handle_idx_by_type_for_pid(h: u64, owner_pid: u32, expected_type: u64) -> Option<u32> {
-    if handle_type_for_pid(h, owner_pid) != expected_type {
-        return None;
-    }
-    let idx = handle_idx_for_pid(h, owner_pid);
-    if idx == 0 {
-        return None;
-    }
-    Some(idx)
-}
-
-pub fn make_new_handle(htype: u64, obj_idx: u32) -> Option<u64> {
-    make_new_handle_for_pid(current_handle_owner_pid(), htype, obj_idx)
-}
-
-pub fn make_new_handle_for_pid(owner_pid: u32, htype: u64, obj_idx: u32) -> Option<u64> {
-    alloc_handle_instance_for_key(make_handle(htype, obj_idx) as u32, owner_pid)
-}
-
-pub fn duplicate_handle(h: u64) -> Option<u64> {
-    let owner_pid = current_handle_owner_pid();
-    duplicate_handle_between(owner_pid, h, owner_pid).ok()
-}
-
-pub fn duplicate_handle_between(
-    source_pid: u32,
-    source_handle: u64,
-    target_pid: u32,
-) -> Result<u64, u32> {
-    let (_hid, _htype, _idx, key) =
-        resolve_user_handle_for_pid(source_handle, source_pid).ok_or(STATUS_INVALID_HANDLE)?;
-    alloc_handle_instance_for_key(key, target_pid).ok_or(status::NO_MEMORY)
-}
-
-fn close_handle_slot_for_pid(hid: u32, owner_pid: u32) -> Option<HandleCloseInfo> {
-    let ptr = handles_store_mut().get_ptr(hid);
-    if ptr.is_null() {
-        return None;
-    }
-    let entry = unsafe { *ptr };
-    if entry.owner_pid != owner_pid {
-        return None;
-    }
-    let htype = key_type(entry.key);
-    let obj_idx = key_idx(entry.key);
-    if htype == 0 || obj_idx == 0 {
-        return None;
-    }
-    if !handles_store_mut().free(hid) {
-        return None;
-    }
-    let destroy_object = ref_dec_is_last(entry.key);
-    Some(HandleCloseInfo {
-        htype,
-        obj_idx,
-        destroy_object,
-    })
-}
-
-pub fn close_handle_info(h: u64) -> Option<HandleCloseInfo> {
-    let (hid, _htype, _obj_idx, _key) = resolve_user_handle(h)?;
-    close_handle_slot_for_pid(hid, current_handle_owner_pid())
-}
-
-pub fn close_handle_info_for_pid(owner_pid: u32, h: u64) -> Option<HandleCloseInfo> {
-    let (hid, _htype, _obj_idx, _key) = resolve_user_handle_for_pid(h, owner_pid)?;
-    close_handle_slot_for_pid(hid, owner_pid)
-}
-
-pub fn close_all_handles_for_pid(owner_pid: u32) -> usize {
-    if owner_pid == 0 {
-        return 0;
-    }
-
-    let mut handle_ids = Vec::new();
-    handles_store_mut().for_each_live_ptr(|hid, ptr| unsafe {
-        if (*ptr).owner_pid == owner_pid {
-            let _ = handle_ids.try_reserve(1);
-            handle_ids.push(hid);
-        }
-    });
-
-    let mut closed = 0usize;
-    for hid in handle_ids {
-        let Some(info) = close_handle_slot_for_pid(hid, owner_pid) else {
-            continue;
-        };
-        closed += 1;
-        if info.destroy_object {
-            let _ = destroy_object_by_type(info.htype, info.obj_idx);
-        }
-    }
-    closed
-}
-
-pub fn object_ref_count(htype: u64, obj_idx: u32) -> u32 {
-    if htype == 0 || obj_idx == 0 {
-        return 0;
-    }
-    let key = make_handle(htype, obj_idx) as u32;
-    let refs = refs_mut();
-    let mut i = 0usize;
-    while i < refs.len() {
-        if refs[i].key == key {
-            return refs[i].refs;
-        }
-        i += 1;
-    }
-    0
-}
-
-pub fn object_type_stats(htype: u64) -> ObjectTypeStats {
-    if htype == 0 {
-        return ObjectTypeStats::default();
-    }
-    let refs = refs_mut();
-    let mut stats = ObjectTypeStats::default();
-    let mut i = 0usize;
-    while i < refs.len() {
-        let entry = refs[i];
-        if key_type(entry.key) == htype {
-            stats.object_count = stats.object_count.saturating_add(1);
-            stats.handle_count = stats.handle_count.saturating_add(entry.refs);
-        }
-        i += 1;
-    }
-    let live_objects = backing_object_count(htype);
-    if live_objects > stats.object_count {
-        stats.object_count = live_objects;
-    }
-    stats
-}
-
-fn backing_store_live_count<T>(slot: &UnsafeCell<Option<ObjectStore<T>>>) -> u32 {
-    unsafe {
-        let Some(store) = (&*slot.get()).as_ref() else {
-            return 0;
-        };
-        let mut count = 0u32;
-        store.for_each_live_id(|_| {
-            count = count.saturating_add(1);
-        });
-        count
-    }
-}
-
-fn backing_object_count(htype: u64) -> u32 {
-    match htype {
-        HANDLE_TYPE_EVENT => backing_store_live_count(&SYNC_STATE.events),
-        HANDLE_TYPE_MUTEX => backing_store_live_count(&SYNC_STATE.mutexes),
-        HANDLE_TYPE_SEMAPHORE => backing_store_live_count(&SYNC_STATE.semaphores),
-        HANDLE_TYPE_THREAD => thread_count(),
-        HANDLE_TYPE_PROCESS => crate::process::process_count(),
-        _ => 0,
-    }
-}
-
-fn recompute_owned_mutex_priority_locked(owner_tid: u32) {
-    if owner_tid == 0 || !thread_exists(owner_tid) {
-        return;
-    }
-    let mut target = with_thread(owner_tid, |t| t.base_priority);
-    mutexes_store_mut().for_each_live_ptr(|_id, ptr| unsafe {
-        if (*ptr).owner_tid != owner_tid {
-            return;
-        }
-        if let Some(waiter_prio) = (*ptr).waiters.highest_waiting_priority() {
-            if waiter_prio > target {
-                target = waiter_prio;
+        if !wait_all {
+            // WaitAny: check if any is already signaled.
+            let mut found = None;
+            for (i, &h) in handles.iter().enumerate() {
+                if sync_get(h).map(|o| o.is_signaled()).unwrap_or(false) {
+                    found = Some(i);
+                    break;
+                }
+            }
+            if let Some(i) = found {
+                let h = handles[i];
+                if let Some(obj) = sync_get_mut(h) {
+                    match obj {
+                        SyncObject::Event(e)     => { if e.auto_reset { e.clear(); } }
+                        SyncObject::Mutex(m)     => { m.owner_tid = tid; m.recursion = 1; }
+                        SyncObject::Semaphore(s) => { s.count -= 1; }
+                    }
+                }
+                slp.cancel();
+                STATUS_WAIT_0 + i as u32
+            } else if deadline == WaitDeadline::Immediate {
+                slp.cancel();
+                STATUS_TIMEOUT
+            } else if let Some(&h) = handles.first() {
+                // Block on first handle.
+                let r = match sync_get_mut(h) {
+                    Some(SyncObject::Event(e))     => e.wait(tid, deadline),
+                    Some(SyncObject::Mutex(m))     => m.acquire(tid, deadline),
+                    Some(SyncObject::Semaphore(s)) => s.wait(tid, deadline),
+                    None => { slp.cancel(); STATUS_INVALID_HANDLE }
+                };
+                if r != STATUS_PENDING { slp.cancel(); }
+                r
+            } else {
+                slp.cancel();
+                STATUS_TIMEOUT
+            }
+        } else {
+            // WaitAll: check if all are signaled.
+            let all = handles.iter().all(|&h| {
+                sync_get(h).map(|o| o.is_signaled()).unwrap_or(false)
+            });
+            if all {
+                for &h in handles {
+                    if let Some(obj) = sync_get_mut(h) {
+                        match obj {
+                            SyncObject::Event(e)     => { if e.auto_reset { e.clear(); } }
+                            SyncObject::Mutex(m)     => { m.owner_tid = tid; m.recursion = 1; }
+                            SyncObject::Semaphore(s) => { s.count -= 1; }
+                        }
+                    }
+                }
+                slp.cancel();
+                STATUS_WAIT_0
+            } else if deadline == WaitDeadline::Immediate {
+                slp.cancel();
+                STATUS_TIMEOUT
+            } else {
+                // Block on first unsignaled handle.
+                let mut blocked = STATUS_TIMEOUT;
+                for &h in handles {
+                    if !sync_get(h).map(|o| o.is_signaled()).unwrap_or(false) {
+                        blocked = match sync_get_mut(h) {
+                            Some(SyncObject::Event(e))     => e.wait(tid, deadline),
+                            Some(SyncObject::Mutex(m))     => m.acquire(tid, deadline),
+                            Some(SyncObject::Semaphore(s)) => s.wait(tid, deadline),
+                            None => STATUS_INVALID_HANDLE,
+                        };
+                        break;
+                    }
+                }
+                if blocked != STATUS_PENDING { slp.cancel(); }
+                blocked
             }
         }
-    });
-    set_thread_priority_locked(owner_tid, target);
+        // slp drops here → unlock-edge if STATUS_PENDING
+    };
+
+    if status == STATUS_PENDING {
+        with_thread(tid, |t| t.wait.result).unwrap_or(STATUS_TIMEOUT)
+    } else {
+        status
+    }
 }
 
+// ── Close ─────────────────────────────────────────────────────────────────────
+
+pub fn close_handle(handle: u64) -> u32 {
+    if sync_free(handle) { STATUS_SUCCESS } else { STATUS_INVALID_HANDLE }
+}

@@ -1,213 +1,144 @@
-// ── KEvent ────────────────────────────────────────────────────
+// sched/sync/state.rs — Per-process sync object handle table
+//
+// Stores KEvent / KMutex / KSemaphore objects keyed by NT handle (u64).
+// All access requires the scheduler lock to be held.
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum EventType {
-    NotificationEvent = 0,    // manual-reset
-    SynchronizationEvent = 1, // auto-reset
+use crate::sched::sync::primitives_api::{KEvent, KMutex, KSemaphore};
+use crate::kobj::ObjectStore;
+
+// ── SyncObject enum ───────────────────────────────────────────────────────────
+
+pub enum SyncObject {
+    Event(KEvent),
+    Mutex(KMutex),
+    Semaphore(KSemaphore),
 }
 
-pub struct KEvent {
-    pub signaled: bool,
-    pub ev_type: EventType,
-    pub waiters: WaitQueue,
-}
-
-impl KEvent {
-    fn new(ev_type: EventType, signaled: bool) -> Self {
-        Self {
-            signaled,
-            ev_type,
-            waiters: WaitQueue::new(),
-        }
+impl SyncObject {
+    pub fn as_event(&self) -> Option<&KEvent> {
+        if let SyncObject::Event(e) = self { Some(e) } else { None }
+    }
+    pub fn as_event_mut(&mut self) -> Option<&mut KEvent> {
+        if let SyncObject::Event(e) = self { Some(e) } else { None }
+    }
+    pub fn as_mutex(&self) -> Option<&KMutex> {
+        if let SyncObject::Mutex(m) = self { Some(m) } else { None }
+    }
+    pub fn as_mutex_mut(&mut self) -> Option<&mut KMutex> {
+        if let SyncObject::Mutex(m) = self { Some(m) } else { None }
+    }
+    pub fn as_semaphore(&self) -> Option<&KSemaphore> {
+        if let SyncObject::Semaphore(s) = self { Some(s) } else { None }
+    }
+    pub fn as_semaphore_mut(&mut self) -> Option<&mut KSemaphore> {
+        if let SyncObject::Semaphore(s) = self { Some(s) } else { None }
     }
 
-    fn set_locked(&mut self, idx: u32) {
-        let h = make_handle(HANDLE_TYPE_EVENT, idx);
-        if self.ev_type == EventType::SynchronizationEvent {
-            self.signaled = true;
-            let woke = wake_queue_one_for_handle_locked(&mut self.waiters, h);
-            if woke {
-                self.signaled = false;
-            }
-            return;
+    pub fn is_signaled(&self) -> bool {
+        match self {
+            SyncObject::Event(e)     => e.is_signaled(),
+            SyncObject::Mutex(m)     => m.owner_tid == 0,
+            SyncObject::Semaphore(s) => s.count > 0,
         }
-        self.signaled = true;
-        let _ = wake_queue_all_for_handle_locked(&mut self.waiters, h);
-    }
-
-    fn reset(&mut self) {
-        self.signaled = false;
-    }
-}
-
-// ── KMutex ────────────────────────────────────────────────────
-
-pub struct KMutex {
-    pub owner_tid: u32, // 0 = unowned
-    pub recursion: u32,
-    pub waiters: WaitQueue,
-}
-
-impl KMutex {
-    fn new(initial_owner: bool) -> Self {
-        let owner_tid = if initial_owner { current_tid() } else { 0 };
-        let recursion = if initial_owner { 1 } else { 0 };
-        Self {
-            owner_tid,
-            recursion,
-            waiters: WaitQueue::new(),
-        }
-    }
-
-    fn release_locked(&mut self, idx: u32, current_tid: u32) -> u32 {
-        if self.owner_tid != current_tid {
-            return STATUS_MUTANT_NOT_OWNED;
-        }
-
-        if self.recursion > 0 {
-            self.recursion -= 1;
-        }
-        if self.recursion > 0 {
-            return STATUS_SUCCESS;
-        }
-
-        self.owner_tid = 0;
-        let h = make_handle(HANDLE_TYPE_MUTEX, idx);
-        let _ = wake_queue_one_for_handle_locked(&mut self.waiters, h);
-
-        recompute_owned_mutex_priority_locked(current_tid);
-        if self.owner_tid != 0 {
-            recompute_owned_mutex_priority_locked(self.owner_tid);
-        }
-        STATUS_SUCCESS
     }
 }
 
-// ── KSemaphore ────────────────────────────────────────────────
+// ── SyncHandleTable ───────────────────────────────────────────────────────────
 
-pub struct KSemaphore {
-    pub count: i32,
-    pub maximum: i32,
-    pub waiters: WaitQueue,
+/// Per-process handle table for sync objects.
+/// Handle values are u32 indices into the ObjectStore.
+pub struct SyncHandleTable {
+    store: ObjectStore<SyncObject>,
 }
 
-impl KSemaphore {
-    fn new(initial: i32, maximum: i32) -> Self {
-        Self {
-            count: initial,
-            maximum,
-            waiters: WaitQueue::new(),
-        }
+impl SyncHandleTable {
+    pub fn new() -> Self {
+        Self { store: ObjectStore::new() }
     }
 
-    fn release_locked(&mut self, idx: u32, count: i32) -> Result<u32, u32> {
-        if count <= 0 {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let prev = self.count;
-        let new_count = self.count.saturating_add(count);
-        if new_count > self.maximum {
-            return Err(STATUS_SEMAPHORE_LIMIT_EXCEEDED);
-        }
-        self.count = new_count;
-
-        let h = make_handle(HANDLE_TYPE_SEMAPHORE, idx);
-        let mut rounds = self.waiters.len();
-        while rounds > 0 && self.count > 0 {
-            if !wake_queue_one_for_handle_locked(&mut self.waiters, h) {
-                break;
-            }
-            rounds -= 1;
-        }
-        Ok(prev as u32)
+    /// Allocate a new sync object. Returns the handle (u32 cast to u64).
+    pub fn alloc(&mut self, obj: SyncObject) -> Option<u64> {
+        self.store.alloc_with(|_id| obj).map(|id| id as u64)
     }
-}
 
-struct SyncState {
-    events: UnsafeCell<Option<ObjectStore<KEvent>>>,
-    mutexes: UnsafeCell<Option<ObjectStore<KMutex>>>,
-    semaphores: UnsafeCell<Option<ObjectStore<KSemaphore>>>,
-    handles: UnsafeCell<Option<ObjectStore<HandleEntry>>>,
-    refs: UnsafeCell<Option<Vec<ObjectRef>>>,
-    wait_queue_pool: UnsafeCell<Option<SlabPool<WaitQueueNode>>>,
-}
+    /// Get an immutable reference to the object for `handle`.
+    pub fn get(&self, handle: u64) -> Option<&SyncObject> {
+        let ptr = self.store.get_ptr(handle as u32);
+        if ptr.is_null() { None } else { Some(unsafe { &*ptr }) }
+    }
 
-unsafe impl Sync for SyncState {}
+    /// Get a mutable reference to the object for `handle`.
+    pub fn get_mut(&mut self, handle: u64) -> Option<&mut SyncObject> {
+        let ptr = self.store.get_ptr(handle as u32);
+        if ptr.is_null() { None } else { Some(unsafe { &mut *ptr }) }
+    }
 
-static SYNC_STATE: SyncState = SyncState {
-    events: UnsafeCell::new(None),
-    mutexes: UnsafeCell::new(None),
-    semaphores: UnsafeCell::new(None),
-    handles: UnsafeCell::new(None),
-    refs: UnsafeCell::new(None),
-    wait_queue_pool: UnsafeCell::new(None),
-};
+    /// Free a handle.
+    pub fn free(&mut self, handle: u64) -> bool {
+        self.store.free(handle as u32)
+    }
 
-fn wait_queue_pool_mut() -> &'static mut Option<SlabPool<WaitQueueNode>> {
-    unsafe { &mut *SYNC_STATE.wait_queue_pool.get() }
-}
-
-fn events_store_mut() -> &'static mut ObjectStore<KEvent> {
-    unsafe {
-        let slot = &mut *SYNC_STATE.events.get();
-        if slot.is_none() {
-            *slot = Some(ObjectStore::new());
-        }
-        slot.as_mut().unwrap()
+    pub fn contains(&self, handle: u64) -> bool {
+        self.store.contains(handle as u32)
     }
 }
 
-fn mutexes_store_mut() -> &'static mut ObjectStore<KMutex> {
-    unsafe {
-        let slot = &mut *SYNC_STATE.mutexes.get();
-        if slot.is_none() {
-            *slot = Some(ObjectStore::new());
-        }
-        slot.as_mut().unwrap()
+unsafe impl Send for SyncHandleTable {}
+unsafe impl Sync for SyncHandleTable {}
+
+// ── Global sync handle table ──────────────────────────────────────────────────
+// For now a single global table (single-process model).
+// In a multi-process model this would be per-KProcess.
+
+use core::cell::UnsafeCell;
+
+pub struct GlobalSyncState {
+    table: UnsafeCell<Option<SyncHandleTable>>,
+}
+
+unsafe impl Sync for GlobalSyncState {}
+unsafe impl Send for GlobalSyncState {}
+
+impl GlobalSyncState {
+    const fn new() -> Self {
+        Self { table: UnsafeCell::new(None) }
+    }
+
+    pub fn init(&self) {
+        unsafe { *self.table.get() = Some(SyncHandleTable::new()) };
+    }
+
+    #[inline]
+    pub unsafe fn table(&self) -> &SyncHandleTable {
+        (*self.table.get()).as_ref().expect("sync state not initialized")
+    }
+
+    #[inline]
+    pub unsafe fn table_mut(&self) -> &mut SyncHandleTable {
+        (*self.table.get()).as_mut().expect("sync state not initialized")
     }
 }
 
-fn semaphores_store_mut() -> &'static mut ObjectStore<KSemaphore> {
-    unsafe {
-        let slot = &mut *SYNC_STATE.semaphores.get();
-        if slot.is_none() {
-            *slot = Some(ObjectStore::new());
-        }
-        slot.as_mut().unwrap()
-    }
+pub static SYNC_STATE: GlobalSyncState = GlobalSyncState::new();
+
+pub fn init_sync_state() {
+    SYNC_STATE.init();
 }
 
-fn thread_waiters_ptr(tid: u32) -> *mut WaitQueue {
-    if tid == 0 || !thread_exists(tid) {
-        return null_mut();
-    }
-    let mut ptr = null_mut();
-    with_thread_mut(tid, |t| {
-        ptr = &mut t.waiters as *mut WaitQueue;
-    });
-    ptr
+// ── Free-function helpers (require scheduler lock) ────────────────────────────
+
+pub fn sync_alloc(obj: SyncObject) -> Option<u64> {
+    unsafe { SYNC_STATE.table_mut() }.alloc(obj)
 }
 
-fn process_waiters_ptr(pid: u32) -> *mut WaitQueue {
-    if pid == 0 || !crate::process::process_exists(pid) {
-        return null_mut();
-    }
-    let mut ptr = null_mut();
-    let _ = crate::process::with_process_mut(pid, |p| {
-        ptr = &mut p.waiters as *mut WaitQueue;
-    });
-    ptr
+pub fn sync_get(handle: u64) -> Option<&'static SyncObject> {
+    unsafe { SYNC_STATE.table() }.get(handle)
 }
 
-fn event_ptr(idx: u32) -> *mut KEvent {
-    events_store_mut().get_ptr(idx)
+pub fn sync_get_mut(handle: u64) -> Option<&'static mut SyncObject> {
+    unsafe { SYNC_STATE.table_mut() }.get_mut(handle)
 }
 
-fn mutex_ptr(idx: u32) -> *mut KMutex {
-    mutexes_store_mut().get_ptr(idx)
-}
-
-fn semaphore_ptr(idx: u32) -> *mut KSemaphore {
-    semaphores_store_mut().get_ptr(idx)
+pub fn sync_free(handle: u64) -> bool {
+    unsafe { SYNC_STATE.table_mut() }.free(handle)
 }

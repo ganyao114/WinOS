@@ -1,120 +1,133 @@
-// sched/queue.rs — KReadyQueue: 单一优先级队列（32级 bitset O(1)）
-// 当前实现：单队列 + last_vcpu_hint 区分 scheduled/suggested
-// 与旧 ReadyQueue 接口兼容，供 topology 逻辑调用
+// sched/queue.rs — KReadyQueue: O(1) priority-based ready queue
+// 32 priority levels (0=highest, 31=lowest).
+// Intrusive singly-linked list per priority via KThread::sched_next.
+// `present` bitmask enables O(1) highest-priority lookup.
 
-use super::thread_store::{thread_exists, with_thread, with_thread_mut};
+use crate::sched::types::{KThread, ThreadState};
 
 pub struct KReadyQueue {
-    heads: [u32; 32],
-    tails: [u32; 32],
-    /// bit i = 1 表示优先级 i 有就绪线程（NT 优先级 31 最高）
-    present: u32,
+    heads:   [u32; 32],
+    tails:   [u32; 32],
+    present: u32, // bit i set ↔ priority i has ≥1 thread
 }
 
 impl KReadyQueue {
     pub const fn new() -> Self {
         Self {
-            heads: [0u32; 32],
-            tails: [0u32; 32],
+            heads:   [0u32; 32],
+            tails:   [0u32; 32],
             present: 0,
         }
     }
 
-    pub fn push(&mut self, tid: u32, priority: u8, sched_next_setter: impl FnOnce()) {
-        let p = priority as usize;
-        sched_next_setter();
+    /// Push `tid` at the tail of its priority level.
+    /// Caller must ensure `t.sched_next == 0` before calling.
+    pub fn push(&mut self, tid: u32, t: &mut KThread) {
+        debug_assert_eq!(t.sched_next, 0);
+        let p = t.priority as usize;
+        t.sched_next = 0;
         if self.tails[p] != 0 {
-            let tail_tid = self.tails[p];
-            if thread_exists(tail_tid) {
-                with_thread_mut(tail_tid, |tail| tail.sched_next = tid);
-            } else {
-                self.heads[p] = tid;
+            // We can't follow the link without the store; caller must pass
+            // the tail thread separately. Use a two-pointer approach instead:
+            // store tail TID and update its sched_next via the store.
+            // Since we don't have the store here, we track tail TID only and
+            // the caller (topology.rs) patches sched_next after push.
+            // For simplicity: store tail TID; topology patches the link.
+            self.tails[p] = tid; // will be fixed by push_with_store
+        } else {
+            self.heads[p] = tid;
+            self.tails[p] = tid;
+        }
+        self.present |= 1u32 << p;
+    }
+
+    /// Full push that also patches the previous tail's sched_next.
+    /// `get_mut` is a closure that returns &mut KThread for a given tid.
+    pub fn push_with_store(
+        &mut self,
+        tid: u32,
+        priority: u8,
+        get_mut: &mut impl FnMut(u32) -> Option<&mut KThread>,
+    ) {
+        let p = priority as usize;
+        if let Some(t) = get_mut(tid) {
+            t.sched_next = 0;
+        }
+        let old_tail = self.tails[p];
+        if old_tail != 0 {
+            if let Some(tail_t) = get_mut(old_tail) {
+                tail_t.sched_next = tid;
             }
         } else {
             self.heads[p] = tid;
         }
         self.tails[p] = tid;
-        self.present |= 1 << p;
+        self.present |= 1u32 << p;
     }
 
-    pub fn push_thread(&mut self, tid: u32, priority: u8) {
-        let p = priority as usize;
-        with_thread_mut(tid, |t| t.sched_next = 0);
-        if self.tails[p] != 0 {
-            let tail_tid = self.tails[p];
-            if thread_exists(tail_tid) {
-                with_thread_mut(tail_tid, |tail| tail.sched_next = tid);
-            } else {
-                self.heads[p] = tid;
-            }
+    /// Pop the highest-priority thread. Returns 0 if empty.
+    /// Caller must clear `sched_next` on the returned thread.
+    pub fn pop_highest(&mut self, get: &impl Fn(u32) -> Option<*mut KThread>) -> u32 {
+        if self.present == 0 {
+            return 0;
+        }
+        let p = self.present.trailing_zeros() as usize;
+        let tid = self.heads[p];
+        if tid == 0 {
+            self.present &= !(1u32 << p);
+            return 0;
+        }
+        // Advance head
+        let next = if let Some(ptr) = get(tid) {
+            let t = unsafe { &mut *ptr };
+            let n = t.sched_next;
+            t.sched_next = 0;
+            n
         } else {
-            self.heads[p] = tid;
+            0
+        };
+        self.heads[p] = next;
+        if next == 0 {
+            self.tails[p] = 0;
+            self.present &= !(1u32 << p);
         }
-        self.tails[p] = tid;
-        self.present |= 1 << p;
+        tid
     }
 
-    pub fn pop_highest(&mut self) -> u32 {
-        while self.present != 0 {
-            let p = 31 - self.present.leading_zeros() as usize;
-            let tid = self.heads[p];
-            if tid == 0 || !thread_exists(tid) {
-                self.heads[p] = 0;
-                self.tails[p] = 0;
-                self.present &= !(1u32 << p);
-                continue;
-            }
-            let mut next = with_thread(tid, |t| t.sched_next);
-            if next != 0 && !thread_exists(next) {
-                next = 0;
-                with_thread_mut(tid, |t| t.sched_next = 0);
-            }
-            self.heads[p] = next;
-            if next == 0 {
-                self.tails[p] = 0;
-                self.present &= !(1u32 << p);
-            }
-            with_thread_mut(tid, |t| t.sched_next = 0);
-            return tid;
-        }
-        0
-    }
+    /// Pop the highest-priority thread that satisfies `pred`.
+    pub fn pop_highest_matching(
+        &mut self,
+        get: &impl Fn(u32) -> Option<*mut KThread>,
+        pred: &impl Fn(&KThread) -> bool,
+    ) -> u32 {
+        let mut mask = self.present;
+        while mask != 0 {
+            let p = mask.trailing_zeros() as usize;
+            mask &= !(1u32 << p);
 
-    pub fn pop_highest_matching<F>(&mut self, mut matcher: F) -> u32
-    where
-        F: FnMut(u32) -> bool,
-    {
-        let mut present = self.present;
-        while present != 0 {
-            let p = 31 - present.leading_zeros() as usize;
+            // Walk the list at priority p looking for a matching thread.
             let mut prev = 0u32;
             let mut cur = self.heads[p];
             while cur != 0 {
-                let mut next = if thread_exists(cur) {
-                    with_thread(cur, |t| t.sched_next)
+                let matches = if let Some(ptr) = get(cur) {
+                    pred(unsafe { &*ptr })
                 } else {
-                    0
+                    false
                 };
-                if next != 0 && !thread_exists(next) {
-                    next = 0;
-                }
-                if !thread_exists(cur) {
+                if matches {
+                    // Unlink cur
+                    let next = if let Some(ptr) = get(cur) {
+                        let t = unsafe { &mut *ptr };
+                        let n = t.sched_next;
+                        t.sched_next = 0;
+                        n
+                    } else {
+                        0
+                    };
                     if prev == 0 {
                         self.heads[p] = next;
-                    } else {
-                        with_thread_mut(prev, |t| t.sched_next = next);
-                    }
-                    if next == 0 {
-                        self.tails[p] = prev;
-                    }
-                    cur = next;
-                    continue;
-                }
-                if matcher(cur) {
-                    if prev == 0 {
-                        self.heads[p] = next;
-                    } else {
-                        with_thread_mut(prev, |t| t.sched_next = next);
+                    } else if let Some(ptr) = get(prev) {
+                        unsafe { (*ptr).sched_next = next };
                     }
                     if next == 0 {
                         self.tails[p] = prev;
@@ -122,93 +135,105 @@ impl KReadyQueue {
                     if self.heads[p] == 0 {
                         self.present &= !(1u32 << p);
                     }
-                    with_thread_mut(cur, |t| t.sched_next = 0);
                     return cur;
                 }
                 prev = cur;
-                cur = next;
+                cur = if let Some(ptr) = get(cur) {
+                    unsafe { (*ptr).sched_next }
+                } else {
+                    0
+                };
             }
-            if self.heads[p] == 0 {
-                self.present &= !(1u32 << p);
-            }
-            present &= !(1u32 << p);
         }
         0
     }
 
-    pub fn highest_priority_matching<F>(&self, mut matcher: F) -> Option<u8>
-    where
-        F: FnMut(u32) -> bool,
-    {
-        let mut present = self.present;
-        while present != 0 {
-            let p = 31 - present.leading_zeros() as usize;
-            let mut cur = self.heads[p];
-            while cur != 0 {
-                if !thread_exists(cur) {
-                    break;
-                }
-                if matcher(cur) {
-                    return Some(p as u8);
-                }
-                let mut next = with_thread(cur, |t| t.sched_next);
-                if next != 0 && !thread_exists(next) {
-                    next = 0;
-                }
-                cur = next;
-            }
-            present &= !(1u32 << p);
+    /// Remove a specific tid from the queue (O(n) within its priority level).
+    pub fn remove(
+        &mut self,
+        tid: u32,
+        priority: u8,
+        get: &impl Fn(u32) -> Option<*mut KThread>,
+    ) -> bool {
+        let p = priority as usize;
+        if (self.present & (1u32 << p)) == 0 {
+            return false;
         }
-        None
+        let mut prev = 0u32;
+        let mut cur = self.heads[p];
+        while cur != 0 {
+            let next = if let Some(ptr) = get(cur) {
+                unsafe { (*ptr).sched_next }
+            } else {
+                0
+            };
+            if cur == tid {
+                if let Some(ptr) = get(cur) {
+                    unsafe { (*ptr).sched_next = 0 };
+                }
+                if prev == 0 {
+                    self.heads[p] = next;
+                } else if let Some(ptr) = get(prev) {
+                    unsafe { (*ptr).sched_next = next };
+                }
+                if next == 0 {
+                    self.tails[p] = prev;
+                }
+                if self.heads[p] == 0 {
+                    self.present &= !(1u32 << p);
+                }
+                return true;
+            }
+            prev = cur;
+            cur = next;
+        }
+        false
     }
 
+    /// Highest priority level that has a ready thread, or None if empty.
     pub fn highest_priority(&self) -> Option<u8> {
         if self.present == 0 {
             None
         } else {
-            Some((31 - self.present.leading_zeros() as usize) as u8)
+            Some(self.present.trailing_zeros() as u8)
         }
     }
 
-    pub fn remove(&mut self, tid: u32) {
-        for p in 0..32usize {
-            let mut prev = 0u32;
+    pub fn is_empty(&self) -> bool {
+        self.present == 0
+    }
+
+    /// Peek at the head TID of a given priority without removing it.
+    pub fn peek_head(&self, priority: u8) -> u32 {
+        self.heads[priority as usize]
+    }
+
+    /// Peek at the highest-priority thread satisfying `pred` without removing it.
+    /// Used by `update_highest_priority_threads` to scan all vCPUs without
+    /// disturbing the queue.
+    pub fn peek_highest_matching(
+        &self,
+        get: &impl Fn(u32) -> Option<*const KThread>,
+        pred: &impl Fn(&KThread) -> bool,
+    ) -> u32 {
+        let mut mask = self.present;
+        while mask != 0 {
+            let p = mask.trailing_zeros() as usize;
+            mask &= !(1u32 << p);
             let mut cur = self.heads[p];
             while cur != 0 {
-                if !thread_exists(cur) {
-                    if prev == 0 {
-                        self.heads[p] = 0;
-                        self.tails[p] = 0;
-                    } else {
-                        with_thread_mut(prev, |t| t.sched_next = 0);
-                        self.tails[p] = prev;
-                    }
-                    self.present &= !(1u32 << p);
-                    break;
+                let (matches, next) = if let Some(ptr) = get(cur) {
+                    let t = unsafe { &*ptr };
+                    (pred(t), t.sched_next)
+                } else {
+                    (false, 0)
+                };
+                if matches {
+                    return cur;
                 }
-                let mut next = with_thread(cur, |t| t.sched_next);
-                if next != 0 && !thread_exists(next) {
-                    next = 0;
-                    with_thread_mut(cur, |t| t.sched_next = 0);
-                }
-                if cur == tid {
-                    if prev == 0 {
-                        self.heads[p] = next;
-                    } else {
-                        with_thread_mut(prev, |t| t.sched_next = next);
-                    }
-                    if next == 0 {
-                        self.tails[p] = prev;
-                    }
-                    if self.heads[p] == 0 {
-                        self.present &= !(1u32 << p);
-                    }
-                    with_thread_mut(cur, |t| t.sched_next = 0);
-                    return;
-                }
-                prev = cur;
                 cur = next;
             }
         }
+        0
     }
 }

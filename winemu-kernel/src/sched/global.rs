@@ -1,85 +1,176 @@
-// sched/global.rs — KGlobalScheduler 全局单例 + KScheduler per-vCPU
+// sched/global.rs — KGlobalScheduler: the single scheduler state singleton
 
 use core::cell::UnsafeCell;
-use crate::kobj::ObjectStore;
-use super::types::{KThread, MAX_VCPUS};
-use super::queue::KReadyQueue;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-pub(crate) const DEFERRED_KSTACK_CAP: usize = 1024;
+use crate::sched::queue::KReadyQueue;
+use crate::sched::thread_store::ThreadStore;
+use crate::sched::types::{KThread, MAX_VCPUS};
 
-// ── per-vCPU 调度器 ───────────────────────────────────────────
+// ── Per-vCPU state ────────────────────────────────────────────────────────────
 
-pub struct KScheduler {
-    pub current_tid: u32,
-    pub needs_scheduling: bool,
+pub struct KVcpuState {
+    pub current_tid:          u32,
+    pub idle_tid:             u32,
+    pub needs_scheduling:     bool,
+    pub is_idle:              bool,
+    /// Next thread selected by flush_unlock_edge (0 = none/idle).
+    pub highest_priority_tid: u32,
 }
 
-impl KScheduler {
-    pub const fn new() -> Self {
+impl KVcpuState {
+    const fn new() -> Self {
         Self {
-            current_tid: 0,
-            needs_scheduling: false,
+            current_tid:          0,
+            idle_tid:             0,
+            needs_scheduling:     false,
+            is_idle:              false,
+            highest_priority_tid: 0,
         }
     }
 }
 
-// ── 全局调度器 ────────────────────────────────────────────────
+// ── Deferred kstack reclaim ───────────────────────────────────────────────────
+
+const MAX_DEFERRED_KSTACKS: usize = 16;
+
+pub struct DeferredKstacks {
+    bases: [u64; MAX_DEFERRED_KSTACKS],
+    sizes: [usize; MAX_DEFERRED_KSTACKS],
+    count: usize,
+}
+
+impl DeferredKstacks {
+    const fn new() -> Self {
+        Self {
+            bases: [0u64; MAX_DEFERRED_KSTACKS],
+            sizes: [0usize; MAX_DEFERRED_KSTACKS],
+            count: 0,
+        }
+    }
+
+    pub fn push(&mut self, base: u64, size: usize) -> bool {
+        if self.count >= MAX_DEFERRED_KSTACKS {
+            return false;
+        }
+        self.bases[self.count] = base;
+        self.sizes[self.count] = size;
+        self.count += 1;
+        true
+    }
+
+    pub fn drain(&mut self, mut f: impl FnMut(u64, usize)) {
+        let n = self.count;
+        self.count = 0;
+        for i in 0..n {
+            f(self.bases[i], self.sizes[i]);
+        }
+    }
+}
+
+// ── KGlobalScheduler ─────────────────────────────────────────────────────────
 
 pub struct KGlobalScheduler {
-    pub threads: UnsafeCell<Option<ObjectStore<KThread>>>,
-    pub ready_queue: UnsafeCell<KReadyQueue>,
-    pub vcpus: UnsafeCell<[KScheduler; MAX_VCPUS]>,
-    pub idle_tid_by_vcpu: UnsafeCell<[u32; MAX_VCPUS]>,
-
-    // 调度掩码
-    pub pending_reschedule_mask: UnsafeCell<u32>,
-    pub reschedule_mask: UnsafeCell<u32>,
-    pub idle_vcpu_mask: UnsafeCell<u32>,
-    pub online_vcpu_mask: UnsafeCell<u32>,
-
-    // 轮询入队计数器
-    pub enqueue_rr: UnsafeCell<u8>,
-
-    // 统计
-    pub schedule_unlock_edge_count: UnsafeCell<u64>,
-    pub schedule_trap_count: UnsafeCell<u64>,
-
-    // 延迟释放内核栈
-    pub deferred_kstack_bases: UnsafeCell<[u64; DEFERRED_KSTACK_CAP]>,
-    pub deferred_kstack_len: UnsafeCell<usize>,
-
-    // 调度锁（可重入自旋锁）
-    pub lock_count: UnsafeCell<u32>,
-    pub lock_owner: UnsafeCell<u32>, // vcpu_id+1，0=未持有
-    pub spinlock: UnsafeCell<u32>,   // 0=free, 1=locked
+    /// Option<ThreadStore> — None until init() is called.
+    threads:          UnsafeCell<Option<ThreadStore>>,
+    pub ready_queue:  UnsafeCell<KReadyQueue>,
+    pub vcpus:        UnsafeCell<[KVcpuState; MAX_VCPUS]>,
+    pub deferred_kstacks: UnsafeCell<DeferredKstacks>,
+    /// bitmask of vCPUs that need a reschedule IPI
+    pub reschedule_mask: AtomicU32,
+    /// monotonic schedule-event counter (for debug)
+    pub schedule_events: AtomicU32,
+    /// Set when thread state changes; cleared by update_highest_priority_threads.
+    /// Mirrors Atmosphere's s_scheduler_update_needed.
+    pub scheduler_update_needed: AtomicBool,
+    initialized: AtomicU32,
 }
 
 unsafe impl Sync for KGlobalScheduler {}
+unsafe impl Send for KGlobalScheduler {}
 
 impl KGlobalScheduler {
-    pub const fn new() -> Self {
+    const fn new_uninit() -> Self {
         Self {
-            threads: UnsafeCell::new(None),
-            ready_queue: UnsafeCell::new(KReadyQueue::new()),
-            vcpus: UnsafeCell::new([const { KScheduler::new() }; MAX_VCPUS]),
-            idle_tid_by_vcpu: UnsafeCell::new([0; MAX_VCPUS]),
-            pending_reschedule_mask: UnsafeCell::new(0),
-            reschedule_mask: UnsafeCell::new(0),
-            idle_vcpu_mask: UnsafeCell::new(0),
-            online_vcpu_mask: UnsafeCell::new(0),
-            enqueue_rr: UnsafeCell::new(0),
-            schedule_unlock_edge_count: UnsafeCell::new(0),
-            schedule_trap_count: UnsafeCell::new(0),
-            deferred_kstack_bases: UnsafeCell::new([0; DEFERRED_KSTACK_CAP]),
-            deferred_kstack_len: UnsafeCell::new(0),
-            lock_count: UnsafeCell::new(0),
-            lock_owner: UnsafeCell::new(0),
-            spinlock: UnsafeCell::new(0),
+            threads:          UnsafeCell::new(None),
+            ready_queue:      UnsafeCell::new(KReadyQueue::new()),
+            vcpus:            UnsafeCell::new([
+                KVcpuState::new(), KVcpuState::new(),
+                KVcpuState::new(), KVcpuState::new(),
+                KVcpuState::new(), KVcpuState::new(),
+                KVcpuState::new(), KVcpuState::new(),
+            ]),
+            deferred_kstacks: UnsafeCell::new(DeferredKstacks::new()),
+            reschedule_mask:          AtomicU32::new(0),
+            schedule_events:          AtomicU32::new(0),
+            scheduler_update_needed:  AtomicBool::new(false),
+            initialized:              AtomicU32::new(0),
         }
+    }
+
+    pub fn init(&self) {
+        if self.initialized.swap(1, Ordering::AcqRel) == 0 {
+            unsafe { *self.threads.get() = Some(ThreadStore::new()) };
+        }
+    }
+
+    // ── Raw accessors (caller must hold scheduler lock) ───────────────────
+
+    #[inline]
+    pub unsafe fn threads_raw(&self) -> &ThreadStore {
+        (*self.threads.get()).as_ref().expect("scheduler not initialized")
+    }
+
+    #[inline]
+    pub unsafe fn threads_raw_mut(&self) -> &mut ThreadStore {
+        (*self.threads.get()).as_mut().expect("scheduler not initialized")
+    }
+
+    #[inline]
+    pub unsafe fn queue_raw_mut(&self) -> &mut KReadyQueue {
+        &mut *self.ready_queue.get()
+    }
+
+    #[inline]
+    pub unsafe fn vcpu_raw_mut(&self, vid: usize) -> &mut KVcpuState {
+        &mut (*self.vcpus.get())[vid]
+    }
+
+    #[inline]
+    pub unsafe fn vcpu_raw(&self, vid: usize) -> &KVcpuState {
+        &(*self.vcpus.get())[vid]
+    }
+
+    #[inline]
+    pub unsafe fn deferred_kstacks_mut(&self) -> &mut DeferredKstacks {
+        &mut *self.deferred_kstacks.get()
     }
 }
 
-pub static SCHED: KGlobalScheduler = KGlobalScheduler::new();
+// ── Global singleton ──────────────────────────────────────────────────────────
 
-#[no_mangle]
-pub static mut __winemu_vcpu_kernel_sp: [u64; MAX_VCPUS] = [0; MAX_VCPUS];
+pub static SCHED: KGlobalScheduler = KGlobalScheduler::new_uninit();
+
+pub fn init_scheduler() {
+    SCHED.init();
+}
+
+// ── Convenience free-functions (require scheduler lock) ──────────────────────
+
+#[inline]
+pub fn with_thread<R>(tid: u32, f: impl FnOnce(&KThread) -> R) -> Option<R> {
+    unsafe { SCHED.threads_raw() }.get(tid).map(f)
+}
+
+#[inline]
+pub fn with_thread_mut<R>(tid: u32, f: impl FnOnce(&mut KThread) -> R) -> Option<R> {
+    unsafe { SCHED.threads_raw_mut() }.get_mut(tid).map(f)
+}
+
+#[inline]
+pub fn thread_exists(tid: u32) -> bool {
+    if tid == 0 {
+        return false;
+    }
+    unsafe { SCHED.threads_raw() }.contains(tid)
+}

@@ -1,60 +1,72 @@
-// sched/thread_store.rs — ObjectStore<KThread> 封装
-// 提供 with_thread / with_thread_mut / thread_exists 等安全 API
+// sched/thread_store.rs — Thin wrapper around ObjectStore<KThread>
+// Free-functions (with_thread, thread_exists) live in global.rs to avoid
+// circular dependency.
 
 use crate::kobj::ObjectStore;
-use super::types::KThread;
-use super::global::SCHED;
+use crate::sched::types::KThread;
 
-pub(crate) fn thread_store_mut() -> &'static mut ObjectStore<KThread> {
-    unsafe {
-        let slot = &mut *SCHED.threads.get();
-        if slot.is_none() {
-            *slot = Some(ObjectStore::new());
+pub struct ThreadStore(ObjectStore<KThread>);
+
+impl ThreadStore {
+    pub fn new() -> Self {
+        Self(ObjectStore::new())
+    }
+
+    /// Allocate a new KThread slot, calling `f(tid)` to construct it.
+    pub fn alloc(&mut self, f: impl FnOnce(u32) -> KThread) -> Option<u32> {
+        self.0.alloc_with(f)
+    }
+
+    /// Free a thread slot (drops the KThread).
+    pub fn free(&mut self, tid: u32) -> bool {
+        self.0.free(tid)
+    }
+
+    pub fn contains(&self, tid: u32) -> bool {
+        self.0.contains(tid)
+    }
+
+    /// Immutable borrow — None if tid not found.
+    pub fn get(&self, tid: u32) -> Option<&KThread> {
+        let ptr = self.0.get_ptr(tid);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*ptr })
         }
-        slot.as_mut().unwrap()
     }
-}
 
-fn thread_ptr(tid: u32) -> *mut KThread {
-    if tid == 0 {
-        return core::ptr::null_mut();
+    /// Mutable borrow — None if tid not found.
+    pub fn get_mut(&mut self, tid: u32) -> Option<&mut KThread> {
+        let ptr = self.0.get_ptr(tid);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &mut *ptr })
+        }
     }
-    thread_store_mut().get_ptr(tid)
-}
 
-pub fn thread_exists(tid: u32) -> bool {
-    if tid == 0 {
-        return false;
+    /// Return a raw mutable pointer to the thread, or null if not found.
+    pub fn get_ptr(&self, tid: u32) -> Option<*mut KThread> {
+        let ptr = self.0.get_ptr(tid);
+        if ptr.is_null() { None } else { Some(ptr) }
     }
-    unsafe {
-        let Some(store) = (&*SCHED.threads.get()).as_ref() else {
-            return false;
-        };
-        store.contains(tid)
-    }
-}
 
-pub fn thread_count() -> u32 {
-    unsafe {
-        let Some(store) = (&*SCHED.threads.get()).as_ref() else {
-            return 0;
-        };
-        let mut count = 0u32;
-        store.for_each_live_id(|_| {
-            count = count.saturating_add(1);
+    /// Iterate over all live thread IDs.
+    pub fn for_each_id(&self, mut f: impl FnMut(u32)) {
+        self.0.for_each_live_id(|id| f(id));
+    }
+
+    /// Iterate over all live threads (immutable).
+    pub fn for_each(&self, mut f: impl FnMut(u32, &KThread)) {
+        self.0.for_each_live_ptr(|id, ptr| {
+            if !ptr.is_null() {
+                f(id, unsafe { &*ptr });
+            }
         });
-        count
     }
 }
 
-#[inline(always)]
-pub fn with_thread<R>(tid: u32, f: impl FnOnce(&KThread) -> R) -> R {
-    let ptr = thread_ptr(tid);
-    unsafe { f(&*ptr) }
-}
-
-#[inline(always)]
-pub fn with_thread_mut<R>(tid: u32, f: impl FnOnce(&mut KThread) -> R) -> R {
-    let ptr = thread_ptr(tid);
-    unsafe { f(&mut *ptr) }
-}
+// SAFETY: ThreadStore is only accessed under the scheduler spinlock.
+unsafe impl Send for ThreadStore {}
+unsafe impl Sync for ThreadStore {}
