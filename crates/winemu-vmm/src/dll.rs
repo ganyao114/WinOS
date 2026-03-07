@@ -187,7 +187,11 @@ impl DllLoader {
             let mem = memory.read().unwrap();
             (mem.base_gpa().0, mem.base_gpa().0 + mem.size() as u64)
         };
-        let alloc_end = mem_end.min(crate::phys::PHYS_POOL_BASE);
+        let va_alloc_end = {
+            let va = vaspace.lock().unwrap();
+            va.alloc_end()
+        };
+        let alloc_end = mem_end.min(va_alloc_end);
 
         let fits_guest_window = |base: u64| -> bool {
             if base < mem_base {

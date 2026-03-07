@@ -13,3 +13,4 @@ log = { workspace = true }
 memmap2 = { workspace = true }
 num_cpus = { workspace = true }
 tokio = { workspace = true }
+libc = "0.2"

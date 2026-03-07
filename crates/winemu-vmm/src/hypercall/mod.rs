@@ -5,6 +5,7 @@ use crate::memory::GuestMemory;
 use crate::sched::Scheduler;
 use crate::section::SectionTable;
 use crate::vaspace::VaSpace;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use winemu_shared::hostcall as hc;
@@ -156,12 +157,29 @@ pub enum HypercallResult {
     Exit(u32),
 }
 
+struct PhysAllocState {
+    budget_bytes: usize,
+    used_bytes: usize,
+    allocs: BTreeMap<u64, usize>,
+}
+
+impl PhysAllocState {
+    fn new(budget_bytes: usize) -> Self {
+        Self {
+            budget_bytes,
+            used_bytes: 0,
+            allocs: BTreeMap::new(),
+        }
+    }
+}
+
 pub struct HypercallManager {
     exe_image: Vec<u8>,
     exe_path: std::path::PathBuf,
     memory: Arc<RwLock<GuestMemory>>,
     vaspace: Arc<Mutex<VaSpace>>,
-    phys_pool: Mutex<crate::phys::PhysPagePool>,
+    gpa_alloc: Mutex<crate::gpa_alloc::GpaAllocator>,
+    phys_alloc_state: Mutex<PhysAllocState>,
     files: FileTable,
     sections: SectionTable,
     pub sched: Arc<Scheduler>,
@@ -198,12 +216,15 @@ impl HypercallManager {
         root: impl Into<std::path::PathBuf>,
         sched: Arc<Scheduler>,
         exe_path: impl Into<std::path::PathBuf>,
+        phys_pool_base: u64,
+        phys_pool_end: u64,
+        phys_alloc_budget_bytes: usize,
     ) -> Self {
         let exe_path: std::path::PathBuf = exe_path.into();
         let exe_image = std::fs::read(&exe_path).unwrap_or_default();
         let root_path: std::path::PathBuf = root.into();
         let host_files = Arc::new(HostFileTable::new(root_path.clone()));
-        let mut vaspace_init = VaSpace::new();
+        let mut vaspace_init = VaSpace::with_alloc_end(phys_pool_base);
         vaspace_init.set_base(EARLY_HOST_MMAP_BASE);
         let vaspace = Arc::new(Mutex::new(vaspace_init));
         let hostcall = HostCallBroker::new(
@@ -212,12 +233,22 @@ impl HypercallManager {
             Arc::clone(&vaspace),
             Arc::clone(&sched),
         );
+        log::info!(
+            "phys pool configured: gpa=[{:#x}, {:#x}) size_mb={} budget_mb={}",
+            phys_pool_base,
+            phys_pool_end,
+            (phys_pool_end.saturating_sub(phys_pool_base) / (1024 * 1024) as u64),
+            phys_alloc_budget_bytes / (1024 * 1024)
+        );
         Self {
             exe_image,
             exe_path,
             memory,
             vaspace,
-            phys_pool: Mutex::new(crate::phys::PhysPagePool::new()),
+            gpa_alloc: Mutex::new(
+                crate::gpa_alloc::GpaAllocator::new(phys_pool_base, 0).with_limit(phys_pool_end),
+            ),
+            phys_alloc_state: Mutex::new(PhysAllocState::new(phys_alloc_budget_bytes)),
             files: FileTable::new(root_path),
             sections: SectionTable::new(),
             sched,
@@ -554,20 +585,95 @@ impl HypercallManager {
                 if pages == 0 {
                     return HypercallResult::Sync(0);
                 }
-                let gpa = self
-                    .phys_pool
-                    .lock()
-                    .unwrap()
-                    .alloc_contiguous(pages)
-                    .unwrap_or(0);
-                log::debug!("ALLOC_PHYS_PAGES: pages={} gpa={:#x}", pages, gpa);
-                HypercallResult::Sync(gpa)
+                let Some(size) = pages.checked_mul(4096) else {
+                    log::warn!("ALLOC_PHYS_PAGES: overflow pages={}", pages);
+                    return HypercallResult::Sync(0);
+                };
+                let mut state = self.phys_alloc_state.lock().unwrap();
+                let Some(next_used) = state.used_bytes.checked_add(size) else {
+                    log::warn!(
+                        "ALLOC_PHYS_PAGES: used overflow pages={} size={}",
+                        pages,
+                        size
+                    );
+                    return HypercallResult::Sync(0);
+                };
+                if next_used > state.budget_bytes {
+                    log::warn!(
+                        "ALLOC_PHYS_PAGES: over budget pages={} size={} used={} budget={}",
+                        pages,
+                        size,
+                        state.used_bytes,
+                        state.budget_bytes
+                    );
+                    return HypercallResult::Sync(0);
+                }
+                let mut gpa_alloc = self.gpa_alloc.lock().unwrap();
+                let Some((gpa, _)) = gpa_alloc.alloc(size) else {
+                    log::warn!(
+                        "ALLOC_PHYS_PAGES: allocator exhausted pages={} size={} used={} budget={}",
+                        pages,
+                        size,
+                        state.used_bytes,
+                        state.budget_bytes
+                    );
+                    return HypercallResult::Sync(0);
+                };
+                state.used_bytes = next_used;
+                if state.allocs.insert(gpa.0, size).is_some() {
+                    log::error!(
+                        "ALLOC_PHYS_PAGES: duplicate gpa allocation detected gpa={:#x}",
+                        gpa.0
+                    );
+                }
+                log::debug!(
+                    "ALLOC_PHYS_PAGES: pages={} size={} gpa={:#x} used={} budget={}",
+                    pages,
+                    size,
+                    gpa.0,
+                    state.used_bytes,
+                    state.budget_bytes
+                );
+                HypercallResult::Sync(gpa.0)
             }
             nr::FREE_PHYS_PAGES => {
                 let gpa = args[0];
                 let pages = args[1] as usize;
-                let ok = self.phys_pool.lock().unwrap().free_contiguous(gpa, pages);
-                log::debug!("FREE_PHYS_PAGES: gpa={:#x} pages={} ok={}", gpa, pages, ok);
+                if pages == 0 {
+                    return HypercallResult::Sync(0);
+                }
+                let Some(size) = pages.checked_mul(4096) else {
+                    log::warn!("FREE_PHYS_PAGES: overflow gpa={:#x} pages={}", gpa, pages);
+                    return HypercallResult::Sync(u64::MAX);
+                };
+                let mut state = self.phys_alloc_state.lock().unwrap();
+                let Some(alloc_size) = state.allocs.get(&gpa).copied() else {
+                    log::warn!("FREE_PHYS_PAGES: unknown gpa={:#x} pages={}", gpa, pages);
+                    return HypercallResult::Sync(u64::MAX);
+                };
+                if alloc_size != size {
+                    log::warn!(
+                        "FREE_PHYS_PAGES: size mismatch gpa={:#x} req={} alloc={}",
+                        gpa,
+                        size,
+                        alloc_size
+                    );
+                    return HypercallResult::Sync(u64::MAX);
+                }
+                let ok = self.gpa_alloc.lock().unwrap().free(gpa, size).is_some();
+                if ok {
+                    state.allocs.remove(&gpa);
+                    state.used_bytes = state.used_bytes.saturating_sub(size);
+                }
+                log::debug!(
+                    "FREE_PHYS_PAGES: gpa={:#x} pages={} size={} ok={} used={} budget={}",
+                    gpa,
+                    pages,
+                    size,
+                    ok,
+                    state.used_bytes,
+                    state.budget_bytes
+                );
                 HypercallResult::Sync(if ok { 0 } else { u64::MAX })
             }
             // ── Host 文件操作 ──────────────────────────────────

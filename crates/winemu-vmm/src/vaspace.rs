@@ -25,6 +25,7 @@ pub struct Region {
 pub struct VaSpace {
     // key = region base VA
     regions: BTreeMap<u64, Region>,
+    alloc_end: u64,
 }
 
 impl VaSpace {
@@ -32,9 +33,7 @@ impl VaSpace {
     pub fn set_base(&mut self, heap_start: u64) {
         // Align up to 64KB
         let base = (heap_start + 0xFFFF) & !0xFFFF;
-        // GuestMemory is 512MB: [0x40000000, 0x60000000).
-        // Reserve top region for ALLOC_PHYS_PAGES pool.
-        let end = crate::phys::PHYS_POOL_BASE;
+        let end = self.alloc_end;
         if base >= end {
             self.regions.clear();
             return;
@@ -51,17 +50,26 @@ impl VaSpace {
         );
     }
     pub fn new() -> Self {
+        Self::with_alloc_end(USER_END)
+    }
+
+    pub fn with_alloc_end(alloc_end: u64) -> Self {
+        let alloc_end = alloc_end.min(USER_END).max(USER_BASE);
         let mut regions = BTreeMap::new();
         regions.insert(
             USER_BASE,
             Region {
                 base: USER_BASE,
-                size: USER_END - USER_BASE,
+                size: alloc_end - USER_BASE,
                 state: RegionState::Free,
                 prot: 0,
             },
         );
-        Self { regions }
+        Self { regions, alloc_end }
+    }
+
+    pub fn alloc_end(&self) -> u64 {
+        self.alloc_end
     }
 
     /// 分配 `size` 字节（向上对齐到 64KB），返回 base VA。

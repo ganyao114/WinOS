@@ -15,6 +15,9 @@ use std::collections::BTreeSet;
 use std::sync::OnceLock;
 use winemu_core::addr::Gpa;
 
+pub const DEFAULT_PHYS_POOL_MB: usize = 64;
+pub const MIN_PHYS_POOL_MB: usize = 16;
+
 /// Query host page size once via sysconf(_SC_PAGESIZE).
 fn host_page_size() -> usize {
     static HPS: OnceLock<usize> = OnceLock::new();
@@ -68,6 +71,13 @@ fn align_up_host(v: u64) -> u64 {
     (v + mask) & !mask
 }
 
+/// Align `v` down to host page boundary
+#[inline]
+fn align_down_host(v: u64) -> u64 {
+    let mask = host_page_size() as u64 - 1;
+    v & !mask
+}
+
 struct HostChunk {
     hva: *mut u8,
     gpa: u64,
@@ -94,6 +104,11 @@ impl GpaAllocator {
             chunks: Vec::new(),
             free_page_count: 0,
         }
+    }
+
+    pub fn with_limit(mut self, limit_gpa: u64) -> Self {
+        self.limit = align_down_host(limit_gpa).max(self.next_gpa);
+        self
     }
 
     pub fn free_bytes(&self) -> usize {
@@ -179,12 +194,22 @@ impl GpaAllocator {
     /// Free a previously allocated region.
     /// `size` is the original requested size (must be 4KB-aligned).
     pub fn free(&mut self, gpa: u64, size: usize) -> Option<usize> {
-        if size == 0 || (size & (GUEST_PAGE_SIZE - 1)) != 0 {
+        if size == 0 || (size & (GUEST_PAGE_SIZE - 1)) != 0 || (gpa & (GUEST_PAGE_SIZE as u64 - 1)) != 0 {
             return None;
         }
         let alloc_size = align_up_host(size as u64) as usize;
         let order = size_to_order(alloc_size);
         if order >= MAX_ORDER { return None; }
+        let Some(chunk_base) = self.find_chunk_base(gpa) else {
+            return None;
+        };
+        let block_size = order_size(order) as u64;
+        if ((gpa - chunk_base) & (block_size - 1)) != 0 {
+            return None;
+        }
+        if self.resolve_hva(gpa, alloc_size).is_none() {
+            return None;
+        }
 
         self.free_order(gpa, order);
         self.shrink_pool();

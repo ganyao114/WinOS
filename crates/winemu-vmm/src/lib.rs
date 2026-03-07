@@ -1,9 +1,9 @@
 pub mod file_io;
+pub mod gpa_alloc;
 pub mod host_file;
 pub mod hostcall;
 pub mod hypercall;
 pub mod memory;
-pub mod phys;
 pub mod sched;
 pub mod section;
 pub mod vaspace;
@@ -18,6 +18,17 @@ use winemu_hypervisor::{Hypervisor, Regs, Vm, VmConfig};
 
 #[cfg(target_arch = "aarch64")]
 const KERNEL_ENTRY_PC: u64 = 0x4000_0000;
+const GUEST_BASE_GPA: u64 = 0x4000_0000;
+const DEFAULT_GUEST_MEMORY_MB: usize = 1024;
+const MIN_GUEST_MEMORY_MB: usize = 256;
+const MAX_GUEST_MEMORY_MB: usize = 16 * 1024;
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+}
 
 #[inline(always)]
 fn set_kernel_boot_entry_pc(regs: &mut Regs) {
@@ -52,14 +63,37 @@ impl Vmm {
             .and_then(|s| s.parse::<u32>().ok())
             .map(|n| n.clamp(1, host_cpus))
             .unwrap_or(1);
+        let guest_memory_mb = env_usize("WINEMU_GUEST_MEM_MB")
+            .map(|mb| mb.clamp(MIN_GUEST_MEMORY_MB, MAX_GUEST_MEMORY_MB))
+            .unwrap_or(DEFAULT_GUEST_MEMORY_MB);
+        let guest_memory_size = guest_memory_mb * 1024 * 1024;
+        let max_phys_pool_mb = (guest_memory_mb / 2).max(gpa_alloc::MIN_PHYS_POOL_MB);
+        let phys_pool_mb = env_usize("WINEMU_PHYS_POOL_MB")
+            .map(|mb| mb.clamp(gpa_alloc::MIN_PHYS_POOL_MB, max_phys_pool_mb))
+            .unwrap_or(gpa_alloc::DEFAULT_PHYS_POOL_MB.min(max_phys_pool_mb));
+        let phys_pool_size = phys_pool_mb * 1024 * 1024;
+        let guest_gpa_end = GUEST_BASE_GPA + guest_memory_size as u64;
+        let phys_pool_end = guest_gpa_end;
+        let phys_pool_base = phys_pool_end - phys_pool_size as u64;
+        let phys_alloc_budget_mb = env_usize("WINEMU_PHYS_ALLOC_BUDGET_MB")
+            .map(|mb| mb.clamp(1, phys_pool_mb))
+            .unwrap_or(phys_pool_mb);
+        let phys_alloc_budget_bytes = phys_alloc_budget_mb * 1024 * 1024;
+        log::info!(
+            "vm config: guest_mem_mb={} phys_pool_mb={} phys_budget_mb={} vcpu_count={}",
+            guest_memory_mb,
+            phys_pool_mb,
+            phys_alloc_budget_mb,
+            vcpu_count
+        );
         let config = VmConfig {
-            memory_size: 512 * 1024 * 1024,
+            memory_size: guest_memory_size,
             vcpu_count,
         };
         let vm: Arc<dyn Vm> = Arc::from(hypervisor.create_vm(config)?);
-        let mut memory = GuestMemory::new(512 * 1024 * 1024)?;
+        let mut memory = GuestMemory::new(guest_memory_size)?;
         vm.map_memory(memory.base_gpa(), memory.hva(), memory.size(), MemProt::RWX)?;
-        memory.write_bytes(Gpa(0x40000000), kernel_image);
+        memory.write_bytes(Gpa(GUEST_BASE_GPA), kernel_image);
 
         let memory = Arc::new(RwLock::new(memory));
         let sched = Scheduler::new(vcpu_count);
@@ -69,6 +103,9 @@ impl Vmm {
             fs_root,
             Arc::clone(&sched),
             exe_path,
+            phys_pool_base,
+            phys_pool_end,
+            phys_alloc_budget_bytes,
         ));
 
         Ok(Self {
