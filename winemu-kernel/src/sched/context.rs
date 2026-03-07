@@ -12,13 +12,14 @@ use crate::sched::types::KERNEL_STACK_SIZE;
 
 // ── Context-switch wrappers ───────────────────────────────────────────────────
 
-/// Save `from` kctx, restore `to` kctx. Does not return.
+/// Save `from` kctx, restore `to` kctx.
+///
+/// This call may return later when another thread switches back to `from`.
 #[inline(always)]
-pub unsafe fn __sched_switch_kernel_context(from: *mut u8, to: *const u8) -> ! {
+pub unsafe fn __sched_switch_kernel_context(from: *mut u8, to: *const u8) {
     use crate::arch::context::switch_kernel_context;
     use crate::sched::types::KernelContext;
     switch_kernel_context(from as *mut KernelContext, to as *const KernelContext);
-    core::hint::unreachable_unchecked()
 }
 
 /// Enter EL0 from a fresh kernel stack. Does not return.

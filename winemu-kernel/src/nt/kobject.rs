@@ -201,7 +201,8 @@ pub(crate) fn handle_to_tid(handle: u64) -> Option<u32> {
 }
 
 pub(crate) fn make_thread_handle(tid: u32) -> u64 {
-    sync::encode_handle(HANDLE_TYPE_THREAD, tid)
+    sync::make_new_handle(HANDLE_TYPE_THREAD, tid)
+        .unwrap_or_else(|| sync::encode_handle(HANDLE_TYPE_THREAD, tid))
 }
 
 pub(crate) fn ops_for_type(htype: u64) -> Option<&'static KObjectOps> {

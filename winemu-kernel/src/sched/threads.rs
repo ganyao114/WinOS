@@ -12,7 +12,7 @@ use crate::sched::context::{
 use crate::sched::global::{with_thread, with_thread_mut, SCHED};
 use crate::sched::thread_control::terminate_thread_locked;
 use crate::sched::topology::set_thread_state_locked;
-use crate::sched::types::{alloc_tid, KThread, ThreadState, KERNEL_STACK_SIZE};
+use crate::sched::types::{alloc_tid, KThread, ThreadState, KERNEL_STACK_SIZE, MAX_VCPUS};
 
 // ── spawn ─────────────────────────────────────────────────────────────────────
 
@@ -40,7 +40,7 @@ pub fn spawn_locked(mut thread: KThread) -> Option<u32> {
 pub struct UserThreadParams {
     pub pid:        u32,
     pub entry:      u64,   // EL0 entry point (RtlUserThreadStart or similar)
-    pub stack_base: u64,
+    pub stack_base: u64,   // EL0 stack top (high address)
     pub stack_size: u64,
     pub teb_va:     u64,
     pub arg:        u64,   // x0 on entry
@@ -65,7 +65,8 @@ pub fn create_user_thread_locked(p: UserThreadParams) -> Option<u32> {
 
     // Set up EL0 entry context.
     t.ctx.pc      = p.entry;
-    t.ctx.sp      = p.stack_base + p.stack_size; // stack grows down
+    // UserThreadParams::stack_base is the high-address top-of-stack.
+    t.ctx.sp      = p.stack_base;
     t.ctx.x[0]    = p.arg;
     // SPSR: EL0t (0b0000), interrupts enabled.
     t.ctx.pstate  = 0x0000_0000;
@@ -144,7 +145,18 @@ pub fn free_terminated_threads_locked() {
     {
         let store = unsafe { SCHED.threads_raw() };
         store.for_each(|tid, t| {
-            if t.state == ThreadState::Terminated && !t.is_idle_thread && count < 64 {
+            if t.state != ThreadState::Terminated || t.is_idle_thread || count >= 64 {
+                return;
+            }
+            // Do not free a terminated thread that is still the active current
+            // thread on any vCPU; its kernel context may still be needed by an
+            // in-flight switch path.
+            for vid in 0..MAX_VCPUS {
+                if unsafe { SCHED.vcpu_raw(vid) }.current_tid == tid {
+                    return;
+                }
+            }
+            if count < 64 {
                 to_free[count] = tid;
                 count += 1;
             }

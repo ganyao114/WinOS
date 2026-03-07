@@ -30,6 +30,21 @@ fn set_primary_boot_ready() {
     crate::arch::cpu::send_event();
 }
 
+#[inline(always)]
+fn boot_vcpu_id_from_mpidr() -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mpidr: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nostack, nomem));
+        }
+        let aff0 = (mpidr & 0xff) as u32;
+        return aff0.min((sched::MAX_VCPUS - 1) as u32);
+    }
+    #[allow(unreachable_code)]
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn kernel_secondary_main() -> ! {
     // Secondary CPUs must install vectors locally and then participate in the
@@ -39,17 +54,10 @@ pub extern "C" fn kernel_secondary_main() -> ! {
     // MMU/system control registers are per-CPU; secondary CPUs need local MMU
     // init before touching scheduler global state under virtual addresses.
     mm::init_per_cpu();
+    // TPIDR_EL1 must be initialized before any scheduler API usage.
+    let boot_vid = boot_vcpu_id_from_mpidr();
+    sched::init_cpu_local(boot_vid);
     let vid = (sched::vcpu_id() as usize).min(sched::MAX_VCPUS - 1);
-    #[cfg(target_arch = "aarch64")]
-    let mpidr = {
-        let v: u64;
-        unsafe {
-            core::arch::asm!("mrs {}, mpidr_el1", out(reg) v, options(nostack, nomem));
-        }
-        v
-    };
-    #[cfg(target_arch = "aarch64")]
-    crate::kdebug!("secondary: mpidr={:#x} vid={}", mpidr, vid);
     sched::register_idle_thread_for_vcpu(vid as u32);
     sched::enter_core_scheduler_entry(vid)
 }
@@ -204,6 +212,10 @@ pub extern "C" fn kernel_main() -> ! {
     vectors::install();
     mm::init_global_bootstrap();
     mm::init_per_cpu();
+    // Primary vCPU scheduler bootstrap.
+    sched::init_cpu_local(boot_vcpu_id_from_mpidr());
+    sched::init_scheduler();
+    sched::init_sync_state();
     crate::kinfo!("kernel_main: mmu ok");
     alloc::init();
 
@@ -228,6 +240,9 @@ pub extern "C" fn kernel_main() -> ! {
         };
         let tid = sched::create_user_thread_locked(params)
             .expect("kernel: thread0 alloc failed");
+        // Keep thread0 bound to bootstrap execution context, but do not leave
+        // it in the ready queue before its user entry is fully initialized.
+        sched::set_thread_state_locked(tid, sched::ThreadState::Running);
         sched::set_vcpu_current_thread(vid as usize, tid);
         sched::set_current_tid(tid);
         sched::set_thread_in_kernel_locked(tid, true);
@@ -357,8 +372,9 @@ pub extern "C" fn kernel_main() -> ! {
     }
     let now = sched::current_ticks();
     {
-        let _lock = sched::KSchedulerLock::lock();
-        sched::set_thread_state_locked(thread0_tid, sched::ThreadState::Running);
+        // Bootstrap path: avoid unlock-edge scheduling before we enter the
+        // unified scheduler entry below.
+        sched::SCHED_LOCK.acquire();
         sched::with_thread_mut(thread0_tid, |t| {
             t.ctx.pc = start_thunk_va;
             t.ctx.sp = teb_peb.stack_base;
@@ -371,6 +387,9 @@ pub extern "C" fn kernel_main() -> ! {
             t.last_start_100ns = now;
             t.in_kernel = false;
         });
+        // Re-queue thread0 only after its EL0 context is complete.
+        sched::set_thread_state_locked(thread0_tid, sched::ThreadState::Ready);
+        sched::SCHED_LOCK.release();
     }
     process::switch_to_thread_process(thread0_tid);
 

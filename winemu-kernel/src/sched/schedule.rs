@@ -11,7 +11,7 @@ use crate::sched::cpu::{cpu_local, set_current_tid, vcpu_id};
 use crate::sched::global::{with_thread, with_thread_mut, SCHED};
 use crate::sched::thread_control::reset_quantum_locked;
 use crate::sched::threads::free_terminated_threads_locked;
-use crate::sched::topology::all_threads_done;
+use crate::sched::topology::{all_threads_done, set_thread_state_locked};
 use crate::sched::types::{KernelContext, ThreadState};
 use crate::sched::wait::check_wait_timeouts_locked;
 
@@ -79,6 +79,18 @@ pub fn scheduler_round_locked(vid: u32, from_tid: u32, quantum_100ns: u64) -> Sc
     let to_tid = pick_next_thread_locked(vid);
 
     if to_tid == 0 {
+        // Current running thread is not kept in ready queue; if there is no
+        // ready candidate, continue current instead of falling into idle wait.
+        if from_tid != 0
+            && with_thread(from_tid, |t| t.state).unwrap_or(ThreadState::Terminated)
+                == ThreadState::Running
+        {
+            return SchedulerRoundAction::ContinueCurrent {
+                now_100ns,
+                next_deadline_100ns,
+                slice_remaining_100ns: slice_remaining,
+            };
+        }
         return SchedulerRoundAction::IdleWait {
             now_100ns,
             next_deadline_100ns,
@@ -92,6 +104,13 @@ pub fn scheduler_round_locked(vid: u32, from_tid: u32, quantum_100ns: u64) -> Sc
             next_deadline_100ns,
             slice_remaining_100ns: slice_remaining,
         };
+    }
+
+    // Preempted running thread must be returned to ready queue when we switch
+    // away from it. Blocked/terminated threads are handled by their own state
+    // transitions and must not be re-queued here.
+    if from_tid != 0 && to_tid != from_tid && !cur_not_running {
+        set_thread_state_locked(from_tid, ThreadState::Ready);
     }
 
     reset_quantum_locked(to_tid);
@@ -149,7 +168,7 @@ pub fn execute_kernel_continuation_switch(
     let from_kctx = with_thread_mut(from_tid, |t| &mut t.kctx as *mut KernelContext as usize)
         .unwrap_or(0) as *mut u8;
 
-    crate::sched::lock::KSchedulerLock::release_raw(vid);
+    crate::sched::lock::unlock_after_raw_or_scoped(vid);
 
     unsafe { __sched_switch_kernel_context(from_kctx, to_kctx) }
 }
@@ -167,7 +186,7 @@ pub unsafe fn enter_kernel_continuation_noreturn(to_tid: u32) -> ! {
     with_thread_mut(to_tid, |t| t.state = ThreadState::Running);
 
     let kctx = with_thread(to_tid, |t| t.kctx).unwrap_or_else(KernelContext::new);
-    crate::sched::lock::KSchedulerLock::release_raw(vid);
+    crate::sched::lock::unlock_after_raw_or_scoped(vid);
 
     unsafe {
         asm!(
@@ -281,35 +300,46 @@ pub fn flush_unlock_edge(vid: usize) -> u32 {
     let action = scheduler_round_locked(vid as u32, from_tid, 0);
 
     // Apply the round result to the current vCPU's state.
-    {
-        let vs = unsafe { SCHED.vcpu_raw_mut(vid) };
-        match action {
-            SchedulerRoundAction::RunThread { to_tid, .. } => {
-                vs.highest_priority_tid = to_tid;
-                vs.needs_scheduling = true;
-                // Mark update needed so other vCPUs are also re-evaluated.
-                SCHED.scheduler_update_needed
-                    .store(true, core::sync::atomic::Ordering::Relaxed);
-            }
-            SchedulerRoundAction::IdleWait { .. } => {
-                let idle = vs.idle_tid;
-                vs.highest_priority_tid = idle;
-                vs.needs_scheduling = idle != 0;
-            }
-            SchedulerRoundAction::ContinueCurrent { .. } => {
-                vs.highest_priority_tid = 0;
-                vs.needs_scheduling = false;
-            }
+    match action {
+        SchedulerRoundAction::RunThread { .. } => {
+            // Mark update needed so other vCPUs are also re-evaluated.
+            SCHED.scheduler_update_needed
+                .store(true, core::sync::atomic::Ordering::Relaxed);
         }
+        SchedulerRoundAction::IdleWait { .. } | SchedulerRoundAction::ContinueCurrent { .. } => {}
     }
 
     // Now do the full multi-core scan (UpdateHighestPriorityThreads).
     // This may add the current vCPU back into the mask if its candidate changed.
     let mut mask = update_highest_priority_threads();
 
-    // Ensure the current vCPU is in the mask if it needs scheduling.
-    if unsafe { SCHED.vcpu_raw(vid) }.needs_scheduling {
-        mask |= 1u32 << vid;
+    // Keep the current-vCPU decision from scheduler_round_locked authoritative.
+    // update_highest_priority_threads() scans ready queues and must not override
+    // the already-popped current candidate with idle.
+    {
+        let vs = unsafe { SCHED.vcpu_raw_mut(vid) };
+        match action {
+            SchedulerRoundAction::RunThread { to_tid, .. } => {
+                vs.highest_priority_tid = to_tid;
+                vs.needs_scheduling = true;
+                mask |= 1u32 << vid;
+            }
+            SchedulerRoundAction::IdleWait { .. } => {
+                let idle = vs.idle_tid;
+                vs.highest_priority_tid = idle;
+                vs.needs_scheduling = idle != 0;
+                if idle != 0 {
+                    mask |= 1u32 << vid;
+                } else {
+                    mask &= !(1u32 << vid);
+                }
+            }
+            SchedulerRoundAction::ContinueCurrent { .. } => {
+                vs.highest_priority_tid = 0;
+                vs.needs_scheduling = false;
+                mask &= !(1u32 << vid);
+            }
+        }
     }
 
     mask
@@ -338,9 +368,15 @@ pub fn reschedule_current_core(vid: usize) {
     // Clear the flag before switching.
     unsafe { SCHED.vcpu_raw_mut(vid) }.needs_scheduling = false;
 
-    if from_tid == 0 || from_tid == to_tid {
+    if from_tid == 0 {
         // No current thread or same thread — just jump in.
         unsafe { enter_kernel_continuation_noreturn(to_tid) }
+    } else if from_tid == to_tid {
+        // No actual switch needed on unlock-edge. Keep running in the current
+        // kernel control flow and just restore the running state.
+        with_thread_mut(to_tid, |t| t.state = ThreadState::Running);
+        crate::sched::lock::unlock_after_raw_or_scoped(vid);
+        return;
     } else {
         execute_kernel_continuation_switch(from_tid, to_tid, 0, u64::MAX, 0, "unlock-edge");
     }
@@ -370,8 +406,12 @@ pub fn schedule_noreturn_locked(from_tid: u32) -> ! {
             .unwrap_or(0) as *const u8;
         let from_kctx = with_thread_mut(from_tid, |t| &mut t.kctx as *mut KernelContext as usize)
             .unwrap_or(0) as *mut u8;
-        crate::sched::lock::KSchedulerLock::release_raw(vid);
+        crate::sched::lock::unlock_after_raw_or_scoped(vid);
         unsafe { crate::sched::context::__sched_switch_kernel_context(from_kctx, to_kctx) }
+        panic!(
+            "schedule_noreturn_locked: switched back to terminated/non-runnable thread tid={}",
+            from_tid
+        );
     } else {
         unsafe { enter_kernel_continuation_noreturn(target) }
     }
@@ -394,7 +434,7 @@ pub fn enter_core_scheduler_entry(vid: usize) -> ! {
         let to_tid = pick_next_thread_locked(vid as u32);
         let idle_tid = unsafe { SCHED.vcpu_raw(vid) }.idle_tid;
         let target = if to_tid != 0 { to_tid } else if idle_tid != 0 { idle_tid } else {
-            crate::sched::lock::KSchedulerLock::release_raw(vid);
+            crate::sched::lock::unlock_after_raw_or_scoped(vid);
             crate::arch::cpu::wait_for_event();
             continue;
         };

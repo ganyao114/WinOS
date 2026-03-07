@@ -106,6 +106,17 @@ impl KSchedulerLock {
     }
 }
 
+/// Release scheduler lock for context-switch paths that may hold the lock
+/// either through `KSchedulerLock` (depth > 0) or a raw `SCHED_LOCK.acquire()`.
+#[inline]
+pub fn unlock_after_raw_or_scoped(vid: usize) {
+    if LOCK_DEPTH[vid].load(Ordering::Relaxed) > 0 {
+        KSchedulerLock::release_raw(vid);
+    } else {
+        SCHED_LOCK.release();
+    }
+}
+
 impl Drop for KSchedulerLock {
     fn drop(&mut self) {
         let depth = LOCK_DEPTH[self.vid].fetch_sub(1, Ordering::Relaxed);

@@ -5,8 +5,8 @@
 use crate::hypercall;
 use crate::sched::{
     current_tid, drain_deferred_kstacks, set_thread_in_kernel_locked,
-    vcpu_id, with_thread, with_thread_mut, ThreadState,
-    KSchedulerLock, SCHED_LOCK, SchedulerRoundAction, scheduler_round_locked,
+    vcpu_id, with_thread, with_thread_mut, set_current_tid, set_vcpu_current_thread, ThreadState,
+    SCHED_LOCK, SchedulerRoundAction, scheduler_round_locked,
     execute_kernel_continuation_switch, enter_kernel_continuation_noreturn,
 };
 use crate::timer;
@@ -213,9 +213,10 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                 next_deadline_100ns,
                 slice_remaining_100ns,
             } => {
-                crate::sched::lock::KSchedulerLock::release_raw(vid as usize);
+                crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
                 let cur = current_tid();
                 if cur != 0 {
+                    with_thread_mut(cur, |t| t.state = ThreadState::Running);
                     set_thread_in_kernel_locked(cur, false);
                 }
                 timer::schedule_running_slice_100ns(
@@ -257,8 +258,21 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                             slice_remaining_100ns,
                             "trap",
                         );
-                        from = current_tid();
-                        continue;
+                        let cur = current_tid();
+                        if cur != 0 {
+                            set_vcpu_current_thread(vid as usize, cur);
+                            set_current_tid(cur);
+                            with_thread_mut(cur, |t| t.state = ThreadState::Running);
+                            crate::process::switch_to_thread_process(cur);
+                            restore_ctx_to_frame(cur, frame);
+                            set_thread_in_kernel_locked(cur, false);
+                        }
+                        timer::schedule_running_slice_100ns(
+                            now_100ns,
+                            next_deadline_100ns,
+                            slice_remaining_100ns,
+                        );
+                        return cur != from_sched;
                     }
                     if to_in_kernel {
                         panic!(
@@ -266,10 +280,13 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                             from_sched, to
                         );
                     }
+                    set_vcpu_current_thread(vid as usize, to);
+                    set_current_tid(to);
+                    with_thread_mut(to, |t| t.state = ThreadState::Running);
                     crate::process::switch_to_thread_process(to);
                     save_ctx_for(from_sched, frame);
                     restore_ctx_to_frame(to, frame);
-                    crate::sched::lock::KSchedulerLock::release_raw(vid as usize);
+                    crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
                     if !cur_not_running {
                         set_thread_in_kernel_locked(from_sched, false);
                     }
@@ -286,11 +303,17 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                     if with_thread(to, |t| t.is_idle_thread).unwrap_or(false) {
                         unsafe { enter_kernel_continuation_noreturn(to) }
                     }
+                    set_vcpu_current_thread(vid as usize, to);
+                    set_current_tid(to);
+                    with_thread_mut(to, |t| t.state = ThreadState::Running);
                     restore_ctx_to_frame(to, frame);
                 } else if from_sched == to && (cur_not_running || pending_resched || timeout_woke) {
+                    set_vcpu_current_thread(vid as usize, to);
+                    set_current_tid(to);
+                    with_thread_mut(to, |t| t.state = ThreadState::Running);
                     restore_ctx_to_frame(to, frame);
                 }
-                crate::sched::lock::KSchedulerLock::release_raw(vid as usize);
+                crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
                 set_thread_in_kernel_locked(to, false);
                 timer::schedule_running_slice_100ns(
                     now_100ns,
@@ -305,7 +328,7 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                 from_tid: from_sched,
             } => {
                 if !allow_idle_wait {
-                    crate::sched::lock::KSchedulerLock::release_raw(vid as usize);
+                    crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
                     timer::schedule_running_slice_100ns(
                         now_100ns,
                         next_deadline_100ns,
@@ -317,7 +340,7 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                     save_ctx_for(from_sched, frame);
                     from = 0;
                 }
-                crate::sched::lock::KSchedulerLock::release_raw(vid as usize);
+                crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
                 if crate::sched::all_threads_done() {
                     let code =
                         crate::process::process_exit_status(crate::process::current_pid()).unwrap_or(0);

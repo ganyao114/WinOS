@@ -1,5 +1,5 @@
 use crate::sched::{
-    self, current_tid, with_thread, with_thread_mut,
+    self, current_tid, with_thread,
     create_user_thread_locked, terminate_thread_locked,
     suspend_thread_locked, resume_thread_locked,
     set_thread_priority_locked, ThreadState,
@@ -263,7 +263,12 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
     if !out_ptr.is_null() {
         unsafe { out_ptr.write_volatile(handle) };
     }
-    let _ = (desired_access, create_flags);
+    // NtCreateThreadEx: 0x1 = CREATE_SUSPENDED.
+    if (create_flags & 0x1) != 0 {
+        let _lock = KSchedulerLock::lock();
+        suspend_thread_locked(tid);
+    }
+    let _ = desired_access;
     frame.x[0] = status::SUCCESS as u64;
 }
 
