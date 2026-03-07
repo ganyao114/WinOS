@@ -142,3 +142,20 @@ pub fn sync_get_mut(handle: u64) -> Option<&'static mut SyncObject> {
 pub fn sync_free(handle: u64) -> bool {
     unsafe { SYNC_STATE.table_mut() }.free(handle)
 }
+
+/// Get by raw obj_idx (not handle). Used after resolving via KHandleTable.
+pub fn sync_get_by_idx(idx: u32) -> Option<&'static SyncObject> {
+    let ptr = unsafe { SYNC_STATE.table() }.store.get_ptr(idx);
+    if ptr.is_null() { None } else { Some(unsafe { &*ptr }) }
+}
+
+/// Get mutable by raw obj_idx.
+pub fn sync_get_mut_by_idx(idx: u32) -> Option<&'static mut SyncObject> {
+    let ptr = unsafe { SYNC_STATE.table_mut() }.store.get_ptr(idx);
+    if ptr.is_null() { None } else { Some(unsafe { &mut *ptr }) }
+}
+
+/// Free by raw obj_idx. Called from kobject close_last_ref.
+pub fn sync_free_idx(idx: u32) -> bool {
+    unsafe { SYNC_STATE.table_mut() }.store.free(idx)
+}

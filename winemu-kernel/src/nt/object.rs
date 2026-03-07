@@ -1,8 +1,5 @@
 use core::mem::size_of;
 
-use crate::sched::sync::{
-    close_handle_info, close_handle_info_for_pid, duplicate_handle_between,
-};
 use crate::sched::wait::STATUS_SUCCESS;
 use winemu_shared::status;
 
@@ -70,17 +67,14 @@ pub(crate) fn handle_duplicate_object(frame: &mut SvcFrame) {
         return;
     };
 
-    let Some((src_htype, _src_idx)) = kobject::resolve_handle_target_for_pid(source_pid, src)
+    let Some((src_kind, _src_idx)) = kobject::resolve_handle_target_for_pid(source_pid, src)
     else {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     };
 
     if (options & DUPLICATE_SAME_ACCESS) == 0 {
-        let Some(meta) = kobject::object_type_meta(src_htype) else {
-            frame.x[0] = status::INVALID_HANDLE as u64;
-            return;
-        };
+        let meta = kobject::object_type_meta_for_kind(src_kind);
         if (desired_access & !meta.valid_access_mask) != 0 {
             close_source_if_requested(options, source_pid, src);
             frame.x[0] = status::ACCESS_DENIED as u64;
@@ -88,11 +82,11 @@ pub(crate) fn handle_duplicate_object(frame: &mut SvcFrame) {
         }
     }
 
-    let dup = match duplicate_handle_between(source_pid, src, target_pid) {
-        Ok(v) => v,
-        Err(st) => {
+    let dup = match kobject::duplicate_handle(source_pid, src, target_pid) {
+        Some(v) => v,
+        None => {
             close_source_if_requested(options, source_pid, src);
-            frame.x[0] = st as u64;
+            frame.x[0] = status::NO_MEMORY as u64;
             return;
         }
     };
@@ -108,12 +102,7 @@ fn close_source_if_requested(options: u32, source_pid: u32, source_handle: u64) 
     if (options & DUPLICATE_CLOSE_SOURCE) == 0 {
         return;
     }
-    let Some(info) = close_handle_info_for_pid(source_pid, source_handle) else {
-        return;
-    };
-    if info.destroy_object {
-        let _ = kobject::close_last_ref(info.htype, info.obj_idx);
-    }
+    kobject::close_handle_for_pid(source_pid, source_handle);
 }
 
 pub(crate) fn handle_close(frame: &mut SvcFrame) -> bool {
@@ -122,18 +111,7 @@ pub(crate) fn handle_close(frame: &mut SvcFrame) -> bool {
         frame.x[0] = STATUS_SUCCESS as u64;
         return true;
     }
-
-    let Some(info) = close_handle_info(h) else {
-        frame.x[0] = status::INVALID_HANDLE as u64;
-        return true;
-    };
-
-    if !info.destroy_object {
-        frame.x[0] = STATUS_SUCCESS as u64;
-        return true;
-    }
-
-    frame.x[0] = kobject::close_last_ref(info.htype, info.obj_idx) as u64;
+    frame.x[0] = kobject::close_handle_for_current(h) as u64;
     true
 }
 
@@ -143,14 +121,14 @@ fn query_object_basic(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) 
         return status::INFO_LENGTH_MISMATCH;
     }
 
-    let Some((htype, obj_idx)) = kobject::resolve_handle_target(handle) else {
+    if kobject::resolve_handle_target(handle).is_none() {
         return status::INVALID_HANDLE;
-    };
+    }
 
-    let refs = kobject::object_ref_count(htype, obj_idx).max(1);
+    let refs = 1u32;
     let mut obi = [0u8; OBJECT_BASIC_INFORMATION_SIZE];
-    obi[8..12].copy_from_slice(&refs.to_le_bytes()); // HandleCount
-    obi[12..16].copy_from_slice(&refs.to_le_bytes()); // PointerCount
+    obi[8..12].copy_from_slice(&refs.to_le_bytes());
+    obi[12..16].copy_from_slice(&refs.to_le_bytes());
 
     unsafe {
         core::ptr::copy_nonoverlapping(obi.as_ptr(), buf, OBJECT_BASIC_INFORMATION_SIZE);
@@ -160,10 +138,10 @@ fn query_object_basic(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) 
 }
 
 fn query_object_name(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -> u32 {
-    let Some((htype, obj_idx)) = kobject::resolve_handle_target(handle) else {
+    let Some((kind, obj_idx)) = kobject::resolve_handle_target(handle) else {
         return status::INVALID_HANDLE;
     };
-    let name_utf16 = kobject::object_name_utf16(htype, obj_idx);
+    let name_utf16 = kobject::object_name_utf16_for_kind(kind, obj_idx);
     let name_len_bytes = name_utf16
         .as_ref()
         .map(|n| n.len().saturating_mul(size_of::<u16>()))
@@ -201,12 +179,10 @@ fn query_object_name(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -
 }
 
 fn query_object_type(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -> u32 {
-    let Some((htype, obj_idx)) = kobject::resolve_handle_target(handle) else {
+    let Some((kind, _obj_idx)) = kobject::resolve_handle_target(handle) else {
         return status::INVALID_HANDLE;
     };
-    let Some(type_name_utf16) = kobject::object_type_name(htype) else {
-        return status::INVALID_HANDLE;
-    };
+    let type_name_utf16 = kobject::ops_for_kind(kind).type_name_utf16;
 
     let type_name_bytes = type_name_utf16.len() * size_of::<u16>();
     let required = OBJECT_TYPE_INFORMATION_SIZE + type_name_bytes;
@@ -219,11 +195,7 @@ fn query_object_type(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -
         core::ptr::write_bytes(buf, 0, OBJECT_TYPE_INFORMATION_SIZE);
     }
 
-    let refs = kobject::object_ref_count(htype, obj_idx).max(1);
-    let type_stats = kobject::object_type_stats(htype);
-    let total_objects = type_stats.object_count.max(1);
-    let total_handles = type_stats.handle_count.max(refs);
-    let type_meta = kobject::object_type_meta(htype).unwrap_or_default();
+    let type_meta = kobject::object_type_meta_for_kind(kind);
     let name_ptr = unsafe { buf.add(OBJECT_TYPE_INFORMATION_SIZE) };
     let name_addr = name_ptr as u64;
 
@@ -232,21 +204,9 @@ fn query_object_type(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -
         (buf.add(2) as *mut u16).write_volatile(type_name_bytes as u16);
         (buf.add(8) as *mut u64).write_volatile(name_addr);
 
-        // OBJECT_TYPE_INFORMATION counters:
-        // TotalNumberOfObjects / TotalNumberOfHandles / HighWater*.
-        (buf.add(16) as *mut u32).write_volatile(total_objects);
-        (buf.add(20) as *mut u32).write_volatile(total_handles);
-        (buf.add(40) as *mut u32).write_volatile(total_objects);
-        (buf.add(44) as *mut u32).write_volatile(total_handles);
-
         (buf.add(84) as *mut u32).write_volatile(type_meta.valid_access_mask);
-        (buf.add(88) as *mut u8).write_volatile(if type_meta.security_required { 1 } else { 0 });
-        (buf.add(89) as *mut u8).write_volatile(if type_meta.maintain_handle_count {
-            1
-        } else {
-            0
-        });
-        (buf.add(90) as *mut u8).write_volatile(htype as u8);
+        (buf.add(88) as *mut u8).write_volatile(type_meta.security_required as u8);
+        (buf.add(89) as *mut u8).write_volatile(type_meta.maintain_handle_count as u8);
 
         let mut i = 0usize;
         while i < type_name_utf16.len() {

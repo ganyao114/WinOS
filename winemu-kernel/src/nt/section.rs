@@ -1,6 +1,6 @@
 use crate::kobj::ObjectStore;
+use crate::process::{KObjectKind, KObjectRef, with_process_mut};
 use crate::rust_alloc::vec::Vec;
-use crate::sched::sync::{self, make_new_handle, HANDLE_TYPE_FILE, HANDLE_TYPE_SECTION};
 use winemu_shared::status;
 
 use super::common::align_up_4k;
@@ -140,10 +140,7 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
     let alloc_attrs = frame.x[5] as u32;
     let file_handle = frame.x[6];
 
-    let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_SECTION) else {
-        frame.x[0] = status::INVALID_HANDLE as u64;
-        return;
-    };
+    let meta = super::kobject::object_type_meta_for_kind(KObjectKind::Section);
     if (desired_access & !meta.valid_access_mask) != 0 {
         frame.x[0] = status::ACCESS_DENIED as u64;
         return;
@@ -167,11 +164,12 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
     let file_fd = if file_handle == 0 {
         None
     } else {
-        if sync::handle_type(file_handle) != HANDLE_TYPE_FILE {
-            frame.x[0] = status::INVALID_HANDLE as u64;
-            return;
+        let pid = crate::process::current_pid();
+        let obj = with_process_mut(pid, |p| p.handle_table.get(file_handle as u32)).flatten();
+        match obj {
+            Some(o) if o.kind == KObjectKind::File => file_host_fd(o.obj_idx),
+            _ => { frame.x[0] = status::INVALID_HANDLE as u64; return; }
         }
-        file_host_fd(sync::handle_idx(file_handle))
     };
     if file_handle != 0 && file_fd.is_none() {
         frame.x[0] = status::INVALID_HANDLE as u64;
@@ -194,7 +192,10 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
         frame.x[0] = status::NO_MEMORY as u64;
         return;
     }
-    let Some(handle) = make_new_handle(HANDLE_TYPE_SECTION, idx) else {
+    let pid = crate::process::current_pid();
+    let Some(handle) = with_process_mut(pid, |p| {
+        p.handle_table.add(KObjectRef::section(idx)).map(|v| v as u64)
+    }).flatten() else {
         named_section_remove_by_section(idx);
         section_free(idx);
         frame.x[0] = status::NO_MEMORY as u64;
@@ -212,10 +213,7 @@ pub(crate) fn handle_open_section(frame: &mut SvcFrame) {
     let desired_access = frame.x[1] as u32;
     let oa_ptr = frame.x[2];
 
-    let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_SECTION) else {
-        frame.x[0] = status::INVALID_HANDLE as u64;
-        return;
-    };
+    let meta = super::kobject::object_type_meta_for_kind(KObjectKind::Section);
     if (desired_access & !meta.valid_access_mask) != 0 {
         frame.x[0] = status::ACCESS_DENIED as u64;
         return;
@@ -239,7 +237,10 @@ pub(crate) fn handle_open_section(frame: &mut SvcFrame) {
         return;
     }
 
-    let Some(handle) = make_new_handle(HANDLE_TYPE_SECTION, section_idx) else {
+    let pid = crate::process::current_pid();
+    let Some(handle) = with_process_mut(pid, |p| {
+        p.handle_table.add(KObjectRef::section(section_idx)).map(|v| v as u64)
+    }).flatten() else {
         frame.x[0] = status::NO_MEMORY as u64;
         return;
     };
@@ -253,11 +254,13 @@ pub(crate) fn handle_open_section(frame: &mut SvcFrame) {
 // stack[0]=AllocationType, stack[1]=Win32Protect
 pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     let h = frame.x[0];
-    if sync::handle_type(h) != HANDLE_TYPE_SECTION {
-        frame.x[0] = status::INVALID_HANDLE as u64;
-        return;
-    }
-    let sec = match section_get(sync::handle_idx(h)) {
+    let pid = crate::process::current_pid();
+    let obj = with_process_mut(pid, |p| p.handle_table.get(h as u32)).flatten();
+    let sec_idx = match obj {
+        Some(o) if o.kind == KObjectKind::Section => o.obj_idx,
+        _ => { frame.x[0] = status::INVALID_HANDLE as u64; return; }
+    };
+    let sec = match section_get(sec_idx) {
         Some(s) => s,
         None => {
             frame.x[0] = status::INVALID_HANDLE as u64;

@@ -1,5 +1,3 @@
-use crate::sched::sync::{self, HANDLE_TYPE_PROCESS};
-
 use super::{boot_pid, current_vcpu_pid, process_exists};
 
 pub const PSEUDO_CURRENT_PROCESS: u64 = u64::MAX;
@@ -14,11 +12,7 @@ pub fn current_pid() -> u32 {
     }
     let vid = (crate::sched::vcpu_id() as usize).min(crate::sched::MAX_VCPUS - 1);
     let pid = current_vcpu_pid(vid);
-    if pid != 0 {
-        pid
-    } else {
-        boot_pid()
-    }
+    if pid != 0 { pid } else { boot_pid() }
 }
 
 pub fn resolve_process_handle(process_handle: u64) -> Option<u32> {
@@ -27,12 +21,15 @@ pub fn resolve_process_handle(process_handle: u64) -> Option<u32> {
         return if pid != 0 { Some(pid) } else { None };
     }
 
-    if sync::handle_type(process_handle) != HANDLE_TYPE_PROCESS {
+    use crate::process::{KObjectKind, with_process_mut};
+    let pid = current_pid();
+    let obj = with_process_mut(pid, |p| p.handle_table.get(process_handle as u32)).flatten()?;
+    if obj.kind != KObjectKind::Process {
         return None;
     }
-    let pid = sync::handle_idx(process_handle);
-    if pid == 0 || !process_exists(pid) {
+    let target_pid = obj.obj_idx;
+    if target_pid == 0 || !process_exists(target_pid) {
         return None;
     }
-    Some(pid)
+    Some(target_pid)
 }

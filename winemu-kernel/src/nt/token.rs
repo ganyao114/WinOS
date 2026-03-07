@@ -2,8 +2,6 @@ use core::mem::size_of;
 
 use winemu_shared::status;
 
-use crate::sched::sync::HANDLE_TYPE_TOKEN;
-
 use super::SvcFrame;
 
 const TOKEN_USER_CLASS: u32 = 1;
@@ -57,16 +55,17 @@ pub(crate) fn handle_open_process_token(frame: &mut SvcFrame) {
         return;
     };
 
-    let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_TOKEN) else {
-        frame.x[0] = status::INVALID_HANDLE as u64;
-        return;
-    };
+    let meta = super::kobject::object_type_meta_for_kind(crate::process::KObjectKind::Token);
     if (desired_access & !meta.valid_access_mask) != 0 {
         frame.x[0] = status::ACCESS_DENIED as u64;
         return;
     }
 
-    let Some(token_handle) = crate::sched::sync::make_new_handle(HANDLE_TYPE_TOKEN, pid) else {
+    let cur_pid = crate::process::current_pid();
+    let Some(token_handle) = super::kobject::add_handle_for_pid(
+        cur_pid,
+        crate::process::KObjectRef::token(pid),
+    ) else {
         frame.x[0] = status::NO_MEMORY as u64;
         return;
     };
@@ -112,16 +111,17 @@ fn resolve_token_owner_pid(token_handle: u64) -> Option<u32> {
         || token_handle == PSEUDO_CURRENT_THREAD_EFFECTIVE_TOKEN
     {
         let pid = crate::process::current_pid();
-        if pid != 0 {
-            return Some(pid);
-        }
-        return None;
+        return if pid != 0 { Some(pid) } else { None };
     }
 
-    if crate::sched::sync::handle_type(token_handle) != HANDLE_TYPE_TOKEN {
+    let cur_pid = crate::process::current_pid();
+    let obj = crate::process::with_process_mut(cur_pid, |p| {
+        p.handle_table.get(token_handle as u32)
+    }).flatten()?;
+    if obj.kind != crate::process::KObjectKind::Token {
         return None;
     }
-    let pid = crate::sched::sync::handle_idx(token_handle);
+    let pid = obj.obj_idx;
     if pid == 0 || !crate::process::process_exists(pid) {
         return None;
     }
@@ -154,12 +154,14 @@ fn query_token_linked_token(pid: u32, buf: *mut u8, len: usize, ret_len: *mut u3
         return status::BUFFER_TOO_SMALL;
     }
 
-    let Some(linked) = crate::sched::sync::make_new_handle(HANDLE_TYPE_TOKEN, pid) else {
+    let cur_pid = crate::process::current_pid();
+    let Some(linked) = super::kobject::add_handle_for_pid(
+        cur_pid,
+        crate::process::KObjectRef::token(pid),
+    ) else {
         return status::NO_MEMORY;
     };
-    unsafe {
-        (buf as *mut u64).write_volatile(linked);
-    }
+    unsafe { (buf as *mut u64).write_volatile(linked) };
     write_ret_len(ret_len, size_of::<u64>() as u32);
     status::SUCCESS
 }

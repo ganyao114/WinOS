@@ -1,4 +1,4 @@
-use crate::sched::sync::{self, HANDLE_TYPE_FILE};
+use crate::process::{KObjectKind, with_process_mut};
 
 use super::state::file_host_fd;
 
@@ -66,10 +66,10 @@ pub(crate) fn file_handle_to_host_fd_for_pid(owner_pid: u32, file_handle: u64) -
         STD_OUTPUT_HANDLE => Some(1),
         STD_ERROR_HANDLE => Some(2),
         _ => {
-            if sync::handle_type_by_owner(file_handle, owner_pid) == HANDLE_TYPE_FILE {
-                file_host_fd(sync::handle_idx_by_owner(file_handle, owner_pid))
-            } else {
-                None
+            let obj = with_process_mut(owner_pid, |p| p.handle_table.get(file_handle as u32)).flatten();
+            match obj {
+                Some(o) if o.kind == KObjectKind::File => file_host_fd(o.obj_idx),
+                _ => None,
             }
         }
     }

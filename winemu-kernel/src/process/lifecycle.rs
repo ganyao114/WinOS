@@ -61,12 +61,18 @@ pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> R
     };
     crate::log::debug_u64(0xC502_0002);
 
-    if section_handle != 0
-        && crate::sched::sync::handle_type(section_handle)
-            != crate::sched::sync::HANDLE_TYPE_SECTION
-    {
-        crate::log::debug_u64(0xC502_E002);
-        return Err(status::INVALID_HANDLE);
+    if section_handle != 0 {
+        use crate::process::{KObjectKind, with_process_mut};
+        let ppid = super::resolve_process_handle(parent_handle).unwrap_or(0);
+        let ok = with_process_mut(ppid, |p| {
+            p.handle_table.get(section_handle as u32)
+                .map(|o| o.kind == KObjectKind::Section)
+                .unwrap_or(false)
+        }).unwrap_or(false);
+        if !ok {
+            crate::log::debug_u64(0xC502_E002);
+            return Err(status::INVALID_HANDLE);
+        }
     }
 
     let Some((state, image_base, peb_va, child_as)) = with_process(parent_pid, |parent| {
@@ -102,12 +108,10 @@ pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> R
         return Err(status::NO_MEMORY);
     }
 
-    let Some(handle) = crate::sched::sync::make_new_handle_for_pid(
-        crate::sched::sync::HANDLE_TYPE_PROCESS,
-        pid,
+    let Some(handle) = crate::nt::kobject::add_handle_for_pid(
         parent_pid,
-    )
-    else {
+        crate::process::KObjectRef::process(pid),
+    ) else {
         crate::log::debug_u64(0xC502_E007);
         let _ = free_process(pid);
         return Err(status::NO_MEMORY);
@@ -121,7 +125,8 @@ pub fn open_process(pid: u32, _desired_access: u32) -> Result<u64, u32> {
     if pid == 0 || !process_exists(pid) {
         return Err(status::INVALID_PARAMETER);
     }
-    crate::sched::sync::make_new_handle(crate::sched::sync::HANDLE_TYPE_PROCESS, pid)
+    let cur_pid = super::handle::current_pid();
+    crate::nt::kobject::add_handle_for_pid(cur_pid, crate::process::KObjectRef::process(pid))
         .ok_or(status::NO_MEMORY)
 }
 
@@ -169,12 +174,10 @@ pub fn terminate_process(pid: u32, exit_status: u32) -> u32 {
 
     let tids = crate::sched::thread_ids_by_pid(pid);
     for tid in tids {
-        if crate::sched::terminate_thread_by_tid(tid) {
-            crate::sched::sync::thread_notify_terminated(tid);
-        }
+        let _ = crate::sched::terminate_thread_by_tid(tid);
     }
 
-    let _ = crate::sched::sync::close_all_handles_for_pid(pid);
+    crate::nt::kobject::drain_handles_for_pid(pid);
     finalize_process_if_no_threads(pid);
     status::SUCCESS
 }
@@ -221,7 +224,6 @@ fn finalize_process_if_no_threads(pid: u32) {
     crate::nt::file::cancel_pending_dir_notify_for_pid(pid);
     crate::nt::state::cleanup_process_owned_resources(pid);
     let _ = crate::hostcall::cancel_requests_for_owner_pid(pid);
-    crate::sched::sync::process_notify_terminated(pid);
     maybe_free_if_unreferenced(pid);
 }
 
@@ -229,16 +231,11 @@ fn maybe_free_if_unreferenced(pid: u32) {
     if pid == 0 || pid == boot_pid() {
         return;
     }
-
     let Some(thread_count) = with_process(pid, |p| p.thread_count) else {
         return;
     };
     if thread_count != 0 {
         return;
     }
-    if crate::sched::sync::object_ref_count(crate::sched::sync::HANDLE_TYPE_PROCESS, pid) != 0 {
-        return;
-    }
-
     let _ = free_process(pid);
 }

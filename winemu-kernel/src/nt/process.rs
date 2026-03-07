@@ -226,11 +226,7 @@ pub(crate) fn handle_open_process(frame: &mut SvcFrame) {
         return;
     }
 
-    let Some(meta) = super::kobject::object_type_meta(crate::sched::sync::HANDLE_TYPE_PROCESS)
-    else {
-        frame.x[0] = status::INVALID_HANDLE as u64;
-        return;
-    };
+    let meta = super::kobject::object_type_meta_for_kind(crate::process::KObjectKind::Process);
     if (desired_access & !meta.valid_access_mask) != 0 {
         frame.x[0] = status::ACCESS_DENIED as u64;
         return;
@@ -257,11 +253,7 @@ pub(crate) fn handle_create_process(frame: &mut SvcFrame) {
     let flags = frame.x[4] as u32;
     let section_handle = frame.x[5];
 
-    let Some(meta) = super::kobject::object_type_meta(crate::sched::sync::HANDLE_TYPE_PROCESS)
-    else {
-        frame.x[0] = status::INVALID_HANDLE as u64;
-        return;
-    };
+    let meta = super::kobject::object_type_meta_for_kind(crate::process::KObjectKind::Process);
     if (desired_access & !meta.valid_access_mask) != 0 {
         frame.x[0] = status::ACCESS_DENIED as u64;
         return;

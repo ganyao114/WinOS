@@ -3,7 +3,7 @@ use crate::rust_alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use crate::sched::sync::{self, make_new_handle, HANDLE_TYPE_KEY};
+use crate::process::{KObjectKind, KObjectRef, with_process_mut};
 use winemu_shared::status;
 use winereg::{
     KeyNode, RegistryKey, RegistryValue, RegistryValueData, REG_BINARY, REG_DWORD, REG_EXPAND_SZ,
@@ -59,10 +59,12 @@ fn alloc_key_handle(state: &mut RegistryState, node: KeyNode) -> Option<u32> {
 }
 
 fn key_node_from_handle(state: &RegistryState, handle: u64) -> Option<KeyNode> {
-    if sync::handle_type(handle) != HANDLE_TYPE_KEY {
+    let pid = crate::process::current_pid();
+    let obj = with_process_mut(pid, |p| p.handle_table.get(handle as u32)).flatten()?;
+    if obj.kind != KObjectKind::Key {
         return None;
     }
-    let idx = sync::handle_idx(handle);
+    let idx = obj.obj_idx;
     let ptr = state.handles.get_ptr(idx);
     if ptr.is_null() {
         return None;
@@ -276,7 +278,10 @@ pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
     };
 
     if !out_ptr.is_null() {
-        let Some(h) = make_new_handle(HANDLE_TYPE_KEY, handle_idx) else {
+        let pid = crate::process::current_pid();
+        let Some(h) = with_process_mut(pid, |p| {
+            p.handle_table.add(KObjectRef::key(handle_idx)).map(|v| v as u64)
+        }).flatten() else {
             let _ = state.handles.free(handle_idx);
             frame.x[0] = status::NO_MEMORY as u64;
             return;
@@ -318,7 +323,10 @@ pub(crate) fn handle_create_key(frame: &mut SvcFrame) {
         unsafe { disp_ptr.write_volatile(disp) };
     }
     if !out_ptr.is_null() {
-        let Some(h) = make_new_handle(HANDLE_TYPE_KEY, handle_idx) else {
+        let pid = crate::process::current_pid();
+        let Some(h) = with_process_mut(pid, |p| {
+            p.handle_table.add(KObjectRef::key(handle_idx)).map(|v| v as u64)
+        }).flatten() else {
             let _ = state.handles.free(handle_idx);
             frame.x[0] = status::NO_MEMORY as u64;
             return;

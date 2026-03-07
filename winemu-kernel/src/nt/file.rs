@@ -1,10 +1,19 @@
 use crate::hostcall;
 use crate::hypercall;
 use crate::kobj::ObjectStore;
+use crate::process::{KObjectKind, KObjectRef, with_process_mut};
 use crate::rust_alloc::vec::Vec;
-use crate::sched::sync::{self, make_new_handle, HANDLE_TYPE_FILE};
+use crate::sched::sync::event_set_by_handle_for_pid;
 use winemu_shared::hostcall as hc;
 use winemu_shared::status;
+
+fn handle_kind_for_pid(handle: u64, pid: u32) -> Option<KObjectKind> {
+    with_process_mut(pid, |p| p.handle_table.get(handle as u32)).flatten().map(|o| o.kind)
+}
+
+fn handle_idx_for_pid(handle: u64, pid: u32) -> u32 {
+    with_process_mut(pid, |p| p.handle_table.get(handle as u32)).flatten().map(|o| o.obj_idx).unwrap_or(0)
+}
 
 use super::common::{
     file_handle_to_host_fd, map_open_flags, write_iosb, IoStatusBlock, FILE_OPEN, HOST_OPEN_READ,
@@ -169,7 +178,7 @@ fn complete_pending_notify(req: &PendingDirNotify, st: u32, info: u64, signal_ev
         write_iosb(req.iosb_ptr, st, info);
     });
     if signal_event && req.event_handle != 0 {
-        let _ = sync::event_set_by_handle_for_pid(req.owner_pid, req.event_handle);
+        let _ = event_set_by_handle_for_pid(req.owner_pid, req.event_handle);
     }
     if req.waiter_tid != 0 {
         crate::sched::wake(req.waiter_tid, st);
@@ -438,7 +447,7 @@ fn cancel_pending_file_io_for_file(owner_pid: u32, file_idx: u32) {
                     let _ = with_owner_ttbr0(req.owner_pid, || {
                         write_iosb(req.iosb_ptr, status::INVALID_HANDLE, 0);
                     });
-                    let _ = sync::event_set_by_handle_for_pid(req.owner_pid, req.event_handle);
+                    let _ = event_set_by_handle_for_pid(req.owner_pid, req.event_handle);
                 }
                 let _ = to_remove.try_reserve(1);
                 to_remove.push(id);
@@ -510,7 +519,7 @@ pub(crate) fn cancel_pending_dir_notify_for_pid(owner_pid: u32) {
                     let _ = with_owner_ttbr0(req.owner_pid, || {
                         write_iosb(req.iosb_ptr, status::INVALID_HANDLE, 0);
                     });
-                    let _ = sync::event_set_by_handle_for_pid(req.owner_pid, req.event_handle);
+                    let _ = event_set_by_handle_for_pid(req.owner_pid, req.event_handle);
                 }
                 let _ = io_remove.try_reserve(1);
                 io_remove.push(id);
@@ -607,7 +616,7 @@ fn complete_pending_host_ioctl(
         write_iosb(req.iosb_ptr, st, info);
     });
     if req.event_handle != 0 {
-        let _ = sync::event_set_by_handle_for_pid(req.owner_pid, req.event_handle);
+        let _ = event_set_by_handle_for_pid(req.owner_pid, req.event_handle);
     }
     if req.waiter_tid != 0 {
         crate::sched::wake(req.waiter_tid, st);
@@ -622,7 +631,7 @@ fn complete_pending_file_io(req: &PendingFileIo, st: u32, info: u64) {
         write_iosb(req.iosb_ptr, st, info);
     });
     if req.event_handle != 0 {
-        let _ = sync::event_set_by_handle_for_pid(req.owner_pid, req.event_handle);
+        let _ = event_set_by_handle_for_pid(req.owner_pid, req.event_handle);
     }
 }
 
@@ -802,11 +811,7 @@ pub(crate) fn handle_create_file(frame: &mut SvcFrame) {
     let disposition = frame.x[7] as u32;
     let mut path_buf = [0u8; 512];
 
-    let Some(meta) = super::kobject::object_type_meta(HANDLE_TYPE_FILE) else {
-        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
-        frame.x[0] = status::INVALID_HANDLE as u64;
-        return;
-    };
+    let meta = super::kobject::object_type_meta_for_kind(crate::process::KObjectKind::File);
     if (access & !meta.valid_access_mask) != 0 {
         write_iosb(iosb_ptr, status::ACCESS_DENIED, 0);
         frame.x[0] = status::ACCESS_DENIED as u64;
@@ -853,7 +858,10 @@ pub(crate) fn handle_create_file(frame: &mut SvcFrame) {
         }
     };
     if !out_ptr.is_null() {
-        let Some(h) = make_new_handle(HANDLE_TYPE_FILE, idx) else {
+        let pid = crate::process::current_pid();
+        let Some(h) = with_process_mut(pid, |p| {
+            p.handle_table.add(KObjectRef::file(idx)).map(|v| v as u64)
+        }).flatten() else {
             file_free(idx);
             write_iosb(iosb_ptr, status::NO_MEMORY, 0);
             frame.x[0] = status::NO_MEMORY as u64;
@@ -886,14 +894,14 @@ pub(crate) fn handle_write_file(frame: &mut SvcFrame) {
     let byte_offset_ptr = frame.x[7] as *const u64;
 
     if event_handle != 0
-        && sync::handle_type_by_owner(event_handle, owner_pid) != sync::HANDLE_TYPE_EVENT
+        && handle_kind_for_pid(event_handle, owner_pid) != Some(KObjectKind::Event)
     {
         write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     }
 
-    let file_idx = sync::handle_idx_by_owner(file_handle, owner_pid);
+    let file_idx = handle_idx_for_pid(file_handle, owner_pid);
 
     let host_fd = match file_handle_to_host_fd(file_handle) {
         Some(fd) => fd,
@@ -988,14 +996,14 @@ pub(crate) fn handle_read_file(frame: &mut SvcFrame) {
     let byte_offset_ptr = frame.x[7] as *const u64;
 
     if event_handle != 0
-        && sync::handle_type_by_owner(event_handle, owner_pid) != sync::HANDLE_TYPE_EVENT
+        && handle_kind_for_pid(event_handle, owner_pid) != Some(KObjectKind::Event)
     {
         write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     }
 
-    let file_idx = sync::handle_idx_by_owner(file_handle, owner_pid);
+    let file_idx = handle_idx_for_pid(file_handle, owner_pid);
 
     let host_fd = match file_handle_to_host_fd(file_handle) {
         Some(fd) => fd,
@@ -1240,19 +1248,19 @@ pub(crate) fn handle_notify_change_directory_file(frame: &mut SvcFrame) {
     let completion_filter = frame.x[7] as u32;
     let watch_tree = unsafe { (frame.sp_el0 as *const u64).read_volatile() != 0 };
 
-    if sync::handle_type_by_owner(file_handle, owner_pid) != HANDLE_TYPE_FILE {
+    if handle_kind_for_pid(file_handle, owner_pid) != Some(KObjectKind::File) {
         write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     }
     if event_handle != 0
-        && sync::handle_type_by_owner(event_handle, owner_pid) != sync::HANDLE_TYPE_EVENT
+        && handle_kind_for_pid(event_handle, owner_pid) != Some(KObjectKind::Event)
     {
         write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     }
-    let file_idx = sync::handle_idx_by_owner(file_handle, owner_pid);
+    let file_idx = handle_idx_for_pid(file_handle, owner_pid);
     if file_idx == 0 {
         write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
         frame.x[0] = status::INVALID_HANDLE as u64;
@@ -1396,7 +1404,7 @@ pub(crate) fn handle_device_io_control_file(frame: &mut SvcFrame) {
     let output_len = unsafe { (frame.sp_el0 as *const u64).add(1).read_volatile() as usize };
 
     if event_handle != 0
-        && sync::handle_type_by_owner(event_handle, owner_pid) != sync::HANDLE_TYPE_EVENT
+        && handle_kind_for_pid(event_handle, owner_pid) != Some(KObjectKind::Event)
     {
         write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
         frame.x[0] = status::INVALID_HANDLE as u64;
@@ -1430,7 +1438,7 @@ pub(crate) fn handle_device_io_control_file(frame: &mut SvcFrame) {
                 write_iosb(iosb_ptr, status::SUCCESS, 0);
             }
             if event_handle != 0 {
-                let _ = sync::event_set_by_handle_for_pid(owner_pid, event_handle);
+                let _ = event_set_by_handle_for_pid(owner_pid, event_handle);
             }
             frame.x[0] = status::SUCCESS as u64;
         }
@@ -1452,7 +1460,7 @@ pub(crate) fn handle_device_io_control_file(frame: &mut SvcFrame) {
                 frame.x[0] = status::INVALID_PARAMETER as u64;
                 return;
             }
-            let file_idx = sync::handle_idx_by_owner(file_handle, owner_pid);
+            let file_idx = handle_idx_for_pid(file_handle, owner_pid);
             if file_idx == 0 {
                 write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
                 frame.x[0] = status::INVALID_HANDLE as u64;

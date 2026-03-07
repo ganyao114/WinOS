@@ -2,11 +2,13 @@ mod handle;
 mod lifecycle;
 mod query;
 mod set;
+pub mod handle_table;
 
 use crate::kobj::ObjectStore;
 use core::cell::UnsafeCell;
 
 pub use handle::{current_pid, resolve_process_handle};
+pub use handle_table::{KHandleTable, KObjectRef, KObjectKind, encode_handle, decode_handle};
 pub use lifecycle::{
     create_process, init_boot_process, last_handle_closed, on_thread_created, on_thread_terminated,
     open_process, process_accepts_new_threads, process_exists, process_exit_status,
@@ -38,9 +40,10 @@ pub struct KProcess {
     pub main_thread_tid: u32,
     pub thread_count: u32,
     pub create_time_100ns: u64,
-    pub waiters: crate::sched::sync::WaitQueue, // waiters on this process handle termination
+    pub waiters: crate::sched::sync::WaitQueue,
     pub address_space: ProcessAddressSpace,
     pub vm: crate::mm::vaspace::ProcessVmManager,
+    pub handle_table: KHandleTable,
 }
 
 impl KProcess {
@@ -67,6 +70,7 @@ impl KProcess {
             waiters: crate::sched::sync::WaitQueue::new(),
             address_space,
             vm: ProcessVmManager::new(USER_VA_BASE, USER_VA_LIMIT),
+            handle_table: KHandleTable::new(),
         }
     }
 }
