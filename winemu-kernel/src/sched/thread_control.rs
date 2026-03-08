@@ -6,14 +6,12 @@ use core::sync::atomic::Ordering;
 
 use crate::sched::global::{with_thread, with_thread_mut};
 use crate::sched::global::SCHED;
-use crate::sched::priority_queue::mark_shadow_priority_queue_dirty_locked;
 use crate::sched::topology::set_thread_state_locked;
 use crate::sched::types::ThreadState;
 use crate::sched::wait::{unblock_thread_locked, STATUS_SUCCESS};
 
 #[inline]
 fn notify_priority_changed_locked() {
-    mark_shadow_priority_queue_dirty_locked();
     SCHED
         .scheduler_update_needed
         .store(true, Ordering::Relaxed);
@@ -23,18 +21,31 @@ fn purge_tid_from_ready_queue_locked(tid: u32, priority: u8) {
     if tid == 0 {
         return;
     }
+    if !with_thread(tid, |t| t.in_ready_queue).unwrap_or(false) {
+        return;
+    }
     let queue = unsafe { SCHED.queue_raw_mut() };
     let store = unsafe { SCHED.threads_raw() };
-    while queue.remove(tid, priority, &|id| store.get_ptr(id)) {}
+    let _ = queue.remove(tid, priority, &|id| store.get_ptr(id));
+    with_thread_mut(tid, |t| {
+        t.in_ready_queue = false;
+        t.sched_next = 0;
+    });
 }
 
 fn push_tid_to_ready_queue_locked(tid: u32, priority: u8) {
     if tid == 0 {
         return;
     }
+    if with_thread(tid, |t| t.in_ready_queue).unwrap_or(false) {
+        return;
+    }
     let queue = unsafe { SCHED.queue_raw_mut() };
     let store = unsafe { SCHED.threads_raw_mut() } as *mut crate::sched::thread_store::ThreadStore;
     queue.push_with_store(tid, priority, &mut |id| unsafe { (*store).get_mut(id) });
+    with_thread_mut(tid, |t| {
+        t.in_ready_queue = true;
+    });
 }
 
 // ── Priority ──────────────────────────────────────────────────────────────────

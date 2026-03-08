@@ -182,6 +182,7 @@ pub struct KThread {
 
     // ready-queue intrusive link
     pub sched_next:     u32,
+    pub in_ready_queue: bool,
 }
 
 impl KThread {
@@ -209,6 +210,7 @@ impl KThread {
             transient_boost:         0,
             wait:                    WaitState::new(),
             sched_next:              0,
+            in_ready_queue:          false,
         }
     }
 }

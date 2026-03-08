@@ -6,7 +6,6 @@ use core::sync::atomic::Ordering;
 use crate::sched::cpu::{cpu_local, current_tid, vcpu_id};
 use crate::sched::cpu::set_needs_reschedule;
 use crate::sched::global::{SCHED, with_thread, with_thread_mut};
-use crate::sched::priority_queue::mark_shadow_priority_queue_dirty_locked;
 use crate::sched::types::{ThreadState, MAX_VCPUS};
 
 // ── set_thread_state_locked ───────────────────────────────────────────────────
@@ -43,9 +42,7 @@ pub fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
     // Push to ready queue if becoming Ready.
     if new_state == ThreadState::Ready {
         let priority = with_thread(tid, |t| t.priority).unwrap_or(8);
-        let queue = unsafe { SCHED.queue_raw_mut() };
-        let store = unsafe { SCHED.threads_raw_mut() } as *mut crate::sched::thread_store::ThreadStore;
-        queue.push_with_store(tid, priority, &mut |id| unsafe { (*store).get_mut(id) });
+        push_tid_to_ready_queue_locked(tid, priority);
 
         // Signal a vCPU that might be idle.
         hint_reschedule_any_idle();
@@ -57,7 +54,6 @@ pub fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
     }
 
     // Notify flush_unlock_edge that a full re-scan is needed.
-    mark_shadow_priority_queue_dirty_locked();
     SCHED.scheduler_update_needed.store(true, Ordering::Relaxed);
 }
 
@@ -116,9 +112,16 @@ fn purge_tid_from_ready_queue_locked(tid: u32, priority: u8) {
     if tid == 0 {
         return;
     }
+    if !with_thread(tid, |t| t.in_ready_queue).unwrap_or(false) {
+        return;
+    }
     let queue = unsafe { SCHED.queue_raw_mut() };
     let store = unsafe { SCHED.threads_raw() };
-    while queue.remove(tid, priority, &|id| store.get_ptr(id)) {}
+    let _ = queue.remove(tid, priority, &|id| store.get_ptr(id));
+    with_thread_mut(tid, |t| {
+        t.in_ready_queue = false;
+        t.sched_next = 0;
+    });
 }
 
 #[inline]
@@ -126,10 +129,16 @@ fn push_tid_to_ready_queue_locked(tid: u32, priority: u8) {
     if tid == 0 {
         return;
     }
+    if with_thread(tid, |t| t.in_ready_queue).unwrap_or(false) {
+        return;
+    }
     let queue = unsafe { SCHED.queue_raw_mut() };
     let store =
         unsafe { SCHED.threads_raw_mut() } as *mut crate::sched::thread_store::ThreadStore;
     queue.push_with_store(tid, priority, &mut |id| unsafe { (*store).get_mut(id) });
+    with_thread_mut(tid, |t| {
+        t.in_ready_queue = true;
+    });
 }
 
 #[inline]
@@ -190,7 +199,6 @@ pub fn set_thread_affinity_mask_locked(tid: u32, requested_mask: u64) -> bool {
         }
     }
 
-    mark_shadow_priority_queue_dirty_locked();
     SCHED.scheduler_update_needed.store(true, Ordering::Relaxed);
     true
 }

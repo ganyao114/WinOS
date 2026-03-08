@@ -4,10 +4,8 @@ pub mod types;
 pub mod thread_store;
 pub mod global;
 pub mod cpu;
-pub mod config;
 pub mod lock;
 pub mod queue;
-pub mod priority_queue;
 pub mod topology;
 pub mod context;
 pub mod wait;
@@ -37,10 +35,6 @@ pub use cpu::{
     set_needs_reschedule, take_needs_reschedule,
 };
 
-pub use config::{
-    SCHED_ENABLE_MESO_SHADOW, SCHED_ENABLE_STATE_SANITIZER, SCHED_USE_MESO_PICK,
-};
-
 // Scheduler lock
 pub use lock::{
     KSchedulerLock, SchedSpinlock, SCHED_LOCK,
@@ -50,14 +44,6 @@ pub use lock::{
 
 // Ready queue
 pub use queue::KReadyQueue;
-pub use priority_queue::{
-    KPriorityQueue,
-    mark_shadow_priority_queue_dirty_locked,
-    rebuild_shadow_priority_queue_if_dirty_locked,
-    rebuild_shadow_priority_queue_locked,
-    shadow_pick_for_vcpu,
-    validate_shadow_priority_queue_locked,
-};
 
 // Topology / state transitions
 pub use topology::{

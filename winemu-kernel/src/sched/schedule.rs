@@ -55,14 +55,21 @@ pub enum ScheduleReason {
 fn pick_next_thread_locked(vid: u32) -> u32 {
     let queue = unsafe { SCHED.queue_raw_mut() };
     let store = unsafe { SCHED.threads_raw() };
-    queue.pop_highest_matching(
+    let tid = queue.pop_highest_matching(
         &|id| store.get_ptr(id),
         &|t| {
             !t.is_idle_thread
                 && (t.affinity_mask & (1u32 << vid)) != 0
                 && (!t.in_kernel || t.last_vcpu_hint as u32 == vid)
         },
-    )
+    );
+    if tid != 0 {
+        with_thread_mut(tid, |t| {
+            t.in_ready_queue = false;
+            t.sched_next = 0;
+        });
+    }
+    tid
 }
 
 fn peek_next_thread_locked(vid: u32) -> u32 {
@@ -79,12 +86,20 @@ fn peek_next_thread_locked(vid: u32) -> u32 {
 }
 
 fn dequeue_ready_tid_locked(tid: u32) -> bool {
-    let Some(prio) = with_thread(tid, |t| t.priority) else {
+    let Some((prio, in_queue)) = with_thread(tid, |t| (t.priority, t.in_ready_queue)) else {
         return false;
     };
+    if !in_queue {
+        return false;
+    }
     let queue = unsafe { SCHED.queue_raw_mut() };
     let store = unsafe { SCHED.threads_raw() };
-    queue.remove(tid, prio, &|id| store.get_ptr(id))
+    let removed = queue.remove(tid, prio, &|id| store.get_ptr(id));
+    with_thread_mut(tid, |t| {
+        t.in_ready_queue = false;
+        t.sched_next = 0;
+    });
+    removed
 }
 
 // ── scheduler_round_locked ────────────────────────────────────────────────────
