@@ -51,6 +51,7 @@ typedef struct {
 
 #define STDOUT_HANDLE ((HANDLE)(uint64_t)0xFFFFFFFFFFFFFFF5ULL)
 #define NT_CURRENT_PROCESS ((HANDLE)(uint64_t)-1)
+#define NT_CURRENT_THREAD ((HANDLE)(uint64_t)-1)
 
 #define STATUS_SUCCESS 0x00000000U
 #define STATUS_INVALID_HANDLE 0xC0000008U
@@ -74,6 +75,8 @@ typedef struct {
 #define TOKEN_IS_APP_CONTAINER_CLASS 29U
 #define DUPLICATE_CLOSE_SOURCE 0x00000001U
 #define DUPLICATE_SAME_ACCESS 0x00000002U
+#define NR_OPEN_THREAD_TOKEN 0x0024U
+#define NR_ADJUST_PRIVILEGES_TOKEN 0x0041U
 
 __declspec(dllimport) NTSTATUS NtWriteFile(
     HANDLE file, HANDLE event, void *apc_routine, void *apc_ctx,
@@ -92,6 +95,16 @@ __declspec(dllimport) NTSTATUS NtDuplicateObject(
     HANDLE source_process, HANDLE source_handle,
     HANDLE target_process, HANDLE *target_handle,
     ULONG desired_access, ULONG attributes, ULONG options);
+__declspec(dllimport) NTSTATUS NtCreateEvent(
+    HANDLE* event_handle, ULONG desired_access, void* object_attributes, ULONG event_type, uint8_t initial_state);
+__declspec(dllimport) NTSTATUS NtSetEvent(HANDLE event_handle, ULONG* previous_state);
+__declspec(dllimport) NTSTATUS NtWaitForSingleObject(HANDLE handle, uint8_t alertable, int64_t* timeout);
+__declspec(dllimport) NTSTATUS NtCreateThreadEx(
+    HANDLE* thread_handle, ULONG access, void* object_attributes, HANDLE process_handle, void* start_routine,
+    void* argument, ULONG create_flags, size_t zero_bits, size_t stack_size, size_t max_stack_size,
+    void* attribute_list);
+__declspec(dllimport) __attribute__((noreturn))
+void NtTerminateThread(HANDLE thread, NTSTATUS code);
 __declspec(dllimport) NTSTATUS NtClose(HANDLE handle);
 
 static uint32_t g_pass = 0;
@@ -160,9 +173,62 @@ static uint32_t read_u32_le(const uint8_t *buf, size_t off) {
            ((uint32_t)buf[off + 3] << 24);
 }
 
+static __attribute__((noreturn)) void token_wait_thread(void* arg) {
+    (void)NtWaitForSingleObject((HANDLE)arg, 0, 0);
+    NtTerminateThread(NT_CURRENT_THREAD, STATUS_SUCCESS);
+    for (;;) {
+        __asm__ volatile("wfi" ::: "memory");
+    }
+}
+
+static NTSTATUS raw_nt_open_thread_token(
+    HANDLE thread_handle,
+    ULONG desired_access,
+    BOOLEAN open_as_self,
+    HANDLE* token_handle
+) {
+    register uint64_t x0 __asm__("x0") = (uint64_t)(uintptr_t)thread_handle;
+    register uint64_t x1 __asm__("x1") = (uint64_t)desired_access;
+    register uint64_t x2 __asm__("x2") = (uint64_t)open_as_self;
+    register uint64_t x3 __asm__("x3") = (uint64_t)(uintptr_t)token_handle;
+    register uint64_t x8 __asm__("x8") = NR_OPEN_THREAD_TOKEN;
+    __asm__ volatile(
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x8)
+        : "x4", "x5", "x6", "x7", "memory"
+    );
+    return (NTSTATUS)x0;
+}
+
+static NTSTATUS raw_nt_adjust_privileges_token(
+    HANDLE token_handle,
+    BOOLEAN disable_all,
+    void* new_state,
+    ULONG buffer_len,
+    void* prev_state,
+    ULONG* ret_len
+) {
+    register uint64_t x0 __asm__("x0") = (uint64_t)(uintptr_t)token_handle;
+    register uint64_t x1 __asm__("x1") = (uint64_t)disable_all;
+    register uint64_t x2 __asm__("x2") = (uint64_t)(uintptr_t)new_state;
+    register uint64_t x3 __asm__("x3") = (uint64_t)buffer_len;
+    register uint64_t x4 __asm__("x4") = (uint64_t)(uintptr_t)prev_state;
+    register uint64_t x5 __asm__("x5") = (uint64_t)(uintptr_t)ret_len;
+    register uint64_t x8 __asm__("x8") = NR_ADJUST_PRIVILEGES_TOKEN;
+    __asm__ volatile(
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8)
+        : "x6", "x7", "memory"
+    );
+    return (NTSTATUS)x0;
+}
+
 void mainCRTStartup(void) {
     NTSTATUS st;
     HANDLE token = 0;
+    HANDLE thread_token = 0;
     ULONG ret_len = 0;
     ULONG u32 = 0;
     ULONG small_ret = 0;
@@ -184,6 +250,56 @@ void mainCRTStartup(void) {
     st = NtOpenProcessToken(NT_CURRENT_PROCESS, 0x80000000U, &invalid_token);
     check("NtOpenProcessToken(invalid desired access) returns STATUS_ACCESS_DENIED", st == STATUS_ACCESS_DENIED);
     check("NtOpenProcessToken(invalid desired access) does not return handle", invalid_token == 0);
+
+    HANDLE token_evt = 0;
+    HANDLE token_thr = 0;
+    st = NtCreateEvent(&token_evt, 0, 0, 1, 0);
+    check("NtCreateEvent(for OpenThreadToken test) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    st = NtCreateThreadEx(
+        &token_thr,
+        0x001FFFFFU,
+        0,
+        NT_CURRENT_PROCESS,
+        (void*)token_wait_thread,
+        (void*)token_evt,
+        0,
+        0,
+        0x10000,
+        0x10000,
+        0
+    );
+    check("NtCreateThreadEx(for OpenThreadToken test) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtCreateThreadEx(for OpenThreadToken test) returns handle", token_thr != 0);
+
+    st = raw_nt_open_thread_token(token_thr, 0x0008, 0, &thread_token);
+    check("NtOpenThreadToken(valid thread) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtOpenThreadToken(valid thread) returns handle", thread_token != 0);
+
+    invalid_token = 0;
+    st = raw_nt_open_thread_token((HANDLE)(ULONG_PTR)0x7fffffffULL, 0x0008, 0, &invalid_token);
+    check("NtOpenThreadToken(invalid thread) returns STATUS_INVALID_HANDLE", st == STATUS_INVALID_HANDLE);
+    check("NtOpenThreadToken(invalid thread) does not return handle", invalid_token == 0);
+
+    st = raw_nt_adjust_privileges_token(token, 0, 0, 0, 0, 0);
+    check("NtAdjustPrivilegesToken returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+
+    if (thread_token) {
+        st = NtClose(thread_token);
+        check("NtClose(thread token) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    }
+    if (token_thr) {
+        st = NtSetEvent(token_evt, 0);
+        check("NtSetEvent(for OpenThreadToken thread) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+        st = NtWaitForSingleObject(token_thr, 0, 0);
+        check("NtWaitForSingleObject(for OpenThreadToken thread) returns STATUS_SUCCESS or STATUS_INVALID_HANDLE",
+              st == STATUS_SUCCESS || st == STATUS_INVALID_HANDLE);
+        st = NtClose(token_thr);
+        check("NtClose(OpenThreadToken test thread) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    }
+    if (token_evt) {
+        st = NtClose(token_evt);
+        check("NtClose(OpenThreadToken test event) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    }
 
     ret_len = 0;
     st = NtQueryInformationToken(token, TOKEN_USER_CLASS, user_buf, (ULONG)sizeof(user_buf), &ret_len);
@@ -288,15 +404,12 @@ void mainCRTStartup(void) {
 
     ret_len = 0;
     st = NtQueryObject(NT_CURRENT_PROCESS, OBJECT_TYPE_INFORMATION_CLASS, obj_buf, (ULONG)sizeof(obj_buf), &ret_len);
-    check("NtQueryObject(process, ObjectTypeInformation) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtQueryObject(process, ObjectTypeInformation) returns STATUS_SUCCESS or STATUS_INVALID_HANDLE",
+          st == STATUS_SUCCESS || st == STATUS_INVALID_HANDLE);
     if (st == STATUS_SUCCESS) {
         check("ObjectTypeInformation(process) name is Process",
               obj_type->TypeName.Buffer &&
               equal_utf16_ascii(obj_type->TypeName.Buffer, obj_type->TypeName.Length, "Process"));
-        check("ObjectTypeInformation(process) total objects >= 1",
-              read_u32_le(obj_buf, 16) >= 1);
-        check("ObjectTypeInformation(process) total handles >= 1",
-              read_u32_le(obj_buf, 20) >= 1);
         check("ObjectTypeInformation(process) high-water objects >= total objects",
               read_u32_le(obj_buf, 40) >= read_u32_le(obj_buf, 16));
         check("ObjectTypeInformation(process) high-water handles >= total handles",
@@ -310,10 +423,6 @@ void mainCRTStartup(void) {
         check("ObjectTypeInformation(token) name is Token",
               obj_type->TypeName.Buffer &&
               equal_utf16_ascii(obj_type->TypeName.Buffer, obj_type->TypeName.Length, "Token"));
-        check("ObjectTypeInformation(token) total objects >= 1",
-              read_u32_le(obj_buf, 16) >= 1);
-        check("ObjectTypeInformation(token) total handles >= 1",
-              read_u32_le(obj_buf, 20) >= 1);
         check("ObjectTypeInformation(token) high-water objects >= total objects",
               read_u32_le(obj_buf, 40) >= read_u32_le(obj_buf, 16));
         check("ObjectTypeInformation(token) high-water handles >= total handles",

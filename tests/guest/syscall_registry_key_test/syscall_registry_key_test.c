@@ -39,6 +39,7 @@ typedef struct {
 #define STATUS_BUFFER_TOO_SMALL 0xC0000023U
 #define STATUS_INFO_LENGTH_MISMATCH 0xC0000004U
 #define STATUS_ACCESS_DENIED 0xC0000022U
+#define STATUS_OBJECT_NAME_NOT_FOUND 0xC0000034U
 
 #define KEY_BASIC_INFORMATION_CLASS 0U
 #define KEY_FULL_INFORMATION_CLASS 2U
@@ -47,6 +48,7 @@ typedef struct {
 
 #define REG_DWORD 4U
 #define OBJ_CASE_INSENSITIVE 0x40U
+#define NR_OPEN_KEY_EX 0x012BU
 
 __declspec(dllimport) NTSTATUS NtWriteFile(
     HANDLE file, HANDLE event, void* apc_routine, void* apc_ctx,
@@ -165,6 +167,26 @@ static int utf16_ends_with_ascii(const WCHAR* wstr, ULONG wbytes, const char* as
     return 1;
 }
 
+static NTSTATUS raw_nt_open_key_ex(
+    HANDLE* key_handle,
+    ULONG desired_access,
+    OBJECT_ATTRIBUTES* object_attributes,
+    ULONG open_options
+) {
+    register uint64_t x0 __asm__("x0") = (uint64_t)(uintptr_t)key_handle;
+    register uint64_t x1 __asm__("x1") = (uint64_t)desired_access;
+    register uint64_t x2 __asm__("x2") = (uint64_t)(uintptr_t)object_attributes;
+    register uint64_t x3 __asm__("x3") = (uint64_t)open_options;
+    register uint64_t x8 __asm__("x8") = NR_OPEN_KEY_EX;
+    __asm__ volatile(
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x8)
+        : "x4", "x5", "x6", "x7", "memory"
+    );
+    return (NTSTATUS)x0;
+}
+
 void mainCRTStartup(void) {
     NTSTATUS st;
     HANDLE parent_key = 0;
@@ -203,10 +225,27 @@ void mainCRTStartup(void) {
     check("NtOpenKey(valid desired access) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     check("NtOpenKey(valid desired access) returns non-zero handle", opened_key != 0);
 
+    HANDLE opened_key_ex = 0;
+    st = raw_nt_open_key_ex(&opened_key_ex, 0, &parent_oa, 0);
+    check("NtOpenKeyEx(valid desired access) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtOpenKeyEx(valid desired access) returns non-zero handle", opened_key_ex != 0);
+
+    HANDLE denied_key_ex = 0;
+    st = raw_nt_open_key_ex(&denied_key_ex, 0x80000000U, &parent_oa, 0);
+    check("NtOpenKeyEx(invalid desired access) returns STATUS_ACCESS_DENIED", st == STATUS_ACCESS_DENIED);
+    check("NtOpenKeyEx(invalid desired access) returns no handle", denied_key_ex == 0);
+
     denied_key = 0;
     st = NtOpenKey(&denied_key, 0x80000000U, &parent_oa);
     check("NtOpenKey(invalid desired access) returns STATUS_ACCESS_DENIED", st == STATUS_ACCESS_DENIED);
     check("NtOpenKey(invalid desired access) returns no handle", denied_key == 0);
+
+    init_unicode(&sub_name, sub_buf, "DefinitelyMissingSubKey");
+    init_oa(&sub_oa, &sub_name, parent_key);
+    HANDLE missing_key_ex = 0;
+    st = raw_nt_open_key_ex(&missing_key_ex, 0, &sub_oa, 0);
+    check("NtOpenKeyEx(missing) returns STATUS_OBJECT_NAME_NOT_FOUND", st == STATUS_OBJECT_NAME_NOT_FOUND);
+    check("NtOpenKeyEx(missing) returns no handle", missing_key_ex == 0);
 
     init_unicode(&sub_name, sub_buf, "SubKeyA");
     init_oa(&sub_oa, &sub_name, parent_key);
@@ -282,6 +321,8 @@ void mainCRTStartup(void) {
 
     st = NtClose(sub_key);
     check("NtClose(sub key) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    st = NtClose(opened_key_ex);
+    check("NtClose(opened key ex) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     st = NtClose(opened_key);
     check("NtClose(opened key) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     st = NtClose(parent_key);

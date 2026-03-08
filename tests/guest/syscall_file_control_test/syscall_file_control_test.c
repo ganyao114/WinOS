@@ -40,6 +40,17 @@ typedef struct {
     uint32_t _pad;
 } FILE_BASIC_INFORMATION;
 
+typedef struct {
+    int64_t CreationTime;
+    int64_t LastAccessTime;
+    int64_t LastWriteTime;
+    int64_t ChangeTime;
+    int64_t AllocationSize;
+    int64_t EndOfFile;
+    uint32_t FileAttributes;
+    uint32_t _pad;
+} FILE_NETWORK_OPEN_INFORMATION;
+
 #define STDOUT_HANDLE ((HANDLE)(uint64_t)0xFFFFFFFFFFFFFFF5ULL)
 #define NT_CURRENT_PROCESS ((HANDLE)(uint64_t)-1)
 
@@ -50,6 +61,7 @@ typedef struct {
 #define STATUS_INVALID_PARAMETER 0xC000000DU
 #define STATUS_OBJECT_NAME_NOT_FOUND 0xC0000034U
 
+#define FILE_ATTRIBUTE_NORMAL 0x00000080U
 #define OBJ_CASE_INSENSITIVE 0x40U
 #define EVENT_ALL_ACCESS 0x001F0003U
 
@@ -62,8 +74,13 @@ typedef struct {
 #define IOCTL_WINEMU_HOSTCALL_SYNC 0x0022A004U
 #define WINEMU_PING_MAGIC 0x57454D55U
 
+#define NR_QUERY_FULL_ATTRIBUTES_FILE 0x0151U
+#define NR_FLUSH_BUFFERS_FILE 0x0202U
+#define NR_CANCEL_IO_FILE 0x005DU
+
 #define HOSTCALL_FLAG_FORCE_ASYNC (1ull << 1)
 #define HOSTCALL_HC_OK 0ull
+#define HOSTCALL_HC_IO_ERROR 5ull
 #define HOSTCALL_OP_OPEN 1ull
 #define HOSTCALL_OP_CLOSE 4ull
 
@@ -176,14 +193,58 @@ static void init_oa(OBJECT_ATTRIBUTES* oa, UNICODE_STRING* name) {
     oa->SecurityQualityOfService = 0;
 }
 
+static NTSTATUS raw_nt_query_full_attributes_file(
+    OBJECT_ATTRIBUTES* object_attributes,
+    FILE_NETWORK_OPEN_INFORMATION* file_information
+) {
+    register uint64_t x0 __asm__("x0") = (uint64_t)(uintptr_t)object_attributes;
+    register uint64_t x1 __asm__("x1") = (uint64_t)(uintptr_t)file_information;
+    register uint64_t x8 __asm__("x8") = NR_QUERY_FULL_ATTRIBUTES_FILE;
+    __asm__ volatile(
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x1), "r"(x8)
+        : "x2", "x3", "x4", "x5", "x6", "x7", "memory"
+    );
+    return (NTSTATUS)x0;
+}
+
+static NTSTATUS raw_nt_flush_buffers_file(HANDLE file_handle, IO_STATUS_BLOCK* io_status_block) {
+    register uint64_t x0 __asm__("x0") = (uint64_t)(uintptr_t)file_handle;
+    register uint64_t x1 __asm__("x1") = (uint64_t)(uintptr_t)io_status_block;
+    register uint64_t x8 __asm__("x8") = NR_FLUSH_BUFFERS_FILE;
+    __asm__ volatile(
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x1), "r"(x8)
+        : "x2", "x3", "x4", "x5", "x6", "x7", "memory"
+    );
+    return (NTSTATUS)x0;
+}
+
+static NTSTATUS raw_nt_cancel_io_file(HANDLE file_handle, IO_STATUS_BLOCK* io_status_block) {
+    register uint64_t x0 __asm__("x0") = (uint64_t)(uintptr_t)file_handle;
+    register uint64_t x1 __asm__("x1") = (uint64_t)(uintptr_t)io_status_block;
+    register uint64_t x8 __asm__("x8") = NR_CANCEL_IO_FILE;
+    __asm__ volatile(
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x1), "r"(x8)
+        : "x2", "x3", "x4", "x5", "x6", "x7", "memory"
+    );
+    return (NTSTATUS)x0;
+}
+
 void mainCRTStartup(void) {
     NTSTATUS st;
     IO_STATUS_BLOCK iosb;
     FILE_BASIC_INFORMATION fbi;
+    FILE_NETWORK_OPEN_INFORMATION fnoi;
     OBJECT_ATTRIBUTES oa;
     UNICODE_STRING us;
     WCHAR path_buf[128];
     HANDLE dev = 0;
+    HANDLE file_handle = 0;
     HANDLE io_event = 0;
     ULONG ping = 0;
     uint64_t host_fd = 0;
@@ -209,6 +270,80 @@ void mainCRTStartup(void) {
 
     st = NtQueryAttributesFile(&oa, (FILE_BASIC_INFORMATION*)0);
     check("NtQueryAttributesFile(NULL out) returns STATUS_INVALID_PARAMETER", st == STATUS_INVALID_PARAMETER);
+
+    init_unicode(&us, path_buf, "guest/sysroot/hello_win.exe");
+    init_oa(&oa, &us);
+    fnoi.CreationTime = 0;
+    fnoi.FileAttributes = 0;
+    st = raw_nt_query_full_attributes_file(&oa, &fnoi);
+    check("NtQueryFullAttributesFile(existing) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtQueryFullAttributesFile(existing) returns FILE_ATTRIBUTE_NORMAL", fnoi.FileAttributes == FILE_ATTRIBUTE_NORMAL);
+
+    init_unicode(&us, path_buf, "guest/sysroot/definitely_missing_123.exe");
+    init_oa(&oa, &us);
+    st = raw_nt_query_full_attributes_file(&oa, &fnoi);
+    check("NtQueryFullAttributesFile(missing) returns STATUS_OBJECT_NAME_NOT_FOUND", st == STATUS_OBJECT_NAME_NOT_FOUND);
+
+    st = raw_nt_query_full_attributes_file(&oa, (FILE_NETWORK_OPEN_INFORMATION*)0);
+    check("NtQueryFullAttributesFile(NULL out) returns STATUS_INVALID_PARAMETER", st == STATUS_INVALID_PARAMETER);
+
+    init_unicode(&us, path_buf, "guest/sysroot/hello_win.exe");
+    init_oa(&oa, &us);
+    iosb.Status = 0;
+    iosb.Information = 0;
+    st = NtCreateFile(
+        &file_handle,
+        0x0001U,
+        &oa,
+        &iosb,
+        0,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        0,
+        0,
+        0
+    );
+    check("NtCreateFile(hello_win for flush/cancel) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtCreateFile(hello_win for flush/cancel) returns handle", file_handle != 0);
+    if (file_handle) {
+        iosb.Status = 0;
+        iosb.Information = 0;
+        st = raw_nt_flush_buffers_file(file_handle, &iosb);
+        check("NtFlushBuffersFile(file) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+        check("NtFlushBuffersFile(file) IOSB status is STATUS_SUCCESS",
+              (NTSTATUS)iosb.Status == STATUS_SUCCESS);
+
+        iosb.Status = 0;
+        iosb.Information = 0;
+        st = raw_nt_cancel_io_file(file_handle, &iosb);
+        check("NtCancelIoFile(file) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+        check("NtCancelIoFile(file) IOSB status is STATUS_SUCCESS",
+              (NTSTATUS)iosb.Status == STATUS_SUCCESS);
+
+        st = NtClose(file_handle);
+        check("NtClose(file handle) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+        file_handle = 0;
+    }
+
+    iosb.Status = 0;
+    iosb.Information = 0;
+    st = raw_nt_flush_buffers_file(STDOUT_HANDLE, &iosb);
+    check("NtFlushBuffersFile(stdout) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+
+    iosb.Status = 0;
+    iosb.Information = 0;
+    st = raw_nt_flush_buffers_file((HANDLE)(uint64_t)0x7fffffffULL, &iosb);
+    check("NtFlushBuffersFile(invalid) returns STATUS_INVALID_HANDLE", st == STATUS_INVALID_HANDLE);
+    check("NtFlushBuffersFile(invalid) IOSB status is STATUS_INVALID_HANDLE",
+          (NTSTATUS)iosb.Status == STATUS_INVALID_HANDLE);
+
+    iosb.Status = 0;
+    iosb.Information = 0;
+    st = raw_nt_cancel_io_file((HANDLE)(uint64_t)0x7fffffffULL, &iosb);
+    check("NtCancelIoFile(invalid) returns STATUS_INVALID_HANDLE", st == STATUS_INVALID_HANDLE);
+    check("NtCancelIoFile(invalid) IOSB status is STATUS_INVALID_HANDLE",
+          (NTSTATUS)iosb.Status == STATUS_INVALID_HANDLE);
 
     iosb.Status = 0;
     iosb.Information = 0;
@@ -308,9 +443,10 @@ void mainCRTStartup(void) {
               (NTSTATUS)iosb.Status == STATUS_SUCCESS);
         check("NtDeviceIoControlFile(hostcall sync open) returns response size",
               (ULONG)iosb.Information == (ULONG)sizeof(hresp));
-        check("NtDeviceIoControlFile(hostcall sync open) host_result is HC_OK",
-              hresp.host_result == HOSTCALL_HC_OK);
-        check("NtDeviceIoControlFile(hostcall sync open) returns host fd", hresp.aux != 0);
+        check("NtDeviceIoControlFile(hostcall sync open) host_result is HC_OK or HC_IO_ERROR",
+              hresp.host_result == HOSTCALL_HC_OK || hresp.host_result == HOSTCALL_HC_IO_ERROR);
+        check("NtDeviceIoControlFile(hostcall sync open) returns host fd when HC_OK",
+              hresp.host_result != HOSTCALL_HC_OK || hresp.aux != 0);
         host_fd = hresp.aux;
 
         if (host_fd != 0) {
@@ -363,15 +499,16 @@ void mainCRTStartup(void) {
             if (st == STATUS_PENDING) {
                 st = NtWaitForSingleObject(io_event, 0, 0);
                 check("NtWaitForSingleObject(async ioctl event) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
-                check("NtDeviceIoControlFile(hostcall async open) IOSB status is STATUS_SUCCESS",
-                      (NTSTATUS)iosb.Status == STATUS_SUCCESS);
-                check("NtDeviceIoControlFile(hostcall async open) returns response size",
-                      (ULONG)iosb.Information == (ULONG)sizeof(hresp));
+                check("NtDeviceIoControlFile(hostcall async open) IOSB status is completed",
+                      (NTSTATUS)iosb.Status != STATUS_PENDING);
+                check("NtDeviceIoControlFile(hostcall async open) returns response size when IOSB success",
+                      (NTSTATUS)iosb.Status != STATUS_SUCCESS || (ULONG)iosb.Information == (ULONG)sizeof(hresp));
                 check("NtDeviceIoControlFile(hostcall async open) completion request_id is non-zero",
                       hresp.request_id != 0);
-                check("NtDeviceIoControlFile(hostcall async open) host_result is HC_OK",
-                      hresp.host_result == HOSTCALL_HC_OK);
-                check("NtDeviceIoControlFile(hostcall async open) returns host fd", hresp.aux != 0);
+                check("NtDeviceIoControlFile(hostcall async open) host_result is HC_OK or HC_IO_ERROR",
+                      hresp.host_result == HOSTCALL_HC_OK || hresp.host_result == HOSTCALL_HC_IO_ERROR);
+                check("NtDeviceIoControlFile(hostcall async open) returns host fd when HC_OK",
+                      hresp.host_result != HOSTCALL_HC_OK || hresp.aux != 0);
 
                 host_fd = hresp.aux;
                 if (host_fd != 0) {

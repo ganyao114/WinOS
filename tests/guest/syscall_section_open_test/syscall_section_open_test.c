@@ -30,11 +30,20 @@ typedef struct {
     void* SecurityQualityOfService;
 } OBJECT_ATTRIBUTES;
 
+typedef struct {
+    uint64_t BaseAddress;
+    uint32_t AllocationAttributes;
+    uint32_t _pad;
+    uint64_t MaximumSize;
+} SECTION_BASIC_INFORMATION;
+
 #define STDOUT_HANDLE ((HANDLE)(uint64_t)0xFFFFFFFFFFFFFFF5ULL)
 #define NT_CURRENT_PROCESS ((HANDLE)(uint64_t)-1)
 
 #define STATUS_SUCCESS 0x00000000U
 #define STATUS_INVALID_PARAMETER 0xC000000DU
+#define STATUS_INVALID_HANDLE 0xC0000008U
+#define STATUS_BUFFER_TOO_SMALL 0xC0000023U
 #define STATUS_OBJECT_NAME_COLLISION 0xC0000035U
 #define STATUS_OBJECT_NAME_NOT_FOUND 0xC0000034U
 #define STATUS_INFO_LENGTH_MISMATCH 0xC0000004U
@@ -44,6 +53,7 @@ typedef struct {
 #define SEC_COMMIT 0x08000000U
 #define OBJ_CASE_INSENSITIVE 0x40U
 #define OBJECT_NAME_INFORMATION_CLASS 1U
+#define NR_QUERY_SECTION 0x0051U
 
 __declspec(dllimport) NTSTATUS NtWriteFile(
     HANDLE file, HANDLE event, void* apc_routine, void* apc_ctx,
@@ -157,12 +167,36 @@ static int utf16_ends_with_ascii_ci(const WCHAR* wstr, ULONG wbytes, const char*
     return 1;
 }
 
+static NTSTATUS raw_nt_query_section(
+    HANDLE section_handle,
+    ULONG info_class,
+    void* info,
+    ULONG info_len,
+    ULONG* ret_len
+) {
+    register uint64_t x0 __asm__("x0") = (uint64_t)(uintptr_t)section_handle;
+    register uint64_t x1 __asm__("x1") = (uint64_t)info_class;
+    register uint64_t x2 __asm__("x2") = (uint64_t)(uintptr_t)info;
+    register uint64_t x3 __asm__("x3") = (uint64_t)info_len;
+    register uint64_t x4 __asm__("x4") = (uint64_t)(uintptr_t)ret_len;
+    register uint64_t x8 __asm__("x8") = NR_QUERY_SECTION;
+    __asm__ volatile(
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x8)
+        : "x5", "x6", "x7", "memory"
+    );
+    return (NTSTATUS)x0;
+}
+
 void mainCRTStartup(void) {
     NTSTATUS st;
     HANDLE section_a = 0;
     HANDLE section_b = 0;
     HANDLE section_c = 0;
     ULONG ret_len = 0;
+    SECTION_BASIC_INFORMATION sbi = {0};
+    uint8_t section_image_info[40];
     uint64_t section_size = 0x2000;
     uint8_t obj_name_info[256];
     uint8_t short_obj_name_info[8];
@@ -190,6 +224,38 @@ void mainCRTStartup(void) {
     st = NtOpenSection(&section_b, 0, &named_oa);
     check("NtOpenSection(existing name) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     check("NtOpenSection(existing name) returns non-zero handle", section_b != 0);
+
+    ret_len = 0;
+    sbi.AllocationAttributes = 0;
+    sbi.MaximumSize = 0;
+    st = raw_nt_query_section(section_a, 0, &sbi, (ULONG)sizeof(sbi), &ret_len);
+    check("NtQuerySection(SectionBasicInformation) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtQuerySection(SectionBasicInformation) reports expected length", ret_len == (ULONG)sizeof(sbi));
+    check("NtQuerySection(SectionBasicInformation) allocation attrs match SEC_COMMIT",
+          sbi.AllocationAttributes == SEC_COMMIT);
+    check("NtQuerySection(SectionBasicInformation) maximum size is 0x2000", sbi.MaximumSize == section_size);
+
+    ret_len = 0;
+    st = raw_nt_query_section(section_a, 0, &sbi, 8, &ret_len);
+    check("NtQuerySection(SectionBasicInformation, short) returns STATUS_BUFFER_TOO_SMALL",
+          st == STATUS_BUFFER_TOO_SMALL);
+    check("NtQuerySection(SectionBasicInformation, short) reports expected length",
+          ret_len == (ULONG)sizeof(sbi));
+
+    ret_len = 0;
+    section_image_info[0] = 0xAA;
+    st = raw_nt_query_section(section_a, 1, section_image_info, (ULONG)sizeof(section_image_info), &ret_len);
+    check("NtQuerySection(SectionImageInformation) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtQuerySection(SectionImageInformation) reports expected length", ret_len == (ULONG)sizeof(section_image_info));
+    check("NtQuerySection(SectionImageInformation) zero-fills output", section_image_info[0] == 0);
+
+    ret_len = 0;
+    st = raw_nt_query_section(section_a, 0xFFFFU, &sbi, (ULONG)sizeof(sbi), &ret_len);
+    check("NtQuerySection(unknown class) returns STATUS_INVALID_PARAMETER", st == STATUS_INVALID_PARAMETER);
+
+    ret_len = 0;
+    st = raw_nt_query_section((HANDLE)(uint64_t)0x7fffffffULL, 0, &sbi, (ULONG)sizeof(sbi), &ret_len);
+    check("NtQuerySection(invalid handle) returns STATUS_INVALID_HANDLE", st == STATUS_INVALID_HANDLE);
 
     section_c = 0;
     st = NtOpenSection(&section_c, 0x80000000U, &named_oa);
