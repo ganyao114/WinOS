@@ -278,41 +278,14 @@ pub(crate) fn handle_create_process(frame: &mut SvcFrame) {
 pub(crate) fn handle_terminate_process(frame: &mut SvcFrame) {
     let process_handle = frame.x[0];
     let exit_status = frame.x[1] as u32;
-    let dbg2 = frame.x[2];
-    let dbg3 = frame.x[3];
-    let dbg4 = frame.x[4];
-    let dbg5 = frame.x[5];
-    crate::log::debug_print("nt: NtTerminateProcess enter h=");
-    crate::log::debug_u64(process_handle);
-    crate::log::debug_print(" status=");
-    crate::log::debug_u64(exit_status as u64);
-    crate::log::debug_print(" d2=");
-    crate::log::debug_u64(dbg2);
-    crate::log::debug_print(" d3=");
-    crate::log::debug_u64(dbg3);
-    crate::log::debug_print(" d4=");
-    crate::log::debug_u64(dbg4);
-    crate::log::debug_print(" d5=");
-    crate::log::debug_u64(dbg5);
-    crate::log::debug_print(" elr=");
-    crate::log::debug_u64(frame.elr);
-    crate::log::debug_print(" fp=");
-    crate::log::debug_u64(frame.x[29]);
-    crate::log::debug_print(" lr=");
-    crate::log::debug_u64(frame.x[30]);
-    crate::log::debug_print("\n");
-
     let Some(pid) = crate::process::resolve_process_handle(process_handle) else {
-        crate::log::debug_print("nt: NtTerminateProcess invalid handle\n");
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     };
-    crate::log::debug_print("nt: NtTerminateProcess pid=");
-    crate::log::debug_u64(pid as u64);
-    crate::log::debug_print("\n");
     if exit_status == CPP_EH_EXCEPTION_CODE {
-        trace_cpp_exception_type_name(pid, dbg2, dbg3);
+        trace_cpp_exception_type_name(pid, frame.x[2], frame.x[3]);
     }
 
-    frame.x[0] = crate::process::terminate_process(pid, exit_status) as u64;
+    let st = crate::process::terminate_process(pid, exit_status);
+    frame.x[0] = st as u64;
 }

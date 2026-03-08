@@ -239,6 +239,34 @@ pub fn host_notify_dir(
     }
 }
 
+/// HOST_MEMSET — fill guest physical memory range.
+/// Returns true on success.
+pub fn host_memset(dst_gpa: u64, len: usize, value: u8) -> bool {
+    hypercall6(
+        nr::HOST_MEMSET,
+        dst_gpa,
+        len as u64,
+        value as u64,
+        0,
+        0,
+        0,
+    ) == 0
+}
+
+/// HOST_MEMCPY — copy guest physical memory range.
+/// Returns true on success.
+pub fn host_memcpy(dst_gpa: u64, src_gpa: u64, len: usize) -> bool {
+    hypercall6(
+        nr::HOST_MEMCPY,
+        dst_gpa,
+        src_gpa,
+        len as u64,
+        0,
+        0,
+        0,
+    ) == 0
+}
+
 /// Raw HOST_MMAP primitive. Keep internal so callers must choose explicit
 /// tracked/untracked mapping semantics.
 fn host_mmap_raw(fd: u64, offset: u64, size: u64, prot: u32) -> u64 {

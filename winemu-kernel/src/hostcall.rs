@@ -329,7 +329,7 @@ pub fn wait_current_for_request_pending(request_id: u64, timeout: WaitDeadline) 
         sched::block_thread_locked(cur, deadline);
         // _slp drops here → flush_unlock_edge → thread switches out
     }
-    // Thread resumes here after pump_completions calls sched::wake()
+    // Thread resumes here after pump_completions calls sched::wake().
     STATUS_PENDING
 }
 
@@ -349,23 +349,33 @@ fn cleanup_request(request_id: u64, cancel_host: bool) {
 }
 
 pub fn pump_completions() {
-    const CPL_BATCH: usize = 32;
-    let mut cpls = [hypercall::HostCallCompletion::default(); CPL_BATCH];
-    let got = hypercall::hostcall_poll_batch(cpls.as_mut_ptr(), cpls.len());
-    if got == 0 {
-        return;
-    }
-
-    for cpl in cpls.iter().take(got.min(cpls.len())) {
-        let cpl = *cpl;
-        let Some(waiter) = take_waiter_by_request(cpl.request_id) else {
-            continue;
+    const CPL_POLL_LIMIT: usize = 32;
+    let mut cpl = hypercall::HostCallCompletion::default();
+    let mut processed = 0usize;
+    loop {
+        if processed >= CPL_POLL_LIMIT {
+            break;
+        }
+        let got = hypercall::hostcall_poll_batch(&mut cpl as *mut _, 1);
+        if got == 0 {
+            break;
+        }
+        let cpl = cpl;
+        let waiter = match take_waiter_by_request(cpl.request_id) {
+            Some(w) => w,
+            None => {
+                processed = processed.saturating_add(1);
+                continue;
+            }
         };
+
         if waiter.waiter_tid == 0 {
             let _ = crate::nt::file::dispatch_async_hostcall_completion(cpl);
+            processed = processed.saturating_add(1);
             continue;
         }
         if crate::nt::file::dispatch_async_hostcall_completion(cpl) {
+            processed = processed.saturating_add(1);
             continue;
         }
         let host_result = if cpl.host_result < 0 {
@@ -382,6 +392,7 @@ pub fn pump_completions() {
         if crate::process::process_exists(waiter.owner_pid) {
             sched::wake(waiter.waiter_tid, wake_st);
         }
+        processed = processed.saturating_add(1);
     }
 }
 

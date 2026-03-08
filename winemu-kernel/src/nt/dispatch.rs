@@ -5,6 +5,7 @@
 use crate::hypercall;
 use crate::sched::{
     current_tid, drain_deferred_kstacks, set_thread_in_kernel_locked,
+    set_needs_reschedule,
     vcpu_id, with_thread, with_thread_mut, set_current_tid, set_vcpu_current_thread, ThreadState,
     SCHED_LOCK, SchedulerRoundAction, scheduler_round_locked,
     execute_kernel_continuation_switch, enter_kernel_continuation_noreturn,
@@ -23,6 +24,32 @@ use super::{
 };
 
 static SYSCALL_ERR_TRACE_BUDGET: AtomicU32 = AtomicU32::new(512);
+const DEFERRED_RESCHED_RETRY_100NS: u64 = 10_000; // 1ms
+static TRAP_SCHED_ACTIVE: [AtomicU32; 8] = [
+    AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0),
+];
+
+struct TrapSchedGuard {
+    vid: usize,
+}
+
+impl TrapSchedGuard {
+    #[inline]
+    fn enter(vid: usize) -> Self {
+        TRAP_SCHED_ACTIVE[vid].fetch_add(1, Ordering::AcqRel);
+        Self { vid }
+    }
+}
+
+impl Drop for TrapSchedGuard {
+    #[inline]
+    fn drop(&mut self) {
+        TRAP_SCHED_ACTIVE[self.vid].fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn svc_migrate_frame_to_thread_stack(_frame_ptr: u64, _frame_size: u64) -> u64 {
@@ -49,7 +76,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
                 0x127 => {
                     // NtUserInitializeClientPfnArrays
                     win32k::handle_user_initialize_client_pfn_arrays(frame);
-                    schedule_from_trap(frame, true, true);
+                    schedule_from_trap(frame, true, true, 0);
                     return;
                 }
                 _ => {}
@@ -59,7 +86,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         // Non-NT tables still need normal trap-exit scheduling so timer slice /
         // deadline programming remains consistent on this path.
         forward_to_vmm(frame, nr, table);
-        schedule_from_trap(frame, true, true);
+        schedule_from_trap(frame, true, true, 0);
         return;
     }
 
@@ -139,7 +166,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
     }
 
     trace_syscall_error(nr, table, frame);
-    schedule_from_trap(frame, true, true);
+    schedule_from_trap(frame, true, true, 0);
 }
 
 fn trace_syscall_error(nr: u16, table: u8, frame: &SvcFrame) {
@@ -195,9 +222,15 @@ fn restore_ctx_to_frame(tid: u32, frame: &mut SvcFrame) {
     });
 }
 
-fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcall: bool) -> bool {
+fn schedule_from_trap(
+    frame: &mut SvcFrame,
+    allow_idle_wait: bool,
+    drain_hostcall: bool,
+    quantum_100ns: u64,
+) -> bool {
     let vid = vcpu_id();
-    let quantum_100ns = timer::DEFAULT_TIMESLICE_100NS;
+    let vid_u8 = vid as u8;
+    let _active_guard = TrapSchedGuard::enter(vid as usize);
     let mut from = current_tid();
     if from != 0 {
         save_ctx_for(from, frame);
@@ -216,7 +249,10 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                 crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
                 let cur = current_tid();
                 if cur != 0 {
-                    with_thread_mut(cur, |t| t.state = ThreadState::Running);
+                    with_thread_mut(cur, |t| {
+                        t.state = ThreadState::Running;
+                        t.last_vcpu_hint = vid_u8;
+                    });
                     set_thread_in_kernel_locked(cur, false);
                 }
                 timer::schedule_running_slice_100ns(
@@ -262,7 +298,10 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                         if cur != 0 {
                             set_vcpu_current_thread(vid as usize, cur);
                             set_current_tid(cur);
-                            with_thread_mut(cur, |t| t.state = ThreadState::Running);
+                            with_thread_mut(cur, |t| {
+                                t.state = ThreadState::Running;
+                                t.last_vcpu_hint = vid_u8;
+                            });
                             crate::process::switch_to_thread_process(cur);
                             restore_ctx_to_frame(cur, frame);
                             set_thread_in_kernel_locked(cur, false);
@@ -282,7 +321,10 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                     }
                     set_vcpu_current_thread(vid as usize, to);
                     set_current_tid(to);
-                    with_thread_mut(to, |t| t.state = ThreadState::Running);
+                    with_thread_mut(to, |t| {
+                        t.state = ThreadState::Running;
+                        t.last_vcpu_hint = vid_u8;
+                    });
                     crate::process::switch_to_thread_process(to);
                     save_ctx_for(from_sched, frame);
                     restore_ctx_to_frame(to, frame);
@@ -305,12 +347,18 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                     }
                     set_vcpu_current_thread(vid as usize, to);
                     set_current_tid(to);
-                    with_thread_mut(to, |t| t.state = ThreadState::Running);
+                    with_thread_mut(to, |t| {
+                        t.state = ThreadState::Running;
+                        t.last_vcpu_hint = vid_u8;
+                    });
                     restore_ctx_to_frame(to, frame);
                 } else if from_sched == to && (cur_not_running || pending_resched || timeout_woke) {
                     set_vcpu_current_thread(vid as usize, to);
                     set_current_tid(to);
-                    with_thread_mut(to, |t| t.state = ThreadState::Running);
+                    with_thread_mut(to, |t| {
+                        t.state = ThreadState::Running;
+                        t.last_vcpu_hint = vid_u8;
+                    });
                     restore_ctx_to_frame(to, frame);
                 }
                 crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
@@ -341,12 +389,11 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
                     from = 0;
                 }
                 crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
-                if crate::sched::all_threads_done() {
-                    let code =
-                        crate::process::process_exit_status(crate::process::current_pid()).unwrap_or(0);
-                    hypercall::process_exit(code);
-                }
-                timer::idle_wait_until_deadline_100ns(now_100ns, next_deadline_100ns);
+                crate::sched::schedule::idle_wait_or_exit(
+                    vid as usize,
+                    now_100ns,
+                    next_deadline_100ns,
+                );
                 continue;
             }
         }
@@ -355,12 +402,28 @@ fn schedule_from_trap(frame: &mut SvcFrame, allow_idle_wait: bool, drain_hostcal
 
 #[no_mangle]
 pub extern "C" fn timer_irq_dispatch(frame: &mut SvcFrame) {
+    let vid = vcpu_id() as usize;
     let cur = current_tid();
+    let in_nested_trap_sched = TRAP_SCHED_ACTIVE[vid].load(Ordering::Acquire) != 0;
+    let cur_in_kernel = if cur != 0 {
+        with_thread(cur, |t| t.in_kernel).unwrap_or(false)
+    } else {
+        false
+    };
+    if in_nested_trap_sched || cur_in_kernel {
+        set_needs_reschedule();
+        let now = crate::sched::wait::current_ticks();
+        // Nested-trap / in-kernel IRQ path cannot switch immediately.
+        // Re-arm a short retry slice so deferred preemption is observed before
+        // CPU-bound user code can run to completion.
+        timer::schedule_running_slice_100ns(now, u64::MAX, DEFERRED_RESCHED_RETRY_100NS);
+        return;
+    }
     if cur != 0 {
         set_thread_in_kernel_locked(cur, true);
     }
     drain_deferred_kstacks();
-    let _ = schedule_from_trap(frame, false, true);
+    schedule_from_trap(frame, false, true, timer::DEFAULT_TIMESLICE_100NS);
 }
 
 #[no_mangle]

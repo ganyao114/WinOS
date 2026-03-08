@@ -3,16 +3,18 @@
 // All functions require the scheduler lock to be held.
 
 use core::sync::atomic::Ordering;
-use crate::sched::cpu::{cpu_local, vcpu_id};
+use crate::sched::cpu::{cpu_local, current_tid, vcpu_id};
+use crate::sched::cpu::set_needs_reschedule;
 use crate::sched::global::{SCHED, with_thread, with_thread_mut};
-use crate::sched::types::{KThread, ThreadState, MAX_VCPUS};
+use crate::sched::priority_queue::mark_shadow_priority_queue_dirty_locked;
+use crate::sched::types::{ThreadState, MAX_VCPUS};
 
 // ── set_thread_state_locked ───────────────────────────────────────────────────
 
 /// Transition a thread's state and update the ready queue accordingly.
 /// Must be called with the scheduler lock held.
 pub fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
-    let (old_state, priority, is_idle) = match with_thread(tid, |t| {
+    let (old_state, _priority, is_idle) = match with_thread(tid, |t| {
         (t.state, t.priority, t.is_idle_thread)
     }) {
         Some(v) => v,
@@ -29,13 +31,14 @@ pub fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
         return;
     }
 
-    // Remove from ready queue if was Ready.
-    if old_state == ThreadState::Ready {
+    // Defensive invariant: any state transition first purges stale ready-queue
+    // links for this TID, then re-enqueues only if target state is Ready.
+    {
         let queue = unsafe { SCHED.queue_raw_mut() };
         let store = unsafe { SCHED.threads_raw() };
-        queue.remove(tid, priority, &|id| {
-            store.get_ptr(id)
-        });
+        for p in 0..32u8 {
+            while queue.remove(tid, p, &|id| store.get_ptr(id)) {}
+        }
     }
 
     // Update state.
@@ -45,14 +48,26 @@ pub fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
     if new_state == ThreadState::Ready {
         let priority = with_thread(tid, |t| t.priority).unwrap_or(8);
         let queue = unsafe { SCHED.queue_raw_mut() };
+        // Defensive de-dup: if state/accounting got transiently out of sync,
+        // ensure this TID is not already linked before re-queueing.
+        let store_ro = unsafe { SCHED.threads_raw() };
+        for p in 0..32u8 {
+            while queue.remove(tid, p, &|id| store_ro.get_ptr(id)) {}
+        }
         let store = unsafe { SCHED.threads_raw_mut() } as *mut crate::sched::thread_store::ThreadStore;
         queue.push_with_store(tid, priority, &mut |id| unsafe { (*store).get_mut(id) });
 
         // Signal a vCPU that might be idle.
         hint_reschedule_any_idle();
+        // Also force local unlock-edge evaluation so same-priority wake/create
+        // paths do not get stuck behind "continue current" policy.
+        if tid != crate::sched::cpu::current_tid() {
+            set_needs_reschedule();
+        }
     }
 
     // Notify flush_unlock_edge that a full re-scan is needed.
+    mark_shadow_priority_queue_dirty_locked();
     SCHED.scheduler_update_needed.store(true, Ordering::Relaxed);
 }
 
@@ -93,6 +108,103 @@ pub fn thread_can_run_on(tid: u32, vid: u32) -> bool {
     with_thread(tid, |t| {
         (t.affinity_mask & (1u32 << vid)) != 0
     }).unwrap_or(false)
+}
+
+#[inline]
+fn active_vcpu_mask_locked() -> u32 {
+    let mut mask = 0u32;
+    for vid in 0..MAX_VCPUS {
+        if unsafe { SCHED.vcpu_raw(vid) }.idle_tid != 0 {
+            mask |= 1u32 << vid;
+        }
+    }
+    if mask == 0 { 1 } else { mask }
+}
+
+#[inline]
+fn purge_tid_from_ready_queue_locked(tid: u32) {
+    if tid == 0 {
+        return;
+    }
+    let queue = unsafe { SCHED.queue_raw_mut() };
+    let store = unsafe { SCHED.threads_raw() };
+    for p in 0..32u8 {
+        while queue.remove(tid, p, &|id| store.get_ptr(id)) {}
+    }
+}
+
+#[inline]
+fn push_tid_to_ready_queue_locked(tid: u32, priority: u8) {
+    if tid == 0 {
+        return;
+    }
+    let queue = unsafe { SCHED.queue_raw_mut() };
+    let store =
+        unsafe { SCHED.threads_raw_mut() } as *mut crate::sched::thread_store::ThreadStore;
+    queue.push_with_store(tid, priority, &mut |id| unsafe { (*store).get_mut(id) });
+}
+
+#[inline]
+fn find_running_vcpu_for_tid_locked(tid: u32) -> Option<usize> {
+    for vid in 0..MAX_VCPUS {
+        if unsafe { SCHED.vcpu_raw(vid) }.current_tid == tid {
+            return Some(vid);
+        }
+    }
+    None
+}
+
+/// Update a thread's affinity mask (Windows KAFFINITY semantics, low bits used).
+/// Returns false if mask is invalid after clamping to active vCPUs.
+/// Requires scheduler lock to be held.
+pub fn set_thread_affinity_mask_locked(tid: u32, requested_mask: u64) -> bool {
+    let allowed = active_vcpu_mask_locked();
+    let new_mask = (requested_mask as u32) & allowed;
+    if new_mask == 0 {
+        return false;
+    }
+
+    let (state, old_mask, is_idle, prio) = match with_thread(tid, |t| {
+        (t.state, t.affinity_mask, t.is_idle_thread, t.priority)
+    }) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    if is_idle {
+        return false;
+    }
+    if old_mask == new_mask {
+        return true;
+    }
+
+    if state == ThreadState::Ready {
+        purge_tid_from_ready_queue_locked(tid);
+    }
+
+    with_thread_mut(tid, |t| t.affinity_mask = new_mask);
+
+    if state == ThreadState::Ready {
+        push_tid_to_ready_queue_locked(tid, prio);
+        hint_reschedule_any_idle();
+        if tid != current_tid() {
+            set_needs_reschedule();
+        }
+    } else if state == ThreadState::Running {
+        if let Some(run_vid) = find_running_vcpu_for_tid_locked(tid) {
+            if (new_mask & (1u32 << run_vid)) == 0 {
+                if run_vid == vcpu_id() as usize {
+                    set_needs_reschedule();
+                } else {
+                    request_reschedule_vcpu(run_vid as u32);
+                }
+            }
+        }
+    }
+
+    mark_shadow_priority_queue_dirty_locked();
+    SCHED.scheduler_update_needed.store(true, Ordering::Relaxed);
+    true
 }
 
 /// Returns the best vCPU hint for a thread (last used or least loaded).

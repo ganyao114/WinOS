@@ -85,6 +85,21 @@ fn write_info_struct<T: Copy>(buf: *mut u8, buf_len: usize, ret_len: *mut u32, i
 }
 
 fn query_system_basic_information(buf: *mut u8, buf_len: usize, ret_len: *mut u32) -> u32 {
+    let (active_mask, processor_count) = {
+        let _lock = crate::sched::KSchedulerLock::lock();
+        let mut mask = 0u64;
+        for vid in 0..crate::sched::MAX_VCPUS {
+            if unsafe { crate::sched::SCHED.vcpu_raw(vid) }.idle_tid != 0 {
+                mask |= 1u64 << vid;
+            }
+        }
+        if mask == 0 {
+            (1u64, 1u8)
+        } else {
+            (mask, mask.count_ones() as u8)
+        }
+    };
+
     let mut pages = crate::mm::phys::free_page_count() as u32;
     if pages < 0x2000 {
         pages = 0x2000;
@@ -101,8 +116,8 @@ fn query_system_basic_information(buf: *mut u8, buf_len: usize, ret_len: *mut u3
         allocation_granularity: ALLOCATION_GRANULARITY,
         minimum_user_mode_address: crate::process::USER_VA_BASE,
         maximum_user_mode_address: max_user,
-        active_processors_affinity_mask: 1,
-        number_of_processors: 1,
+        active_processors_affinity_mask: active_mask,
+        number_of_processors: processor_count,
         pad: [0; 3],
     };
     write_info_struct(buf, buf_len, ret_len, &info)

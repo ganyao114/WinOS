@@ -20,6 +20,7 @@ pub use handles::{
     wait_for_single_object, wait_for_multiple_objects,
     close_handle,
     delay_current_thread_sync, event_set_by_handle_for_pid,
+    detach_thread_sync_wait_links_locked,
     STATUS_INVALID_HANDLE, STATUS_OBJECT_TYPE_MISMATCH,
 };
 // HANDLE_TYPE_* constants still used by kobject::htype_to_kind

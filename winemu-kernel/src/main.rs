@@ -136,7 +136,15 @@ pub extern "C" fn el0_page_fault(far: u64, esr: u64, elr: u64, frame_ptr: u64) -
 /// EL1 synchronous exception handler for kernel faults.
 /// Called from vectors with: far=fault address, esr=syndrome, elr=faulting PC.
 #[no_mangle]
-pub extern "C" fn el1_sync_fault(far: u64, esr: u64, elr: u64) -> ! {
+pub extern "C" fn el1_sync_fault(
+    far: u64,
+    esr: u64,
+    elr: u64,
+    lr: u64,
+    x0: u64,
+    x1: u64,
+    x2: u64,
+) -> ! {
     const KERNEL_TEXT_MIN: u64 = 0x4000_0000;
     const KERNEL_TEXT_MAX: u64 = 0x5000_0000;
     let mut insn_m2 = 0u64;
@@ -154,10 +162,14 @@ pub extern "C" fn el1_sync_fault(far: u64, esr: u64, elr: u64) -> ! {
     let vid = crate::sched::vcpu_id();
     let tid = crate::sched::current_tid();
     crate::kerror!(
-        "KERNEL_FAULT far={:#x} esr={:#x} elr={:#x} insn={:#x} win=[{:#x},{:#x},{:#x},{:#x},{:#x}] vcpu={} tid={}",
+        "KERNEL_FAULT far={:#x} esr={:#x} elr={:#x} lr={:#x} x0={:#x} x1={:#x} x2={:#x} insn={:#x} win=[{:#x},{:#x},{:#x},{:#x},{:#x}] vcpu={} tid={}",
         far,
         esr,
         elr,
+        lr,
+        x0,
+        x1,
+        x2,
         insn,
         insn_m2,
         insn_m1,
@@ -212,12 +224,14 @@ pub extern "C" fn kernel_main() -> ! {
     vectors::install();
     mm::init_global_bootstrap();
     mm::init_per_cpu();
+    // kmalloc must be ready before any scheduler/object-store init, otherwise
+    // early Vec allocations may fall back to untracked direct pages.
+    alloc::init();
     // Primary vCPU scheduler bootstrap.
     sched::init_cpu_local(boot_vcpu_id_from_mpidr());
     sched::init_scheduler();
     sched::init_sync_state();
     crate::kinfo!("kernel_main: mmu ok");
-    alloc::init();
 
     // Bootstrap process/thread context first so sync hostcall path runs under
     // kernel-thread semantics from the beginning of image loading.
@@ -236,7 +250,8 @@ pub extern "C" fn kernel_main() -> ! {
             stack_size: 0,
             teb_va: 0,
             arg: 0,
-            priority: 8,
+            // Scheduler-internal priority is inverted from NT (smaller = higher).
+            priority: 23,
         };
         let tid = sched::create_user_thread_locked(params)
             .expect("kernel: thread0 alloc failed");
@@ -329,11 +344,23 @@ pub extern "C" fn kernel_main() -> ! {
         crate::kerror!("kernel: boot process update failed");
         hypercall::process_exit(1);
     }
-    // Update thread0's TEB VA.
+    // Update thread0 metadata now that the boot process PID is known.
+    // thread0 was created during early bootstrap with pid=0; bind it to the
+    // boot process and account it once in process lifecycle tracking.
+    let mut account_thread0 = false;
     {
         let tid = sched::current_tid();
         let _lock = sched::KSchedulerLock::lock();
-        sched::with_thread_mut(tid, |t| t.teb_va = teb_peb.teb_va);
+        sched::with_thread_mut(tid, |t| {
+            t.teb_va = teb_peb.teb_va;
+            if t.pid == 0 {
+                t.pid = boot_pid;
+                account_thread0 = true;
+            }
+        });
+    }
+    if account_thread0 {
+        process::on_thread_created(boot_pid, sched::current_tid());
     }
 
     // ── 4. 通知 VMM 内核已就绪 + 内核侧直入首用户线程 ───────────

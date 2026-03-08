@@ -65,12 +65,27 @@ fn set_priority_class(pid: u32, info: *const u8, info_len: usize) -> u32 {
 }
 
 fn set_affinity_mask(pid: u32, info: *const u8, info_len: usize) -> u32 {
-    let _ = pid;
     if info.is_null() || info_len != core::mem::size_of::<u64>() {
         return status::INVALID_PARAMETER;
     }
-    let mask = unsafe { (info as *const u64).read_volatile() };
-    if mask != 1 {
+    let requested_mask = unsafe { (info as *const u64).read_volatile() };
+    if requested_mask == 0 {
+        return status::INVALID_PARAMETER;
+    }
+
+    let _lock = crate::sched::KSchedulerLock::lock();
+    let tids = crate::sched::thread_ids_by_pid(pid);
+    if tids.is_empty() {
+        return status::INVALID_PARAMETER;
+    }
+
+    let mut changed = false;
+    for tid in tids {
+        if crate::sched::set_thread_affinity_mask_locked(tid, requested_mask) {
+            changed = true;
+        }
+    }
+    if !changed {
         return status::INVALID_PARAMETER;
     }
 

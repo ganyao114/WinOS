@@ -113,6 +113,11 @@ global_asm!(
     // ── Sync exception from EL1 (kernel fault) ────────────────
     "__el1_sync:",
     "stp x29, x30, [sp, #-16]!",
+    // Preserve faulting EL1 x0/x1/x2/x30 for diagnostics.
+    "mov x4, x0",
+    "mov x5, x1",
+    "mov x6, x2",
+    "mov x3, x30",
     "mrs x0, far_el1",
     "mrs x1, esr_el1",
     "mrs x2, elr_el1",
@@ -194,6 +199,8 @@ global_asm!(
     "ldp x24, x25, [x28, #0x0c0]",
     "ldp x26, x27, [x28, #0x0d0]",
     "ldr x30,      [x28, #0x0f0]",
+    // Restore EL1 stack top for next trap entry (frame base + frame size).
+    "add sp, x28, #0x120",
     "ldp x28, x29, [x28, #0x0e0]",
     "eret",
     // ── Data Abort / Instruction Abort from EL0 ────────────────

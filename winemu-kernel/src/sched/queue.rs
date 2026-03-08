@@ -68,30 +68,34 @@ impl KReadyQueue {
     /// Pop the highest-priority thread. Returns 0 if empty.
     /// Caller must clear `sched_next` on the returned thread.
     pub fn pop_highest(&mut self, get: &impl Fn(u32) -> Option<*mut KThread>) -> u32 {
-        if self.present == 0 {
-            return 0;
-        }
-        let p = self.present.trailing_zeros() as usize;
-        let tid = self.heads[p];
-        if tid == 0 {
-            self.present &= !(1u32 << p);
-            return 0;
-        }
-        // Advance head
-        let next = if let Some(ptr) = get(tid) {
+        loop {
+            if self.present == 0 {
+                return 0;
+            }
+            let p = self.present.trailing_zeros() as usize;
+            let tid = self.heads[p];
+            if tid == 0 {
+                self.present &= !(1u32 << p);
+                self.tails[p] = 0;
+                continue;
+            }
+            let Some(ptr) = get(tid) else {
+                // Corrupted head: drop this priority list.
+                self.heads[p] = 0;
+                self.tails[p] = 0;
+                self.present &= !(1u32 << p);
+                continue;
+            };
             let t = unsafe { &mut *ptr };
-            let n = t.sched_next;
+            let next = t.sched_next;
             t.sched_next = 0;
-            n
-        } else {
-            0
-        };
-        self.heads[p] = next;
-        if next == 0 {
-            self.tails[p] = 0;
-            self.present &= !(1u32 << p);
+            self.heads[p] = next;
+            if next == 0 {
+                self.tails[p] = 0;
+                self.present &= !(1u32 << p);
+            }
+            return tid;
         }
-        tid
     }
 
     /// Pop the highest-priority thread that satisfies `pred`.
@@ -109,21 +113,28 @@ impl KReadyQueue {
             let mut prev = 0u32;
             let mut cur = self.heads[p];
             while cur != 0 {
-                let matches = if let Some(ptr) = get(cur) {
-                    pred(unsafe { &*ptr })
-                } else {
-                    false
+                let Some(cur_ptr) = get(cur) else {
+                    // Corrupted node: truncate list at `prev`.
+                    if prev == 0 {
+                        self.heads[p] = 0;
+                        self.tails[p] = 0;
+                        self.present &= !(1u32 << p);
+                    } else if let Some(prev_ptr) = get(prev) {
+                        unsafe { (*prev_ptr).sched_next = 0 };
+                        self.tails[p] = prev;
+                    } else {
+                        self.heads[p] = 0;
+                        self.tails[p] = 0;
+                        self.present &= !(1u32 << p);
+                    }
+                    break;
                 };
+                let matches = pred(unsafe { &*cur_ptr });
                 if matches {
                     // Unlink cur
-                    let next = if let Some(ptr) = get(cur) {
-                        let t = unsafe { &mut *ptr };
-                        let n = t.sched_next;
-                        t.sched_next = 0;
-                        n
-                    } else {
-                        0
-                    };
+                    let t = unsafe { &mut *cur_ptr };
+                    let next = t.sched_next;
+                    t.sched_next = 0;
                     if prev == 0 {
                         self.heads[p] = next;
                     } else if let Some(ptr) = get(prev) {
@@ -162,15 +173,25 @@ impl KReadyQueue {
         let mut prev = 0u32;
         let mut cur = self.heads[p];
         while cur != 0 {
-            let next = if let Some(ptr) = get(cur) {
-                unsafe { (*ptr).sched_next }
-            } else {
-                0
-            };
-            if cur == tid {
-                if let Some(ptr) = get(cur) {
-                    unsafe { (*ptr).sched_next = 0 };
+            let Some(cur_ptr) = get(cur) else {
+                // Corrupted node: truncate list at `prev`.
+                if prev == 0 {
+                    self.heads[p] = 0;
+                    self.tails[p] = 0;
+                    self.present &= !(1u32 << p);
+                } else if let Some(prev_ptr) = get(prev) {
+                    unsafe { (*prev_ptr).sched_next = 0 };
+                    self.tails[p] = prev;
+                } else {
+                    self.heads[p] = 0;
+                    self.tails[p] = 0;
+                    self.present &= !(1u32 << p);
                 }
+                return false;
+            };
+            let next = unsafe { (*cur_ptr).sched_next };
+            if cur == tid {
+                unsafe { (*cur_ptr).sched_next = 0 };
                 if prev == 0 {
                     self.heads[p] = next;
                 } else if let Some(ptr) = get(prev) {
@@ -222,12 +243,13 @@ impl KReadyQueue {
             mask &= !(1u32 << p);
             let mut cur = self.heads[p];
             while cur != 0 {
-                let (matches, next) = if let Some(ptr) = get(cur) {
-                    let t = unsafe { &*ptr };
-                    (pred(t), t.sched_next)
-                } else {
-                    (false, 0)
+                let Some(ptr) = get(cur) else {
+                    // Corrupted chain: stop scanning this priority.
+                    break;
                 };
+                let t = unsafe { &*ptr };
+                let matches = pred(t);
+                let next = t.sched_next;
                 if matches {
                     return cur;
                 }

@@ -170,6 +170,14 @@ pub mod nr {
     ///   - u64::MAX: invalid / not a directory
     ///   - 其他: bits[39:32]=action, low32=name_len
     pub const HOST_NOTIFY_DIR: u64 = 0x081B;
+    /// 以固定字节填充 guest 物理内存区间
+    /// args: [dst_gpa, len, value(u8), 0, 0, 0]
+    /// 返回: 0=ok, u64::MAX=invalid
+    pub const HOST_MEMSET: u64 = 0x081C;
+    /// guest 物理内存区间复制
+    /// args: [dst_gpa, src_gpa, len, 0, 0, 0]
+    /// 返回: 0=ok, u64::MAX=invalid
+    pub const HOST_MEMCPY: u64 = 0x081D;
 
     // ── HostCall IPC: 0x0820 - 0x082F ──────────────────────
     /// HostCall 通道初始化（预留）

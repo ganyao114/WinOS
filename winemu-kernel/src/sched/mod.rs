@@ -4,8 +4,10 @@ pub mod types;
 pub mod thread_store;
 pub mod global;
 pub mod cpu;
+pub mod config;
 pub mod lock;
 pub mod queue;
+pub mod priority_queue;
 pub mod topology;
 pub mod context;
 pub mod wait;
@@ -35,6 +37,8 @@ pub use cpu::{
     set_needs_reschedule, take_needs_reschedule,
 };
 
+pub use config::{SCHED_ENABLE_MESO_SHADOW, SCHED_REBUILD_READY_EACH_ROUND, SCHED_USE_MESO_PICK};
+
 // Scheduler lock
 pub use lock::{
     KSchedulerLock, SchedSpinlock, SCHED_LOCK,
@@ -44,13 +48,22 @@ pub use lock::{
 
 // Ready queue
 pub use queue::KReadyQueue;
+pub use priority_queue::{
+    KPriorityQueue,
+    mark_shadow_priority_queue_dirty_locked,
+    rebuild_shadow_priority_queue_if_dirty_locked,
+    rebuild_shadow_priority_queue_locked,
+    shadow_pick_for_vcpu,
+    validate_shadow_priority_queue_locked,
+};
 
 // Topology / state transitions
 pub use topology::{
     set_thread_state_locked, request_reschedule_self, request_reschedule_vcpu,
     hint_reschedule_any_idle, thread_can_run_on, pick_vcpu_for_thread,
+    set_thread_affinity_mask_locked,
     set_vcpu_current_thread, get_vcpu_current_thread,
-    any_thread_running, all_threads_done,
+    any_thread_running,
 };
 
 // Context switch

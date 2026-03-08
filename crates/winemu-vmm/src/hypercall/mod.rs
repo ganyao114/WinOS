@@ -790,6 +790,48 @@ impl HypercallManager {
                     HypercallResult::Sync(u64::MAX)
                 }
             }
+            nr::HOST_MEMSET => {
+                let dst_gpa = winemu_core::addr::Gpa(args[0]);
+                let len = args[1] as usize;
+                let value = args[2] as u8;
+                if len > 64 * 1024 * 1024 {
+                    return HypercallResult::Sync(u64::MAX);
+                }
+                if len != 0 {
+                    let mut mem = self.memory.write().unwrap();
+                    let chunk = [value; 4096];
+                    let mut left = len;
+                    let mut cur = dst_gpa.0;
+                    while left != 0 {
+                        let n = left.min(chunk.len());
+                        mem.write_bytes(winemu_core::addr::Gpa(cur), &chunk[..n]);
+                        cur = cur.saturating_add(n as u64);
+                        left -= n;
+                    }
+                }
+                HypercallResult::Sync(0)
+            }
+            nr::HOST_MEMCPY => {
+                let dst_gpa = winemu_core::addr::Gpa(args[0]);
+                let src_gpa = winemu_core::addr::Gpa(args[1]);
+                let len = args[2] as usize;
+                if len > 64 * 1024 * 1024 {
+                    return HypercallResult::Sync(u64::MAX);
+                }
+                if len != 0 {
+                    let buf = {
+                        let mem = self.memory.read().unwrap();
+                        let bytes = mem.read_bytes(src_gpa, len);
+                        if bytes.len() != len {
+                            return HypercallResult::Sync(u64::MAX);
+                        }
+                        bytes.to_vec()
+                    };
+                    let mut mem = self.memory.write().unwrap();
+                    mem.write_bytes(dst_gpa, &buf);
+                }
+                HypercallResult::Sync(0)
+            }
             nr::HOSTCALL_SUBMIT => {
                 // args: [opcode, flags, arg0, arg1, arg2, arg3]
                 let opcode = args[0];

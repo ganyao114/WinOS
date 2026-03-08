@@ -6,7 +6,7 @@
 //   - On final unlock, runs deferred topology updates then checks reschedule.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use crate::sched::cpu::{cpu_local, vcpu_id};
+use crate::sched::cpu::vcpu_id;
 
 // ── Raw spinlock ──────────────────────────────────────────────────────────────
 

@@ -5,6 +5,7 @@
 
 use crate::sched::sync::primitives_api::{KEvent, KMutex, KSemaphore};
 use crate::kobj::ObjectStore;
+use winemu_shared::status;
 
 // ── SyncObject enum ───────────────────────────────────────────────────────────
 
@@ -157,5 +158,27 @@ pub fn sync_get_mut_by_idx(idx: u32) -> Option<&'static mut SyncObject> {
 
 /// Free by raw obj_idx. Called from kobject close_last_ref.
 pub fn sync_free_idx(idx: u32) -> bool {
-    unsafe { SYNC_STATE.table_mut() }.store.free(idx)
+    let table = unsafe { SYNC_STATE.table_mut() };
+    let ptr = table.store.get_ptr(idx);
+    if ptr.is_null() {
+        return false;
+    }
+
+    unsafe {
+        match &mut *ptr {
+            SyncObject::Event(e) => {
+                e.waiters.wake_all_with_status(status::INVALID_HANDLE);
+            }
+            SyncObject::Mutex(m) => {
+                m.owner_tid = 0;
+                m.recursion = 0;
+                m.waiters.wake_all_with_status(status::INVALID_HANDLE);
+            }
+            SyncObject::Semaphore(s) => {
+                s.waiters.wake_all_with_status(status::INVALID_HANDLE);
+            }
+        }
+    }
+
+    table.store.free(idx)
 }

@@ -5,9 +5,12 @@
 // check_wait_timeout    — called from scheduler round to expire deadlines
 
 use crate::sched::global::{with_thread, with_thread_mut, SCHED};
+use crate::sched::cpu::set_needs_reschedule;
 use crate::sched::topology::set_thread_state_locked;
-use crate::sched::types::{ThreadState, WaitDeadline, WAIT_KIND_DELAY, WAIT_KIND_NONE};
-use crate::hypercall;
+use crate::sched::types::{
+    ThreadState, WaitDeadline, WAIT_KIND_DELAY, WAIT_KIND_MULTIPLE, WAIT_KIND_NONE,
+    WAIT_KIND_SINGLE,
+};
 
 // ── NTSTATUS codes ────────────────────────────────────────────────────────────
 
@@ -23,8 +26,9 @@ pub const STATUS_USER_APC:         u32 = 0x0000_00C0;
 /// `deadline` controls timeout behaviour.
 /// Must be called with the scheduler lock held.
 pub fn block_thread_locked(tid: u32, deadline: WaitDeadline) {
+    let dl = deadline.to_ticks();
     with_thread_mut(tid, |t| {
-        t.wait.deadline = deadline.to_ticks();
+        t.wait.deadline = dl;
         t.wait.result   = STATUS_SUCCESS;
     });
     set_thread_state_locked(tid, ThreadState::Waiting);
@@ -46,16 +50,37 @@ pub fn block_thread_delay_locked(tid: u32, deadline: WaitDeadline) {
 /// No-op if the thread is not in Waiting state.
 /// Must be called with the scheduler lock held.
 pub fn unblock_thread_locked(tid: u32, result: u32) {
-    let is_waiting = with_thread(tid, |t| t.state == ThreadState::Waiting)
-        .unwrap_or(false);
-    if !is_waiting {
+    let Some((state, wait_kind)) = with_thread(tid, |t| (t.state, t.wait.kind)) else {
+        return;
+    };
+    if state != ThreadState::Waiting {
+        // Defensive cleanup: a raced wake/timeout can leave stale sync wait-link
+        // metadata behind even after state transitioned away from Waiting.
+        if wait_kind == WAIT_KIND_SINGLE || wait_kind == WAIT_KIND_MULTIPLE {
+            crate::sched::sync::detach_thread_sync_wait_links_locked(tid);
+            with_thread_mut(tid, |t| {
+                t.wait.kind = WAIT_KIND_NONE;
+                t.wait.handle_count = 0;
+                t.wait.wait_all = false;
+                t.wait.signaled_mask = 0;
+                t.wait.wait_next = 0;
+            });
+        }
         return;
     }
+    crate::sched::sync::detach_thread_sync_wait_links_locked(tid);
     with_thread_mut(tid, |t| {
         t.wait.result = result;
         t.wait.kind   = WAIT_KIND_NONE;
+        t.wait.handle_count = 0;
+        t.wait.wait_all = false;
+        t.wait.signaled_mask = 0;
+        t.wait.wait_next = 0;
     });
     set_thread_state_locked(tid, ThreadState::Ready);
+    // Wake-up should be observed at the current unlock edge so syscall paths
+    // can promptly hand off to newly readied peers.
+    set_needs_reschedule();
 }
 
 /// Wake a waiting thread due to timeout.

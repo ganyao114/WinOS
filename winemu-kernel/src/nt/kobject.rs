@@ -53,7 +53,10 @@ fn query_name_key(idx: u32)     -> Option<Vec<u16>> { registry::key_name_utf16(i
 fn query_name_section(idx: u32) -> Option<Vec<u16>> { section::section_name_utf16(idx) }
 fn query_name_file(idx: u32)    -> Option<Vec<u16>> { file::file_name_utf16(idx) }
 
-fn close_event(idx: u32)     -> u32 { crate::sched::sync::sync_free_idx(idx); status::SUCCESS }
+fn close_event(idx: u32)     -> u32 {
+    crate::sched::sync::sync_free_idx(idx);
+    status::SUCCESS
+}
 fn close_mutant(idx: u32)    -> u32 { crate::sched::sync::sync_free_idx(idx); status::SUCCESS }
 fn close_semaphore(idx: u32) -> u32 { crate::sched::sync::sync_free_idx(idx); status::SUCCESS }
 fn close_thread(_tid: u32)   -> u32 { status::SUCCESS }

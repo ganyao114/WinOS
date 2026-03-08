@@ -1,9 +1,64 @@
 use winemu_shared::status;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::{
     alloc_process, boot_pid, free_process, set_boot_pid, set_current_vcpu_pid, with_process,
     with_process_mut, ProcessAddressSpace, ProcessState,
 };
+
+// 0 = no shutdown request; otherwise stores (exit_code + 1).
+static KERNEL_SHUTDOWN_EXIT_CODE_PLUS1: AtomicU32 = AtomicU32::new(0);
+
+fn has_live_processes() -> bool {
+    let mut live = false;
+    super::for_each_process(|_, p| {
+        if p.state != ProcessState::Terminated {
+            live = true;
+        }
+    });
+    live
+}
+
+fn compute_shutdown_exit_code() -> u32 {
+    let bpid = boot_pid();
+    if bpid != 0 {
+        if let Some(code) = process_exit_status(bpid) {
+            return code;
+        }
+    }
+    let mut code = 0u32;
+    super::for_each_process(|_, p| {
+        if p.state == ProcessState::Terminated {
+            code = p.exit_status;
+        }
+    });
+    code
+}
+
+fn maybe_request_kernel_shutdown() {
+    if has_live_processes() {
+        return;
+    }
+    let encoded = compute_shutdown_exit_code().wrapping_add(1);
+    let _ = KERNEL_SHUTDOWN_EXIT_CODE_PLUS1.compare_exchange(
+        0,
+        encoded,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+pub fn take_kernel_shutdown_exit_code(current_vid: usize) -> Option<u32> {
+    if current_vid != 0 {
+        return None;
+    }
+    let encoded = KERNEL_SHUTDOWN_EXIT_CODE_PLUS1.swap(0, Ordering::AcqRel);
+    if encoded == 0 {
+        None
+    } else {
+        Some(encoded.wrapping_sub(1))
+    }
+}
 
 pub fn process_exists(pid: u32) -> bool {
     if pid == 0 {
@@ -225,6 +280,7 @@ fn finalize_process_if_no_threads(pid: u32) {
     crate::nt::state::cleanup_process_owned_resources(pid);
     let _ = crate::hostcall::cancel_requests_for_owner_pid(pid);
     maybe_free_if_unreferenced(pid);
+    maybe_request_kernel_shutdown();
 }
 
 fn maybe_free_if_unreferenced(pid: u32) {

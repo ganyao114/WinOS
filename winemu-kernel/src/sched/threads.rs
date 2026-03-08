@@ -52,6 +52,7 @@ pub struct UserThreadParams {
 ///
 /// Must be called with the scheduler lock held.
 pub fn create_user_thread_locked(p: UserThreadParams) -> Option<u32> {
+    let pid = p.pid;
     let (kstack_base, kstack_size) = alloc_kstack();
 
     let mut t = KThread::new(0 /* filled by alloc_with */, p.pid);
@@ -62,6 +63,7 @@ pub fn create_user_thread_locked(p: UserThreadParams) -> Option<u32> {
     t.teb_va      = p.teb_va;
     t.priority    = p.priority;
     t.base_priority = p.priority;
+    t.last_vcpu_hint = 0;
 
     // Set up EL0 entry context.
     t.ctx.pc      = p.entry;
@@ -73,7 +75,11 @@ pub fn create_user_thread_locked(p: UserThreadParams) -> Option<u32> {
     // x18 = TEB (ARM64 Windows ABI).
     t.ctx.x[18]   = p.teb_va;
 
-    spawn_locked(t)
+    let tid = spawn_locked(t)?;
+    if pid != 0 {
+        crate::process::on_thread_created(pid, tid);
+    }
+    Some(tid)
 }
 
 // ── register_idle_thread_for_vcpu ─────────────────────────────────────────────
@@ -89,6 +95,7 @@ pub fn register_idle_thread_for_vcpu(vcpu_id: u32) -> u32 {
         t.is_idle_thread = true;
         t.priority       = 31; // lowest priority
         t.base_priority  = 31;
+        t.last_vcpu_hint = vcpu_id as u8;
         t.kstack_base    = kstack_base;
         t.kstack_size    = kstack_size as u64;
         t.state          = ThreadState::Ready;
@@ -148,11 +155,17 @@ pub fn free_terminated_threads_locked() {
             if t.state != ThreadState::Terminated || t.is_idle_thread || count >= 64 {
                 return;
             }
+            // Conservative safety gates: a terminated thread can still be
+            // transiently referenced by scheduler handoff metadata.
+            if t.in_kernel || t.kctx.has_continuation() {
+                return;
+            }
             // Do not free a terminated thread that is still the active current
             // thread on any vCPU; its kernel context may still be needed by an
             // in-flight switch path.
             for vid in 0..MAX_VCPUS {
-                if unsafe { SCHED.vcpu_raw(vid) }.current_tid == tid {
+                let vs = unsafe { SCHED.vcpu_raw(vid) };
+                if vs.current_tid == tid || vs.highest_priority_tid == tid {
                     return;
                 }
             }

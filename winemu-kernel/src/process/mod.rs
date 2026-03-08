@@ -12,7 +12,8 @@ pub use handle_table::{KHandleTable, KObjectRef, KObjectKind, encode_handle, dec
 pub use lifecycle::{
     create_process, init_boot_process, last_handle_closed, on_thread_created, on_thread_terminated,
     open_process, process_accepts_new_threads, process_exists, process_exit_status,
-    process_signaled, switch_to_thread_process, terminate_process,
+    process_signaled, switch_to_thread_process, take_kernel_shutdown_exit_code,
+    terminate_process,
 };
 pub use query::query_information_process;
 pub use set::set_information_process;

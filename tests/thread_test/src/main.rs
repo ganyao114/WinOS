@@ -850,7 +850,7 @@ unsafe fn test_wait_wake_burst() {
 
     let st_set = set_event(ev);
     check(b"Set burst event", st_set == STATUS_SUCCESS);
-    let all_done = wait_flag_with_yield(&BURST_DONE, 40_000);
+    let all_done = wait_counter_at_least(&BURST_DONE, BURST_WAITERS as u32, 40_000);
     check(
         b"All burst waiters woke",
         all_done && BURST_DONE.load(Ordering::Acquire) == BURST_WAITERS as u32,

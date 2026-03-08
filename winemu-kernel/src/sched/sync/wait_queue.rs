@@ -95,6 +95,13 @@ impl WaitQueue {
         }
     }
 
+    /// Wake all waiters with the provided wait result.
+    pub fn wake_all_with_status(&mut self, status: u32) {
+        while let Some(tid) = self.dequeue_highest() {
+            unblock_thread_locked(tid, status);
+        }
+    }
+
     /// Peek at the highest-priority waiter's priority, if any.
     pub fn highest_priority(&self) -> Option<u8> {
         with_thread(self.head, |t| t.priority)

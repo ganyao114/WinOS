@@ -73,10 +73,8 @@ global_asm!(
     "__timer_irq_el0:",
     "msr cntv_ctl_el0, xzr",
     "isb",
-    // Preserve interrupted user x16 before borrowing it as scratch.
-    "msr tpidrro_el0, x16",
-    "ldr x16, =__svc_stack_top",
-    "mov sp, x16",
+    // Build IRQ frame on current thread EL1 stack (SP_EL1). Do not switch to
+    // the legacy global SVC stack, otherwise continuation stacks alias.
     "sub sp, sp, #0x120",
     // Save x0-x30 (SvcFrame.x[0..31))
     "stp x0,  x1,  [sp, #0x000]",
@@ -87,9 +85,7 @@ global_asm!(
     "stp x10, x11, [sp, #0x050]",
     "stp x12, x13, [sp, #0x060]",
     "stp x14, x15, [sp, #0x070]",
-    "mrs x16, tpidrro_el0",
-    "str x16,      [sp, #0x080]",
-    "str x17,      [sp, #0x088]",
+    "stp x16, x17, [sp, #0x080]",
     "stp x18, x19, [sp, #0x090]",
     "stp x20, x21, [sp, #0x0a0]",
     "stp x22, x23, [sp, #0x0b0]",
@@ -111,37 +107,39 @@ global_asm!(
     "mov x0, sp",
     "mov x1, #0x120",
     "bl svc_migrate_frame_to_thread_stack",
-    "mov sp, x0",
+    // Keep frame base in x28 (callee-saved) and run EL1 call stack below it.
+    "mov x28, x0",
+    "sub sp, x28, #0x10",
     // Call Rust dispatcher: timer_irq_dispatch(&mut frame)
-    "mov x0, sp",
+    "mov x0, x28",
     "bl timer_irq_dispatch",
     // Restore ELR/SPSR/SP_EL0/TPIDR_EL0 from potentially modified frame.
-    "ldr x16, [sp, #0x100]",
+    "ldr x16, [x28, #0x100]",
     "msr elr_el1, x16",
-    "ldr x16, [sp, #0x108]",
+    "ldr x16, [x28, #0x108]",
     "msr spsr_el1, x16",
-    "ldr x16, [sp, #0x0f8]",
+    "ldr x16, [x28, #0x0f8]",
     "msr sp_el0, x16",
-    "ldr x16, [sp, #0x110]",
+    "ldr x16, [x28, #0x110]",
     "msr tpidr_el0, x16",
     // Restore x0-x30 and return to EL0.
-    "ldp x0,  x1,  [sp, #0x000]",
-    "ldp x2,  x3,  [sp, #0x010]",
-    "ldp x4,  x5,  [sp, #0x020]",
-    "ldp x6,  x7,  [sp, #0x030]",
-    "ldp x8,  x9,  [sp, #0x040]",
-    "ldp x10, x11, [sp, #0x050]",
-    "ldp x12, x13, [sp, #0x060]",
-    "ldp x14, x15, [sp, #0x070]",
-    "ldp x16, x17, [sp, #0x080]",
-    "ldp x18, x19, [sp, #0x090]",
-    "ldp x20, x21, [sp, #0x0a0]",
-    "ldp x22, x23, [sp, #0x0b0]",
-    "ldp x24, x25, [sp, #0x0c0]",
-    "ldp x26, x27, [sp, #0x0d0]",
-    "ldp x28, x29, [sp, #0x0e0]",
-    "ldr x30,      [sp, #0x0f0]",
-    "add sp, sp, #0x120",
+    "ldp x0,  x1,  [x28, #0x000]",
+    "ldp x2,  x3,  [x28, #0x010]",
+    "ldp x4,  x5,  [x28, #0x020]",
+    "ldp x6,  x7,  [x28, #0x030]",
+    "ldp x8,  x9,  [x28, #0x040]",
+    "ldp x10, x11, [x28, #0x050]",
+    "ldp x12, x13, [x28, #0x060]",
+    "ldp x14, x15, [x28, #0x070]",
+    "ldp x16, x17, [x28, #0x080]",
+    "ldp x18, x19, [x28, #0x090]",
+    "ldp x20, x21, [x28, #0x0a0]",
+    "ldp x22, x23, [x28, #0x0b0]",
+    "ldp x24, x25, [x28, #0x0c0]",
+    "ldp x26, x27, [x28, #0x0d0]",
+    "ldr x30,      [x28, #0x0f0]",
+    "add sp, x28, #0x120",
+    "ldp x28, x29, [x28, #0x0e0]",
     "eret",
 );
 
@@ -201,10 +199,13 @@ pub fn schedule_running_slice_100ns(now_100ns: u64, next_deadline_100ns: u64, qu
 
 #[inline(always)]
 pub fn idle_wait_until_deadline_100ns(now_100ns: u64, next_deadline_100ns: u64) {
-    if next_deadline_100ns > now_100ns {
-        arm_vtimer_oneshot_100ns(next_deadline_100ns - now_100ns);
+    // Keep a bounded idle poll period so hostcall completions and wake events
+    // are observed even when there is no finite wait deadline.
+    let delta = if next_deadline_100ns > now_100ns {
+        (next_deadline_100ns - now_100ns).min(DEFAULT_TIMESLICE_100NS)
     } else {
-        disarm_vtimer();
-    }
+        DEFAULT_TIMESLICE_100NS
+    };
+    arm_vtimer_oneshot_100ns(delta.max(1));
     wait_for_timer_irq();
 }

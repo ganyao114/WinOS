@@ -145,11 +145,19 @@ fn vm_fill_section_page(area: &VmArea, idx: usize, gpa: u64) -> bool {
     let read =
         crate::hypercall::host_read(area.section_file_fd, gpa as *mut u8, read_len, file_off);
     if read < read_len {
-        unsafe {
-            core::ptr::write_bytes((gpa as *mut u8).add(read), 0, read_len - read);
-        }
+        phys_memset(gpa.saturating_add(read as u64), 0, read_len - read);
     }
     true
+}
+
+#[inline]
+fn phys_memset(gpa: u64, value: u8, len: usize) {
+    let _ = crate::hypercall::host_memset(gpa, len, value);
+}
+
+#[inline]
+fn phys_memcpy(dst_gpa: u64, src_gpa: u64, len: usize) {
+    let _ = crate::hypercall::host_memcpy(dst_gpa, src_gpa, len);
 }
 
 // ─── ProcessVmManager ────────────────────────────────────────────────────────
@@ -492,9 +500,7 @@ impl ProcessVmManager {
         let Some(new_gpa) = crate::mm::phys::alloc_pages(1) else {
             return false;
         };
-        unsafe {
-            core::ptr::write_bytes(new_gpa as *mut u8, 0, PAGE_SIZE as usize);
-        }
+        phys_memset(new_gpa, 0, PAGE_SIZE as usize);
         if seg.value().kind == VmKind::Section
             && !vm_fill_section_page(seg.value(), idx, new_gpa)
         {
@@ -830,8 +836,12 @@ impl ProcessVmManager {
         let Some(gpa) = crate::mm::phys::alloc_pages(1) else {
             return false;
         };
-        unsafe {
-            core::ptr::write_bytes(gpa as *mut u8, 0, PAGE_SIZE as usize);
+        phys_memset(gpa, 0, PAGE_SIZE as usize);
+        if seg.value().kind == VmKind::Section
+            && !vm_fill_section_page(seg.value(), idx, gpa)
+        {
+            crate::mm::phys::free_pages(gpa, 1);
+            return false;
         }
         if !aspace.map_user_range(va, gpa, PAGE_SIZE, prot) {
             crate::mm::phys::free_pages(gpa, 1);
@@ -906,17 +916,9 @@ impl ProcessVmManager {
             return false;
         };
         if old_gpa != 0 {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    old_gpa as *const u8,
-                    new_gpa as *mut u8,
-                    PAGE_SIZE as usize,
-                );
-            }
+            phys_memcpy(new_gpa, old_gpa, PAGE_SIZE as usize);
         } else {
-            unsafe {
-                core::ptr::write_bytes(new_gpa as *mut u8, 0, PAGE_SIZE as usize);
-            }
+            phys_memset(new_gpa, 0, PAGE_SIZE as usize);
             if seg.value().kind == VmKind::Section
                 && !vm_fill_section_page(seg.value(), idx, new_gpa)
             {

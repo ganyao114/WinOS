@@ -2,13 +2,14 @@ use crate::sched::{
     self, current_tid, with_thread,
     create_user_thread_locked, terminate_thread_locked,
     suspend_thread_locked, resume_thread_locked,
-    set_thread_priority_locked, ThreadState,
+    set_thread_affinity_mask_locked, set_thread_priority_locked, ThreadState,
     KSchedulerLock, thread_exists,
 };
 use winemu_shared::status;
 
 use super::constants::{
-    THREAD_BASIC_INFORMATION_SIZE, THREAD_INFO_CLASS_BASE_PRIORITY, THREAD_INFO_CLASS_PRIORITY,
+    THREAD_BASIC_INFORMATION_SIZE, THREAD_INFO_CLASS_AFFINITY_MASK, THREAD_INFO_CLASS_BASE_PRIORITY,
+    THREAD_INFO_CLASS_PRIORITY,
 };
 use super::SvcFrame;
 
@@ -21,6 +22,16 @@ pub const HANDLE_TYPE_THREAD: u8 = 3;
 pub enum CreateThreadError {
     InvalidParameter,
     NoMemory,
+}
+
+#[inline]
+fn win_to_sched_priority(prio: u8) -> u8 {
+    31u8.saturating_sub(prio.min(31))
+}
+
+#[inline]
+fn sched_to_win_priority(prio: u8) -> u8 {
+    31u8.saturating_sub(prio.min(31))
 }
 
 // ── Thread handle resolution ──────────────────────────────────────────────────
@@ -42,7 +53,10 @@ pub fn resolve_thread_tid_from_handle(handle: u64) -> Option<u32> {
 /// Returns a THREAD_BASIC_INFORMATION blob (64 bytes) for the given TID.
 pub fn thread_basic_info(tid: u32) -> Option<[u8; THREAD_BASIC_INFORMATION_SIZE]> {
     let _lock = KSchedulerLock::lock();
-    let (state, pid, prio) = with_thread(tid, |t| (t.state, t.pid, t.priority))?;
+    let (state, pid, prio, affinity) = with_thread(tid, |t| {
+        (t.state, t.pid, t.priority, t.affinity_mask as u64)
+    })?;
+    let win_prio = sched_to_win_priority(prio);
     let exit_status: u32 = if state == ThreadState::Terminated { 0 } else { status::STILL_ACTIVE };
     let mut buf = [0u8; THREAD_BASIC_INFORMATION_SIZE];
     // THREAD_BASIC_INFORMATION layout (Windows):
@@ -59,9 +73,9 @@ pub fn thread_basic_info(tid: u32) -> Option<[u8; THREAD_BASIC_INFORMATION_SIZE]
     buf[8..16].copy_from_slice(&teb.to_le_bytes());
     buf[16..24].copy_from_slice(&(pid as u64).to_le_bytes());
     buf[24..32].copy_from_slice(&(tid as u64).to_le_bytes());
-    buf[32..40].copy_from_slice(&1u64.to_le_bytes()); // affinity
-    buf[40..44].copy_from_slice(&(prio as i32).to_le_bytes());
-    buf[44..48].copy_from_slice(&(prio as i32).to_le_bytes());
+    buf[32..40].copy_from_slice(&affinity.to_le_bytes());
+    buf[40..44].copy_from_slice(&(win_prio as i32).to_le_bytes());
+    buf[44..48].copy_from_slice(&(win_prio as i32).to_le_bytes());
     Some(buf)
 }
 
@@ -87,9 +101,10 @@ pub fn create_user_thread(
         stack_base,
         stack_size,
         teb_va,
-        priority,
+        priority: win_to_sched_priority(priority),
     };
-    create_user_thread_locked(params).ok_or(CreateThreadError::NoMemory)
+    let tid = create_user_thread_locked(params).ok_or(CreateThreadError::NoMemory)?;
+    Ok(tid)
 }
 
 // ── terminate_current_thread ──────────────────────────────────────────────────
@@ -137,9 +152,23 @@ pub fn set_thread_base_priority_by_handle(handle: u64, prio: i32) -> u32 {
     let Some(tid) = resolve_thread_tid_from_handle(handle) else {
         return status::INVALID_HANDLE;
     };
-    let p = prio.clamp(0, 31) as u8;
+    let p = win_to_sched_priority(prio.clamp(0, 31) as u8);
     let _lock = KSchedulerLock::lock();
     set_thread_priority_locked(tid, p);
+    status::SUCCESS
+}
+
+pub fn set_thread_affinity_by_handle(handle: u64, affinity_mask: u64) -> u32 {
+    let Some(tid) = resolve_thread_tid_from_handle(handle) else {
+        return status::INVALID_HANDLE;
+    };
+    if affinity_mask == 0 {
+        return status::INVALID_PARAMETER;
+    }
+    let _lock = KSchedulerLock::lock();
+    if !set_thread_affinity_mask_locked(tid, affinity_mask) {
+        return status::INVALID_PARAMETER;
+    }
     status::SUCCESS
 }
 
@@ -149,6 +178,8 @@ pub fn yield_current_thread() {
     let tid = current_tid();
     if tid == 0 { return; }
     let _lock = KSchedulerLock::lock();
+    // Voluntary yield should force unlock-edge to pick a peer if available.
+    sched::set_needs_reschedule();
     sched::set_thread_state_locked(tid, ThreadState::Ready);
 }
 
@@ -204,18 +235,27 @@ pub(crate) fn handle_set_information_thread(frame: &mut SvcFrame) {
     let info_ptr = frame.x[2] as *const u8;
     let info_len = frame.x[3] as usize;
 
-    if info_class != THREAD_INFO_CLASS_PRIORITY && info_class != THREAD_INFO_CLASS_BASE_PRIORITY {
-        frame.x[0] = status::SUCCESS as u64;
-        return;
+    match info_class {
+        THREAD_INFO_CLASS_PRIORITY | THREAD_INFO_CLASS_BASE_PRIORITY => {
+            if info_ptr.is_null() || info_len < core::mem::size_of::<i32>() {
+                frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
+                return;
+            }
+            let prio = unsafe { (info_ptr as *const i32).read_volatile() };
+            frame.x[0] = set_thread_base_priority_by_handle(thread_handle, prio) as u64;
+        }
+        THREAD_INFO_CLASS_AFFINITY_MASK => {
+            if info_ptr.is_null() || info_len < core::mem::size_of::<u64>() {
+                frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
+                return;
+            }
+            let affinity = unsafe { (info_ptr as *const u64).read_volatile() };
+            frame.x[0] = set_thread_affinity_by_handle(thread_handle, affinity) as u64;
+        }
+        _ => {
+            frame.x[0] = status::SUCCESS as u64;
+        }
     }
-
-    if info_ptr.is_null() || info_len < core::mem::size_of::<i32>() {
-        frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
-        return;
-    }
-
-    let prio = unsafe { (info_ptr as *const i32).read_volatile() };
-    frame.x[0] = set_thread_base_priority_by_handle(thread_handle, prio) as u64;
 }
 
 pub(crate) fn handle_yield(frame: &mut SvcFrame) {
