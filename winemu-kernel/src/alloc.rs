@@ -6,7 +6,7 @@ extern "C" {
     static __heap_start: u8;
 }
 
-const HEAP_SIZE: usize = 4 * 1024 * 1024;
+const HEAP_SIZE: usize = 128 * 1024 * 1024;
 
 static mut HEAP_BASE: usize = 0;
 

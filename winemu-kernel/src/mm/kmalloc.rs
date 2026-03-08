@@ -1019,16 +1019,24 @@ impl KmallocManager {
         }
         self.reset_bookkeeping();
 
-        self.arenas[0].init(heap_base, heap_size);
-        let primary_pages = core::cmp::min(MAX_PAGES, heap_size / PAGE_SIZE);
-        self.metas[0] = ArenaMeta {
-            active: true,
-            dynamic: false,
-            base_gpa: heap_base as u64,
-            pages: primary_pages,
-        };
-        if primary_pages != 0 {
-            self.insert_range(0, heap_base, heap_base + primary_pages * PAGE_SIZE);
+        let mut pages_left = heap_size / PAGE_SIZE;
+        let mut page_cursor = 0usize;
+        let mut slot = 0usize;
+        while slot < MAX_ARENAS && pages_left != 0 {
+            let pages = core::cmp::min(MAX_PAGES, pages_left);
+            let base = heap_base + page_cursor * PAGE_SIZE;
+            self.arenas[slot].init(base, pages * PAGE_SIZE);
+            self.metas[slot] = ArenaMeta {
+                active: true,
+                dynamic: false,
+                base_gpa: base as u64,
+                pages,
+            };
+            self.insert_range(slot, base, base + pages * PAGE_SIZE);
+
+            page_cursor += pages;
+            pages_left -= pages;
+            slot += 1;
         }
         self.alloc_hint = 0;
     }
@@ -1667,42 +1675,13 @@ fn drain_pending_frees(pending: &[PendingPhysFree; MAX_PENDING_PHYS_FREES], pend
 }
 
 fn alloc_direct(size: usize, align: usize) -> *mut u8 {
-    let size = size.max(1);
-    let align = align.max(1);
-    if !align.is_power_of_two() {
-        with_state_mut(|s| s.note_direct_alloc_failure());
-        return null_mut();
-    }
-    let total = match size.checked_add(align - 1) {
-        Some(v) => v,
-        None => {
-            with_state_mut(|s| s.note_direct_alloc_failure());
-            return null_mut();
-        }
-    };
-    let pages = match pages_for_bytes(total) {
-        Some(v) => v,
-        None => {
-            with_state_mut(|s| s.note_direct_alloc_failure());
-            return null_mut();
-        }
-    };
-    let Some(gpa) = crate::mm::phys::alloc_pages(pages) else {
-        with_state_mut(|s| s.note_direct_alloc_failure());
-        return null_mut();
-    };
-    let base = gpa as usize;
-    let Some(user_ptr) = align_up(base, align) else {
-        crate::mm::phys::free_pages(gpa, pages);
-        with_state_mut(|s| s.note_direct_alloc_failure());
-        return null_mut();
-    };
-    let ok = with_state_mut(|s| s.alloc_direct_install(user_ptr, size, gpa, pages));
-    if !ok {
-        crate::mm::phys::free_pages(gpa, pages);
-        return null_mut();
-    }
-    user_ptr as *mut u8
+    let _ = (size, align);
+    // Direct physical pages are guest-physical addresses and are not guaranteed
+    // to be permanently accessible in EL1 VA space across process TTBR0 tables.
+    // Until we add a dedicated kernel VA mapping for direct chunks, treat this
+    // path as allocation failure instead of returning an invalid pointer.
+    with_state_mut(|s| s.note_direct_alloc_failure());
+    null_mut()
 }
 
 pub fn init(heap_base: usize, heap_size: usize) {
