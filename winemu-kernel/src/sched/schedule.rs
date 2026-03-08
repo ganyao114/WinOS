@@ -229,9 +229,14 @@ pub fn scheduler_round_locked(
                 // least as urgent as current.
                 higher_priority || same_priority
             }
-            ScheduleReason::TimerPreempt | ScheduleReason::Ipi => {
-                // Timer/IPI preemption can rotate equal-priority peers but must
-                // not let lower-priority work overtake the current thread.
+            ScheduleReason::TimerPreempt => {
+                // Periodic timer preemption should rotate equal-priority peers
+                // without requiring an extra reschedule hint.
+                higher_priority || same_priority
+            }
+            ScheduleReason::Ipi => {
+                // IPI-driven preemption can rotate equal-priority peers when
+                // the target core has explicit reschedule pressure.
                 higher_priority
                     || (same_priority && (pending_resched || timeout_woke || slice_expired))
             }

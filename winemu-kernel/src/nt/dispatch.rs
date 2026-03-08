@@ -34,20 +34,39 @@ static TRAP_SCHED_ACTIVE: [AtomicU32; 8] = [
 
 struct TrapSchedGuard {
     vid: usize,
+    active: bool,
 }
 
 impl TrapSchedGuard {
     #[inline]
     fn enter(vid: usize) -> Self {
         TRAP_SCHED_ACTIVE[vid].fetch_add(1, Ordering::AcqRel);
-        Self { vid }
+        Self { vid, active: true }
+    }
+
+    #[inline]
+    fn suspend(&mut self) {
+        if self.active {
+            TRAP_SCHED_ACTIVE[self.vid].fetch_sub(1, Ordering::AcqRel);
+            self.active = false;
+        }
+    }
+
+    #[inline]
+    fn resume(&mut self) {
+        if !self.active {
+            TRAP_SCHED_ACTIVE[self.vid].fetch_add(1, Ordering::AcqRel);
+            self.active = true;
+        }
     }
 }
 
 impl Drop for TrapSchedGuard {
     #[inline]
     fn drop(&mut self) {
-        TRAP_SCHED_ACTIVE[self.vid].fetch_sub(1, Ordering::AcqRel);
+        if self.active {
+            TRAP_SCHED_ACTIVE[self.vid].fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -277,7 +296,7 @@ fn schedule_from_trap(
 ) -> bool {
     let vid = vcpu_id();
     let vid_u8 = vid as u8;
-    let _active_guard = TrapSchedGuard::enter(vid as usize);
+    let mut active_guard = TrapSchedGuard::enter(vid as usize);
     let mut from = current_tid();
     if from != 0 {
         save_ctx_for(from, frame);
@@ -333,6 +352,7 @@ fn schedule_from_trap(
                     }
                     if to_has_kctx {
                         save_ctx_for(from_sched, frame);
+                        active_guard.suspend();
                         execute_kernel_continuation_switch(
                             from_sched,
                             to,
@@ -341,6 +361,7 @@ fn schedule_from_trap(
                             slice_remaining_100ns,
                             "trap",
                         );
+                        active_guard.resume();
                         let cur = current_tid();
                         if cur != 0 {
                             set_vcpu_current_thread(vid as usize, cur);
@@ -390,6 +411,7 @@ fn schedule_from_trap(
                 crate::process::switch_to_thread_process(to);
                 if from_sched == 0 {
                     if with_thread(to, |t| t.is_idle_thread).unwrap_or(false) {
+                        active_guard.suspend();
                         unsafe { enter_kernel_continuation_noreturn(to) }
                     }
                     set_vcpu_current_thread(vid as usize, to);
@@ -452,12 +474,10 @@ pub extern "C" fn timer_irq_dispatch(frame: &mut SvcFrame) {
     let vid = vcpu_id() as usize;
     let cur = current_tid();
     let in_nested_trap_sched = TRAP_SCHED_ACTIVE[vid].load(Ordering::Acquire) != 0;
-    let cur_in_kernel = if cur != 0 {
-        with_thread(cur, |t| t.in_kernel).unwrap_or(false)
-    } else {
-        false
-    };
-    if in_nested_trap_sched || cur_in_kernel {
+    // SPSR.M[3:0] == 0b0000 means interrupted from EL0t (user mode).
+    // If we interrupted EL1, defer preemption to avoid nested kernel re-entry.
+    let interrupted_from_el0 = (frame.spsr & 0xF) == 0;
+    if in_nested_trap_sched || !interrupted_from_el0 {
         set_needs_reschedule();
         let now = crate::sched::wait::current_ticks();
         // Nested-trap / in-kernel IRQ path cannot switch immediately.
