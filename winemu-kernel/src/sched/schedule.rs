@@ -156,7 +156,6 @@ pub fn scheduler_round_locked(
     quantum_100ns: u64,
     reason: ScheduleReason,
 ) -> SchedulerRoundAction {
-    let _ = reason;
     if SCHED_ENABLE_STATE_SANITIZER && sanitize_invalid_thread_states_locked() {
         mark_shadow_priority_queue_dirty_locked();
     }
@@ -226,13 +225,20 @@ pub fn scheduler_round_locked(
         let should_switch = match reason {
             ScheduleReason::Yield => true,
             ScheduleReason::Wakeup | ScheduleReason::Timeout => {
-                higher_priority || same_priority || pending_resched || timeout_woke || slice_expired
+                // Wake/timeout should only preempt current when candidate is at
+                // least as urgent as current.
+                higher_priority || same_priority
             }
             ScheduleReason::TimerPreempt | ScheduleReason::Ipi => {
-                higher_priority || same_priority || pending_resched || timeout_woke || slice_expired
+                // Timer/IPI preemption can rotate equal-priority peers but must
+                // not let lower-priority work overtake the current thread.
+                higher_priority
+                    || (same_priority && (pending_resched || timeout_woke || slice_expired))
             }
             ScheduleReason::UnlockEdge => {
-                higher_priority || pending_resched || timeout_woke || slice_expired
+                // Ordinary syscall unlock-edge keeps current unless a strictly
+                // higher-priority candidate becomes runnable.
+                higher_priority
             }
         };
         if !should_switch {
