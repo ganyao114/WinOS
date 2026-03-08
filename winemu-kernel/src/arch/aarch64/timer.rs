@@ -143,7 +143,7 @@ global_asm!(
     "eret",
 );
 
-pub const DEFAULT_TIMESLICE_100NS: u64 = 150_000; // 15ms
+pub const DEFAULT_TIMESLICE_100NS: u64 = 30_000; // 3ms
 
 #[inline(always)]
 fn timer_frequency() -> u64 {

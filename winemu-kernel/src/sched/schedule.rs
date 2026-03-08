@@ -554,13 +554,13 @@ pub fn flush_unlock_edge(vid: usize) -> u32 {
         SchedulerRoundAction::IdleWait { .. } | SchedulerRoundAction::ContinueCurrent { .. } => {}
     }
 
-    // Now do the full multi-core scan (UpdateHighestPriorityThreads).
-    // This may add the current vCPU back into the mask if its candidate changed.
-    let mut mask = update_highest_priority_threads();
+    // Keep unlock-edge local by default: current vCPU selection is decided by
+    // scheduler_round_locked above. Other vCPUs reschedule on their own trap/IRQ
+    // edges instead of consuming cross-core peek snapshots.
+    let mut mask = 0u32;
 
     // Keep the current-vCPU decision from scheduler_round_locked authoritative.
-    // update_highest_priority_threads() scans ready queues and must not override
-    // the already-popped current candidate with idle.
+    // We only stage local unlock-edge switching here.
     {
         let vs = unsafe { SCHED.vcpu_raw_mut(vid) };
         match action {
