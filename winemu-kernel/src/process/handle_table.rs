@@ -79,9 +79,9 @@ const INLINE_CAP: usize = 16;
 const MAX_CAP:    usize = 1024;
 
 pub struct KHandleTable {
-    // Pointers to current active arrays (inline_objects/inline_slots or heap)
-    objects:  *mut Option<KObjectRef>,
-    slots:    *mut SlotInfo,
+    // Heap arrays used after inline capacity is exhausted.
+    heap_objects: *mut Option<KObjectRef>,
+    heap_slots:   *mut SlotInfo,
     capacity: u16,
     free_head: i16,   // -1 = full
     count:    u16,
@@ -99,8 +99,8 @@ unsafe impl Sync for KHandleTable {}
 impl KHandleTable {
     pub fn new() -> Self {
         let mut t = Self {
-            objects:  core::ptr::null_mut(),
-            slots:    core::ptr::null_mut(),
+            heap_objects: core::ptr::null_mut(),
+            heap_slots:   core::ptr::null_mut(),
             capacity: INLINE_CAP as u16,
             free_head: 0,
             count:    0,
@@ -115,9 +115,43 @@ impl KHandleTable {
                 next_free: if i + 1 < INLINE_CAP { i as i16 + 1 } else { -1 },
             };
         }
-        t.objects = t.inline_objects.as_mut_ptr();
-        t.slots   = t.inline_slots.as_mut_ptr();
         t
+    }
+
+    #[inline]
+    fn objects_ptr(&self) -> *const Option<KObjectRef> {
+        if self.is_heap {
+            self.heap_objects as *const Option<KObjectRef>
+        } else {
+            self.inline_objects.as_ptr()
+        }
+    }
+
+    #[inline]
+    fn objects_mut_ptr(&mut self) -> *mut Option<KObjectRef> {
+        if self.is_heap {
+            self.heap_objects
+        } else {
+            self.inline_objects.as_mut_ptr()
+        }
+    }
+
+    #[inline]
+    fn slots_ptr(&self) -> *const SlotInfo {
+        if self.is_heap {
+            self.heap_slots as *const SlotInfo
+        } else {
+            self.inline_slots.as_ptr()
+        }
+    }
+
+    #[inline]
+    fn slots_mut_ptr(&mut self) -> *mut SlotInfo {
+        if self.is_heap {
+            self.heap_slots
+        } else {
+            self.inline_slots.as_mut_ptr()
+        }
     }
 
     #[inline]
@@ -135,6 +169,9 @@ impl KHandleTable {
             256 => 1024,
             _   => return false,
         };
+        crate::log::debug_u64(
+            0xC1C0_0000_0000_0000 | ((self.capacity as u64) << 16) | (new_cap as u64),
+        );
         let obj_bytes = new_cap * core::mem::size_of::<Option<KObjectRef>>();
         let slt_bytes = new_cap * core::mem::size_of::<SlotInfo>();
         let new_obj = crate::mm::kmalloc::alloc(obj_bytes, 8) as *mut Option<KObjectRef>;
@@ -142,13 +179,14 @@ impl KHandleTable {
         if new_obj.is_null() || new_slt.is_null() {
             if !new_obj.is_null() { crate::mm::kmalloc::dealloc(new_obj as *mut u8); }
             if !new_slt.is_null() { crate::mm::kmalloc::dealloc(new_slt as *mut u8); }
+            crate::log::debug_u64(0xC1C1_FFFF_FFFF_FFFF);
             return false;
         }
         let old_cap = self.capacity as usize;
         unsafe {
             // Copy existing entries
-            core::ptr::copy_nonoverlapping(self.objects, new_obj, old_cap);
-            core::ptr::copy_nonoverlapping(self.slots,   new_slt, old_cap);
+            core::ptr::copy_nonoverlapping(self.objects_ptr(), new_obj, old_cap);
+            core::ptr::copy_nonoverlapping(self.slots_ptr(), new_slt, old_cap);
             // Init new slots as freelist: old_cap → old_cap+1 → ... → new_cap-1 → old free_head
             for i in old_cap..new_cap {
                 (*new_obj.add(i)) = None;
@@ -158,14 +196,15 @@ impl KHandleTable {
             }
         }
         if self.is_heap {
-            crate::mm::kmalloc::dealloc(self.objects as *mut u8);
-            crate::mm::kmalloc::dealloc(self.slots   as *mut u8);
+            crate::mm::kmalloc::dealloc(self.heap_objects as *mut u8);
+            crate::mm::kmalloc::dealloc(self.heap_slots as *mut u8);
         }
-        self.objects   = new_obj;
-        self.slots     = new_slt;
+        self.heap_objects = new_obj;
+        self.heap_slots = new_slt;
         self.free_head = old_cap as i16;
         self.capacity  = new_cap as u16;
         self.is_heap   = true;
+        crate::log::debug_u64(0xC1C1_0000_0000_0000 | (new_cap as u64));
         true
     }
 
@@ -177,9 +216,11 @@ impl KHandleTable {
         let idx = self.free_head as usize;
         let lid = self.alloc_lid();
         unsafe {
-            self.free_head = (*self.slots.add(idx)).next_free;
-            (*self.objects.add(idx)) = Some(obj);
-            (*self.slots.add(idx))   = SlotInfo { linear_id: lid };
+            let slots = self.slots_mut_ptr();
+            let objects = self.objects_mut_ptr();
+            self.free_head = (*slots.add(idx)).next_free;
+            (*objects.add(idx)) = Some(obj);
+            (*slots.add(idx)) = SlotInfo { linear_id: lid };
         }
         self.count += 1;
         Some(encode_handle(idx as u16, lid))
@@ -190,8 +231,10 @@ impl KHandleTable {
         let (idx, lid) = decode_handle(handle)?;
         if idx >= self.capacity as usize { return None; }
         unsafe {
-            if (*self.slots.add(idx)).linear_id != lid { return None; }
-            (*self.objects.add(idx))
+            let slots = self.slots_ptr();
+            let objects = self.objects_ptr();
+            if (*slots.add(idx)).linear_id != lid { return None; }
+            *objects.add(idx)
         }
     }
 
@@ -200,9 +243,11 @@ impl KHandleTable {
         let (idx, lid) = decode_handle(handle)?;
         if idx >= self.capacity as usize { return None; }
         unsafe {
-            if (*self.slots.add(idx)).linear_id != lid { return None; }
-            let obj = (*self.objects.add(idx)).take()?;
-            (*self.slots.add(idx)) = SlotInfo { next_free: self.free_head };
+            let slots = self.slots_mut_ptr();
+            let objects = self.objects_mut_ptr();
+            if (*slots.add(idx)).linear_id != lid { return None; }
+            let obj = (*objects.add(idx)).take()?;
+            (*slots.add(idx)) = SlotInfo { next_free: self.free_head };
             self.free_head = idx as i16;
             self.count -= 1;
             Some(obj)
@@ -211,10 +256,12 @@ impl KHandleTable {
 
     /// Drain all entries, calling f for each. Used on process exit.
     pub fn drain(&mut self, mut f: impl FnMut(KObjectRef)) {
+        let objects = self.objects_mut_ptr();
+        let slots = self.slots_mut_ptr();
         for i in 0..self.capacity as usize {
             unsafe {
-                if let Some(obj) = (*self.objects.add(i)).take() {
-                    (*self.slots.add(i)) = SlotInfo { next_free: self.free_head };
+                if let Some(obj) = (*objects.add(i)).take() {
+                    (*slots.add(i)) = SlotInfo { next_free: self.free_head };
                     self.free_head = i as i16;
                     self.count -= 1;
                     f(obj);
@@ -228,10 +275,12 @@ impl KHandleTable {
 
     /// Iterate all live entries (handle, obj). Used for stats/query.
     pub fn for_each(&self, mut f: impl FnMut(u32, KObjectRef)) {
+        let objects = self.objects_ptr();
+        let slots = self.slots_ptr();
         for i in 0..self.capacity as usize {
             unsafe {
-                if let Some(obj) = (*self.objects.add(i)) {
-                    let lid = (*self.slots.add(i)).linear_id;
+                if let Some(obj) = *objects.add(i) {
+                    let lid = (*slots.add(i)).linear_id;
                     if lid != 0 {
                         f(encode_handle(i as u16, lid), obj);
                     }
@@ -244,8 +293,8 @@ impl KHandleTable {
 impl Drop for KHandleTable {
     fn drop(&mut self) {
         if self.is_heap {
-            crate::mm::kmalloc::dealloc(self.objects as *mut u8);
-            crate::mm::kmalloc::dealloc(self.slots   as *mut u8);
+            crate::mm::kmalloc::dealloc(self.heap_objects as *mut u8);
+            crate::mm::kmalloc::dealloc(self.heap_slots as *mut u8);
         }
     }
 }
