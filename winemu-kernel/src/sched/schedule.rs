@@ -103,7 +103,7 @@ fn purge_tid_from_ready_queue_locked(tid: u32) {
     };
     let queue = unsafe { SCHED.queue_raw_mut() };
     let store = unsafe { SCHED.threads_raw() };
-    let _ = queue.remove(tid, prio, &|id| store.get_ptr(id));
+    while queue.remove(tid, prio, &|id| store.get_ptr(id)) {}
     if SCHED_ENABLE_STATE_SANITIZER {
         for p in 0..32u8 {
             if p != prio {

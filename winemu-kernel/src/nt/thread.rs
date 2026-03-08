@@ -177,10 +177,11 @@ pub fn set_thread_affinity_by_handle(handle: u64, affinity_mask: u64) -> u32 {
 pub fn yield_current_thread() {
     let tid = current_tid();
     if tid == 0 { return; }
-    let _lock = KSchedulerLock::lock();
-    // Voluntary yield should force unlock-edge to pick a peer if available.
+    // Voluntary yield should request a reschedule, but keep the current thread
+    // in Running until scheduler_round_locked decides whether to switch.
+    // This preserves Yield semantics: switch to peer if available, otherwise
+    // continue current without transiently self-selecting from ready-queue.
     sched::set_needs_reschedule();
-    sched::set_thread_state_locked(tid, ThreadState::Ready);
 }
 
 // ── thread_notify_terminated ──────────────────────────────────────────────────
