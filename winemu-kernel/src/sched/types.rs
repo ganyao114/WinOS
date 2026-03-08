@@ -177,6 +177,9 @@ pub struct KThread {
     pub suspend_count:          u32,
     pub transient_boost:        u8,
 
+    // alert (NtAlertThreadByThreadId / NtWaitForAlertByThreadId)
+    pub alerted:        bool,
+
     // wait state
     pub wait:           WaitState,
 
@@ -208,6 +211,7 @@ impl KThread {
             last_start_100ns:        0,
             suspend_count:           0,
             transient_boost:         0,
+            alerted:                 false,
             wait:                    WaitState::new(),
             sched_next:              0,
             in_ready_queue:          false,

@@ -120,11 +120,14 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         sysno::WRITE_FILE => file::handle_write_file(frame),
         sysno::QUERY_INFORMATION_FILE => file::handle_query_information_file(frame),
         sysno::QUERY_ATTRIBUTES_FILE => file::handle_query_attributes_file(frame),
+        sysno::QUERY_FULL_ATTRIBUTES_FILE => file::handle_query_full_attributes_file(frame),
         sysno::QUERY_VOLUME_INFORMATION_FILE => file::handle_query_volume_information_file(frame),
         sysno::SET_INFORMATION_FILE => file::handle_set_information_file(frame),
         sysno::FS_CONTROL_FILE => file::handle_fs_control_file(frame),
         sysno::QUERY_DIRECTORY_FILE => file::handle_query_directory_file(frame),
         sysno::NOTIFY_CHANGE_DIRECTORY_FILE => file::handle_notify_change_directory_file(frame),
+        sysno::FLUSH_BUFFERS_FILE => file::handle_flush_buffers_file(frame),
+        sysno::CANCEL_IO_FILE => file::handle_cancel_io_file(frame),
         sysno::QUERY_SYSTEM_INFORMATION => system::handle_query_system_information(frame),
         sysno::QUERY_SYSTEM_TIME => system::handle_query_system_time(frame),
         sysno::QUERY_PERFORMANCE_COUNTER => system::handle_query_performance_counter(frame),
@@ -132,14 +135,20 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         sysno::CREATE_EVENT => sync::handle_create_event(frame),
         sysno::SET_EVENT => sync::handle_set_event(frame),
         sysno::RESET_EVENT => sync::handle_reset_event_or_delay(frame),
+        sysno::CLEAR_EVENT => sync::handle_clear_event(frame),
+        sysno::OPEN_EVENT => sync::handle_open_event(frame),
+        sysno::QUERY_EVENT => sync::handle_query_event(frame),
         sysno::WAIT_SINGLE => sync::handle_wait_single(frame),
         sysno::WAIT_MULTIPLE => sync::handle_wait_multiple(frame),
         sysno::CREATE_MUTEX => sync::handle_create_mutex(frame),
         sysno::RELEASE_MUTANT => sync::handle_release_mutant_or_set_information_process(frame),
+        sysno::OPEN_MUTANT => sync::handle_open_mutex(frame),
         sysno::CREATE_SEMAPHORE => sync::handle_create_semaphore(frame),
         sysno::RELEASE_SEMAPHORE => sync::handle_release_semaphore(frame),
+        sysno::OPEN_SEMAPHORE => sync::handle_open_semaphore(frame),
 
         sysno::OPEN_KEY => registry::handle_open_key(frame),
+        sysno::OPEN_KEY_EX => registry::handle_open_key_ex(frame),
         sysno::CREATE_KEY => registry::handle_create_key(frame),
         sysno::QUERY_KEY => registry::handle_query_key(frame),
         sysno::QUERY_VALUE_KEY => registry::handle_query_value_key(frame),
@@ -160,12 +169,17 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         sysno::OPEN_SECTION => section::handle_open_section(frame),
         sysno::MAP_VIEW_OF_SECTION => section::handle_map_view_of_section(frame),
         sysno::UNMAP_VIEW_OF_SECTION => section::handle_unmap_view_of_section(frame),
+        sysno::QUERY_SECTION => section::handle_query_section(frame),
 
         sysno::QUERY_INFORMATION_PROCESS => process::handle_query_information_process(frame),
         sysno::OPEN_PROCESS => process::handle_open_process(frame),
         sysno::CREATE_PROCESS_EX => process::handle_create_process(frame),
         sysno::TERMINATE_PROCESS => process::handle_terminate_process(frame),
         sysno::OPEN_PROCESS_TOKEN => token::handle_open_process_token(frame),
+        sysno::OPEN_PROCESS_TOKEN_EX => token::handle_open_process_token_ex(frame),
+        sysno::OPEN_THREAD_TOKEN => token::handle_open_thread_token(frame),
+        sysno::OPEN_THREAD_TOKEN_EX => token::handle_open_thread_token_ex(frame),
+        sysno::ADJUST_PRIVILEGES_TOKEN => token::handle_adjust_privileges_token(frame),
         sysno::QUERY_INFORMATION_TOKEN => token::handle_query_information_token(frame),
 
         sysno::QUERY_INFORMATION_THREAD => thread::handle_query_information_thread(frame),
@@ -175,6 +189,10 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         sysno::RESUME_THREAD => thread::handle_resume_thread(frame),
         sysno::YIELD_EXECUTION => thread::handle_yield(frame),
         sysno::TERMINATE_THREAD => thread::handle_terminate_thread(frame),
+        sysno::ALERT_THREAD_BY_THREAD_ID => thread::handle_alert_thread_by_thread_id(frame),
+        sysno::WAIT_FOR_ALERT_BY_THREAD_ID => thread::handle_wait_for_alert_by_thread_id(frame),
+        sysno::CONTINUE => thread::handle_continue(frame),
+        sysno::RAISE_EXCEPTION => thread::handle_raise_exception(frame),
 
         sysno::DUPLICATE_OBJECT => object::handle_duplicate_object(frame),
         sysno::QUERY_OBJECT => object::handle_query_object(frame),
@@ -200,7 +218,7 @@ fn schedule_reason_for_syscall(
 ) -> ScheduleReason {
     match nr {
         sysno::YIELD_EXECUTION => ScheduleReason::Yield,
-        sysno::WAIT_SINGLE | sysno::WAIT_MULTIPLE => {
+        sysno::WAIT_SINGLE | sysno::WAIT_MULTIPLE | sysno::WAIT_FOR_ALERT_BY_THREAD_ID => {
             // Only treat wait syscalls as timeout-driven scheduling when the
             // caller actually entered Waiting.
             if current != 0

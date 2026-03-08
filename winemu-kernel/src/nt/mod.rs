@@ -4,6 +4,7 @@ pub mod dispatch;
 pub mod file;
 pub mod kobject;
 pub mod memory;
+pub mod named_objects;
 pub mod object;
 pub mod path;
 pub mod process;

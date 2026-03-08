@@ -1391,6 +1391,47 @@ pub(crate) fn handle_query_attributes_file(frame: &mut SvcFrame) {
     frame.x[0] = status::SUCCESS as u64;
 }
 
+// x0=ObjectAttributes, x1=FileInformation (FILE_NETWORK_OPEN_INFORMATION, 56 bytes)
+pub(crate) fn handle_query_full_attributes_file(frame: &mut SvcFrame) {
+    let oa_ptr = frame.x[0];
+    let out_ptr = frame.x[1] as *mut u8;
+    let mut path_buf = [0u8; 512];
+
+    if out_ptr.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+
+    let path_len = read_oa_path(oa_ptr, &mut path_buf);
+    if path_len == 0 {
+        frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
+        return;
+    }
+    let path = match core::str::from_utf8(&path_buf[..path_len]) {
+        Ok(s) => s,
+        Err(_) => {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        }
+    };
+
+    let fd = hypercall::host_open(path, HOST_OPEN_READ);
+    if fd == u64::MAX {
+        frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
+        return;
+    }
+    hypercall::host_close(fd);
+
+    // FILE_NETWORK_OPEN_INFORMATION: 56 bytes
+    // CreationTime(8)+LastAccessTime(8)+LastWriteTime(8)+ChangeTime(8)
+    // +AllocationSize(8)+EndOfFile(8)+FileSize(8)+FileAttributes(4)+pad(4)
+    unsafe {
+        core::ptr::write_bytes(out_ptr, 0, 56);
+        (out_ptr.add(48) as *mut u32).write_volatile(FILE_ATTRIBUTE_NORMAL);
+    }
+    frame.x[0] = status::SUCCESS as u64;
+}
+
 // x0=FileHandle, x4=*IoStatusBlock
 pub(crate) fn handle_device_io_control_file(frame: &mut SvcFrame) {
     let owner_pid = crate::process::current_pid();
@@ -1668,4 +1709,36 @@ pub(crate) fn close_file_idx(idx: u32) {
         cancel_pending_host_ioctl_for_file(owner_pid, idx);
     }
     file_free(idx);
+}
+
+// x0=FileHandle, x1=*IoStatusBlock
+pub(crate) fn handle_flush_buffers_file(frame: &mut SvcFrame) {
+    let file_handle = frame.x[0];
+    let iosb_ptr = frame.x[1] as *mut IoStatusBlock;
+    let pid = crate::process::current_pid();
+    if handle_idx_for_pid(file_handle, pid) == 0 && !is_std_file_handle(file_handle) {
+        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    }
+    // Host VFS handles durability; stub as success.
+    write_iosb(iosb_ptr, status::SUCCESS, 0);
+    frame.x[0] = status::SUCCESS as u64;
+}
+
+// x0=FileHandle, x1=*IoStatusBlock
+pub(crate) fn handle_cancel_io_file(frame: &mut SvcFrame) {
+    let file_handle = frame.x[0];
+    let iosb_ptr = frame.x[1] as *mut IoStatusBlock;
+    let pid = crate::process::current_pid();
+    let file_idx = handle_idx_for_pid(file_handle, pid);
+    if file_idx == 0 {
+        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    }
+    cancel_pending_file_io_for_file(pid, file_idx);
+    cancel_pending_host_ioctl_for_file(pid, file_idx);
+    write_iosb(iosb_ptr, status::SUCCESS, 0);
+    frame.x[0] = status::SUCCESS as u64;
 }

@@ -3,7 +3,7 @@ use crate::process::{KObjectKind, KObjectRef, with_process_mut};
 use crate::rust_alloc::vec::Vec;
 use winemu_shared::status;
 
-use super::common::align_up_4k;
+use super::common::{align_up_4k, GuestWriter};
 use super::constants::PAGE_SIZE_4K;
 use super::path::read_oa_path;
 use super::state::{
@@ -12,6 +12,23 @@ use super::state::{
 };
 use super::SvcFrame;
 use crate::mm::vaspace::VmaType;
+
+// ── Guest-memory layout structs ───────────────────────────────────────────────
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct SectionBasicInformation {
+    base_address:         u64,
+    allocation_attributes: u32,
+    _pad:                 u32,
+    maximum_size:         u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct SectionImageInformation {
+    _data: [u8; 40],
+}
 
 const SEC_IMAGE: u32 = 0x0100_0000;
 const PAGE_EXECUTE_READ: u32 = 0x20;
@@ -398,4 +415,55 @@ pub(crate) fn section_name_utf16(section_idx: u32) -> Option<Vec<u16>> {
         out = Some(name);
     });
     out
+}
+
+// x0=SectionHandle, x1=SectionInformationClass, x2=Buffer, x3=Length, x4=*ReturnLength
+pub(crate) fn handle_query_section(frame: &mut SvcFrame) {
+    let h = frame.x[0];
+    let info_class = frame.x[1] as u32;
+    let buf = frame.x[2] as *mut u8;
+    let len = frame.x[3] as usize;
+    let ret_len = frame.x[4] as *mut u32;
+
+    let pid = crate::process::current_pid();
+    let obj = with_process_mut(pid, |p| p.handle_table.get(h as u32)).flatten();
+    let sec_idx = match obj {
+        Some(o) if o.kind == KObjectKind::Section => o.obj_idx,
+        _ => { frame.x[0] = status::INVALID_HANDLE as u64; return; }
+    };
+    let sec = match section_get(sec_idx) {
+        Some(s) => s,
+        None => { frame.x[0] = status::INVALID_HANDLE as u64; return; }
+    };
+
+    match info_class {
+        0 => {
+            let required = core::mem::size_of::<SectionBasicInformation>();
+            let Some(mut w) = GuestWriter::new(buf, len, required) else {
+                if !ret_len.is_null() { unsafe { ret_len.write_volatile(required as u32) }; }
+                frame.x[0] = status::BUFFER_TOO_SMALL as u64;
+                return;
+            };
+            w.write_struct(SectionBasicInformation {
+                base_address: 0,
+                allocation_attributes: sec.alloc_attrs,
+                _pad: 0,
+                maximum_size: sec.size,
+            });
+            if !ret_len.is_null() { unsafe { ret_len.write_volatile(required as u32) }; }
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        1 => {
+            let required = core::mem::size_of::<SectionImageInformation>();
+            let Some(mut w) = GuestWriter::new(buf, len, required) else {
+                if !ret_len.is_null() { unsafe { ret_len.write_volatile(required as u32) }; }
+                frame.x[0] = status::BUFFER_TOO_SMALL as u64;
+                return;
+            };
+            w.write_struct(SectionImageInformation { _data: [0u8; 40] });
+            if !ret_len.is_null() { unsafe { ret_len.write_volatile(required as u32) }; }
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        _ => { frame.x[0] = status::INVALID_PARAMETER as u64; }
+    }
 }

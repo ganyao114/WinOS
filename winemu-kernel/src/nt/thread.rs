@@ -4,6 +4,8 @@ use crate::sched::{
     suspend_thread_locked, resume_thread_locked,
     set_thread_affinity_mask_locked, set_thread_priority_locked, ThreadState,
     KSchedulerLock, thread_exists,
+    alert_thread_by_tid, wait_for_alert_by_tid,
+    timeout_to_deadline, WaitDeadline,
 };
 use winemu_shared::status;
 
@@ -345,5 +347,72 @@ pub(crate) fn handle_resume_thread(frame: &mut SvcFrame) {
             frame.x[0] = status::SUCCESS as u64;
         }
         Err(st) => frame.x[0] = st as u64,
+    }
+}
+
+// x0=ThreadId
+pub(crate) fn handle_alert_thread_by_thread_id(frame: &mut SvcFrame) {
+    let tid = frame.x[0] as u32;
+    frame.x[0] = alert_thread_by_tid(tid) as u64;
+}
+
+// x0=ThreadId, x1=Timeout*
+pub(crate) fn handle_wait_for_alert_by_thread_id(frame: &mut SvcFrame) {
+    let timeout_ptr = frame.x[1] as *const i64;
+    let deadline = if timeout_ptr.is_null() {
+        WaitDeadline::Infinite
+    } else {
+        timeout_to_deadline(unsafe { timeout_ptr.read_volatile() })
+    };
+    frame.x[0] = wait_for_alert_by_tid(deadline) as u64;
+}
+
+// x0=ContextRecord*, x1=TestAlert
+pub(crate) fn handle_continue(frame: &mut SvcFrame) {
+    let ctx_ptr = frame.x[0] as *const u8;
+    if ctx_ptr.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+    // ARM64 CONTEXT layout: ContextFlags(4)+pad(4)+X0..X28(29×8)+Fp(8)+Lr(8)+Sp(8)+Pc(8)+Cpsr(4)+pad(4)
+    // Offset of X0 = 8, Pc = 8 + 31*8 = 256, Sp = 8 + 30*8 = 248, Cpsr = 264
+    let base = ctx_ptr as u64;
+    let pc  = unsafe { ((base + 256) as *const u64).read_volatile() };
+    let sp  = unsafe { ((base + 248) as *const u64).read_volatile() };
+    let cpsr = unsafe { ((base + 264) as *const u32).read_volatile() };
+    // Restore general-purpose registers x0..x18 from context
+    for i in 0u64..19 {
+        let val = unsafe { ((base + 8 + i * 8) as *const u64).read_volatile() };
+        frame.x[i as usize] = val;
+    }
+    frame.elr = pc;
+    frame.sp_el0 = sp;
+    frame.spsr = cpsr as u64;
+    // x0 will be overwritten by the restored value above; status is in the restored context
+}
+
+// x0=ExceptionRecord*, x1=ContextRecord*, x2=FirstChance
+pub(crate) fn handle_raise_exception(frame: &mut SvcFrame) {
+    use crate::ldr::ImportRef;
+    // Resolve KiUserExceptionDispatcher from ntdll (cached by the caller on first use).
+    // ARM64 calling convention: x0=ExceptionRecord*, x1=Context*
+    // The pointers are already in guest memory (passed by the caller).
+    let dispatcher = crate::dll::resolve_import(
+        "ntdll.dll",
+        ImportRef::Name("KiUserExceptionDispatcher"),
+    );
+    match dispatcher {
+        Some(addr) => {
+            // Redirect EL0 return to KiUserExceptionDispatcher.
+            // x0 and x1 already hold ExceptionRecord* and Context* from the syscall args.
+            frame.elr = addr;
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        None => {
+            // ntdll not loaded yet or export missing — terminate.
+            let pid = crate::process::current_pid();
+            crate::process::terminate_process(pid, 0xC000_001D);
+            frame.x[0] = status::SUCCESS as u64;
+        }
     }
 }

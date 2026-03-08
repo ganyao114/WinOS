@@ -304,6 +304,7 @@ pub mod status {
     pub const ABANDONED_WAIT_0: u32 = 0x0000_0080;
     pub const OBJECT_NOT_FOUND: u32 = 0xC000_0034;
     pub const OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
+    pub const OBJECT_NAME_EXISTS: u32 = 0x4000_0000;
     pub const ACCESS_DENIED: u32 = 0xC000_0022;
     pub const INVALID_HANDLE: u32 = 0xC000_0008;
     pub const END_OF_FILE: u32 = 0xC000_011B;
@@ -321,6 +322,7 @@ pub mod status {
     pub const CANCELLED: u32 = 0xC000_0120;
     pub const NOT_IMPLEMENTED: u32 = 0xC000_0002;
     pub const STILL_ACTIVE: u32 = 0x0000_0103; // STATUS_PENDING — thread still running
+    pub const ALERTED: u32 = 0x0000_0101;
 }
 
 /// NT TEB 字段偏移（64-bit，参考 Wine winternl.h + signal_arm64.c）

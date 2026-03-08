@@ -166,3 +166,62 @@ pub fn block_current_and_resched(
 
 /// WAIT_KIND constant for hostcall waits.
 pub const WAIT_KIND_HOSTCALL: u8 = 4;
+
+/// WAIT_KIND constant for alert waits (NtWaitForAlertByThreadId).
+pub const WAIT_KIND_ALERT: u8 = 5;
+
+/// Alert a thread by TID (NtAlertThreadByThreadId).
+/// If the thread is waiting in WAIT_KIND_ALERT, wake it with STATUS_ALERTED.
+/// Otherwise set its alerted flag so the next wait returns immediately.
+pub fn alert_thread_by_tid(tid: u32) -> u32 {
+    let _lock = KSchedulerLock::lock();
+    let is_waiting = with_thread(tid, |t| {
+        t.state == ThreadState::Waiting && t.wait.kind == WAIT_KIND_ALERT
+    }).unwrap_or(false);
+    if is_waiting {
+        unblock_thread_locked(tid, winemu_shared::status::ALERTED);
+    } else {
+        with_thread_mut(tid, |t| { t.alerted = true; });
+    }
+    winemu_shared::status::SUCCESS
+}
+
+/// Wait for an alert on the current thread (NtWaitForAlertByThreadId).
+/// Returns STATUS_ALERTED if already alerted, otherwise blocks.
+pub fn wait_for_alert_by_tid(timeout: WaitDeadline) -> u32 {
+    use crate::sched::lock::SchedLockAndSleep;
+    let tid = current_tid();
+    if tid == 0 {
+        return winemu_shared::status::INVALID_PARAMETER;
+    }
+    let status = {
+        let mut slp = SchedLockAndSleep::new();
+        let already = with_thread(tid, |t| t.alerted).unwrap_or(false);
+        if already {
+            with_thread_mut(tid, |t| { t.alerted = false; });
+            slp.cancel();
+            winemu_shared::status::ALERTED
+        } else {
+            with_thread_mut(tid, |t| { t.wait.kind = WAIT_KIND_ALERT; });
+            block_thread_locked(tid, timeout);
+            STATUS_PENDING
+        }
+    };
+    if status == STATUS_PENDING {
+        loop {
+            let (state, r) = with_thread(tid, |t| (t.state, t.wait.result))
+                .unwrap_or((ThreadState::Terminated, winemu_shared::status::ALERTED));
+            if state != ThreadState::Waiting {
+                break r;
+            }
+            let mut slp = SchedLockAndSleep::new();
+            let state2 = with_thread(tid, |t| t.state).unwrap_or(ThreadState::Terminated);
+            if state2 != ThreadState::Waiting {
+                slp.cancel();
+            }
+            drop(slp);
+        }
+    } else {
+        status
+    }
+}

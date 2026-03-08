@@ -74,3 +74,87 @@ pub(crate) fn file_handle_to_host_fd_for_pid(owner_pid: u32, file_handle: u64) -
         }
     }
 }
+
+// ── GuestWriter ───────────────────────────────────────────────────────────────
+//
+// Writes a flat struct into guest memory at `buf`, advancing an internal
+// offset. Validates buffer length up front via `GuestWriter::new`.
+//
+// Usage:
+//   let mut w = GuestWriter::new(buf, len, 24)?;  // None if buf null or len < 24
+//   w.u64(0);          // BaseAddress
+//   w.u32(attrs);      // AllocationAttributes
+//   w.u32(0);          // padding
+//   w.u64(size);       // MaximumSize
+
+pub(crate) struct GuestWriter {
+    base: *mut u8,
+    offset: usize,
+}
+
+impl GuestWriter {
+    /// Returns None if `buf` is null or `len < required`.
+    #[inline]
+    pub(crate) fn new(buf: *mut u8, len: usize, required: usize) -> Option<Self> {
+        if buf.is_null() || len < required {
+            None
+        } else {
+            Some(Self { base: buf, offset: 0 })
+        }
+    }
+
+    #[inline]
+    pub(crate) fn u8(&mut self, v: u8) -> &mut Self {
+        unsafe { self.base.add(self.offset).write_volatile(v) };
+        self.offset += 1;
+        self
+    }
+
+    #[inline]
+    pub(crate) fn u16(&mut self, v: u16) -> &mut Self {
+        unsafe { (self.base.add(self.offset) as *mut u16).write_volatile(v) };
+        self.offset += 2;
+        self
+    }
+
+    #[inline]
+    pub(crate) fn u32(&mut self, v: u32) -> &mut Self {
+        unsafe { (self.base.add(self.offset) as *mut u32).write_volatile(v) };
+        self.offset += 4;
+        self
+    }
+
+    #[inline]
+    pub(crate) fn u64(&mut self, v: u64) -> &mut Self {
+        unsafe { (self.base.add(self.offset) as *mut u64).write_volatile(v) };
+        self.offset += 8;
+        self
+    }
+
+    /// Zero-fill `n` bytes.
+    #[inline]
+    pub(crate) fn zeros(&mut self, n: usize) -> &mut Self {
+        for i in 0..n {
+            unsafe { self.base.add(self.offset + i).write_volatile(0u8) };
+        }
+        self.offset += n;
+        self
+    }
+
+    #[inline]
+    pub(crate) fn bytes_written(&self) -> usize {
+        self.offset
+    }
+
+    /// Write a `repr(C)` struct directly into guest memory.
+    /// Caller must ensure `T` is `Copy` and has no padding surprises.
+    #[inline]
+    pub(crate) fn write_struct<T: Copy>(&mut self, v: T) -> &mut Self {
+        let size = core::mem::size_of::<T>();
+        unsafe {
+            (self.base.add(self.offset) as *mut T).write_volatile(v);
+        }
+        self.offset += size;
+        self
+    }
+}
