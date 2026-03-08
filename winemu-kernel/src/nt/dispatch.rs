@@ -7,7 +7,7 @@ use crate::sched::{
     current_tid, drain_deferred_kstacks, set_thread_in_kernel_locked,
     set_needs_reschedule,
     vcpu_id, with_thread, with_thread_mut, set_current_tid, set_vcpu_current_thread, ThreadState,
-    SCHED_LOCK, SchedulerRoundAction, scheduler_round_locked,
+    SCHED_LOCK, ScheduleReason, SchedulerRoundAction, scheduler_round_locked,
     execute_kernel_continuation_switch, enter_kernel_continuation_noreturn,
 };
 use crate::timer;
@@ -68,6 +68,11 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
     let tag = frame.x8_orig;
     let nr = (tag & SVC_TAG_NR_MASK) as u16;
     let table = ((tag >> SVC_TAG_TABLE_SHIFT) & SVC_TAG_TABLE_MASK) as u8;
+    let sched_reason = if table == 0 {
+        schedule_reason_for_syscall(nr, frame)
+    } else {
+        ScheduleReason::UnlockEdge
+    };
     crate::log::debug_u64(0xE200_0000 | ((table as u64) << 12) | nr as u64);
 
     if table != 0 {
@@ -76,7 +81,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
                 0x127 => {
                     // NtUserInitializeClientPfnArrays
                     win32k::handle_user_initialize_client_pfn_arrays(frame);
-                    schedule_from_trap(frame, true, true, 0);
+                    schedule_from_trap(frame, true, true, 0, ScheduleReason::UnlockEdge);
                     return;
                 }
                 _ => {}
@@ -86,7 +91,7 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         // Non-NT tables still need normal trap-exit scheduling so timer slice /
         // deadline programming remains consistent on this path.
         forward_to_vmm(frame, nr, table);
-        schedule_from_trap(frame, true, true, 0);
+        schedule_from_trap(frame, true, true, 0, ScheduleReason::UnlockEdge);
         return;
     }
 
@@ -166,7 +171,27 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
     }
 
     trace_syscall_error(nr, table, frame);
-    schedule_from_trap(frame, true, true, 0);
+    schedule_from_trap(frame, true, true, 0, sched_reason);
+}
+
+fn schedule_reason_for_syscall(nr: u16, frame: &SvcFrame) -> ScheduleReason {
+    match nr {
+        sysno::YIELD_EXECUTION => ScheduleReason::Yield,
+        sysno::WAIT_SINGLE | sysno::WAIT_MULTIPLE => ScheduleReason::Timeout,
+        sysno::SET_EVENT
+        | sysno::RELEASE_MUTANT
+        | sysno::RELEASE_SEMAPHORE
+        | sysno::RESUME_THREAD
+        | sysno::CREATE_THREAD_EX => ScheduleReason::Wakeup,
+        sysno::RESET_EVENT => {
+            if system::should_dispatch_delay_execution(frame) {
+                ScheduleReason::Timeout
+            } else {
+                ScheduleReason::UnlockEdge
+            }
+        }
+        _ => ScheduleReason::UnlockEdge,
+    }
 }
 
 fn trace_syscall_error(nr: u16, table: u8, frame: &SvcFrame) {
@@ -227,6 +252,7 @@ fn schedule_from_trap(
     allow_idle_wait: bool,
     drain_hostcall: bool,
     quantum_100ns: u64,
+    reason: ScheduleReason,
 ) -> bool {
     let vid = vcpu_id();
     let vid_u8 = vid as u8;
@@ -240,7 +266,7 @@ fn schedule_from_trap(
             crate::hostcall::pump_completions();
         }
         SCHED_LOCK.acquire();
-        match scheduler_round_locked(vid, from, quantum_100ns) {
+        match scheduler_round_locked(vid, from, quantum_100ns, reason) {
             SchedulerRoundAction::ContinueCurrent {
                 now_100ns,
                 next_deadline_100ns,
@@ -423,7 +449,13 @@ pub extern "C" fn timer_irq_dispatch(frame: &mut SvcFrame) {
         set_thread_in_kernel_locked(cur, true);
     }
     drain_deferred_kstacks();
-    schedule_from_trap(frame, false, true, timer::DEFAULT_TIMESLICE_100NS);
+    schedule_from_trap(
+        frame,
+        false,
+        true,
+        timer::DEFAULT_TIMESLICE_100NS,
+        ScheduleReason::TimerPreempt,
+    );
 }
 
 #[no_mangle]

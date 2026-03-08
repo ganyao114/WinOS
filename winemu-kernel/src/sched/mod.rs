@@ -37,7 +37,10 @@ pub use cpu::{
     set_needs_reschedule, take_needs_reschedule,
 };
 
-pub use config::{SCHED_ENABLE_MESO_SHADOW, SCHED_REBUILD_READY_EACH_ROUND, SCHED_USE_MESO_PICK};
+pub use config::{
+    SCHED_ENABLE_MESO_SHADOW, SCHED_ENABLE_STATE_SANITIZER, SCHED_REBUILD_READY_EACH_ROUND,
+    SCHED_USE_MESO_PICK,
+};
 
 // Scheduler lock
 pub use lock::{
@@ -99,7 +102,7 @@ pub use threads::{
 
 // Scheduler core
 pub use schedule::{
-    scheduler_round_locked, SchedulerRoundAction,
+    scheduler_round_locked, ScheduleReason, SchedulerRoundAction,
     execute_kernel_continuation_switch,
     flush_unlock_edge, reschedule_current_core,
     enable_scheduling, update_highest_priority_threads,

@@ -1,13 +1,14 @@
 // sched/schedule.rs — Core scheduler round + context-switch dispatch
 //
-// scheduler_round_locked(vid, from_tid, quantum_100ns) → SchedulerRoundAction
+// scheduler_round_locked(vid, from_tid, quantum_100ns, reason) → SchedulerRoundAction
 // execute_kernel_continuation_switch(from, to, ...)
 // enter_kernel_continuation_noreturn(to) → !
 
 use core::arch::asm;
 
 use crate::sched::config::{
-    SCHED_ENABLE_MESO_SHADOW, SCHED_REBUILD_READY_EACH_ROUND, SCHED_USE_MESO_PICK,
+    SCHED_ENABLE_MESO_SHADOW, SCHED_ENABLE_STATE_SANITIZER, SCHED_REBUILD_READY_EACH_ROUND,
+    SCHED_USE_MESO_PICK,
 };
 use crate::sched::context::drain_deferred_kstacks;
 use crate::sched::cpu::{set_current_tid, take_needs_reschedule, vcpu_id};
@@ -48,6 +49,16 @@ pub enum SchedulerRoundAction {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScheduleReason {
+    UnlockEdge,
+    Yield,
+    TimerPreempt,
+    Wakeup,
+    Ipi,
+    Timeout,
+}
+
 // ── pick_next_thread_locked ───────────────────────────────────────────────────
 
 fn pick_next_thread_locked(vid: u32) -> u32 {
@@ -63,15 +74,26 @@ fn pick_next_thread_locked(vid: u32) -> u32 {
     )
 }
 
-fn requeue_popped_thread_locked(tid: u32) {
-    if tid == 0 {
-        return;
-    }
-    let prio = with_thread(tid, |t| t.priority).unwrap_or(31);
+fn peek_next_thread_locked(vid: u32) -> u32 {
     let queue = unsafe { SCHED.queue_raw_mut() };
-    let store =
-        unsafe { SCHED.threads_raw_mut() } as *mut crate::sched::thread_store::ThreadStore;
-    queue.push_with_store(tid, prio, &mut |id| unsafe { (*store).get_mut(id) });
+    let store = unsafe { SCHED.threads_raw() };
+    queue.peek_highest_matching(
+        &|id| store.get_ptr(id).map(|p| p as *const _),
+        &|t| {
+            !t.is_idle_thread
+                && (t.affinity_mask & (1u32 << vid)) != 0
+                && (!t.in_kernel || t.last_vcpu_hint as u32 == vid)
+        },
+    )
+}
+
+fn dequeue_ready_tid_locked(tid: u32) -> bool {
+    let Some(prio) = with_thread(tid, |t| t.priority) else {
+        return false;
+    };
+    let queue = unsafe { SCHED.queue_raw_mut() };
+    let store = unsafe { SCHED.threads_raw() };
+    queue.remove(tid, prio, &|id| store.get_ptr(id))
 }
 
 fn purge_tid_from_ready_queue_locked(tid: u32) {
@@ -142,8 +164,14 @@ fn rebuild_ready_queue_locked() {
 
 // ── scheduler_round_locked ────────────────────────────────────────────────────
 
-pub fn scheduler_round_locked(vid: u32, from_tid: u32, quantum_100ns: u64) -> SchedulerRoundAction {
-    if sanitize_invalid_thread_states_locked() {
+pub fn scheduler_round_locked(
+    vid: u32,
+    from_tid: u32,
+    quantum_100ns: u64,
+    reason: ScheduleReason,
+) -> SchedulerRoundAction {
+    let _ = reason;
+    if SCHED_ENABLE_STATE_SANITIZER && sanitize_invalid_thread_states_locked() {
         mark_shadow_priority_queue_dirty_locked();
     }
     if SCHED_REBUILD_READY_EACH_ROUND {
@@ -175,7 +203,7 @@ pub fn scheduler_round_locked(vid: u32, from_tid: u32, quantum_100ns: u64) -> Sc
         purge_tid_from_ready_queue_locked(from_tid);
     }
 
-    let to_tid = pick_next_thread_locked(vid);
+    let mut to_tid = peek_next_thread_locked(vid);
 
     if to_tid == 0 {
         // Current running thread is not kept in ready queue; if there is no
@@ -206,17 +234,25 @@ pub fn scheduler_round_locked(vid: u32, from_tid: u32, quantum_100ns: u64) -> Sc
         };
     }
 
-    // Time-slice policy:
-    // If there is no strictly higher-priority ready thread and current thread
-    // still has quantum left, keep running current and put the popped
-    // candidate back. This avoids switching on every syscall unlock-edge.
     if from_tid != 0 && to_tid != from_tid && !cur_not_running {
         let from_prio = with_thread(from_tid, |t| t.priority).unwrap_or(31);
         let to_prio = with_thread(to_tid, |t| t.priority).unwrap_or(31);
-        let higher_priority_ready = to_prio < from_prio;
+        let higher_priority = to_prio < from_prio;
+        let same_priority = to_prio == from_prio;
         let slice_expired = slice_remaining == 0;
-        if !higher_priority_ready && !slice_expired && !pending_resched && !timeout_woke {
-            requeue_popped_thread_locked(to_tid);
+        let should_switch = match reason {
+            ScheduleReason::Yield => true,
+            ScheduleReason::Wakeup | ScheduleReason::Timeout => {
+                higher_priority || same_priority || pending_resched || timeout_woke || slice_expired
+            }
+            ScheduleReason::TimerPreempt | ScheduleReason::Ipi => {
+                higher_priority || same_priority || pending_resched || timeout_woke || slice_expired
+            }
+            ScheduleReason::UnlockEdge => {
+                higher_priority || pending_resched || timeout_woke || slice_expired
+            }
+        };
+        if !should_switch {
             return SchedulerRoundAction::ContinueCurrent {
                 now_100ns,
                 next_deadline_100ns,
@@ -225,12 +261,31 @@ pub fn scheduler_round_locked(vid: u32, from_tid: u32, quantum_100ns: u64) -> Sc
         }
     }
 
-    if to_tid == from_tid && !cur_not_running && !pending_resched && !timeout_woke {
+    if to_tid == from_tid && !cur_not_running {
         return SchedulerRoundAction::ContinueCurrent {
             now_100ns,
             next_deadline_100ns,
             slice_remaining_100ns: slice_remaining,
         };
+    }
+
+    // Commit selection: dequeue chosen ready thread only after policy decided.
+    if to_tid != 0 && !dequeue_ready_tid_locked(to_tid) {
+        to_tid = pick_next_thread_locked(vid);
+        if to_tid == 0 {
+            if from_tid != 0 && !cur_not_running {
+                return SchedulerRoundAction::ContinueCurrent {
+                    now_100ns,
+                    next_deadline_100ns,
+                    slice_remaining_100ns: slice_remaining,
+                };
+            }
+            return SchedulerRoundAction::IdleWait {
+                now_100ns,
+                next_deadline_100ns,
+                from_tid,
+            };
+        }
     }
 
     // Preempted running thread must be returned to ready queue when we switch
@@ -240,7 +295,7 @@ pub fn scheduler_round_locked(vid: u32, from_tid: u32, quantum_100ns: u64) -> Sc
         set_thread_state_locked(from_tid, ThreadState::Ready);
     }
 
-    // We already popped one queue node for `to_tid`; purge any stale duplicates.
+    // Purge stale duplicate links for the selected thread.
     purge_tid_from_ready_queue_locked(to_tid);
 
     reset_quantum_locked(to_tid);
@@ -496,7 +551,7 @@ pub fn flush_unlock_edge(vid: usize) -> u32 {
     // free terminated threads, and pop the next thread from the ready queue.
     // This also handles the ContinueCurrent / IdleWait cases for this vCPU.
     let from_tid = unsafe { SCHED.vcpu_raw(vid) }.current_tid;
-    let action = scheduler_round_locked(vid as u32, from_tid, 0);
+    let action = scheduler_round_locked(vid as u32, from_tid, 0, ScheduleReason::UnlockEdge);
 
     // Apply the round result to the current vCPU's state.
     match action {

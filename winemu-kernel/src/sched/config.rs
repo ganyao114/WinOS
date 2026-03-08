@@ -12,3 +12,6 @@ pub const SCHED_ENABLE_MESO_SHADOW: bool = false;
 /// Legacy safety net: rebuild ready queue from thread states every scheduler
 /// round. Keep disabled to avoid multi-core duplicate picks.
 pub const SCHED_REBUILD_READY_EACH_ROUND: bool = false;
+
+/// Emergency state sanitizer for debugging only. Keep disabled on normal path.
+pub const SCHED_ENABLE_STATE_SANITIZER: bool = false;

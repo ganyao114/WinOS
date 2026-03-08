@@ -51,6 +51,7 @@ pub unsafe extern "C" fn idle_thread_fn() -> ! {
             vid as u32,
             from_tid,
             crate::timer::DEFAULT_TIMESLICE_100NS,
+            crate::sched::ScheduleReason::Ipi,
         ) {
             crate::sched::SchedulerRoundAction::RunThread {
                 now_100ns,
