@@ -68,11 +68,9 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
     let tag = frame.x8_orig;
     let nr = (tag & SVC_TAG_NR_MASK) as u16;
     let table = ((tag >> SVC_TAG_TABLE_SHIFT) & SVC_TAG_TABLE_MASK) as u8;
-    let sched_reason = if table == 0 {
-        schedule_reason_for_syscall(nr, frame)
-    } else {
-        ScheduleReason::UnlockEdge
-    };
+    let is_delay_execution = table == 0
+        && nr == sysno::RESET_EVENT
+        && system::should_dispatch_delay_execution(frame);
     crate::log::debug_u64(0xE200_0000 | ((table as u64) << 12) | nr as u64);
 
     if table != 0 {
@@ -171,20 +169,43 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
     }
 
     trace_syscall_error(nr, table, frame);
+    let sched_reason = schedule_reason_for_syscall(nr, frame, cur, is_delay_execution);
     schedule_from_trap(frame, true, true, 0, sched_reason);
 }
 
-fn schedule_reason_for_syscall(nr: u16, frame: &SvcFrame) -> ScheduleReason {
+fn schedule_reason_for_syscall(
+    nr: u16,
+    frame: &SvcFrame,
+    current: u32,
+    is_delay_execution: bool,
+) -> ScheduleReason {
     match nr {
         sysno::YIELD_EXECUTION => ScheduleReason::Yield,
-        sysno::WAIT_SINGLE | sysno::WAIT_MULTIPLE => ScheduleReason::Timeout,
+        sysno::WAIT_SINGLE | sysno::WAIT_MULTIPLE => {
+            // Only treat wait syscalls as timeout-driven scheduling when the
+            // caller actually entered Waiting.
+            if current != 0
+                && with_thread(current, |t| t.state == ThreadState::Waiting).unwrap_or(false)
+            {
+                ScheduleReason::Timeout
+            } else {
+                ScheduleReason::UnlockEdge
+            }
+        }
         sysno::SET_EVENT
         | sysno::RELEASE_MUTANT
         | sysno::RELEASE_SEMAPHORE
         | sysno::RESUME_THREAD
-        | sysno::CREATE_THREAD_EX => ScheduleReason::Wakeup,
+        | sysno::CREATE_THREAD_EX => {
+            // Wakeup semantics should only apply to successful operations.
+            if frame.x[0] as u32 == crate::sched::STATUS_SUCCESS {
+                ScheduleReason::Wakeup
+            } else {
+                ScheduleReason::UnlockEdge
+            }
+        }
         sysno::RESET_EVENT => {
-            if system::should_dispatch_delay_execution(frame) {
+            if is_delay_execution {
                 ScheduleReason::Timeout
             } else {
                 ScheduleReason::UnlockEdge
