@@ -6,20 +6,13 @@
 
 use core::arch::asm;
 
-use crate::sched::config::{
-    SCHED_ENABLE_MESO_SHADOW, SCHED_ENABLE_STATE_SANITIZER, SCHED_USE_MESO_PICK,
-};
 use crate::sched::context::drain_deferred_kstacks;
 use crate::sched::cpu::{set_current_tid, take_needs_reschedule, vcpu_id};
 use crate::sched::global::{with_thread, with_thread_mut, SCHED};
-use crate::sched::priority_queue::{
-    mark_shadow_priority_queue_dirty_locked, rebuild_shadow_priority_queue_if_dirty_locked,
-    shadow_pick_for_vcpu,
-};
 use crate::sched::thread_control::reset_quantum_locked;
 use crate::sched::threads::free_terminated_threads_locked;
 use crate::sched::topology::set_thread_state_locked;
-use crate::sched::types::{KernelContext, ThreadState, WAIT_KIND_NONE};
+use crate::sched::types::{KernelContext, ThreadState};
 use crate::sched::wait::check_wait_timeouts_locked;
 
 // ── SchedulerRoundAction ──────────────────────────────────────────────────────
@@ -94,60 +87,6 @@ fn dequeue_ready_tid_locked(tid: u32) -> bool {
     queue.remove(tid, prio, &|id| store.get_ptr(id))
 }
 
-fn purge_tid_from_ready_queue_locked(tid: u32) {
-    if tid == 0 {
-        return;
-    }
-    let Some(prio) = with_thread(tid, |t| t.priority) else {
-        return;
-    };
-    let queue = unsafe { SCHED.queue_raw_mut() };
-    let store = unsafe { SCHED.threads_raw() };
-    while queue.remove(tid, prio, &|id| store.get_ptr(id)) {}
-    if SCHED_ENABLE_STATE_SANITIZER {
-        for p in 0..32u8 {
-            if p != prio {
-                while queue.remove(tid, p, &|id| store.get_ptr(id)) {}
-            }
-        }
-    }
-}
-
-fn sanitize_invalid_thread_states_locked() -> bool {
-    let mut bad = [0u32; 64];
-    let mut count = 0usize;
-    {
-        let store = unsafe { SCHED.threads_raw() };
-        store.for_each(|tid, t| {
-            if (t.state as u8) > (ThreadState::Suspended as u8) && count < bad.len() {
-                bad[count] = tid;
-                count += 1;
-            }
-        });
-    }
-    for tid in bad.iter().take(count).copied() {
-        with_thread_mut(tid, |t| {
-            let old = t.state as u8;
-            t.state = if t.suspend_count > 0 {
-                ThreadState::Suspended
-            } else if t.wait.kind != WAIT_KIND_NONE {
-                ThreadState::Waiting
-            } else if t.is_idle_thread {
-                ThreadState::Ready
-            } else {
-                ThreadState::Running
-            };
-            crate::kerror!(
-                "sched: repaired invalid state tid={} old={} new={}",
-                tid,
-                old,
-                t.state as u8
-            );
-        });
-    }
-    count != 0
-}
-
 // ── scheduler_round_locked ────────────────────────────────────────────────────
 
 pub fn scheduler_round_locked(
@@ -156,9 +95,7 @@ pub fn scheduler_round_locked(
     quantum_100ns: u64,
     reason: ScheduleReason,
 ) -> SchedulerRoundAction {
-    if SCHED_ENABLE_STATE_SANITIZER && sanitize_invalid_thread_states_locked() {
-        mark_shadow_priority_queue_dirty_locked();
-    }
+    unsafe { SCHED.vcpu_raw_mut(vid as usize) }.needs_scheduling = false;
     drain_deferred_kstacks();
     let timeout_woke = check_wait_timeouts_locked() > 0;
     free_terminated_threads_locked();
@@ -180,10 +117,6 @@ pub fn scheduler_round_locked(
     let cur_not_running = from_tid == 0 || {
         with_thread(from_tid, |t| t.state).unwrap_or(ThreadState::Terminated) != ThreadState::Running
     };
-    if from_tid != 0 && !cur_not_running {
-        // Running threads must never remain linked in the ready queue.
-        purge_tid_from_ready_queue_locked(from_tid);
-    }
 
     let mut to_tid = peek_next_thread_locked(vid);
 
@@ -435,65 +368,57 @@ fn peek_next_thread_for_vcpu(vid: u32) -> u32 {
     )
 }
 
-fn peek_next_thread_for_vcpu_meso_shadow(vid: u32) -> u32 {
-    let idle_tid = unsafe { SCHED.vcpu_raw(vid as usize) }.idle_tid;
-    shadow_pick_for_vcpu(vid as usize, idle_tid)
+fn needs_cross_core_reschedule_locked(vid: usize, candidate_tid: u32) -> bool {
+    if candidate_tid == 0 {
+        return false;
+    }
+    let current_tid = unsafe { SCHED.vcpu_raw(vid) }.current_tid;
+    if current_tid == 0 {
+        return true;
+    }
+    if current_tid == candidate_tid {
+        return false;
+    }
+    let current_is_idle = with_thread(current_tid, |t| t.is_idle_thread).unwrap_or(true);
+    if current_is_idle {
+        return true;
+    }
+    let current_prio = with_thread(current_tid, |t| t.priority).unwrap_or(31);
+    let candidate_prio = with_thread(candidate_tid, |t| t.priority).unwrap_or(31);
+    candidate_prio < current_prio
 }
 
 // ── update_highest_priority_threads ──────────────────────────────────────────
 
-/// Mirrors Atmosphere's UpdateHighestPriorityThreadsImpl().
-///
-/// Iterates every active vCPU, peeks at the highest-priority runnable thread
-/// for each, and updates `vcpu[v].highest_priority_tid` + `needs_scheduling`.
-///
-/// Returns a bitmask of vCPUs whose `highest_priority_tid` changed and
-/// therefore need a reschedule (either inline or via IPI).
+/// Build a cross-core reschedule mask from:
+/// 1) explicit `needs_scheduling` flags already raised by state transitions, and
+/// 2) a global ready-queue snapshot that detects higher-priority remote work.
 ///
 /// Must be called with the scheduler spinlock held.
 pub fn update_highest_priority_threads() -> u32 {
     use crate::sched::types::MAX_VCPUS;
 
-    let use_meso_pick = SCHED_USE_MESO_PICK && SCHED_ENABLE_MESO_SHADOW;
-
-    if SCHED_ENABLE_MESO_SHADOW {
-        rebuild_shadow_priority_queue_if_dirty_locked();
-    }
-
-    // Fast path: if nothing changed since last call, skip the scan.
-    if !SCHED.scheduler_update_needed.swap(false, core::sync::atomic::Ordering::AcqRel) {
-        return 0;
-    }
-
     let mut cores_needing_scheduling: u32 = 0;
+    for vid in 0..MAX_VCPUS {
+        let vs = unsafe { SCHED.vcpu_raw(vid) };
+        if vs.idle_tid != 0 && vs.needs_scheduling {
+            cores_needing_scheduling |= 1u32 << vid;
+        }
+    }
+
+    // Fast path: no scheduler topology update is pending; keep explicit flags.
+    if !SCHED.scheduler_update_needed.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        return cores_needing_scheduling;
+    }
 
     for vid in 0..MAX_VCPUS {
-        // Only consider vCPUs that have been initialised (have an idle thread).
         let idle_tid = unsafe { SCHED.vcpu_raw(vid) }.idle_tid;
         if idle_tid == 0 {
             continue;
         }
-
-        let legacy_tid = peek_next_thread_for_vcpu(vid as u32);
-        let shadow_tid = if SCHED_ENABLE_MESO_SHADOW {
-            peek_next_thread_for_vcpu_meso_shadow(vid as u32)
-        } else {
-            0
-        };
-
-        let top_tid = if use_meso_pick {
-            if shadow_tid != 0 { shadow_tid } else { legacy_tid }
-        } else {
-            legacy_tid
-        };
-        // Fall back to idle if no real thread is runnable on this vCPU.
-        let candidate = if top_tid != 0 { top_tid } else { idle_tid };
-
-        let vs = unsafe { SCHED.vcpu_raw_mut(vid) };
-        let prev = vs.highest_priority_tid;
-        if prev != candidate {
-            vs.highest_priority_tid = candidate;
-            vs.needs_scheduling = true;
+        let candidate = peek_next_thread_for_vcpu(vid as u32);
+        if needs_cross_core_reschedule_locked(vid, candidate) {
+            unsafe { SCHED.vcpu_raw_mut(vid) }.needs_scheduling = true;
             cores_needing_scheduling |= 1u32 << vid;
         }
     }
@@ -532,8 +457,8 @@ pub fn enable_scheduling(cores_needing_scheduling: u32, current_vid: usize) {
 /// Called by KSchedulerLock::Drop (depth 1→0) while the spinlock is still held.
 ///
 /// 1. Runs the current-vCPU scheduler round (handles timeouts, frees, etc.).
-/// 2. Calls update_highest_priority_threads() to select the next thread for
-///    every active vCPU and compute the reschedule bitmask.
+/// 2. Calls update_highest_priority_threads() to compute cross-core reschedule
+///    mask and wake peers that should re-enter scheduler_round_locked.
 ///
 /// Returns the bitmask of vCPUs that need rescheduling (for enable_scheduling).
 /// The spinlock is released by the caller immediately after.
@@ -554,10 +479,9 @@ pub fn flush_unlock_edge(vid: usize) -> u32 {
         SchedulerRoundAction::IdleWait { .. } | SchedulerRoundAction::ContinueCurrent { .. } => {}
     }
 
-    // Keep unlock-edge local by default: current vCPU selection is decided by
-    // scheduler_round_locked above. Other vCPUs reschedule on their own trap/IRQ
-    // edges instead of consuming cross-core peek snapshots.
-    let mut mask = 0u32;
+    // Collect remote-core reschedule mask from scheduler update flags and
+    // current queue snapshot.
+    let mut mask = update_highest_priority_threads();
 
     // Keep the current-vCPU decision from scheduler_round_locked authoritative.
     // We only stage local unlock-edge switching here.

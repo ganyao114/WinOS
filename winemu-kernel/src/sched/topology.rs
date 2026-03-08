@@ -3,7 +3,6 @@
 // All functions require the scheduler lock to be held.
 
 use core::sync::atomic::Ordering;
-use crate::sched::config::SCHED_ENABLE_STATE_SANITIZER;
 use crate::sched::cpu::{cpu_local, current_tid, vcpu_id};
 use crate::sched::cpu::set_needs_reschedule;
 use crate::sched::global::{SCHED, with_thread, with_thread_mut};
@@ -120,13 +119,6 @@ fn purge_tid_from_ready_queue_locked(tid: u32, priority: u8) {
     let queue = unsafe { SCHED.queue_raw_mut() };
     let store = unsafe { SCHED.threads_raw() };
     while queue.remove(tid, priority, &|id| store.get_ptr(id)) {}
-    if SCHED_ENABLE_STATE_SANITIZER {
-        for p in 0..32u8 {
-            if p != priority {
-                while queue.remove(tid, p, &|id| store.get_ptr(id)) {}
-            }
-        }
-    }
 }
 
 #[inline]

@@ -490,12 +490,17 @@ pub extern "C" fn timer_irq_dispatch(frame: &mut SvcFrame) {
         set_thread_in_kernel_locked(cur, true);
     }
     drain_deferred_kstacks();
+    let reason = if crate::sched::cpu::cpu_local().needs_reschedule {
+        ScheduleReason::Ipi
+    } else {
+        ScheduleReason::TimerPreempt
+    };
     schedule_from_trap(
         frame,
         false,
         true,
         timer::DEFAULT_TIMESLICE_100NS,
-        ScheduleReason::TimerPreempt,
+        reason,
     );
 }
 
