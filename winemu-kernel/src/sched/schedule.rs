@@ -7,8 +7,7 @@
 use core::arch::asm;
 
 use crate::sched::config::{
-    SCHED_ENABLE_MESO_SHADOW, SCHED_ENABLE_STATE_SANITIZER, SCHED_REBUILD_READY_EACH_ROUND,
-    SCHED_USE_MESO_PICK,
+    SCHED_ENABLE_MESO_SHADOW, SCHED_ENABLE_STATE_SANITIZER, SCHED_USE_MESO_PICK,
 };
 use crate::sched::context::drain_deferred_kstacks;
 use crate::sched::cpu::{set_current_tid, take_needs_reschedule, vcpu_id};
@@ -17,7 +16,6 @@ use crate::sched::priority_queue::{
     mark_shadow_priority_queue_dirty_locked, rebuild_shadow_priority_queue_if_dirty_locked,
     shadow_pick_for_vcpu,
 };
-use crate::sched::queue::KReadyQueue;
 use crate::sched::thread_control::reset_quantum_locked;
 use crate::sched::threads::free_terminated_threads_locked;
 use crate::sched::topology::set_thread_state_locked;
@@ -100,10 +98,18 @@ fn purge_tid_from_ready_queue_locked(tid: u32) {
     if tid == 0 {
         return;
     }
+    let Some(prio) = with_thread(tid, |t| t.priority) else {
+        return;
+    };
     let queue = unsafe { SCHED.queue_raw_mut() };
     let store = unsafe { SCHED.threads_raw() };
-    for p in 0..32u8 {
-        while queue.remove(tid, p, &|id| store.get_ptr(id)) {}
+    let _ = queue.remove(tid, prio, &|id| store.get_ptr(id));
+    if SCHED_ENABLE_STATE_SANITIZER {
+        for p in 0..32u8 {
+            if p != prio {
+                while queue.remove(tid, p, &|id| store.get_ptr(id)) {}
+            }
+        }
     }
 }
 
@@ -142,26 +148,6 @@ fn sanitize_invalid_thread_states_locked() -> bool {
     count != 0
 }
 
-fn rebuild_ready_queue_locked() {
-    let mut ready = crate::rust_alloc::vec::Vec::<(u32, u8)>::new();
-    {
-        let store = unsafe { SCHED.threads_raw() };
-        store.for_each(|tid, t| {
-            if !t.is_idle_thread && t.state == ThreadState::Ready {
-                ready.push((tid, t.priority));
-            }
-        });
-    }
-
-    let queue = unsafe { SCHED.queue_raw_mut() };
-    *queue = KReadyQueue::new();
-
-    let store = unsafe { SCHED.threads_raw_mut() } as *mut crate::sched::thread_store::ThreadStore;
-    for (tid, prio) in ready {
-        queue.push_with_store(tid, prio, &mut |id| unsafe { (*store).get_mut(id) });
-    }
-}
-
 // ── scheduler_round_locked ────────────────────────────────────────────────────
 
 pub fn scheduler_round_locked(
@@ -173,9 +159,6 @@ pub fn scheduler_round_locked(
     let _ = reason;
     if SCHED_ENABLE_STATE_SANITIZER && sanitize_invalid_thread_states_locked() {
         mark_shadow_priority_queue_dirty_locked();
-    }
-    if SCHED_REBUILD_READY_EACH_ROUND {
-        rebuild_ready_queue_locked();
     }
     drain_deferred_kstacks();
     let timeout_woke = check_wait_timeouts_locked() > 0;
@@ -294,9 +277,6 @@ pub fn scheduler_round_locked(
     if from_tid != 0 && to_tid != from_tid && !cur_not_running {
         set_thread_state_locked(from_tid, ThreadState::Ready);
     }
-
-    // Purge stale duplicate links for the selected thread.
-    purge_tid_from_ready_queue_locked(to_tid);
 
     reset_quantum_locked(to_tid);
     let slice_remaining_100ns = with_thread(to_tid, |t| t.slice_remaining_100ns).unwrap_or(0);

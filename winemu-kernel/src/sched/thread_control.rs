@@ -4,6 +4,7 @@
 
 use core::sync::atomic::Ordering;
 
+use crate::sched::config::SCHED_ENABLE_STATE_SANITIZER;
 use crate::sched::global::{with_thread, with_thread_mut};
 use crate::sched::global::SCHED;
 use crate::sched::priority_queue::mark_shadow_priority_queue_dirty_locked;
@@ -19,14 +20,19 @@ fn notify_priority_changed_locked() {
         .store(true, Ordering::Relaxed);
 }
 
-fn purge_tid_from_ready_queue_locked(tid: u32) {
+fn purge_tid_from_ready_queue_locked(tid: u32, priority: u8) {
     if tid == 0 {
         return;
     }
     let queue = unsafe { SCHED.queue_raw_mut() };
     let store = unsafe { SCHED.threads_raw() };
-    for p in 0..32u8 {
-        while queue.remove(tid, p, &|id| store.get_ptr(id)) {}
+    let _ = queue.remove(tid, priority, &|id| store.get_ptr(id));
+    if SCHED_ENABLE_STATE_SANITIZER {
+        for p in 0..32u8 {
+            if p != priority {
+                while queue.remove(tid, p, &|id| store.get_ptr(id)) {}
+            }
+        }
     }
 }
 
@@ -55,7 +61,7 @@ pub fn set_thread_priority_locked(tid: u32, priority: u8) {
     }
 
     if old_state == ThreadState::Ready {
-        purge_tid_from_ready_queue_locked(tid);
+        purge_tid_from_ready_queue_locked(tid, old_prio);
     }
     with_thread_mut(tid, |t| {
         t.priority      = priority;
@@ -82,7 +88,7 @@ pub fn boost_thread_priority_locked(tid: u32, boost: u8) {
     }
 
     if state == ThreadState::Ready {
-        purge_tid_from_ready_queue_locked(tid);
+        purge_tid_from_ready_queue_locked(tid, old_priority);
     }
     with_thread_mut(tid, |t| {
         t.priority = boosted;
@@ -110,7 +116,7 @@ pub fn decay_priority_boost_locked(tid: u32) {
         return;
     }
     if state == ThreadState::Ready && new_priority != old_priority {
-        purge_tid_from_ready_queue_locked(tid);
+        purge_tid_from_ready_queue_locked(tid, old_priority);
     }
     with_thread_mut(tid, |t| {
         t.transient_boost = new_boost;
