@@ -60,8 +60,11 @@ fn close_event(idx: u32)     -> u32 {
 fn close_mutant(idx: u32)    -> u32 { crate::sched::sync::sync_free_idx(idx); status::SUCCESS }
 fn close_semaphore(idx: u32) -> u32 { crate::sched::sync::sync_free_idx(idx); status::SUCCESS }
 fn close_thread(_tid: u32)   -> u32 { status::SUCCESS }
-fn close_process(_pid: u32)  -> u32 { status::SUCCESS }
-fn close_token(idx: u32)     -> u32 { crate::sched::sync::sync_free_idx(idx); status::SUCCESS }
+fn close_process(pid: u32)   -> u32 {
+    crate::process::last_handle_closed(pid);
+    status::SUCCESS
+}
+fn close_token(_idx: u32)    -> u32 { status::SUCCESS }
 fn close_file(idx: u32)      -> u32 { file::close_file_idx(idx); status::SUCCESS }
 fn close_section(idx: u32)   -> u32 { section::close_section_idx(idx); status::SUCCESS }
 fn close_key(idx: u32)       -> u32 {

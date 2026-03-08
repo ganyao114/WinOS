@@ -209,6 +209,12 @@ fn write_ret_len(ptr: u64, len: usize) {
     }
 }
 
+#[inline(always)]
+fn validate_key_desired_access(desired_access: u32) -> bool {
+    let meta = super::kobject::object_type_meta_for_kind(KObjectKind::Key);
+    (desired_access & !meta.valid_access_mask) == 0
+}
+
 fn gc_key_handles(state: &mut RegistryState) {
     let mut stale = Vec::<u32>::new();
     state.handles.for_each_live_ptr(|id, ptr| {
@@ -255,10 +261,14 @@ pub(crate) fn key_name_utf16(idx: u32) -> Option<Vec<u16>> {
 pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
     let state = ensure_state();
     let out_ptr = frame.x[0] as *mut u64;
-    let _desired_access = frame.x[1] as u32;
+    let desired_access = frame.x[1] as u32;
     let oa_ptr = frame.x[2];
     if out_ptr.is_null() || oa_ptr == 0 {
         frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+    if !validate_key_desired_access(desired_access) {
+        frame.x[0] = status::ACCESS_DENIED as u64;
         return;
     }
 
@@ -291,14 +301,24 @@ pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
     frame.x[0] = status::SUCCESS as u64;
 }
 
+// x0=*KeyHandle, x1=DesiredAccess, x2=ObjectAttributes, x3=OpenOptions
+pub(crate) fn handle_open_key_ex(frame: &mut SvcFrame) {
+    // OpenOptions (x3) is ignored — delegate to standard open logic.
+    handle_open_key(frame);
+}
+
 pub(crate) fn handle_create_key(frame: &mut SvcFrame) {
     let state = ensure_state();
     let out_ptr = frame.x[0] as *mut u64;
-    let _desired_access = frame.x[1] as u32;
+    let desired_access = frame.x[1] as u32;
     let oa_ptr = frame.x[2];
     let disp_ptr = frame.x[6] as *mut u32;
     if out_ptr.is_null() || oa_ptr == 0 {
         frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+    if !validate_key_desired_access(desired_access) {
+        frame.x[0] = status::ACCESS_DENIED as u64;
         return;
     }
 

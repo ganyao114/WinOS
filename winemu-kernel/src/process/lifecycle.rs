@@ -293,5 +293,24 @@ fn maybe_free_if_unreferenced(pid: u32) {
     if thread_count != 0 {
         return;
     }
+    if has_process_handle_reference(pid) {
+        return;
+    }
     let _ = free_process(pid);
+}
+
+fn has_process_handle_reference(target_pid: u32) -> bool {
+    use crate::process::KObjectKind;
+    let mut referenced = false;
+    crate::process::for_each_process(|_owner_pid, proc_ref| {
+        if referenced {
+            return;
+        }
+        proc_ref.handle_table.for_each(|_handle, obj| {
+            if obj.kind == KObjectKind::Process && obj.obj_idx == target_pid {
+                referenced = true;
+            }
+        });
+    });
+    referenced
 }
