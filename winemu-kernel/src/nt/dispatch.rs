@@ -94,20 +94,10 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
 
     if table != 0 {
         if table == 1 {
-            match nr {
-                0x127 => {
-                    // NtUserInitializeClientPfnArrays
-                    win32k::handle_user_initialize_client_pfn_arrays(frame);
-                    schedule_from_trap(frame, true, true, 0, ScheduleReason::UnlockEdge);
-                    return;
-                }
-                _ => {}
-            }
+            win32k::handle_win32k_syscall(frame, nr, table);
+        } else {
+            forward_to_vmm(frame, nr, table);
         }
-
-        // Non-NT tables still need normal trap-exit scheduling so timer slice /
-        // deadline programming remains consistent on this path.
-        forward_to_vmm(frame, nr, table);
         schedule_from_trap(frame, true, true, 0, ScheduleReason::UnlockEdge);
         return;
     }
@@ -128,6 +118,8 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
         sysno::NOTIFY_CHANGE_DIRECTORY_FILE => file::handle_notify_change_directory_file(frame),
         sysno::FLUSH_BUFFERS_FILE => file::handle_flush_buffers_file(frame),
         sysno::CANCEL_IO_FILE => file::handle_cancel_io_file(frame),
+        sysno::LOCK_FILE => file::handle_lock_file(frame),
+        sysno::UNLOCK_FILE => file::handle_unlock_file(frame),
         sysno::QUERY_SYSTEM_INFORMATION => system::handle_query_system_information(frame),
         sysno::QUERY_SYSTEM_TIME => system::handle_query_system_time(frame),
         sysno::QUERY_PERFORMANCE_COUNTER => system::handle_query_performance_counter(frame),

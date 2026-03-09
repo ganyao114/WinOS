@@ -111,8 +111,7 @@ fn dispatch_win32k_hostcall(frame: &SvcFrame, nr: u16, table: u8) -> u32 {
         owner_pid,
         hostcall::SubmitArgs {
             opcode: hc::OP_WIN32K_CALL,
-            // TODO: switch to main-thread execution after host win32k runtime lands.
-            flags: 0,
+            flags: hc::FLAG_MAIN_THREAD,
             arg0: (&packet as *const hc::Win32kCallPacket) as u64,
             arg1: hc::WIN32K_CALL_PACKET_SIZE as u64,
             arg2: 0,
