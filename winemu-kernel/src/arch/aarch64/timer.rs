@@ -178,9 +178,11 @@ fn wait_for_timer_irq() {
     // Program one-shot timer, unmask IRQ, then sleep in WFE.
     // Cross-core scheduler kick uses SEV to wake idle vCPUs even before the
     // timer deadline, while timer IRQ still wakes the core for deadlines.
+    crate::sched::cpu::set_in_idle(true);
     super::cpu::daifclr_irq();
     super::cpu::wait_for_event();
     super::cpu::daifset_irq();
+    crate::sched::cpu::set_in_idle(false);
 }
 
 #[inline(always)]

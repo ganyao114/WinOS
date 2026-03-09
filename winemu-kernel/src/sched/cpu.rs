@@ -4,7 +4,6 @@
 // This gives O(1) access to current_tid and vcpu_id without touching
 // the global scheduler lock.
 
-use core::sync::atomic::{AtomicU32, Ordering};
 use crate::sched::types::MAX_VCPUS;
 
 // ── KCpuLocal ─────────────────────────────────────────────────────────────────
@@ -19,6 +18,10 @@ pub struct KCpuLocal {
     /// True while executing the idle loop.
     pub in_idle:     bool,
     _pad: [u8; 2],
+    /// Number of EL1 WFI/WFE traps safely skipped in idle wait path.
+    pub wfx_skip_count: u32,
+    /// Number of unexpected EL1 WFI/WFE traps (not in idle wait path).
+    pub wfx_unexpected_count: u32,
 }
 
 impl KCpuLocal {
@@ -30,6 +33,8 @@ impl KCpuLocal {
             needs_reschedule: false,
             in_idle: false,
             _pad: [0u8; 2],
+            wfx_skip_count: 0,
+            wfx_unexpected_count: 0,
         }
     }
 }
@@ -107,4 +112,25 @@ pub fn take_needs_reschedule() -> bool {
     let v = cl.needs_reschedule;
     cl.needs_reschedule = false;
     v
+}
+
+/// Mark whether this vCPU is inside the idle wait primitive.
+#[inline(always)]
+pub fn set_in_idle(in_idle: bool) {
+    cpu_local().in_idle = in_idle;
+}
+
+#[inline(always)]
+pub fn in_idle() -> bool {
+    cpu_local().in_idle
+}
+
+#[inline(always)]
+pub fn wfx_skip_count() -> u32 {
+    cpu_local().wfx_skip_count
+}
+
+#[inline(always)]
+pub fn wfx_unexpected_count() -> u32 {
+    cpu_local().wfx_unexpected_count
 }

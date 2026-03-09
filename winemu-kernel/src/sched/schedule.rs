@@ -59,6 +59,7 @@ fn pick_next_thread_locked(vid: u32) -> u32 {
         &|id| store.get_ptr(id),
         &|t| {
             !t.is_idle_thread
+                && t.state == ThreadState::Ready
                 && (t.affinity_mask & (1u32 << vid)) != 0
                 && (!t.in_kernel || t.last_vcpu_hint as u32 == vid)
         },
@@ -79,6 +80,7 @@ fn peek_next_thread_locked(vid: u32) -> u32 {
         &|id| store.get_ptr(id).map(|p| p as *const _),
         &|t| {
             !t.is_idle_thread
+                && t.state == ThreadState::Ready
                 && (t.affinity_mask & (1u32 << vid)) != 0
                 && (!t.in_kernel || t.last_vcpu_hint as u32 == vid)
         },
@@ -377,6 +379,7 @@ fn peek_next_thread_for_vcpu(vid: u32) -> u32 {
         &|id| store.get_ptr(id).map(|p| p as *const _),
         &|t| {
             !t.is_idle_thread
+                && t.state == ThreadState::Ready
                 && (t.affinity_mask & (1u32 << vid)) != 0
                 && (!t.in_kernel || t.last_vcpu_hint as u32 == vid)
         },

@@ -112,19 +112,46 @@ global_asm!(
 
     // ── Sync exception from EL1 (kernel fault) ────────────────
     "__el1_sync:",
-    // Check EC field (bits[31:26]). EC=0x01 = WFI/WFE trap — just skip.
+    // Check EC field (bits[31:26]).
     "stp x29, x30, [sp, #-16]!",
     "mrs x29, esr_el1",
     "lsr x29, x29, #26",
     "and x29, x29, #0x3f",
     "cmp x29, #0x01",
     "b.ne 1f",
-    // WFI/WFE trap: advance ELR by 4 and return.
+    // EC=0x01 (WFI/WFE trap): allow skip only when this vCPU is in the idle
+    // wait path and current_tid == idle_tid.
+    // KCpuLocal offsets:
+    //   +0x04 current_tid (u32)
+    //   +0x08 idle_tid (u32)
+    //   +0x0d in_idle (u8)
+    //   +0x10 wfx_skip_count (u32)
+    //   +0x14 wfx_unexpected_count (u32)
+    "mrs x30, tpidr_el1",
+    "cbz x30, 2f",
+    "ldrb w29, [x30, #13]",
+    "cbz w29, 2f",
+    "ldr w29, [x30, #4]",
+    "ldr w30, [x30, #8]",
+    "cmp w29, w30",
+    "b.ne 2f",
+    // Allowed idle-path WFI/WFE trap: count and skip the instruction.
+    "mrs x30, tpidr_el1",
+    "ldr w29, [x30, #16]",
+    "add w29, w29, #1",
+    "str w29, [x30, #16]",
     "mrs x29, elr_el1",
     "add x29, x29, #4",
     "msr elr_el1, x29",
     "ldp x29, x30, [sp], #16",
     "eret",
+    "2:",
+    // Unexpected EL1 WFI/WFE trap: count it and continue fault diagnostics.
+    "mrs x30, tpidr_el1",
+    "cbz x30, 1f",
+    "ldr w29, [x30, #20]",
+    "add w29, w29, #1",
+    "str w29, [x30, #20]",
     "1:",
     "ldp x29, x30, [sp], #16",
     "stp x29, x30, [sp, #-16]!",
