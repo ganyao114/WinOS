@@ -1,5 +1,12 @@
 use std::vec::Vec;
 
+#[derive(Debug)]
+pub enum WorkerPayload {
+    None,
+    Path(Box<str>),
+    Bytes(Box<[u8]>),
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct HostCallCompletion {

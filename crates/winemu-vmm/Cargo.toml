@@ -14,3 +14,5 @@ memmap2 = { workspace = true }
 num_cpus = { workspace = true }
 tokio = { workspace = true }
 libc = "0.2"
+winit = { version = "0.30", features = ["rwh_06"] }
+softbuffer = "0.4"

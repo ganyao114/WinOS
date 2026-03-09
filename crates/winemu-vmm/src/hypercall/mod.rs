@@ -232,6 +232,7 @@ impl HypercallManager {
             Arc::clone(&host_files),
             Arc::clone(&vaspace),
             Arc::clone(&sched),
+            4,
         );
         log::info!(
             "phys pool configured: gpa=[{:#x}, {:#x}) size_mb={} budget_mb={}",
@@ -870,7 +871,8 @@ impl HypercallManager {
             nr::HOSTCALL_SETUP => HypercallResult::Sync(hc::HC_OK),
             nr::HOSTCALL_CANCEL => {
                 let request_id = args[0];
-                HypercallResult::Sync(self.hostcall.cancel(request_id))
+                let (r0, _) = self.hostcall.cancel(request_id);
+                HypercallResult::Sync(r0)
             }
             nr::HOSTCALL_POLL => {
                 let dst_gpa = args[0];
@@ -878,7 +880,7 @@ impl HypercallManager {
                 if cap == 0 {
                     return HypercallResult::Sync(0);
                 }
-                let batch = self.hostcall.poll_batch(cap.min(1));
+                let batch = self.hostcall.poll_completion().into_iter().collect::<Vec<_>>();
                 if batch.is_empty() {
                     return HypercallResult::Sync(0);
                 }
@@ -893,7 +895,8 @@ impl HypercallManager {
                 if cap_entries == 0 {
                     return HypercallResult::Sync(0);
                 }
-                let batch = self.hostcall.poll_batch(cap_entries);
+                let mut batch = Vec::new();
+                self.hostcall.poll_completions_batch(&mut batch, cap_entries);
                 if batch.is_empty() {
                     return HypercallResult::Sync(0);
                 }
@@ -913,16 +916,14 @@ impl HypercallManager {
                 if dst_len < hc::STATS_HEADER_SIZE {
                     return HypercallResult::Sync(0);
                 }
-                let snap = self.hostcall.stats_snapshot();
+                let reset = (flags & hc::STATS_RESET_AFTER_READ) != 0;
+                let snap = self.hostcall.stats_snapshot(reset);
                 let bytes = encode_hostcall_stats(&snap, dst_len);
                 if bytes.is_empty() {
                     return HypercallResult::Sync(0);
                 }
                 let mut mem = self.memory.write().unwrap();
                 mem.write_bytes(winemu_core::addr::Gpa(dst_gpa), &bytes);
-                if (flags & hc::STATS_RESET_AFTER_READ) != 0 {
-                    self.hostcall.reset_stats();
-                }
                 HypercallResult::Sync(bytes.len() as u64)
             }
             nr::HOSTCALL_QUERY_SCHED_WAKE_STATS => {
@@ -1008,8 +1009,9 @@ impl HypercallManager {
         }
     }
 
-    pub fn pump_hostcall_main_thread(&self, max_jobs: usize) -> usize {
-        self.hostcall.run_main_thread_budget(max_jobs)
+    pub fn pump_hostcall_main_thread(&self, _max_jobs: usize) -> usize {
+        self.hostcall.pump_main_thread();
+        0
     }
 
     /// Read EL0 return context snapshot from guest SVC frame (SP_EL1 at hvc time).
