@@ -1432,6 +1432,32 @@ pub(crate) fn handle_query_full_attributes_file(frame: &mut SvcFrame) {
     frame.x[0] = status::SUCCESS as u64;
 }
 
+// x0=FileHandle, x1=Event, x2=ApcRoutine, x3=ApcCtx, x4=IoStatusBlock*
+// x5=ByteOffset(u64*), x6=Length(u64*), x7=Key, stack[0]=FailImmediately, stack[1]=ExclusiveLock
+pub(crate) fn handle_lock_file(frame: &mut SvcFrame) {
+    let iosb_ptr = frame.x[4] as *mut IoStatusBlock;
+    let Some(_fd) = file_handle_to_host_fd(frame.x[0]) else {
+        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+    // File locking is advisory in our single-process model — always succeed.
+    write_iosb(iosb_ptr, status::SUCCESS, 0);
+    frame.x[0] = status::SUCCESS as u64;
+}
+
+// x0=FileHandle, x1=IoStatusBlock*, x2=ByteOffset(u64*), x3=Length(u64*), x4=Key
+pub(crate) fn handle_unlock_file(frame: &mut SvcFrame) {
+    let iosb_ptr = frame.x[1] as *mut IoStatusBlock;
+    let Some(_fd) = file_handle_to_host_fd(frame.x[0]) else {
+        write_iosb(iosb_ptr, status::INVALID_HANDLE, 0);
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    };
+    write_iosb(iosb_ptr, status::SUCCESS, 0);
+    frame.x[0] = status::SUCCESS as u64;
+}
+
 // x0=FileHandle, x4=*IoStatusBlock
 pub(crate) fn handle_device_io_control_file(frame: &mut SvcFrame) {
     let owner_pid = crate::process::current_pid();
