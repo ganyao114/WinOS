@@ -112,6 +112,21 @@ global_asm!(
 
     // ── Sync exception from EL1 (kernel fault) ────────────────
     "__el1_sync:",
+    // Check EC field (bits[31:26]). EC=0x01 = WFI/WFE trap — just skip.
+    "stp x29, x30, [sp, #-16]!",
+    "mrs x29, esr_el1",
+    "lsr x29, x29, #26",
+    "and x29, x29, #0x3f",
+    "cmp x29, #0x01",
+    "b.ne 1f",
+    // WFI/WFE trap: advance ELR by 4 and return.
+    "mrs x29, elr_el1",
+    "add x29, x29, #4",
+    "msr elr_el1, x29",
+    "ldp x29, x30, [sp], #16",
+    "eret",
+    "1:",
+    "ldp x29, x30, [sp], #16",
     "stp x29, x30, [sp, #-16]!",
     // Preserve faulting EL1 x0/x1/x2/x30 for diagnostics.
     "mov x4, x0",
