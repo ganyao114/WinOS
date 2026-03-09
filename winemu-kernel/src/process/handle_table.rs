@@ -169,9 +169,6 @@ impl KHandleTable {
             256 => 1024,
             _   => return false,
         };
-        crate::log::debug_u64(
-            0xC1C0_0000_0000_0000 | ((self.capacity as u64) << 16) | (new_cap as u64),
-        );
         let obj_bytes = new_cap * core::mem::size_of::<Option<KObjectRef>>();
         let slt_bytes = new_cap * core::mem::size_of::<SlotInfo>();
         let new_obj = crate::mm::kmalloc::alloc(obj_bytes, 8) as *mut Option<KObjectRef>;
@@ -179,7 +176,6 @@ impl KHandleTable {
         if new_obj.is_null() || new_slt.is_null() {
             if !new_obj.is_null() { crate::mm::kmalloc::dealloc(new_obj as *mut u8); }
             if !new_slt.is_null() { crate::mm::kmalloc::dealloc(new_slt as *mut u8); }
-            crate::log::debug_u64(0xC1C1_FFFF_FFFF_FFFF);
             return false;
         }
         let old_cap = self.capacity as usize;
@@ -204,7 +200,6 @@ impl KHandleTable {
         self.free_head = old_cap as i16;
         self.capacity  = new_cap as u16;
         self.is_heap   = true;
-        crate::log::debug_u64(0xC1C1_0000_0000_0000 | (new_cap as u64));
         true
     }
 

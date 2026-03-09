@@ -1,7 +1,8 @@
-// sched/sync/state.rs — Per-process sync object handle table
+// sched/sync/state.rs — Global sync object store
 //
-// Stores KEvent / KMutex / KSemaphore objects keyed by NT handle (u64).
-// All access requires the scheduler lock to be held.
+// Stores KEvent / KMutex / KSemaphore objects keyed by object index.
+// The public NT handles are managed by process::KHandleTable and carry obj_idx.
+// All access here requires the scheduler lock to be held.
 
 use crate::sched::sync::primitives_api::{KEvent, KMutex, KSemaphore};
 use crate::kobj::ObjectStore;
@@ -44,20 +45,20 @@ impl SyncObject {
     }
 }
 
-// ── SyncHandleTable ───────────────────────────────────────────────────────────
+// ── SyncObjectStore ───────────────────────────────────────────────────────────
 
-/// Per-process handle table for sync objects.
-/// Handle values are u32 indices into the ObjectStore.
-pub struct SyncHandleTable {
+/// Backing store for sync objects.
+/// Object IDs (u32) are used as obj_idx in process::KHandleTable entries.
+pub struct SyncObjectStore {
     store: ObjectStore<SyncObject>,
 }
 
-impl SyncHandleTable {
+impl SyncObjectStore {
     pub fn new() -> Self {
         Self { store: ObjectStore::new() }
     }
 
-    /// Allocate a new sync object. Returns the handle (u32 cast to u64).
+    /// Allocate a new sync object. Returns object index (u32 cast to u64).
     pub fn alloc(&mut self, obj: SyncObject) -> Option<u64> {
         self.store.alloc_with(|_id| obj).map(|id| id as u64)
     }
@@ -79,22 +80,17 @@ impl SyncHandleTable {
         self.store.free(handle as u32)
     }
 
-    pub fn contains(&self, handle: u64) -> bool {
-        self.store.contains(handle as u32)
-    }
 }
 
-unsafe impl Send for SyncHandleTable {}
-unsafe impl Sync for SyncHandleTable {}
+unsafe impl Send for SyncObjectStore {}
+unsafe impl Sync for SyncObjectStore {}
 
-// ── Global sync handle table ──────────────────────────────────────────────────
-// For now a single global table (single-process model).
-// In a multi-process model this would be per-KProcess.
+// ── Global sync object store ──────────────────────────────────────────────────
 
 use core::cell::UnsafeCell;
 
 pub struct GlobalSyncState {
-    table: UnsafeCell<Option<SyncHandleTable>>,
+    store: UnsafeCell<Option<SyncObjectStore>>,
 }
 
 unsafe impl Sync for GlobalSyncState {}
@@ -102,21 +98,21 @@ unsafe impl Send for GlobalSyncState {}
 
 impl GlobalSyncState {
     const fn new() -> Self {
-        Self { table: UnsafeCell::new(None) }
+        Self { store: UnsafeCell::new(None) }
     }
 
     pub fn init(&self) {
-        unsafe { *self.table.get() = Some(SyncHandleTable::new()) };
+        unsafe { *self.store.get() = Some(SyncObjectStore::new()) };
     }
 
     #[inline]
-    pub unsafe fn table(&self) -> &SyncHandleTable {
-        (*self.table.get()).as_ref().expect("sync state not initialized")
+    pub unsafe fn store(&self) -> &SyncObjectStore {
+        (*self.store.get()).as_ref().expect("sync state not initialized")
     }
 
     #[inline]
-    pub unsafe fn table_mut(&self) -> &mut SyncHandleTable {
-        (*self.table.get()).as_mut().expect("sync state not initialized")
+    pub unsafe fn store_mut(&self) -> &mut SyncObjectStore {
+        (*self.store.get()).as_mut().expect("sync state not initialized")
     }
 }
 
@@ -129,37 +125,25 @@ pub fn init_sync_state() {
 // ── Free-function helpers (require scheduler lock) ────────────────────────────
 
 pub fn sync_alloc(obj: SyncObject) -> Option<u64> {
-    unsafe { SYNC_STATE.table_mut() }.alloc(obj)
-}
-
-pub fn sync_get(handle: u64) -> Option<&'static SyncObject> {
-    unsafe { SYNC_STATE.table() }.get(handle)
-}
-
-pub fn sync_get_mut(handle: u64) -> Option<&'static mut SyncObject> {
-    unsafe { SYNC_STATE.table_mut() }.get_mut(handle)
-}
-
-pub fn sync_free(handle: u64) -> bool {
-    unsafe { SYNC_STATE.table_mut() }.free(handle)
+    unsafe { SYNC_STATE.store_mut() }.alloc(obj)
 }
 
 /// Get by raw obj_idx (not handle). Used after resolving via KHandleTable.
 pub fn sync_get_by_idx(idx: u32) -> Option<&'static SyncObject> {
-    let ptr = unsafe { SYNC_STATE.table() }.store.get_ptr(idx);
+    let ptr = unsafe { SYNC_STATE.store() }.store.get_ptr(idx);
     if ptr.is_null() { None } else { Some(unsafe { &*ptr }) }
 }
 
 /// Get mutable by raw obj_idx.
 pub fn sync_get_mut_by_idx(idx: u32) -> Option<&'static mut SyncObject> {
-    let ptr = unsafe { SYNC_STATE.table_mut() }.store.get_ptr(idx);
+    let ptr = unsafe { SYNC_STATE.store_mut() }.store.get_ptr(idx);
     if ptr.is_null() { None } else { Some(unsafe { &mut *ptr }) }
 }
 
 /// Free by raw obj_idx. Called from kobject close_last_ref.
 pub fn sync_free_idx(idx: u32) -> bool {
-    let table = unsafe { SYNC_STATE.table_mut() };
-    let ptr = table.store.get_ptr(idx);
+    let store = unsafe { SYNC_STATE.store_mut() };
+    let ptr = store.store.get_ptr(idx);
     if ptr.is_null() {
         return false;
     }
@@ -180,5 +164,5 @@ pub fn sync_free_idx(idx: u32) -> bool {
         }
     }
 
-    table.store.free(idx)
+    store.store.free(idx)
 }

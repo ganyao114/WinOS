@@ -104,7 +104,6 @@ pub use sync::{
     create_mutex, release_mutex,
     create_semaphore, release_semaphore,
     wait_for_single_object, wait_for_multiple_objects,
-    close_handle,
 };
 
 // ── Convenience helpers ───────────────────────────────────────────────────────

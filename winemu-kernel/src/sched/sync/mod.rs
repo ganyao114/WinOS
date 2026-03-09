@@ -9,8 +9,8 @@ pub mod legacy_handles;
 pub use wait_queue::WaitQueue;
 pub use primitives_api::{KEvent, KMutex, KSemaphore};
 pub use state::{
-    SyncObject, SyncHandleTable, SYNC_STATE, init_sync_state,
-    sync_alloc, sync_get, sync_get_mut, sync_free,
+    SyncObject, SYNC_STATE, init_sync_state,
+    sync_alloc,
     sync_get_by_idx, sync_get_mut_by_idx, sync_free_idx,
 };
 pub use handles::{
@@ -18,7 +18,6 @@ pub use handles::{
     create_mutex, release_mutex,
     create_semaphore, release_semaphore,
     wait_for_single_object, wait_for_multiple_objects,
-    close_handle,
     delay_current_thread_sync, event_set_by_handle_for_pid,
     detach_thread_sync_wait_links_locked,
     STATUS_INVALID_HANDLE, STATUS_OBJECT_TYPE_MISMATCH,

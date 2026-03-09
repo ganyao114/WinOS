@@ -413,12 +413,3 @@ pub fn delay_current_thread_sync(deadline: WaitDeadline) -> u32 {
 pub fn event_set_by_handle_for_pid(_owner_pid: u32, handle: u64) -> u32 {
     set_event(handle)
 }
-
-// ── Close ─────────────────────────────────────────────────────────────────────
-
-/// Close a handle — removes from process handle table and frees the sync object.
-pub fn close_handle(handle: u64) -> u32 {
-    let _lock = crate::sched::lock::KSchedulerLock::lock();
-    use crate::nt::kobject::close_handle_for_current;
-    close_handle_for_current(handle)
-}
