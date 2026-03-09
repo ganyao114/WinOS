@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use softbuffer::Surface;
 use winit::dpi::PhysicalSize;
+use winit::error::OsError;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
@@ -155,6 +156,7 @@ pub struct Win32kState {
     next_gdi:       u32,
     foreground:     u32,
     pending_create: VecDeque<(u32, u32)>, // (hwnd, owner_tid)
+    pending_visibility: HashMap<u32, bool>,
     tick_ms:        u32,
     brush_colors:   HashMap<u32, u32>,
     pen_colors:     HashMap<u32, u32>,
@@ -173,6 +175,7 @@ impl Win32kState {
             next_gdi:       0x3000,
             foreground:     0,
             pending_create: VecDeque::new(),
+            pending_visibility: HashMap::new(),
             tick_ms:        0,
             brush_colors:   HashMap::new(),
             pen_colors:     HashMap::new(),
@@ -202,37 +205,64 @@ impl Win32kState {
     pub fn create_window_deferred(&mut self, owner_tid: u32) -> u64 {
         let hwnd = self.alloc_hwnd();
         self.pending_create.push_back((hwnd, owner_tid));
+        self.pending_visibility.insert(hwnd, false);
         if self.foreground == 0 {
             self.foreground = hwnd;
         }
         hwnd as u64
     }
 
-    // Called from the winit event loop (main thread) to flush pending creates.
-    pub fn on_event_loop_tick(&mut self, el: &ActiveEventLoop, elapsed_ms: u32) {
-        // Flush pending window creates
+    fn flush_pending_creates(
+        &mut self,
+        mut create_window: impl FnMut(
+            winit::window::WindowAttributes,
+        ) -> Result<Window, OsError>,
+    ) {
         while let Some((hwnd, owner_tid)) = self.pending_create.pop_front() {
+            let title = format!("WinEmu hwnd={:#x}", hwnd);
             let attrs = winit::window::Window::default_attributes()
-                .with_title("WinEmu")
+                .with_title(title)
                 .with_inner_size(PhysicalSize::new(800u32, 600u32));
-            let Ok(win) = el.create_window(attrs) else { continue };
+            let win = match create_window(attrs) {
+                Ok(win) => win,
+                Err(e) => {
+                    log::error!("win32k: create_window failed hwnd={:#x}: {}", hwnd, e);
+                    continue;
+                }
+            };
             let win = Arc::new(win);
-            let Ok(ctx) = softbuffer::Context::new(win.clone()) else { continue };
-            let Ok(surface) = softbuffer::Surface::new(&ctx, win.clone()) else { continue };
+            let ctx = match softbuffer::Context::new(win.clone()) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    log::error!("win32k: softbuffer context failed hwnd={:#x}: {}", hwnd, e);
+                    continue;
+                }
+            };
+            let surface = match softbuffer::Surface::new(&ctx, win.clone()) {
+                Ok(surface) => surface,
+                Err(e) => {
+                    log::error!("win32k: softbuffer surface failed hwnd={:#x}: {}", hwnd, e);
+                    continue;
+                }
+            };
             let mut ws = WinState {
                 window: win,
                 surface,
                 width: 800,
                 height: 600,
-                visible: false,
+                visible: self.pending_visibility.remove(&hwnd).unwrap_or(false),
                 owner_tid,
                 framebuf: Vec::new(),
             };
+            ws.window.set_visible(ws.visible);
+            ws.window.request_redraw();
             ws.ensure_fb();
             self.windows.insert(hwnd, ws);
         }
+    }
 
-        // Advance timers — collect fired events first to avoid borrow conflict
+    fn advance_timers(&mut self, elapsed_ms: u32) {
+        // Collect fired events first to avoid borrow conflict.
         let delta = elapsed_ms.saturating_sub(self.tick_ms);
         self.tick_ms = elapsed_ms;
         if delta > 0 {
@@ -256,19 +286,30 @@ impl Win32kState {
         }
     }
 
+    // Called from the winit event loop (main thread) to flush pending creates.
+    pub fn on_event_loop_tick(&mut self, el: &ActiveEventLoop, elapsed_ms: u32) {
+        self.flush_pending_creates(|attrs| el.create_window(attrs));
+        self.advance_timers(elapsed_ms);
+    }
+
     // ── NtUserShowWindow ─────────────────────────────────────────────────────
     pub fn show_window(&mut self, hwnd: u32, cmd: i32) -> u64 {
+        let visible = cmd != 0;
         if let Some(ws) = self.windows.get_mut(&hwnd) {
-            match cmd {
-                0 => { ws.visible = false; ws.window.set_visible(false); }
-                _ => { ws.visible = true;  ws.window.set_visible(true);  }
+            ws.visible = visible;
+            ws.window.set_visible(visible);
+            if visible {
+                ws.window.request_redraw();
             }
+        } else if self.pending_visibility.contains_key(&hwnd) {
+            self.pending_visibility.insert(hwnd, visible);
         }
         1u64
     }
 
     // ── NtUserDestroyWindow ──────────────────────────────────────────────────
     pub fn destroy_window(&mut self, hwnd: u32) -> u64 {
+        self.pending_visibility.remove(&hwnd);
         if let Some(ws) = self.windows.remove(&hwnd) {
             let tid = ws.owner_tid;
             let q = self.msg_queues.entry(tid).or_default();
@@ -488,6 +529,7 @@ impl Win32kState {
     pub fn query_window(&self, hwnd: u32, cmd: u32) -> u64 {
         match cmd {
             6  => if self.windows.contains_key(&hwnd) { 0 } else { 0 }, // IsIconic
+            // Only report visible once a real host window exists.
             7  => if self.windows.get(&hwnd).map(|w| w.visible).unwrap_or(false) { 1 } else { 0 },
             11 => 0x14CF_0000u64, // WS_OVERLAPPEDWINDOW | WS_VISIBLE
             12 => 0x0000_0100u64, // WS_EX_WINDOWEDGE
@@ -611,10 +653,13 @@ impl Win32kState {
         let q = self.msg_queues.entry(tid).or_default();
         match event {
             WindowEvent::CloseRequested => {
+                if let Some(ws) = self.windows.get_mut(&hwnd) {
+                    ws.visible = false;
+                    ws.window.set_visible(false);
+                }
                 q.push_back(GuestMsg { hwnd: hwnd as u64, message: WM_CLOSE, ..Default::default() });
             }
             WindowEvent::RedrawRequested => {
-                if let Some(ws) = self.windows.get_mut(&hwnd) { ws.present(); }
                 q.push_back(GuestMsg { hwnd: hwnd as u64, message: WM_PAINT, ..Default::default() });
             }
             WindowEvent::Resized(sz) => {

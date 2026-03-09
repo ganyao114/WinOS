@@ -11,9 +11,12 @@ use crate::hostcall::modules::win32k::Win32kState;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use winemu_shared::hostcall as hc;
+use winit::event::WindowEvent;
+use winit::event_loop::ActiveEventLoop;
+use winit::window::WindowId;
 
 const DEFAULT_IO_QUEUE_CAP: usize = 4096;
 const DEFAULT_MAIN_QUEUE_CAP: usize = 1024;
@@ -32,6 +35,7 @@ struct BrokerInner {
     io_submit_tx: SyncSender<WorkerJob>,
     main_submit_tx: SyncSender<WorkerJob>,
     main_submit_rx: Mutex<Receiver<WorkerJob>>,
+    main_executor_thread: Mutex<Option<std::thread::ThreadId>>,
     inflight: Mutex<HashMap<u64, InflightReq>>,
     completions: Mutex<VecDeque<HostCallCompletion>>,
     next_request_id: AtomicU64,
@@ -66,6 +70,8 @@ struct WorkerJob {
     payload: WorkerPayload,
     user_tag: u64,
     cancel: Arc<AtomicBool>,
+    exec_class: ExecClass,
+    sync_reply: Option<SyncSender<(u64, u64)>>,
 }
 
 struct OpCounters {
@@ -190,6 +196,7 @@ impl HostCallBroker {
             io_submit_tx: io_tx,
             main_submit_tx: main_tx,
             main_submit_rx: Mutex::new(main_rx),
+            main_executor_thread: Mutex::new(None),
             inflight: Mutex::new(HashMap::new()),
             completions: Mutex::new(VecDeque::new()),
             next_request_id: AtomicU64::new(1),
@@ -209,8 +216,9 @@ impl HostCallBroker {
                     let job = { rx.lock().unwrap().recv() };
                     match job {
                         Ok(job) => {
-                            run_job(&inner2, job);
-                            inner2.scheduler.unpark_one_vcpu();
+                            if run_job(&inner2, job) {
+                                inner2.scheduler.unpark_one_vcpu();
+                            }
                         }
                         Err(_) => break,
                     }
@@ -258,9 +266,15 @@ impl HostCallBroker {
 
         if !do_async {
             inner.stats.on_submit_sync(opcode);
-            let ctx = self.make_ctx();
-            let (r0, r1) = inner.registry.dispatch(&ctx, opcode, args, None)
-                .unwrap_or((hc::HC_INVALID, 0));
+            let (r0, r1) = if exec_class == ExecClass::MainThread {
+                self.execute_sync_main_thread(opcode, args)
+            } else {
+                let ctx = self.make_ctx();
+                inner
+                    .registry
+                    .dispatch(&ctx, opcode, args, None)
+                    .unwrap_or((hc::HC_INVALID, 0))
+            };
             inner.stats.on_complete_sync(opcode);
             return SubmitResult::Completed { host_result: r0, aux: r1 };
         }
@@ -279,7 +293,16 @@ impl HostCallBroker {
             InflightReq { cancel: Arc::clone(&cancel), opcode },
         );
 
-        let job = WorkerJob { request_id, opcode, args, payload, user_tag, cancel };
+        let job = WorkerJob {
+            request_id,
+            opcode,
+            args,
+            payload,
+            user_tag,
+            cancel,
+            exec_class,
+            sync_reply: None,
+        };
 
         let send_result = match exec_class {
             ExecClass::Io => inner.io_submit_tx.try_send(job).map_err(|e| match e {
@@ -308,6 +331,46 @@ impl HostCallBroker {
             }
         }
     }
+
+    fn execute_sync_main_thread(&self, opcode: u64, args: [u64; 4]) -> (u64, u64) {
+        let inner = &*self.inner;
+
+        // Headless mode keeps historical behavior: execute inline.
+        if !host_ui_main_thread_mode() {
+            let ctx = self.make_ctx();
+            return inner
+                .registry
+                .dispatch(&ctx, opcode, args, None)
+                .unwrap_or((hc::HC_INVALID, 0));
+        }
+
+        // If caller is already the registered main executor thread, run inline.
+        if self.is_current_main_executor_thread() {
+            let ctx = self.make_ctx();
+            return inner
+                .registry
+                .dispatch(&ctx, opcode, args, None)
+                .unwrap_or((hc::HC_INVALID, 0));
+        }
+
+        let (tx, rx) = sync_channel::<(u64, u64)>(1);
+        let job = WorkerJob {
+            request_id: 0,
+            opcode,
+            args,
+            payload: WorkerPayload::None,
+            user_tag: 0,
+            cancel: Arc::new(AtomicBool::new(false)),
+            exec_class: ExecClass::MainThread,
+            sync_reply: Some(tx),
+        };
+        match inner.main_submit_tx.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return (hc::HC_BUSY, 0),
+            Err(TrySendError::Disconnected(_)) => return (hc::HC_IO_ERROR, 0),
+        }
+        rx.recv().unwrap_or((hc::HC_IO_ERROR, 0))
+    }
 }
 
 // ── cancel / poll / pump / stats ──────────────────────────────────────────────
@@ -335,17 +398,79 @@ impl HostCallBroker {
         out.extend(q.drain(..take));
     }
 
-    /// Drive main-thread (win32k) jobs.  Call from the event-loop thread.
-    pub fn pump_main_thread(&self) {
+    fn pump_main_thread_budget(&self, max_jobs: usize) {
         let inner = &*self.inner;
+        self.register_main_executor_thread();
         let rx = inner.main_submit_rx.lock().unwrap();
+        let mut handled = 0usize;
         loop {
+            if handled >= max_jobs {
+                break;
+            }
             match rx.try_recv() {
-                Ok(job) => run_job(inner, job),
+                Ok(job) => {
+                    if run_job(inner, job) {
+                        inner.scheduler.unpark_one_vcpu();
+                    }
+                    handled += 1;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
         }
+    }
+
+    /// Drive main-thread (win32k) jobs.  Call from the event-loop thread.
+    pub fn pump_main_thread(&self) {
+        self.pump_main_thread_budget(usize::MAX);
+    }
+
+    /// Drive a host UI event-loop tick.
+    /// This must run on the UI thread that owns `ActiveEventLoop`.
+    pub fn pump_main_thread_with_event_loop(&self, el: &ActiveEventLoop, elapsed_ms: u32) {
+        // Bound per-tick queue drain to avoid starving window lifecycle work.
+        self.pump_main_thread_budget(64);
+        self.inner
+            .win32k
+            .lock()
+            .unwrap()
+            .on_event_loop_tick(el, elapsed_ms);
+    }
+
+    /// Forward host window events into the win32k message bridge.
+    pub fn handle_window_event(&self, window_id: WindowId, event: &WindowEvent) {
+        self.inner
+            .win32k
+            .lock()
+            .unwrap()
+            .on_window_event(window_id, event);
+    }
+
+    fn register_main_executor_thread(&self) {
+        let current = thread::current().id();
+        let mut owner = self.inner.main_executor_thread.lock().unwrap();
+        match *owner {
+            Some(id) if id == current => {}
+            Some(id) => {
+                log::warn!(
+                    "hostcall main executor switched from {:?} to {:?}",
+                    id,
+                    current
+                );
+                *owner = Some(current);
+            }
+            None => {
+                *owner = Some(current);
+            }
+        }
+    }
+
+    fn is_current_main_executor_thread(&self) -> bool {
+        let owner = self.inner.main_executor_thread.lock().unwrap();
+        owner
+            .as_ref()
+            .map(|id| *id == thread::current().id())
+            .unwrap_or(false)
     }
 
     pub fn stats_snapshot(&self, reset: bool) -> HostCallStatsSnapshot {
@@ -375,11 +500,23 @@ impl HostCallBroker {
 
 // ── worker helpers ────────────────────────────────────────────────────────────
 
-fn run_job(inner: &BrokerInner, job: WorkerJob) {
+fn run_job(inner: &BrokerInner, job: WorkerJob) -> bool {
     if job.cancel.load(Ordering::Relaxed) {
-        push_completion(inner, job.request_id, job.user_tag, hc::HC_CANCELED, 0, true);
+        if let Some(reply) = job.sync_reply {
+            let _ = reply.send((hc::HC_CANCELED, 0));
+            return false;
+        }
+        push_completion(
+            inner,
+            job.request_id,
+            job.user_tag,
+            hc::HC_CANCELED,
+            0,
+            true,
+            job.exec_class == ExecClass::MainThread,
+        );
         inner.stats.on_complete_async(job.opcode);
-        return;
+        return true;
     }
 
     let ctx = HandlerCtx {
@@ -402,10 +539,24 @@ fn run_job(inner: &BrokerInner, job: WorkerJob) {
             .unwrap_or((hc::HC_INVALID, 0))
     };
 
+    if let Some(reply) = job.sync_reply {
+        let _ = reply.send((r0, r1));
+        return false;
+    }
+
     inner.inflight.lock().unwrap().remove(&job.request_id);
     let cancelled = job.cancel.load(Ordering::Relaxed);
-    push_completion(inner, job.request_id, job.user_tag, r0, r1, cancelled);
+    push_completion(
+        inner,
+        job.request_id,
+        job.user_tag,
+        r0,
+        r1,
+        cancelled,
+        job.exec_class == ExecClass::MainThread,
+    );
     inner.stats.on_complete_async(job.opcode);
+    true
 }
 
 fn push_completion(
@@ -415,9 +566,15 @@ fn push_completion(
     r0: u64,
     r1: u64,
     cancelled: bool,
+    main_thread: bool,
 ) {
     let mut flags = 0u32;
-    if cancelled { flags |= hc::CPLF_CANCELED; }
+    if cancelled {
+        flags |= hc::CPLF_CANCELED;
+    }
+    if main_thread {
+        flags |= hc::CPLF_MAIN_THREAD;
+    }
     let cpl = HostCallCompletion {
         request_id,
         host_result: r0 as i32,
@@ -435,4 +592,14 @@ fn push_completion(
             log::warn!("hostcall completion queue depth={}", len);
         }
     }
+}
+
+fn host_ui_main_thread_mode() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("WINEMU_HOST_UI_MAIN_THREAD")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
 }

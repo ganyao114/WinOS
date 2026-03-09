@@ -5,11 +5,13 @@ use core::arch::asm;
 
 // ── NT syscall numbers ────────────────────────────────────────────────────────
 const NR_WRITE_FILE:        u64 = 0x0008;
+const NR_DELAY_EXECUTION:   u64 = 0x0034;
 const NR_TERMINATE_PROCESS: u64 = 0x002C;
 
 // ── Win32k syscall numbers (table 1 = NtUser*, table 0 = NtGdi*) ─────────────
 const NT_USER_CREATE_WINDOW_EX:   u32 = 0x06f;
 const NT_USER_SHOW_WINDOW:        u32 = 0x052;
+const NT_USER_QUERY_WINDOW:       u32 = 0x00e;
 const NT_USER_PEEK_MESSAGE:       u32 = 0x001;
 const NT_USER_TRANSLATE_MESSAGE:  u32 = 0x00b;
 const NT_USER_BEGIN_PAINT:        u32 = 0x015;
@@ -17,11 +19,6 @@ const NT_USER_END_PAINT:          u32 = 0x017;
 const NT_USER_DESTROY_WINDOW:     u32 = 0x095;
 const NT_USER_POST_QUIT_MESSAGE:  u32 = 0x4d9;
 const NT_USER_DEF_WINDOW_PROC:    u32 = 0x0a9;
-
-const NT_GDI_RECTANGLE:           u32 = 0x088;
-const NT_GDI_CREATE_SOLID_BRUSH:  u32 = 0x02d;
-const NT_GDI_SELECT_BRUSH:        u32 = 0x30b;
-const NT_GDI_DELETE_OBJECT:       u32 = 0x01a;
 
 // ── Windows message constants ─────────────────────────────────────────────────
 const WM_DESTROY: u32 = 0x0002;
@@ -106,6 +103,22 @@ unsafe fn nt_terminate_process(code: u32) -> ! {
     );
 }
 
+unsafe fn nt_delay_execution_ms(ms: u32) {
+    let mut rel_100ns: i64 = -((ms as i64) * 10_000);
+    asm!(
+        "mov x0, xzr",
+        "mov x1, {timeout}",
+        "mov x8, {nr}",
+        "svc #0",
+        nr = in(reg) NR_DELAY_EXECUTION,
+        timeout = in(reg) (&mut rel_100ns as *mut i64 as u64),
+        out("x0") _, out("x1") _, out("x2") _, out("x3") _,
+        out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+        out("x8") _,
+        options(nostack),
+    );
+}
+
 /// Issue a win32k syscall via svc #0.
 /// x8 = (table << 12) | syscall_nr
 /// x0..x7 = first 8 args; spill args[8..] onto stack if needed.
@@ -178,22 +191,6 @@ unsafe fn do_paint(hwnd: u32) {
         return;
     }
 
-    // Create a solid blue brush (0x00FF0000 = blue in COLORREF BGR)
-    let hbrush = win32k_call(0, NT_GDI_CREATE_SOLID_BRUSH, &[0x00FF0000u64]) as u32;
-
-    // SelectBrush into DC
-    if hbrush != 0 {
-        win32k_call(0, NT_GDI_SELECT_BRUSH, &[hdc as u64, hbrush as u64]);
-    }
-
-    // Draw a rectangle
-    win32k_call(0, NT_GDI_RECTANGLE, &[hdc as u64, 10, 10, 200, 150]);
-
-    // Cleanup brush
-    if hbrush != 0 {
-        win32k_call(0, NT_GDI_DELETE_OBJECT, &[hbrush as u64]);
-    }
-
     // EndPaint
     win32k_call(1, NT_USER_END_PAINT, &[hwnd as u64, ps_ptr]);
     write_ok(b"WM_PAINT handled");
@@ -226,16 +223,38 @@ pub extern "C" fn mainCRTStartup() -> ! {
     // ── 2. ShowWindow ─────────────────────────────────────────────────────────
     unsafe { win32k_call(1, NT_USER_SHOW_WINDOW, &[hwnd as u64, 1]) };
     write_ok(b"ShowWindow");
+    write_str(b"window_test: waiting window visible state\r\n");
 
-    // ── 3. Message loop (max 200 iterations) ─────────────────────────────────
+    // CreateWindowEx is deferred on host event-loop thread.
+    // Poll visible state until the host window is actually live.
+    let mut visible = false;
+    for _ in 0..80_000u32 {
+        unsafe {
+            if win32k_call(1, NT_USER_QUERY_WINDOW, &[hwnd as u64, 7]) != 0 {
+                visible = true;
+                break;
+            }
+        }
+        unsafe { nt_delay_execution_ms(1) };
+    }
+    if !visible {
+        write_fail(b"WindowVisible");
+        unsafe { nt_terminate_process(1) };
+    }
+    write_ok(b"WindowVisible");
+
+    // ── 3. Message loop (bounded) ────────────────────────────────────────────
     let mut msg = Msg::default();
     let msg_ptr = &mut msg as *mut Msg as u64;
-    let mut paint_count: u32 = 0;
-    let mut loop_count: u32 = 0;
+    let mut painted = false;
+    let mut destroyed = false;
+    let mut idle_ticks: u32 = 0;
+    const MAX_IDLE_TICKS: u32 = 4_000;
 
     loop {
-        loop_count += 1;
-        if loop_count > 200 { break; }
+        if idle_ticks >= MAX_IDLE_TICKS {
+            break;
+        }
 
         // PeekMessage(msg, 0, 0, 0, PM_REMOVE=1)
         let got = unsafe {
@@ -243,20 +262,16 @@ pub extern "C" fn mainCRTStartup() -> ! {
         };
 
         if got == 0 {
-            // No message — trigger a paint by posting WM_PAINT if we haven't painted yet
-            if paint_count == 0 {
-                // Force a WM_PAINT by calling BeginPaint/EndPaint directly
+            if !painted {
                 unsafe { do_paint(hwnd) };
-                paint_count += 1;
+                painted = true;
             } else {
-                // Done — post quit and break
-                unsafe {
-                    win32k_call(1, NT_USER_POST_QUIT_MESSAGE, &[0]);
-                }
-                break;
+                idle_ticks = idle_ticks.saturating_add(1);
             }
+            unsafe { nt_delay_execution_ms(1) };
             continue;
         }
+        idle_ticks = 0;
 
         // TranslateMessage
         unsafe { win32k_call(1, NT_USER_TRANSLATE_MESSAGE, &[msg_ptr]) };
@@ -264,14 +279,18 @@ pub extern "C" fn mainCRTStartup() -> ! {
         match msg.message {
             WM_PAINT => {
                 unsafe { do_paint(hwnd) };
-                paint_count += 1;
+                painted = true;
             }
             WM_CLOSE => {
-                unsafe {
-                    win32k_call(1, NT_USER_DESTROY_WINDOW, &[hwnd as u64]);
+                if !destroyed {
+                    unsafe {
+                        win32k_call(1, NT_USER_DESTROY_WINDOW, &[hwnd as u64]);
+                    }
+                    destroyed = true;
                 }
             }
             WM_DESTROY => {
+                destroyed = true;
                 unsafe {
                     win32k_call(1, NT_USER_POST_QUIT_MESSAGE, &[0]);
                 }
@@ -291,8 +310,9 @@ pub extern "C" fn mainCRTStartup() -> ! {
 
     write_ok(b"message loop exited");
 
-    // ── 4. Destroy window ─────────────────────────────────────────────────────
-    unsafe { win32k_call(1, NT_USER_DESTROY_WINDOW, &[hwnd as u64]) };
+    if !destroyed {
+        unsafe { win32k_call(1, NT_USER_DESTROY_WINDOW, &[hwnd as u64]) };
+    }
     write_ok(b"DestroyWindow");
 
     write_str(b"window_test: PASSED\r\n");

@@ -1009,9 +1009,35 @@ impl HypercallManager {
         }
     }
 
-    pub fn pump_hostcall_main_thread(&self, _max_jobs: usize) -> usize {
+    pub fn pump_hostcall_main_thread(&self, _max_jobs: usize) {
         self.hostcall.pump_main_thread();
-        0
+    }
+
+    pub fn pump_hostcall_main_thread_with_event_loop(
+        &self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        elapsed_ms: u32,
+    ) {
+        self.hostcall
+            .pump_main_thread_with_event_loop(event_loop, elapsed_ms);
+    }
+
+    pub fn handle_host_window_event(
+        &self,
+        window_id: winit::window::WindowId,
+        event: &winit::event::WindowEvent,
+    ) {
+        self.hostcall.handle_window_event(window_id, event);
+    }
+
+    pub fn force_exit_vcpus_if_shutdown(&self) {
+        if self
+            .sched
+            .shutdown
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.force_exit_all_vcpus();
+        }
     }
 
     /// Read EL0 return context snapshot from guest SVC frame (SP_EL1 at hvc time).

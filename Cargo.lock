@@ -2326,6 +2326,7 @@ dependencies = [
  "winemu-core",
  "winemu-hypervisor",
  "winemu-vmm",
+ "winit",
 ]
 
 [[package]]

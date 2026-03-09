@@ -118,6 +118,10 @@ impl Vmm {
         })
     }
 
+    pub fn hypercall_manager(&self) -> Arc<HypercallManager> {
+        Arc::clone(&self.hypercall_mgr)
+    }
+
     pub fn run(&mut self) -> Result<()> {
         if self.vcpu_count <= 1 {
             let vcpu = self.vm.create_vcpu(0)?;

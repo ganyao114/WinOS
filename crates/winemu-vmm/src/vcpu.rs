@@ -1,6 +1,7 @@
 use super::hypercall::{HypercallManager, HypercallResult};
 use super::sched::Scheduler;
 use std::sync::atomic::Ordering;
+use std::sync::OnceLock;
 use std::sync::Arc;
 use std::time::Duration;
 use winemu_hypervisor::{types::VmExit, Vcpu};
@@ -100,9 +101,22 @@ fn run_vcpu_once(vcpu_id: u32, vcpu: &mut dyn Vcpu, sched: &Scheduler) -> Option
 }
 
 fn pump_hostcall_main_thread(hc_mgr: &HypercallManager, main_executor: bool) {
-    if main_executor {
-        let _ = hc_mgr.pump_hostcall_main_thread(HOSTCALL_MAIN_BUDGET);
+    if host_ui_main_thread_mode() {
+        return;
     }
+    if main_executor {
+        hc_mgr.pump_hostcall_main_thread(HOSTCALL_MAIN_BUDGET);
+    }
+}
+
+fn host_ui_main_thread_mode() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("WINEMU_HOST_UI_MAIN_THREAD")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
 }
 
 fn wait_while_idle(sched: &Scheduler, vcpu_id: u32, timeout: Duration) {
