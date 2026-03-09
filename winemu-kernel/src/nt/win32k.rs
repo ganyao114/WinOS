@@ -66,12 +66,15 @@ fn read_user_u64(pid: u32, va: u64) -> Option<u64> {
     if va < crate::process::USER_ACCESS_BASE || va >= crate::process::USER_VA_LIMIT {
         return None;
     }
-    let pa = crate::process::with_process(pid, |p| {
+    crate::process::with_process(pid, |p| {
         p.address_space
             .translate_user_va_for_access(va, VM_ACCESS_READ)
     })
     .flatten()?;
-    Some(unsafe { (pa as *const u64).read_volatile() })
+    // SAFETY: translate_user_va_for_access validated this user VA as readable for
+    // the current process. EL1 keeps SPAN=1, so user VAs can be dereferenced in
+    // syscall context.
+    Some(unsafe { (va as *const u64).read_volatile() })
 }
 
 fn collect_win32k_args(pid: u32, frame: &SvcFrame) -> [u64; hc::WIN32K_CALL_MAX_ARGS] {
