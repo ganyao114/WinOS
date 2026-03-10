@@ -6,16 +6,16 @@ use core::arch::asm;
 const STDOUT: u64 = 0xFFFF_FFFF_FFFF_FFF5;
 
 const NR_WRITE_FILE: u64            = 0x0008;
-const NR_DELETE_KEY: u64            = 0x000C;
-const NR_DELETE_VALUE_KEY: u64      = 0x006A;
-const NR_ENUMERATE_VALUE_KEY: u64   = 0x0010;
+const NR_DELETE_KEY: u64            = 0x00DA;
+const NR_DELETE_VALUE_KEY: u64      = 0x00DD;
+const NR_ENUMERATE_VALUE_KEY: u64   = 0x0013;
 const NR_CLOSE: u64                 = 0x000F;
 const NR_OPEN_KEY: u64              = 0x0012;
-const NR_QUERY_VALUE_KEY: u64       = 0x0016;
+const NR_QUERY_VALUE_KEY: u64       = 0x0017;
 const NR_CREATE_KEY: u64            = 0x001D;
 const NR_TERMINATE_PROCESS: u64     = 0x002C;
 const NR_ENUMERATE_KEY: u64         = 0x0032;
-const NR_SET_VALUE_KEY: u64         = 0x003D;
+const NR_SET_VALUE_KEY: u64         = 0x0060;
 
 const STATUS_SUCCESS: u64 = 0x0000_0000;
 const STATUS_INVALID_HANDLE: u64 = 0xC000_0008;

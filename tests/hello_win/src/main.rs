@@ -5,7 +5,7 @@ use core::arch::asm;
 
 const STDOUT: u64 = 0xFFFF_FFFF_FFFF_FFF5;
 
-// NT syscall numbers (Windows 10 ARM64)
+// NT syscall numbers (Windows 11 ARM64, build 22631)
 const NR_WRITE_FILE:          u64 = 0x0008;
 const NR_TERMINATE_PROCESS:   u64 = 0x002C;
 const NR_CREATE_SECTION:      u64 = 0x004A;
@@ -181,4 +181,3 @@ pub extern "C" fn mainCRTStartup() -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     unsafe { nt_terminate_process(1) }
 }
-

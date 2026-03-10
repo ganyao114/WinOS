@@ -7,20 +7,20 @@ use core::arch::asm;
 // ── Well-known handles ──────────────────────────────────────────
 const STDOUT: u64 = 0xFFFF_FFFF_FFFF_FFF5;
 
-// ── NT syscall numbers (Windows 11 ARM64, table 0) ──────────────
+// ── NT syscall numbers (Windows 11 ARM64 build 22631, table 0) ──
 const NR_WRITE_FILE: u64 = 0x0008;
 const NR_CLOSE: u64 = 0x000F;
 const NR_TERMINATE_PROCESS: u64 = 0x002C;
-const NR_ALLOCATE_VIRTUAL_MEMORY: u64 = 0x0015;
+const NR_ALLOCATE_VIRTUAL_MEMORY: u64 = 0x0018;
 const NR_FREE_VIRTUAL_MEMORY: u64 = 0x001E;
-const NR_PROTECT_VIRTUAL_MEMORY: u64 = 0x004D;
+const NR_PROTECT_VIRTUAL_MEMORY: u64 = 0x0050;
 const NR_QUERY_VIRTUAL_MEMORY: u64 = 0x0023;
 const NR_CREATE_SECTION: u64 = 0x004A;
 const NR_MAP_VIEW_OF_SECTION: u64 = 0x0028;
 const NR_UNMAP_VIEW_OF_SECTION: u64 = 0x002A;
 const NR_CREATE_EVENT: u64 = 0x0048;
 const NR_SET_EVENT: u64 = 0x000E;
-const NR_RESET_EVENT: u64 = 0x0034;
+const NR_RESET_EVENT: u64 = 0x0185;
 const NR_YIELD_EXECUTION: u64 = 0x0046;
 const NR_QUERY_INFORMATION_PROCESS: u64 = 0x0019;
 const NR_DUPLICATE_OBJECT: u64 = 0x003C;

@@ -4,22 +4,22 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-// ── NT syscall numbers (Windows 11 ARM64) ───────────────────
+// ── NT syscall numbers (Windows 11 ARM64, build 22631) ──────
 const STDOUT: u64 = 0xFFFF_FFFF_FFFF_FFF5;
 
 const NR_WRITE_FILE: u64        = 0x0008;
 const NR_WAIT_SINGLE: u64       = 0x0004;
-const NR_WAIT_MULTIPLE: u64     = 0x0040;
+const NR_WAIT_MULTIPLE: u64     = 0x005B;
 const NR_SET_EVENT: u64         = 0x000E;
 const NR_CLOSE: u64             = 0x000F;
 const NR_SET_INFORMATION_THREAD: u64 = 0x000D;
 const NR_TERMINATE_PROCESS: u64 = 0x002C;
 const NR_TERMINATE_THREAD: u64  = 0x0053;
 const NR_CREATE_EVENT: u64      = 0x0048;
-const NR_CREATE_MUTEX: u64      = 0x00A9;
-const NR_RELEASE_MUTANT: u64    = 0x001C;
+const NR_CREATE_MUTEX: u64      = 0x00B8;
+const NR_RELEASE_MUTANT: u64    = 0x0020;
 const NR_YIELD_EXECUTION: u64   = 0x0046;
-const NR_CREATE_THREAD_EX: u64  = 0x00C1;
+const NR_CREATE_THREAD_EX: u64  = 0x00C7;
 
 const STATUS_SUCCESS: u64 = 0;
 const STATUS_TIMEOUT: u64 = 0x0000_0102;
@@ -250,7 +250,10 @@ unsafe fn create_mutex(initial_owner: bool) -> (u64, u64) {
         0x001F0001,
         0,
         if initial_owner { 1 } else { 0 },
-        0, 0, 0, 0,
+        0,
+        0,
+        0,
+        0,
     );
     (st, handle)
 }
