@@ -186,6 +186,7 @@ pub struct HypercallManager {
     host_files: Arc<HostFileTable>,
     hostcall: HostCallBroker,
     mono_start: Instant,
+    windows_build: u32,
 }
 
 impl HypercallManager {
@@ -210,8 +211,30 @@ impl HypercallManager {
     #[cfg(not(target_os = "macos"))]
     fn force_exit_all_vcpus(&self) {}
 
+    fn parse_build_from_toml(toml: &str) -> u32 {
+        let mut in_meta = false;
+        for line in toml.lines() {
+            let trimmed = line.trim();
+            if trimmed == "[meta]" {
+                in_meta = true;
+            } else if trimmed.starts_with('[') {
+                in_meta = false;
+            } else if in_meta {
+                if let Some(rest) = trimmed.strip_prefix("build") {
+                    let rest = rest.trim();
+                    if let Some(rest) = rest.strip_prefix('=') {
+                        if let Ok(n) = rest.trim().parse::<u32>() {
+                            return n;
+                        }
+                    }
+                }
+            }
+        }
+        22631
+    }
+
     pub fn new(
-        _syscall_table_toml: String,
+        syscall_table_toml: String,
         memory: Arc<RwLock<GuestMemory>>,
         root: impl Into<std::path::PathBuf>,
         sched: Arc<Scheduler>,
@@ -220,6 +243,8 @@ impl HypercallManager {
         phys_pool_end: u64,
         phys_alloc_budget_bytes: usize,
     ) -> Self {
+        let windows_build = Self::parse_build_from_toml(&syscall_table_toml);
+        log::info!("windows_build from config: {}", windows_build);
         let exe_path: std::path::PathBuf = exe_path.into();
         let exe_image = std::fs::read(&exe_path).unwrap_or_default();
         let root_path: std::path::PathBuf = root.into();
@@ -256,6 +281,7 @@ impl HypercallManager {
             host_files,
             hostcall,
             mono_start: Instant::now(),
+            windows_build,
         }
     }
 
@@ -324,6 +350,9 @@ impl HypercallManager {
             nr::KICK_VCPU_MASK => {
                 self.sched.kick_vcpu_mask(args[0] as u32);
                 HypercallResult::Sync(0)
+            }
+            nr::QUERY_WINDOWS_BUILD => {
+                HypercallResult::Sync(self.windows_build as u64)
             }
             nr::LOAD_DLL_IMAGE | nr::GET_PROC_ADDRESS => HypercallResult::Sync(u64::MAX),
             nr::PROCESS_CREATE => {

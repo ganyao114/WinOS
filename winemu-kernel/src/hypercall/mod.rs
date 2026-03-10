@@ -110,6 +110,14 @@ pub fn kick_vcpu_mask(mask: u32) {
     let _ = hypercall6(nr::KICK_VCPU_MASK, mask as u64, 0, 0, 0, 0, 0);
 }
 
+/// Query the Windows build number configured in the VMM.
+/// Returns e.g. 22631 or 26100. Falls back to 22631 if the VMM returns 0.
+pub fn query_windows_build() -> u32 {
+    let v = hypercall6(nr::QUERY_WINDOWS_BUILD, 0, 0, 0, 0, 0, 0);
+    let build = v as u32;
+    if build == 0 { 22631 } else { build }
+}
+
 /// NtCreateSection — file_handle=0 表示 pagefile-backed
 /// 返回 (status << 32) | section_handle
 pub fn create_section(file_handle: u64, size: u64, prot: u32) -> u64 {

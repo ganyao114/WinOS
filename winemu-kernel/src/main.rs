@@ -268,6 +268,12 @@ pub extern "C" fn kernel_main() -> ! {
         crate::kwarn!("kernel: hostcall setup failed");
     }
 
+    // ── 0. 加载版本化 NT syscall 分发表 ──────────────────────
+    {
+        let build = hypercall::query_windows_build();
+        nt::sysno_table::load_for_build(build);
+    }
+
     // ── 1. 通过 host fd 加载 EXE ─────────────────────────────
     let (exe_fd, exe_size) = hypercall::query_exe_info();
     if exe_fd == u64::MAX || exe_size == 0 {
