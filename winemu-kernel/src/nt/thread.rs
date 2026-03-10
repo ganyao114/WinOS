@@ -297,6 +297,11 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     };
+    let meta = crate::nt::kobject::object_type_meta_for_kind(crate::process::KObjectKind::Thread);
+    if (desired_access & !meta.valid_access_mask) != 0 {
+        frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
     if !crate::process::process_accepts_new_threads(target_pid) {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
@@ -329,7 +334,6 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
         let _lock = KSchedulerLock::lock();
         suspend_thread_locked(tid);
     }
-    let _ = desired_access;
     frame.x[0] = status::SUCCESS as u64;
 }
 

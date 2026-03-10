@@ -19,6 +19,7 @@ use winemu_shared::status;
 
 pub const STATUS_INVALID_HANDLE:       u32 = status::INVALID_HANDLE;
 pub const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+const WAITABLE_POLL_REL_100NS: i64 = -10_000; // 1ms
 
 // ── Internal: resolve handle → SyncObject ────────────────────────────────────
 
@@ -34,6 +35,57 @@ fn resolve_sync_mut(handle: u64) -> Option<(u32, &'static mut SyncObject)> {
     let obj = with_process_mut(pid, |p| p.handle_table.get(handle as u32)).flatten()?;
     let so  = sync_get_mut_by_idx(obj.obj_idx)?;
     Some((obj.obj_idx, so))
+}
+
+fn waitable_handle_signaled(handle: u64) -> Option<bool> {
+    let (kind, obj_idx) = crate::nt::kobject::resolve_handle_target(handle)?;
+    match kind {
+        crate::process::KObjectKind::Thread => {
+            Some(with_thread(obj_idx, |t| t.state == ThreadState::Terminated).unwrap_or(true))
+        }
+        crate::process::KObjectKind::Process => Some(crate::process::process_signaled(obj_idx)),
+        _ => None,
+    }
+}
+
+fn next_waitable_poll_deadline(deadline: WaitDeadline) -> WaitDeadline {
+    match deadline {
+        WaitDeadline::Immediate => WaitDeadline::Immediate,
+        WaitDeadline::Infinite => crate::sched::wait::timeout_to_deadline(WAITABLE_POLL_REL_100NS),
+        WaitDeadline::DeadlineTicks(limit) => match crate::sched::wait::timeout_to_deadline(
+            WAITABLE_POLL_REL_100NS,
+        ) {
+            WaitDeadline::DeadlineTicks(poll) => WaitDeadline::DeadlineTicks(core::cmp::min(
+                limit, poll,
+            )),
+            _ => WaitDeadline::DeadlineTicks(limit),
+        },
+    }
+}
+
+fn wait_for_process_or_thread(handle: u64, deadline: WaitDeadline) -> u32 {
+    let tid = current_tid();
+    loop {
+        match waitable_handle_signaled(handle) {
+            Some(true) => return STATUS_SUCCESS,
+            Some(false) => {}
+            None => return STATUS_INVALID_HANDLE,
+        }
+
+        match deadline {
+            WaitDeadline::Immediate => return STATUS_TIMEOUT,
+            WaitDeadline::DeadlineTicks(limit) if crate::sched::wait::current_ticks() >= limit => {
+                return STATUS_TIMEOUT;
+            }
+            WaitDeadline::Infinite | WaitDeadline::DeadlineTicks(_) => {}
+        }
+
+        let poll_deadline = next_waitable_poll_deadline(deadline);
+        {
+            let _slp = SchedLockAndSleep::new();
+            crate::sched::wait::block_thread_delay_locked(tid, poll_deadline);
+        }
+    }
 }
 
 #[inline]
@@ -197,6 +249,10 @@ pub fn release_semaphore(handle: u64, count: i32) -> (u32, i32) {
 // ── Wait ──────────────────────────────────────────────────────────────────────
 
 pub fn wait_for_single_object(handle: u64, deadline: WaitDeadline) -> u32 {
+    if waitable_handle_signaled(handle).is_some() {
+        return wait_for_process_or_thread(handle, deadline);
+    }
+
     let tid = current_tid();
     let status = {
         let mut slp = SchedLockAndSleep::new();

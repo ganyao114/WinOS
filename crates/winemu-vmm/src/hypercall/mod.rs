@@ -6,6 +6,7 @@ use crate::sched::Scheduler;
 use crate::section::SectionTable;
 use crate::vaspace::VaSpace;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use winemu_shared::hostcall as hc;
@@ -187,6 +188,7 @@ pub struct HypercallManager {
     hostcall: HostCallBroker,
     mono_start: Instant,
     windows_build: u32,
+    guest_exit_code: AtomicU32,
 }
 
 impl HypercallManager {
@@ -282,6 +284,7 @@ impl HypercallManager {
             hostcall,
             mono_start: Instant::now(),
             windows_build,
+            guest_exit_code: AtomicU32::new(0),
         }
     }
 
@@ -362,6 +365,7 @@ impl HypercallManager {
             }
             nr::PROCESS_EXIT => {
                 let code = args[0] as u32;
+                self.guest_exit_code.store(code, Ordering::Release);
                 log::info!("PROCESS_EXIT: code={}", code);
                 let wake = self.sched.wake_stats_snapshot();
                 log::info!(
@@ -1040,6 +1044,10 @@ impl HypercallManager {
 
     pub fn pump_hostcall_main_thread(&self, _max_jobs: usize) {
         self.hostcall.pump_main_thread();
+    }
+
+    pub fn guest_exit_code(&self) -> u32 {
+        self.guest_exit_code.load(Ordering::Acquire)
     }
 
     pub fn pump_hostcall_main_thread_with_event_loop(

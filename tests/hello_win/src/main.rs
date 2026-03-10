@@ -46,9 +46,13 @@ unsafe fn nt_write_file(handle: u64, buf: *const u8, len: u32) {
 }
 
 unsafe fn nt_terminate_process(code: u32) -> ! {
+    let nr = NR_TERMINATE_PROCESS;
+    let code_u64 = code as u64;
     asm!(
-        "mov x8, {nr}", "mov x0, xzr", "mov x1, {code}", "svc #0",
-        nr = in(reg) NR_TERMINATE_PROCESS, code = in(reg) code as u64,
+        "mov x0, xzr",
+        "svc #0",
+        in("x8") nr,
+        in("x1") code_u64,
         options(noreturn, nostack),
     );
 }

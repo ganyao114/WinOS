@@ -38,9 +38,9 @@ typedef struct {
 #define NR_TERMINATE_PROCESS 0x002C
 #define NR_DUPLICATE_OBJECT 0x003C
 #define NR_YIELD_EXECUTION 0x0046
-#define NR_CREATE_PROCESS_EX 0x004B
+#define NR_CREATE_PROCESS_EX 0x004D
 #define NR_TERMINATE_THREAD 0x0053
-#define NR_CREATE_THREAD_EX 0x00C1
+#define NR_CREATE_THREAD_EX 0x00C7
 
 static inline uint64_t svc8(uint64_t nr,
     uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,

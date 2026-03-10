@@ -1,6 +1,7 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::mpsc;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -77,7 +78,21 @@ impl ApplicationHandler<()> for HostUiApp {
         self.hypercall_mgr
             .pump_hostcall_main_thread_with_event_loop(event_loop, elapsed_ms);
         self.hypercall_mgr.force_exit_vcpus_if_shutdown();
+        if self.hypercall_mgr.sched.shutdown.load(Ordering::Acquire) {
+            let code = self.hypercall_mgr.guest_exit_code();
+            std::process::exit(code as i32);
+        }
         event_loop.set_control_flow(ControlFlow::Poll);
+    }
+}
+
+fn exit_after_host_ui_run(done: std::result::Result<(), String>) -> ! {
+    match done {
+        Ok(()) => std::process::exit(0),
+        Err(msg) => {
+            eprintln!("VMM run failed: {msg}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -110,42 +125,39 @@ fn run_vmm_with_host_ui(mut vmm: winemu_vmm::Vmm) -> Result<()> {
 
     let hypercall_mgr = vmm.hypercall_manager();
     let (done_tx, done_rx) = mpsc::sync_channel::<std::result::Result<(), String>>(1);
-    let join = thread::Builder::new()
+    let _vmm_thread = thread::Builder::new()
         .name("winemu-vmm".to_string())
         .spawn(move || {
             let result = vmm.run().map_err(|e| format!("{e}"));
             let _ = done_tx.send(result);
         })
         .context("failed to spawn VMM thread")?;
+    let _exit_thread = thread::Builder::new()
+        .name("winemu-exit-watch".to_string())
+        .spawn(move || match done_rx.recv() {
+            Ok(done) => exit_after_host_ui_run(done),
+            Err(_) => exit_after_host_ui_run(Err(
+                "VMM completion channel disconnected".to_string(),
+            )),
+        })
+        .context("failed to spawn VMM exit watcher")?;
 
     let mut app = HostUiApp::new(Arc::clone(&hypercall_mgr));
-    let done_result = loop {
+    loop {
         match event_loop.pump_app_events(Some(Duration::from_millis(8)), &mut app) {
             PumpStatus::Continue => {}
             PumpStatus::Exit(code) => {
+                if hypercall_mgr.sched.shutdown.load(Ordering::Acquire) {
+                    exit_after_host_ui_run(Ok(()));
+                }
                 log::warn!("host-ui: event loop requested exit code={code}");
                 hypercall_mgr.sched.request_shutdown();
                 hypercall_mgr.force_exit_vcpus_if_shutdown();
-                break Err(format!("host UI event loop exited with code {code}"));
+                exit_after_host_ui_run(Err(format!(
+                    "host UI event loop exited with code {code}"
+                )));
             }
         }
-
-        match done_rx.try_recv() {
-            Ok(done) => break done,
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                break Err("VMM completion channel disconnected".to_string());
-            }
-        }
-    };
-
-    if join.join().is_err() {
-        return Err(anyhow!("VMM thread panicked"));
-    }
-
-    match done_result {
-        Ok(()) => Ok(()),
-        Err(msg) => Err(anyhow!("VMM run failed: {msg}")),
     }
 }
 
