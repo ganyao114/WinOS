@@ -10,6 +10,7 @@ use super::state::{
     file_host_fd, section_alloc, section_free, section_get, view_alloc, view_free,
     vm_alloc_region_typed, vm_free_region, vm_set_section_backing,
 };
+use crate::mm::usercopy::{read_current_user_value, write_current_user_value};
 use super::SvcFrame;
 use crate::mm::vaspace::VmaType;
 
@@ -174,7 +175,11 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
     let size = if max_size_ptr.is_null() {
         PAGE_SIZE_4K
     } else {
-        align_up_4k(unsafe { max_size_ptr.read_volatile().max(PAGE_SIZE_4K) })
+        let Some(max_size) = read_current_user_value(max_size_ptr) else {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        };
+        align_up_4k(max_size.max(PAGE_SIZE_4K))
     };
     let owner_pid = crate::process::current_pid();
     let is_image = (alloc_attrs & SEC_IMAGE) != 0;
@@ -219,7 +224,12 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
         return;
     };
     if !out_ptr.is_null() {
-        unsafe { out_ptr.write_volatile(handle) };
+        if !write_current_user_value(out_ptr, handle) {
+            named_section_remove_by_section(idx);
+            section_free(idx);
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        }
     }
     frame.x[0] = status::SUCCESS as u64;
 }
@@ -262,7 +272,10 @@ pub(crate) fn handle_open_section(frame: &mut SvcFrame) {
         return;
     };
     if !out_ptr.is_null() {
-        unsafe { out_ptr.write_volatile(handle) };
+        if !write_current_user_value(out_ptr, handle) {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        }
     }
     frame.x[0] = status::SUCCESS as u64;
 }
@@ -288,11 +301,19 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     let base_ptr = frame.x[2] as *mut u64;
     let view_size_ptr = frame.x[6] as *mut u64;
     let offset_ptr = frame.x[5] as *const u64;
-    let win32_protect = unsafe { (frame.sp_el0 as *const u64).add(1).read_volatile() } as u32;
+    let Some(win32_protect) = read_current_user_value((frame.sp_el0 + 8) as *const u64) else {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    };
+    let win32_protect = win32_protect as u32;
     let section_offset = if offset_ptr.is_null() {
         0
     } else {
-        unsafe { offset_ptr.read_volatile() }
+        let Some(offset) = read_current_user_value(offset_ptr) else {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        };
+        offset
     };
     if sec.is_image && section_offset != 0 {
         frame.x[0] = status::INVALID_PARAMETER as u64;
@@ -306,7 +327,11 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     let req_size = if view_size_ptr.is_null() {
         0
     } else {
-        unsafe { view_size_ptr.read_volatile() }
+        let Some(size) = read_current_user_value(view_size_ptr as *const u64) else {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        };
+        size
     };
     if section_offset >= sec.size {
         frame.x[0] = status::INVALID_PARAMETER as u64;
@@ -328,7 +353,11 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     };
     let owner_pid = crate::process::current_pid();
     let hint = if !base_ptr.is_null() {
-        unsafe { base_ptr.read_volatile() }
+        let Some(base) = read_current_user_value(base_ptr as *const u64) else {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        };
+        base
     } else {
         0
     };
@@ -365,10 +394,16 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     }
 
     if !base_ptr.is_null() {
-        unsafe { base_ptr.write_volatile(base) };
+        if !write_current_user_value(base_ptr, base) {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        }
     }
     if !view_size_ptr.is_null() {
-        unsafe { view_size_ptr.write_volatile(map_size) };
+        if !write_current_user_value(view_size_ptr, map_size) {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        }
     }
     frame.x[0] = status::SUCCESS as u64;
 }
@@ -440,7 +475,9 @@ pub(crate) fn handle_query_section(frame: &mut SvcFrame) {
         0 => {
             let required = core::mem::size_of::<SectionBasicInformation>();
             let Some(mut w) = GuestWriter::new(buf, len, required) else {
-                if !ret_len.is_null() { unsafe { ret_len.write_volatile(required as u32) }; }
+                if !ret_len.is_null() {
+                    let _ = write_current_user_value(ret_len, required as u32);
+                }
                 frame.x[0] = status::BUFFER_TOO_SMALL as u64;
                 return;
             };
@@ -450,18 +487,24 @@ pub(crate) fn handle_query_section(frame: &mut SvcFrame) {
                 _pad: 0,
                 maximum_size: sec.size,
             });
-            if !ret_len.is_null() { unsafe { ret_len.write_volatile(required as u32) }; }
+            if !ret_len.is_null() {
+                let _ = write_current_user_value(ret_len, required as u32);
+            }
             frame.x[0] = status::SUCCESS as u64;
         }
         1 => {
             let required = core::mem::size_of::<SectionImageInformation>();
             let Some(mut w) = GuestWriter::new(buf, len, required) else {
-                if !ret_len.is_null() { unsafe { ret_len.write_volatile(required as u32) }; }
+                if !ret_len.is_null() {
+                    let _ = write_current_user_value(ret_len, required as u32);
+                }
                 frame.x[0] = status::BUFFER_TOO_SMALL as u64;
                 return;
             };
             w.write_struct(SectionImageInformation { _data: [0u8; 40] });
-            if !ret_len.is_null() { unsafe { ret_len.write_volatile(required as u32) }; }
+            if !ret_len.is_null() {
+                let _ = write_current_user_value(ret_len, required as u32);
+            }
             frame.x[0] = status::SUCCESS as u64;
         }
         _ => { frame.x[0] = status::INVALID_PARAMETER as u64; }

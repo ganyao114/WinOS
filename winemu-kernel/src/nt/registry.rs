@@ -13,6 +13,9 @@ use winereg::{
 use super::path::{
     bytes_path_to_registry, normalize_registry_path, read_oa_path, read_unicode_direct,
 };
+use crate::mm::usercopy::{
+    read_current_user_bytes, read_current_user_value, write_current_user_value,
+};
 use super::SvcFrame;
 
 const MAX_PATH: usize = 256;
@@ -91,7 +94,7 @@ fn oa_full_path(oa_ptr: u64, state: &RegistryState) -> Option<String> {
         return Some(String::new());
     }
 
-    let root_handle = unsafe { ((oa_ptr + 0x8) as *const u64).read_volatile() };
+    let root_handle = read_current_user_value((oa_ptr + 0x8) as *const u64).unwrap_or(0);
     let mut rel = [0u8; MAX_PATH];
     let rel_len_raw = read_oa_path(oa_ptr, &mut rel);
     let (rel_len, abs) = normalize_registry_path(&mut rel, rel_len_raw);
@@ -205,7 +208,7 @@ fn utf16_byte_len(s: &str) -> usize {
 
 fn write_ret_len(ptr: u64, len: usize) {
     if ptr != 0 {
-        unsafe { (ptr as *mut u32).write_volatile(len as u32) };
+        let _ = write_current_user_value(ptr as *mut u32, len as u32);
     }
 }
 
@@ -296,7 +299,11 @@ pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
             frame.x[0] = status::NO_MEMORY as u64;
             return;
         };
-        unsafe { out_ptr.write_volatile(h) };
+        if !write_current_user_value(out_ptr, h) {
+            let _ = state.handles.free(handle_idx);
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        }
     }
     frame.x[0] = status::SUCCESS as u64;
 }
@@ -340,7 +347,11 @@ pub(crate) fn handle_create_key(frame: &mut SvcFrame) {
     };
 
     if !disp_ptr.is_null() {
-        unsafe { disp_ptr.write_volatile(disp) };
+        if !write_current_user_value(disp_ptr, disp) {
+            let _ = state.handles.free(handle_idx);
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        }
     }
     if !out_ptr.is_null() {
         let pid = crate::process::current_pid();
@@ -351,7 +362,11 @@ pub(crate) fn handle_create_key(frame: &mut SvcFrame) {
             frame.x[0] = status::NO_MEMORY as u64;
             return;
         };
-        unsafe { out_ptr.write_volatile(h) };
+        if !write_current_user_value(out_ptr, h) {
+            let _ = state.handles.free(handle_idx);
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        }
     }
     frame.x[0] = status::SUCCESS as u64;
 }
@@ -418,7 +433,11 @@ pub(crate) fn handle_set_value_key(frame: &mut SvcFrame) {
     let raw_data = if data_len == 0 {
         Vec::new()
     } else {
-        unsafe { core::slice::from_raw_parts(data_ptr, data_len) }.to_vec()
+        let Some(bytes) = read_current_user_bytes(data_ptr, data_len) else {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        };
+        bytes
     };
 
     let value = decode_registry_value(&value_name, value_type, &raw_data);

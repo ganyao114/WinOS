@@ -1,6 +1,7 @@
 use core::mem::size_of;
 use winemu_shared::status;
 
+use crate::mm::usercopy::write_current_user_value;
 use super::SvcFrame;
 
 // ── Guest-memory layout structs ───────────────────────────────────────────────
@@ -93,7 +94,10 @@ pub(crate) fn handle_open_process_token(frame: &mut SvcFrame) {
         return;
     };
 
-    unsafe { out_ptr.write_volatile(token_handle) };
+    if !write_current_user_value(out_ptr, token_handle) {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
     frame.x[0] = status::SUCCESS as u64;
 }
 
@@ -125,7 +129,10 @@ pub(crate) fn handle_open_process_token_ex(frame: &mut SvcFrame) {
         frame.x[0] = status::NO_MEMORY as u64;
         return;
     };
-    unsafe { out_ptr.write_volatile(token_handle) };
+    if !write_current_user_value(out_ptr, token_handle) {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
     frame.x[0] = status::SUCCESS as u64;
 }
 
@@ -163,7 +170,10 @@ fn open_thread_token_inner(thread_handle: u64, out_ptr: *mut u64, frame: &mut Sv
         frame.x[0] = status::NO_MEMORY as u64;
         return;
     };
-    unsafe { out_ptr.write_volatile(token_handle) };
+    if !write_current_user_value(out_ptr, token_handle) {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
     frame.x[0] = status::SUCCESS as u64;
 }
 
@@ -262,7 +272,9 @@ fn query_token_linked_token(pid: u32, buf: *mut u8, len: usize, ret_len: *mut u3
     ) else {
         return status::NO_MEMORY;
     };
-    unsafe { (buf as *mut u64).write_volatile(linked) };
+    if !write_current_user_value(buf as *mut u64, linked) {
+        return status::INVALID_PARAMETER;
+    }
     write_ret_len(ret_len, size_of::<u64>() as u32);
     status::SUCCESS
 }
@@ -273,8 +285,8 @@ fn write_u32(buf: *mut u8, len: usize, ret_len: *mut u32, value: u32) -> u32 {
         return status::BUFFER_TOO_SMALL;
     }
 
-    unsafe {
-        (buf as *mut u32).write_volatile(value);
+    if !write_current_user_value(buf as *mut u32, value) {
+        return status::INVALID_PARAMETER;
     }
     write_ret_len(ret_len, size_of::<u32>() as u32);
     status::SUCCESS
@@ -282,6 +294,6 @@ fn write_u32(buf: *mut u8, len: usize, ret_len: *mut u32, value: u32) -> u32 {
 
 fn write_ret_len(ptr: *mut u32, value: u32) {
     if !ptr.is_null() {
-        unsafe { ptr.write_volatile(value) };
+        let _ = write_current_user_value(ptr, value);
     }
 }

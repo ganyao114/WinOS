@@ -1,6 +1,8 @@
 use crate::process::{KObjectKind, with_process_mut};
 
 use super::state::file_host_fd;
+use crate::mm::usercopy::{copy_to_process_user, current_pid, ensure_user_range_access};
+use super::state::VM_ACCESS_WRITE;
 
 pub(crate) const STD_INPUT_HANDLE: u64 = 0xFFFF_FFFF_FFFF_FFF6;
 pub(crate) const STD_OUTPUT_HANDLE: u64 = 0xFFFF_FFFF_FFFF_FFF5;
@@ -88,7 +90,8 @@ pub(crate) fn file_handle_to_host_fd_for_pid(owner_pid: u32, file_handle: u64) -
 //   w.u64(size);       // MaximumSize
 
 pub(crate) struct GuestWriter {
-    base: *mut u8,
+    pid: u32,
+    base: u64,
     offset: usize,
 }
 
@@ -96,48 +99,60 @@ impl GuestWriter {
     /// Returns None if `buf` is null or `len < required`.
     #[inline]
     pub(crate) fn new(buf: *mut u8, len: usize, required: usize) -> Option<Self> {
-        if buf.is_null() || len < required {
+        let pid = current_pid()?;
+        if buf.is_null()
+            || len < required
+            || !ensure_user_range_access(pid, buf as u64, required, VM_ACCESS_WRITE)
+        {
             None
         } else {
-            Some(Self { base: buf, offset: 0 })
+            Some(Self { pid, base: buf as u64, offset: 0 })
         }
     }
 
     #[inline]
-    pub(crate) fn u8(&mut self, v: u8) -> &mut Self {
-        unsafe { self.base.add(self.offset).write_volatile(v) };
-        self.offset += 1;
+    fn write_bytes(&mut self, bytes: &[u8]) -> &mut Self {
+        let ok = copy_to_process_user(
+            self.pid,
+            self.base.saturating_add(self.offset as u64),
+            bytes.as_ptr(),
+            bytes.len(),
+        );
+        debug_assert!(ok);
+        self.offset += bytes.len();
         self
+    }
+
+    #[inline]
+    pub(crate) fn u8(&mut self, v: u8) -> &mut Self {
+        self.write_bytes(&[v])
     }
 
     #[inline]
     pub(crate) fn u16(&mut self, v: u16) -> &mut Self {
-        unsafe { (self.base.add(self.offset) as *mut u16).write_volatile(v) };
-        self.offset += 2;
-        self
+        self.write_bytes(&v.to_le_bytes())
     }
 
     #[inline]
     pub(crate) fn u32(&mut self, v: u32) -> &mut Self {
-        unsafe { (self.base.add(self.offset) as *mut u32).write_volatile(v) };
-        self.offset += 4;
-        self
+        self.write_bytes(&v.to_le_bytes())
     }
 
     #[inline]
     pub(crate) fn u64(&mut self, v: u64) -> &mut Self {
-        unsafe { (self.base.add(self.offset) as *mut u64).write_volatile(v) };
-        self.offset += 8;
-        self
+        self.write_bytes(&v.to_le_bytes())
     }
 
     /// Zero-fill `n` bytes.
     #[inline]
     pub(crate) fn zeros(&mut self, n: usize) -> &mut Self {
-        for i in 0..n {
-            unsafe { self.base.add(self.offset + i).write_volatile(0u8) };
+        const ZERO_CHUNK: [u8; 32] = [0; 32];
+        let mut remain = n;
+        while remain != 0 {
+            let chunk = core::cmp::min(remain, ZERO_CHUNK.len());
+            let _ = self.write_bytes(&ZERO_CHUNK[..chunk]);
+            remain -= chunk;
         }
-        self.offset += n;
         self
     }
 
@@ -151,9 +166,13 @@ impl GuestWriter {
     #[inline]
     pub(crate) fn write_struct<T: Copy>(&mut self, v: T) -> &mut Self {
         let size = core::mem::size_of::<T>();
-        unsafe {
-            (self.base.add(self.offset) as *mut T).write_volatile(v);
-        }
+        let ok = copy_to_process_user(
+            self.pid,
+            self.base.saturating_add(self.offset as u64),
+            (&v as *const T).cast::<u8>(),
+            size,
+        );
+        debug_assert!(ok);
         self.offset += size;
         self
     }

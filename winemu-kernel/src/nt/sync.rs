@@ -12,6 +12,9 @@ use crate::sched::wait::{timeout_to_deadline, STATUS_SUCCESS};
 use winemu_shared::status;
 
 use super::named_objects as nobj;
+use crate::mm::usercopy::{
+    copy_from_current_user, read_current_user_value, write_current_user_value,
+};
 use super::SvcFrame;
 
 const MAX_WAIT_HANDLES: usize = 64;
@@ -31,20 +34,20 @@ fn read_oa_name(oa_ptr: u64) -> ([u8; 128], usize, u32) {
     if oa_ptr == 0 {
         return (name, 0, 0);
     }
-    let attrs = unsafe { ((oa_ptr + 24) as *const u32).read_volatile() };
-    let us_ptr = unsafe { ((oa_ptr + 16) as *const u64).read_volatile() };
+    let attrs = read_current_user_value((oa_ptr + 24) as *const u32).unwrap_or(0);
+    let us_ptr = read_current_user_value((oa_ptr + 16) as *const u64).unwrap_or(0);
     if us_ptr == 0 {
         return (name, 0, attrs);
     }
-    let byte_len = unsafe { (us_ptr as *const u16).read_volatile() as usize };
-    let buf_ptr  = unsafe { ((us_ptr + 8) as *const u64).read_volatile() };
+    let byte_len = read_current_user_value(us_ptr as *const u16).unwrap_or(0) as usize;
+    let buf_ptr = read_current_user_value((us_ptr + 8) as *const u64).unwrap_or(0);
     if byte_len == 0 || buf_ptr == 0 {
         return (name, 0, attrs);
     }
     let mut raw = [0u8; 128];
     let count = core::cmp::min(byte_len / 2, 128);
     for i in 0..count {
-        let wc = unsafe { ((buf_ptr + (i as u64 * 2)) as *const u16).read_volatile() };
+        let wc = read_current_user_value((buf_ptr + (i as u64 * 2)) as *const u16).unwrap_or(0);
         raw[i] = if wc < 0x80 { wc as u8 } else { b'?' };
     }
     let len = nobj::normalize_name(&raw[..count], &mut name);
@@ -147,8 +150,9 @@ pub(crate) fn handle_wait_multiple(frame: &mut SvcFrame) {
     }
     let timeout = parse_timeout(frame.x[4] as *const i64);
     let mut handles = [0u64; MAX_WAIT_HANDLES];
-    for i in 0..count {
-        handles[i] = unsafe { arr.add(i).read_volatile() };
+    if !copy_from_current_user(arr.cast::<u8>(), handles.as_mut_ptr().cast::<u8>(), count * 8) {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     }
     frame.x[0] = wait_for_multiple_objects(&handles[..count], wait_all, timeout) as u64;
 }
@@ -255,8 +259,10 @@ pub(crate) fn handle_release_semaphore(frame: &mut SvcFrame) {
     let count = frame.x[1] as i32;
     let (st, prev) = release_semaphore(h, count);
     if st == STATUS_SUCCESS {
-        if let Some(ptr) = unsafe { (frame.x[2] as *mut u32).as_mut() } {
-            unsafe { (ptr as *mut u32).write_volatile(prev as u32) };
+        let ptr = frame.x[2] as *mut u32;
+        if !ptr.is_null() && !write_current_user_value(ptr, prev as u32) {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
         }
     }
     frame.x[0] = st as u64;
@@ -322,7 +328,9 @@ pub(crate) fn handle_query_event(frame: &mut SvcFrame) {
         return;
     }
     if buf.is_null() || len < 8 {
-        if !ret_len.is_null() { unsafe { ret_len.write_volatile(8) }; }
+        if !ret_len.is_null() {
+            let _ = write_current_user_value(ret_len, 8u32);
+        }
         frame.x[0] = winemu_shared::status::BUFFER_TOO_SMALL as u64;
         return;
     }
@@ -332,18 +340,22 @@ pub(crate) fn handle_query_event(frame: &mut SvcFrame) {
         return;
     }
     // EventType: 0=NotificationEvent, 1=SynchronizationEvent — we don't track type, use 0
-    unsafe {
-        (buf as *mut u32).write_volatile(0u32);
-        (buf.add(4) as *mut u32).write_volatile(signaled as u32);
+    if !write_current_user_value(buf as *mut u32, 0u32)
+        || !write_current_user_value(unsafe { buf.add(4) } as *mut u32, signaled as u32)
+    {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     }
-    if !ret_len.is_null() { unsafe { ret_len.write_volatile(8) }; }
+    if !ret_len.is_null() {
+        let _ = write_current_user_value(ret_len, 8u32);
+    }
     frame.x[0] = winemu_shared::status::SUCCESS as u64;
 }
 
 fn write_out_handle(frame: &SvcFrame, handle: u64) {
     let out_ptr = frame.x[0] as *mut u64;
     if !out_ptr.is_null() {
-        unsafe { out_ptr.write_volatile(handle) };
+        let _ = write_current_user_value(out_ptr, handle);
     }
 }
 
@@ -351,6 +363,8 @@ fn parse_timeout(timeout_ptr: *const i64) -> WaitDeadline {
     if timeout_ptr.is_null() {
         return WaitDeadline::Infinite;
     }
-    let raw = unsafe { timeout_ptr.read_volatile() };
+    let Some(raw) = read_current_user_value(timeout_ptr) else {
+        return WaitDeadline::Immediate;
+    };
     timeout_to_deadline(raw)
 }

@@ -13,6 +13,10 @@ use super::constants::{
     THREAD_BASIC_INFORMATION_SIZE, THREAD_INFO_CLASS_AFFINITY_MASK, THREAD_INFO_CLASS_BASE_PRIORITY,
     THREAD_INFO_CLASS_PRIORITY,
 };
+use crate::mm::usercopy::{
+    copy_to_current_user, read_current_user_bytes, read_current_user_value,
+    write_current_user_value,
+};
 use super::SvcFrame;
 
 // ── Handle type constant ──────────────────────────────────────────────────────
@@ -205,7 +209,7 @@ pub(crate) fn handle_query_information_thread(frame: &mut SvcFrame) {
         0 => {
             if buf.is_null() || buf_len < THREAD_BASIC_INFORMATION_SIZE {
                 if !ret_len.is_null() {
-                    unsafe { ret_len.write_volatile(THREAD_BASIC_INFORMATION_SIZE as u32) };
+                    let _ = write_current_user_value(ret_len, THREAD_BASIC_INFORMATION_SIZE as u32);
                 }
                 frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
                 return;
@@ -218,11 +222,12 @@ pub(crate) fn handle_query_information_thread(frame: &mut SvcFrame) {
                 frame.x[0] = status::INVALID_HANDLE as u64;
                 return;
             };
-            unsafe {
-                core::ptr::copy_nonoverlapping(tbi.as_ptr(), buf, THREAD_BASIC_INFORMATION_SIZE)
-            };
+            if !copy_to_current_user(buf, tbi.as_ptr(), THREAD_BASIC_INFORMATION_SIZE) {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            }
             if !ret_len.is_null() {
-                unsafe { ret_len.write_volatile(THREAD_BASIC_INFORMATION_SIZE as u32) };
+                let _ = write_current_user_value(ret_len, THREAD_BASIC_INFORMATION_SIZE as u32);
             }
             frame.x[0] = status::SUCCESS as u64;
         }
@@ -244,7 +249,10 @@ pub(crate) fn handle_set_information_thread(frame: &mut SvcFrame) {
                 frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
                 return;
             }
-            let prio = unsafe { (info_ptr as *const i32).read_volatile() };
+            let Some(prio) = read_current_user_value(info_ptr as *const i32) else {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            };
             frame.x[0] = set_thread_base_priority_by_handle(thread_handle, prio) as u64;
         }
         THREAD_INFO_CLASS_AFFINITY_MASK => {
@@ -252,7 +260,10 @@ pub(crate) fn handle_set_information_thread(frame: &mut SvcFrame) {
                 frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
                 return;
             }
-            let affinity = unsafe { (info_ptr as *const u64).read_volatile() };
+            let Some(affinity) = read_current_user_value(info_ptr as *const u64) else {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            };
             frame.x[0] = set_thread_affinity_by_handle(thread_handle, affinity) as u64;
         }
         _ => {
@@ -273,8 +284,14 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
     let entry_va = frame.x[4];
     let arg = frame.x[5];
     let create_flags = frame.x[6] as u32;
-    let stack_size_arg = unsafe { (frame.sp_el0 as *const u64).read_volatile() };
-    let max_stack_size_arg = unsafe { (frame.sp_el0 as *const u64).add(1).read_volatile() };
+    let Some(stack_size_arg) = read_current_user_value(frame.sp_el0 as *const u64) else {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    };
+    let Some(max_stack_size_arg) = read_current_user_value((frame.sp_el0 + 8) as *const u64) else {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    };
 
     let Some(target_pid) = crate::process::resolve_process_handle(process_handle) else {
         frame.x[0] = status::INVALID_HANDLE as u64;
@@ -303,8 +320,9 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
         }
     };
     let handle = crate::nt::kobject::make_thread_handle(tid);
-    if !out_ptr.is_null() {
-        unsafe { out_ptr.write_volatile(handle) };
+    if !out_ptr.is_null() && !write_current_user_value(out_ptr, handle) {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     }
     // NtCreateThreadEx: 0x1 = CREATE_SUSPENDED.
     if (create_flags & 0x1) != 0 {
@@ -327,8 +345,9 @@ pub(crate) fn handle_suspend_thread(frame: &mut SvcFrame) {
     let prev_ptr = frame.x[1] as *mut u32;
     match suspend_thread_by_handle(thread_handle) {
         Ok(prev) => {
-            if !prev_ptr.is_null() {
-                unsafe { prev_ptr.write_volatile(prev) };
+            if !prev_ptr.is_null() && !write_current_user_value(prev_ptr, prev) {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
             }
             frame.x[0] = status::SUCCESS as u64;
         }
@@ -341,8 +360,9 @@ pub(crate) fn handle_resume_thread(frame: &mut SvcFrame) {
     let prev_ptr = frame.x[1] as *mut u32;
     match resume_thread_by_handle(thread_handle) {
         Ok(prev) => {
-            if !prev_ptr.is_null() {
-                unsafe { prev_ptr.write_volatile(prev) };
+            if !prev_ptr.is_null() && !write_current_user_value(prev_ptr, prev) {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
             }
             frame.x[0] = status::SUCCESS as u64;
         }
@@ -362,7 +382,10 @@ pub(crate) fn handle_wait_for_alert_by_thread_id(frame: &mut SvcFrame) {
     let deadline = if timeout_ptr.is_null() {
         WaitDeadline::Infinite
     } else {
-        timeout_to_deadline(unsafe { timeout_ptr.read_volatile() })
+        match read_current_user_value(timeout_ptr) {
+            Some(raw) => timeout_to_deadline(raw),
+            None => WaitDeadline::Immediate,
+        }
     };
     frame.x[0] = wait_for_alert_by_tid(deadline) as u64;
 }
@@ -374,16 +397,26 @@ pub(crate) fn handle_continue(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
+    let Some(ctx) = read_current_user_bytes(ctx_ptr, 272) else {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    };
     // ARM64 CONTEXT layout: ContextFlags(4)+pad(4)+X0..X28(29×8)+Fp(8)+Lr(8)+Sp(8)+Pc(8)+Cpsr(4)+pad(4)
     // Offset of X0 = 8, Pc = 8 + 31*8 = 256, Sp = 8 + 30*8 = 248, Cpsr = 264
-    let base = ctx_ptr as u64;
-    let pc  = unsafe { ((base + 256) as *const u64).read_volatile() };
-    let sp  = unsafe { ((base + 248) as *const u64).read_volatile() };
-    let cpsr = unsafe { ((base + 264) as *const u32).read_volatile() };
+    let read_u64 = |off: usize| -> u64 {
+        let bytes = &ctx[off..off + 8];
+        u64::from_le_bytes(bytes.try_into().unwrap())
+    };
+    let read_u32 = |off: usize| -> u32 {
+        let bytes = &ctx[off..off + 4];
+        u32::from_le_bytes(bytes.try_into().unwrap())
+    };
+    let pc = read_u64(256);
+    let sp = read_u64(248);
+    let cpsr = read_u32(264);
     // Restore general-purpose registers x0..x18 from context
     for i in 0u64..19 {
-        let val = unsafe { ((base + 8 + i * 8) as *const u64).read_volatile() };
-        frame.x[i as usize] = val;
+        frame.x[i as usize] = read_u64(8 + i as usize * 8);
     }
     frame.elr = pc;
     frame.sp_el0 = sp;

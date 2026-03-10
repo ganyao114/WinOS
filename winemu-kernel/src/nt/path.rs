@@ -1,5 +1,7 @@
 use crate::rust_alloc::string::String;
 
+use crate::mm::usercopy::read_current_user_value;
+
 #[inline(always)]
 fn shift_left(path: &mut [u8], len: usize, count: usize) -> usize {
     if count == 0 {
@@ -61,14 +63,14 @@ fn read_unicode_ascii_internal(us_ptr: u64, out: &mut [u8], normalize_path: bool
     if us_ptr == 0 || out.is_empty() {
         return 0;
     }
-    let byte_len = unsafe { (us_ptr as *const u16).read_volatile() as usize };
-    let buf_ptr = unsafe { ((us_ptr + 8) as *const u64).read_volatile() };
+    let byte_len = read_current_user_value(us_ptr as *const u16).unwrap_or(0) as usize;
+    let buf_ptr = read_current_user_value((us_ptr + 8) as *const u64).unwrap_or(0);
     if byte_len == 0 || buf_ptr == 0 {
         return 0;
     }
     let count = core::cmp::min(byte_len / 2, out.len());
     for i in 0..count {
-        let wc = unsafe { ((buf_ptr + (i as u64 * 2)) as *const u16).read_volatile() };
+        let wc = read_current_user_value((buf_ptr + (i as u64 * 2)) as *const u16).unwrap_or(0);
         out[i] = if wc < 0x80 { wc as u8 } else { b'?' };
     }
     if normalize_path {
@@ -119,7 +121,7 @@ pub(crate) fn read_oa_path(oa_ptr: u64, out: &mut [u8]) -> usize {
     if oa_ptr == 0 || out.is_empty() {
         return 0;
     }
-    let us_ptr = unsafe { ((oa_ptr + 0x10) as *const u64).read_volatile() };
+    let us_ptr = read_current_user_value((oa_ptr + 0x10) as *const u64).unwrap_or(0);
     let len = read_unicode_ascii_internal(us_ptr, out, true);
     normalize_nt_path(out, len)
 }

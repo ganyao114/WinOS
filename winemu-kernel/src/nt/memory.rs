@@ -4,137 +4,27 @@ use super::common::{align_up_4k, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESE
 use super::constants::PAGE_MASK_4K;
 use super::state::{
     vm_commit_private, vm_decommit_private, vm_protect_range, vm_query_region, vm_release_private,
-    vm_reserve_private, VM_ACCESS_READ, VM_ACCESS_WRITE,
+    vm_reserve_private, VM_ACCESS_WRITE,
+};
+use crate::mm::usercopy::{
+    copy_between_process_users, copy_to_process_user, ensure_user_range_access, read_user_value,
+    write_user_value,
 };
 use super::SvcFrame;
 
 const PAGE_SIZE_4K: u64 = 0x1000;
-const USER_ACCESS_BASE: u64 = crate::process::USER_ACCESS_BASE;
 const USER_VA_BASE: u64 = crate::process::USER_VA_BASE;
 const USER_VA_LIMIT: u64 = crate::process::USER_VA_LIMIT;
-
-fn ensure_user_range_access(pid: u32, addr: u64, size: usize, access: u8) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    if size == 0 {
-        return true;
-    }
-    let Some(end_addr) = addr.checked_add((size as u64).saturating_sub(1)) else {
-        return false;
-    };
-    let mut page = addr & PAGE_MASK_4K;
-    let end_page = end_addr & PAGE_MASK_4K;
-    loop {
-        if page < USER_ACCESS_BASE || page >= USER_VA_LIMIT {
-            // Disallow non-user pointers from user syscall buffers.
-            return false;
-        }
-        if page >= USER_VA_BASE {
-            // Managed private/user window: demand-map on access.
-            if !super::state::vm_handle_page_fault(pid, page, access) {
-                return false;
-            }
-        }
-        // Regardless of region kind (managed window or shared image mapping),
-        // require user-accessible PTE permissions for this access type.
-        if translate_user_va(pid, page, access).is_none() {
-            return false;
-        }
-        if page == end_page {
-            break;
-        }
-        let Some(next) = page.checked_add(PAGE_SIZE_4K) else {
-            return false;
-        };
-        page = next;
-    }
-    true
-}
-
-fn translate_user_va(pid: u32, va: u64, access: u8) -> Option<u64> {
-    crate::process::with_process(pid, |p| {
-        p.address_space.translate_user_va_for_access(va, access)
-    })
-    .flatten()
-}
-
-fn copy_from_process_user(pid: u32, src_va: u64, dst: *mut u8, size: usize) -> bool {
-    let mut done = 0usize;
-    while done < size {
-        let cur_va = src_va + done as u64;
-        let Some(src_pa) = translate_user_va(pid, cur_va, VM_ACCESS_READ) else {
-            return false;
-        };
-        let page_off = (cur_va as usize) & ((PAGE_SIZE_4K as usize) - 1);
-        let chunk = core::cmp::min(size - done, (PAGE_SIZE_4K as usize) - page_off);
-        unsafe {
-            core::ptr::copy_nonoverlapping(src_pa as *const u8, dst.add(done), chunk);
-        }
-        done += chunk;
-    }
-    true
-}
-
-fn copy_to_process_user(pid: u32, dst_va: u64, src: *const u8, size: usize) -> bool {
-    let mut done = 0usize;
-    while done < size {
-        let cur_va = dst_va + done as u64;
-        let Some(dst_pa) = translate_user_va(pid, cur_va, VM_ACCESS_WRITE) else {
-            return false;
-        };
-        let page_off = (cur_va as usize) & ((PAGE_SIZE_4K as usize) - 1);
-        let chunk = core::cmp::min(size - done, (PAGE_SIZE_4K as usize) - page_off);
-        unsafe {
-            core::ptr::copy_nonoverlapping(src.add(done), dst_pa as *mut u8, chunk);
-        }
-        done += chunk;
-    }
-    true
-}
-
 fn read_user_u64(pid: u32, user_ptr: *const u64) -> Option<u64> {
-    if user_ptr.is_null() {
-        return None;
-    }
-    if !ensure_user_range_access(
-        pid,
-        user_ptr as u64,
-        core::mem::size_of::<u64>(),
-        VM_ACCESS_READ,
-    ) {
-        return None;
-    }
-    let mut v = 0u64;
-    if !copy_from_process_user(
-        pid,
-        user_ptr as u64,
-        (&mut v as *mut u64).cast::<u8>(),
-        core::mem::size_of::<u64>(),
-    ) {
-        return None;
-    }
-    Some(v)
+    read_user_value(pid, user_ptr)
 }
 
 fn write_user_u64(pid: u32, user_ptr: *mut u64, value: u64) -> bool {
-    if user_ptr.is_null() {
-        return false;
-    }
-    if !ensure_user_range_access(
-        pid,
-        user_ptr as u64,
-        core::mem::size_of::<u64>(),
-        VM_ACCESS_WRITE,
-    ) {
-        return false;
-    }
-    copy_to_process_user(
-        pid,
-        user_ptr as u64,
-        (&value as *const u64).cast::<u8>(),
-        core::mem::size_of::<u64>(),
-    )
+    write_user_value(pid, user_ptr, value)
+}
+
+fn write_user_u32(pid: u32, user_ptr: *mut u32, value: u32) -> bool {
+    write_user_value(pid, user_ptr, value)
 }
 
 // x1=*BaseAddress, x3=*RegionSize, x5=Protect
@@ -265,12 +155,22 @@ pub(crate) fn handle_free_virtual_memory(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
-    let base = unsafe { base_ptr.read_volatile() };
     let owner_pid = crate::process::current_pid();
+    if owner_pid == 0 {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+    let Some(base) = read_user_u64(owner_pid, base_ptr as *const u64) else {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    };
     match free_type {
         MEM_RELEASE => {
             if !size_ptr.is_null() {
-                let size = unsafe { size_ptr.read_volatile() };
+                let Some(size) = read_user_u64(owner_pid, size_ptr as *const u64) else {
+                    frame.x[0] = status::INVALID_PARAMETER as u64;
+                    return;
+                };
                 if size != 0 {
                     frame.x[0] = status::INVALID_PARAMETER as u64;
                     return;
@@ -284,7 +184,10 @@ pub(crate) fn handle_free_virtual_memory(frame: &mut SvcFrame) {
                 frame.x[0] = status::INVALID_PARAMETER as u64;
                 return;
             }
-            let size = unsafe { size_ptr.read_volatile() };
+            let Some(size) = read_user_u64(owner_pid, size_ptr as *const u64) else {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            };
             if size == 0 {
                 frame.x[0] = status::INVALID_PARAMETER as u64;
                 return;
@@ -307,28 +210,44 @@ pub(crate) fn handle_protect_virtual_memory(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
-    let base = unsafe { base_ptr.read_volatile() } & PAGE_MASK_4K;
-    let size = align_up_4k(unsafe { size_ptr.read_volatile() });
+    let owner_pid = crate::process::current_pid();
+    if owner_pid == 0 {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+    let Some(base_raw) = read_user_u64(owner_pid, base_ptr as *const u64) else {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    };
+    let Some(size_raw) = read_user_u64(owner_pid, size_ptr as *const u64) else {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    };
+    let base = base_raw & PAGE_MASK_4K;
+    let size = align_up_4k(size_raw);
     if size == 0 {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
 
-    let owner_pid = crate::process::current_pid();
     match vm_protect_range(owner_pid, base, size, frame.x[3] as u32) {
         Ok(old) => {
-            if !old_ptr.is_null() {
-                unsafe { old_ptr.write_volatile(old) };
+            if !old_ptr.is_null() && !write_user_u32(owner_pid, old_ptr, old) {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
             }
-            unsafe {
-                base_ptr.write_volatile(base);
-                size_ptr.write_volatile(size);
+            if !write_user_u64(owner_pid, base_ptr, base)
+                || !write_user_u64(owner_pid, size_ptr, size)
+            {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
             }
             frame.x[0] = status::SUCCESS as u64;
         }
         Err(st) => {
-            if !old_ptr.is_null() {
-                unsafe { old_ptr.write_volatile(0) };
+            if !old_ptr.is_null() && !write_user_u32(owner_pid, old_ptr, 0) {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
             }
             frame.x[0] = st as u64;
         }
@@ -346,6 +265,25 @@ pub(crate) fn handle_query_virtual_memory(frame: &mut SvcFrame) {
         return;
     }
     let owner_pid = crate::process::current_pid();
+    if owner_pid == 0 {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+    if !ensure_user_range_access(owner_pid, buf as u64, 48, VM_ACCESS_WRITE) {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+    if !ret_len_ptr.is_null()
+        && !ensure_user_range_access(
+            owner_pid,
+            ret_len_ptr as u64,
+            core::mem::size_of::<u64>(),
+            VM_ACCESS_WRITE,
+        )
+    {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
 
     let (base, alloc_base, alloc_prot, size, prot, state, mem_type) =
         if let Some(q) = vm_query_region(owner_pid, addr) {
@@ -371,11 +309,13 @@ pub(crate) fn handle_query_virtual_memory(frame: &mut SvcFrame) {
     mbi[32..36].copy_from_slice(&state.to_le_bytes());
     mbi[36..40].copy_from_slice(&prot.to_le_bytes());
     mbi[40..44].copy_from_slice(&mem_type.to_le_bytes());
-    unsafe {
-        core::ptr::copy_nonoverlapping(mbi.as_ptr(), buf, 48);
+    if !copy_to_process_user(owner_pid, buf as u64, mbi.as_ptr(), 48) {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     }
-    if !ret_len_ptr.is_null() {
-        unsafe { ret_len_ptr.write_volatile(48) };
+    if !ret_len_ptr.is_null() && !write_user_u64(owner_pid, ret_len_ptr, 48) {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     }
     frame.x[0] = status::SUCCESS as u64;
 }
@@ -406,7 +346,10 @@ pub(crate) fn handle_read_virtual_memory(frame: &mut SvcFrame) {
                 frame.x[0] = status::NOT_COMMITTED as u64;
                 return;
             }
-            unsafe { out_len.write_volatile(0) };
+            if !write_user_u64(caller_pid, out_len, 0) {
+                frame.x[0] = status::NOT_COMMITTED as u64;
+                return;
+            }
         }
         frame.x[0] = status::SUCCESS as u64;
         return;
@@ -427,27 +370,15 @@ pub(crate) fn handle_read_virtual_memory(frame: &mut SvcFrame) {
         frame.x[0] = status::NOT_COMMITTED as u64;
         return;
     }
-    if !ensure_user_range_access(caller_pid, dst as u64, size, VM_ACCESS_WRITE) {
+    if !copy_between_process_users(pid, src as u64, caller_pid, dst as u64, size) {
         frame.x[0] = status::NOT_COMMITTED as u64;
         return;
     }
-    if !ensure_user_range_access(pid, src as u64, size, VM_ACCESS_READ) {
-        frame.x[0] = status::NOT_COMMITTED as u64;
-        return;
-    }
-
-    if pid == caller_pid {
-        unsafe {
-            core::ptr::copy(src, dst, size);
-        }
-    } else {
-        if !copy_from_process_user(pid, src as u64, dst, size) {
+    if !out_len.is_null() {
+        if !write_user_u64(caller_pid, out_len, size as u64) {
             frame.x[0] = status::NOT_COMMITTED as u64;
             return;
         }
-    }
-    if !out_len.is_null() {
-        unsafe { out_len.write_volatile(size as u64) };
     }
     frame.x[0] = status::SUCCESS as u64;
 }
@@ -478,7 +409,10 @@ pub(crate) fn handle_write_virtual_memory(frame: &mut SvcFrame) {
                 frame.x[0] = status::NOT_COMMITTED as u64;
                 return;
             }
-            unsafe { out_len.write_volatile(0) };
+            if !write_user_u64(caller_pid, out_len, 0) {
+                frame.x[0] = status::NOT_COMMITTED as u64;
+                return;
+            }
         }
         frame.x[0] = status::SUCCESS as u64;
         return;
@@ -499,27 +433,15 @@ pub(crate) fn handle_write_virtual_memory(frame: &mut SvcFrame) {
         frame.x[0] = status::NOT_COMMITTED as u64;
         return;
     }
-    if !ensure_user_range_access(caller_pid, src as u64, size, VM_ACCESS_READ) {
+    if !copy_between_process_users(caller_pid, src as u64, pid, dst as u64, size) {
         frame.x[0] = status::NOT_COMMITTED as u64;
         return;
     }
-    if !ensure_user_range_access(pid, dst as u64, size, VM_ACCESS_WRITE) {
-        frame.x[0] = status::NOT_COMMITTED as u64;
-        return;
-    }
-
-    if pid == caller_pid {
-        unsafe {
-            core::ptr::copy(src, dst, size);
-        }
-    } else {
-        if !copy_to_process_user(pid, dst as u64, src, size) {
+    if !out_len.is_null() {
+        if !write_user_u64(caller_pid, out_len, size as u64) {
             frame.x[0] = status::NOT_COMMITTED as u64;
             return;
         }
-    }
-    if !out_len.is_null() {
-        unsafe { out_len.write_volatile(size as u64) };
     }
     frame.x[0] = status::SUCCESS as u64;
 }

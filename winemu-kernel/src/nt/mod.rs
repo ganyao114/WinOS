@@ -14,6 +14,7 @@ pub mod state;
 pub mod status;
 pub mod sync;
 pub mod sysno;
+pub mod sysno_table;
 pub mod system;
 pub mod thread;
 pub mod token;

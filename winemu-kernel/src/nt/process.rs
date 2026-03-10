@@ -1,6 +1,7 @@
 use winemu_shared::status;
 
 use super::SvcFrame;
+use crate::mm::usercopy::{read_current_user_value, write_current_user_value};
 
 const PAGE_SIZE_4K: u64 = 0x1000;
 const PAGE_MASK_4K: u64 = !(PAGE_SIZE_4K - 1);
@@ -8,6 +9,7 @@ const CPP_EH_EXCEPTION_CODE: u32 = 0xE06D_7363;
 const EXCEPTION_NAME_MAX: usize = 128;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct ClientId {
     unique_process: u64,
     unique_thread: u64,
@@ -23,19 +25,23 @@ fn read_user_u8(pid: u32, va: u64) -> Option<u8> {
     })
     .flatten()
     {
-        return Some(unsafe { (pa as *const u8).read_volatile() });
+        let ptr = crate::mm::physmap::gpa_to_kva(pa)?;
+        // SAFETY: the translated GPA is mapped through the shared kernel physmap.
+        return Some(unsafe { ptr.cast::<u8>().read_volatile() });
     }
 
     let page = va & PAGE_MASK_4K;
     if !super::state::vm_handle_page_fault(pid, page, super::state::VM_ACCESS_READ) {
-        return Some(unsafe { (va as *const u8).read_volatile() });
+        return None;
     }
     let pa = crate::process::with_process(pid, |p| {
         p.address_space
             .translate_user_va_for_access(va, super::state::VM_ACCESS_READ)
     })
     .flatten()?;
-    Some(unsafe { (pa as *const u8).read_volatile() })
+    let ptr = crate::mm::physmap::gpa_to_kva(pa)?;
+    // SAFETY: the translated GPA is mapped through the shared kernel physmap.
+    Some(unsafe { ptr.cast::<u8>().read_volatile() })
 }
 
 fn read_user_u32(pid: u32, va: u64) -> Option<u32> {
@@ -219,7 +225,10 @@ pub(crate) fn handle_open_process(frame: &mut SvcFrame) {
         return;
     }
 
-    let cid = unsafe { &*client_id_ptr };
+    let Some(cid) = read_current_user_value(client_id_ptr) else {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    };
     let target_pid = cid.unique_process as u32;
     if target_pid == 0 {
         frame.x[0] = status::INVALID_PARAMETER as u64;
@@ -234,7 +243,10 @@ pub(crate) fn handle_open_process(frame: &mut SvcFrame) {
 
     match crate::process::open_process(target_pid, desired_access) {
         Ok(handle) => {
-            unsafe { out_ptr.write_volatile(handle) };
+            if !write_current_user_value(out_ptr, handle) {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            }
             frame.x[0] = status::SUCCESS as u64;
         }
         Err(st) => {
@@ -262,8 +274,9 @@ pub(crate) fn handle_create_process(frame: &mut SvcFrame) {
     match crate::process::create_process(parent_handle, section_handle, flags) {
         Ok(handle) => {
             crate::log::debug_u64(0xC501_0002);
-            if !out_ptr.is_null() {
-                unsafe { out_ptr.write_volatile(handle) };
+            if !out_ptr.is_null() && !write_current_user_value(out_ptr, handle) {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
             }
             frame.x[0] = status::SUCCESS as u64;
         }

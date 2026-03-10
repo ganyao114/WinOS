@@ -5,6 +5,7 @@ use winemu_shared::status;
 
 use super::common::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
 use super::kobject;
+use crate::mm::usercopy::{copy_to_current_user, write_current_user_value};
 use super::SvcFrame;
 
 const OBJECT_INFORMATION_CLASS_BASIC: u32 = 0;
@@ -91,8 +92,9 @@ pub(crate) fn handle_duplicate_object(frame: &mut SvcFrame) {
         }
     };
 
-    if !out_ptr.is_null() {
-        unsafe { out_ptr.write_volatile(dup) };
+    if !out_ptr.is_null() && !write_current_user_value(out_ptr, dup) {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     }
     close_source_if_requested(options, source_pid, src);
     frame.x[0] = status::SUCCESS as u64;
@@ -130,8 +132,8 @@ fn query_object_basic(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) 
     obi[8..12].copy_from_slice(&refs.to_le_bytes());
     obi[12..16].copy_from_slice(&refs.to_le_bytes());
 
-    unsafe {
-        core::ptr::copy_nonoverlapping(obi.as_ptr(), buf, OBJECT_BASIC_INFORMATION_SIZE);
+    if !copy_to_current_user(buf, obi.as_ptr(), OBJECT_BASIC_INFORMATION_SIZE) {
+        return status::INVALID_PARAMETER;
     }
     write_ret_len(ret_len, OBJECT_BASIC_INFORMATION_SIZE as u32);
     status::SUCCESS
@@ -155,22 +157,30 @@ fn query_object_name(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -
         return status::INFO_LENGTH_MISMATCH;
     }
 
-    unsafe {
-        core::ptr::write_bytes(buf, 0, required);
+    let zero = [0u8; OBJECT_NAME_INFORMATION_SIZE];
+    if !copy_to_current_user(buf, zero.as_ptr(), zero.len()) {
+        return status::INVALID_PARAMETER;
+    }
 
-        let uni_len = core::cmp::min(name_len_bytes, u16::MAX as usize) as u16;
-        (buf as *mut u16).write_volatile(uni_len);
-        (buf.add(2) as *mut u16).write_volatile(uni_len);
+    let uni_len = core::cmp::min(name_len_bytes, u16::MAX as usize) as u16;
+    if !write_current_user_value(buf as *mut u16, uni_len)
+        || !write_current_user_value(unsafe { buf.add(2) } as *mut u16, uni_len)
+    {
+        return status::INVALID_PARAMETER;
+    }
 
-        if name_len_bytes != 0 {
-            let name_ptr = buf.add(OBJECT_NAME_INFORMATION_SIZE);
-            (buf.add(8) as *mut u64).write_volatile(name_ptr as u64);
-            if let Some(name) = name_utf16.as_ref() {
-                let mut i = 0usize;
-                while i < name.len() {
-                    (name_ptr.add(i * 2) as *mut u16).write_volatile(name[i]);
-                    i += 1;
+    if name_len_bytes != 0 {
+        let name_ptr = unsafe { buf.add(OBJECT_NAME_INFORMATION_SIZE) };
+        if !write_current_user_value(unsafe { buf.add(8) } as *mut u64, name_ptr as u64) {
+            return status::INVALID_PARAMETER;
+        }
+        if let Some(name) = name_utf16.as_ref() {
+            let mut i = 0usize;
+            while i < name.len() {
+                if !write_current_user_value(unsafe { name_ptr.add(i * 2) } as *mut u16, name[i]) {
+                    return status::INVALID_PARAMETER;
                 }
+                i += 1;
             }
         }
     }
@@ -191,28 +201,40 @@ fn query_object_type(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -
         return status::INFO_LENGTH_MISMATCH;
     }
 
-    unsafe {
-        core::ptr::write_bytes(buf, 0, OBJECT_TYPE_INFORMATION_SIZE);
+    let zero = [0u8; OBJECT_TYPE_INFORMATION_SIZE];
+    if !copy_to_current_user(buf, zero.as_ptr(), zero.len()) {
+        return status::INVALID_PARAMETER;
     }
 
     let type_meta = kobject::object_type_meta_for_kind(kind);
     let name_ptr = unsafe { buf.add(OBJECT_TYPE_INFORMATION_SIZE) };
     let name_addr = name_ptr as u64;
 
-    unsafe {
-        (buf as *mut u16).write_volatile(type_name_bytes as u16);
-        (buf.add(2) as *mut u16).write_volatile(type_name_bytes as u16);
-        (buf.add(8) as *mut u64).write_volatile(name_addr);
+    if !write_current_user_value(buf as *mut u16, type_name_bytes as u16)
+        || !write_current_user_value(unsafe { buf.add(2) } as *mut u16, type_name_bytes as u16)
+        || !write_current_user_value(unsafe { buf.add(8) } as *mut u64, name_addr)
+        || !write_current_user_value(
+            unsafe { buf.add(84) } as *mut u32,
+            type_meta.valid_access_mask,
+        )
+        || !write_current_user_value(
+            unsafe { buf.add(88) },
+            type_meta.security_required as u8,
+        )
+        || !write_current_user_value(
+            unsafe { buf.add(89) },
+            type_meta.maintain_handle_count as u8,
+        )
+    {
+        return status::INVALID_PARAMETER;
+    }
 
-        (buf.add(84) as *mut u32).write_volatile(type_meta.valid_access_mask);
-        (buf.add(88) as *mut u8).write_volatile(type_meta.security_required as u8);
-        (buf.add(89) as *mut u8).write_volatile(type_meta.maintain_handle_count as u8);
-
-        let mut i = 0usize;
-        while i < type_name_utf16.len() {
-            (name_ptr.add(i * 2) as *mut u16).write_volatile(type_name_utf16[i]);
-            i += 1;
+    let mut i = 0usize;
+    while i < type_name_utf16.len() {
+        if !write_current_user_value(unsafe { name_ptr.add(i * 2) } as *mut u16, type_name_utf16[i]) {
+            return status::INVALID_PARAMETER;
         }
+        i += 1;
     }
 
     write_ret_len(ret_len, required as u32);
@@ -221,6 +243,6 @@ fn query_object_type(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -
 
 fn write_ret_len(ptr: *mut u32, value: u32) {
     if !ptr.is_null() {
-        unsafe { ptr.write_volatile(value) };
+        let _ = write_current_user_value(ptr, value);
     }
 }
