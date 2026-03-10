@@ -16,6 +16,10 @@ pub enum UserDescLevel {
 }
 
 pub const PAGE_TABLE_ENTRIES: usize = super::backend::mmu::PAGE_TABLE_ENTRIES;
+pub const GUEST_PHYS_BASE: u64 = super::backend::mmu::GUEST_PHYS_BASE;
+pub const GUEST_PHYS_LIMIT: u64 = super::backend::mmu::GUEST_PHYS_LIMIT;
+pub const KERNEL_PHYSMAP_BASE: u64 = super::backend::mmu::KERNEL_PHYSMAP_BASE;
+pub const KERNEL_PHYSMAP_LIMIT: u64 = super::backend::mmu::KERNEL_PHYSMAP_LIMIT;
 
 #[derive(Clone, Copy)]
 pub struct MemoryFeatures {

@@ -152,12 +152,16 @@ fn vm_fill_section_page(area: &VmArea, idx: usize, gpa: u64) -> bool {
 
 #[inline]
 fn phys_memset(gpa: u64, value: u8, len: usize) {
-    let _ = crate::hypercall::host_memset(gpa, len, value);
+    if !crate::mm::physmap::memset_gpa(gpa, value, len) {
+        let _ = crate::hypercall::host_memset(gpa, len, value);
+    }
 }
 
 #[inline]
 fn phys_memcpy(dst_gpa: u64, src_gpa: u64, len: usize) {
-    let _ = crate::hypercall::host_memcpy(dst_gpa, src_gpa, len);
+    if !crate::mm::physmap::copy_gpa(dst_gpa, src_gpa, len) {
+        let _ = crate::hypercall::host_memcpy(dst_gpa, src_gpa, len);
+    }
 }
 
 // ─── ProcessVmManager ────────────────────────────────────────────────────────

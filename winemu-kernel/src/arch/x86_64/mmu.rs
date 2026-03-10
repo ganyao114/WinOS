@@ -4,6 +4,10 @@ fn unsupported() -> ! {
 }
 
 pub const PAGE_TABLE_ENTRIES: usize = 512;
+pub const GUEST_PHYS_BASE: u64 = 0x4000_0000;
+pub const GUEST_PHYS_LIMIT: u64 = 0x8000_0000;
+pub const KERNEL_PHYSMAP_BASE: u64 = 0x8000_0000;
+pub const KERNEL_PHYSMAP_LIMIT: u64 = 0xc000_0000;
 
 #[inline(always)]
 pub fn memory_features_raw() -> u64 {

@@ -2,7 +2,9 @@ pub mod address_space;
 pub mod areaset;
 pub mod kmalloc;
 pub mod phys;
+pub mod physmap;
 pub mod range;
+pub mod usercopy;
 pub mod vaspace;
 pub mod vm_area;
 

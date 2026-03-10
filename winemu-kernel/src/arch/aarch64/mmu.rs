@@ -8,9 +8,15 @@ struct PageTable([u64; 512]);
 static mut L0_TABLE: PageTable = PageTable([0u64; 512]);
 static mut L1_TABLE: PageTable = PageTable([0u64; 512]);
 static mut L2_TABLE: PageTable = PageTable([0u64; 512]);
+static mut PHYSMAP_L2_TABLE: PageTable = PageTable([0u64; 512]);
 static MM_GLOBAL_READY: AtomicU32 = AtomicU32::new(0);
 
 pub const PAGE_TABLE_ENTRIES: usize = 512;
+pub const GUEST_PHYS_BASE: u64 = 0x4000_0000;
+pub const GUEST_PHYS_LIMIT: u64 = 0x8000_0000;
+pub const KERNEL_PHYSMAP_BASE: u64 = 0x8000_0000;
+pub const KERNEL_PHYSMAP_LIMIT: u64 =
+    KERNEL_PHYSMAP_BASE + (GUEST_PHYS_LIMIT - GUEST_PHYS_BASE);
 
 const DESC_TYPE_MASK: u64 = 0b11;
 const DESC_INVALID: u64 = 0b00;
@@ -345,11 +351,13 @@ unsafe fn setup_kernel_mapping() {
     //
     // L0[0] -> L1 table
     // L1[1] -> L2 table for VA 0x4000_0000..0x7fff_ffff (1GB window)
+    // L1[2] -> PHYSMAP_L2 table for VA 0x8000_0000..0xbfff_ffff (EL1-only physmap)
     // L2[i] -> 2MB block identity map
     //   i=0  : EL1 RW only (kernel image/early stacks)
     //   i>0  : EL0+EL1 RW (user image/stack/TEB/PEB/heap)
     let l1_addr = core::ptr::addr_of!(L1_TABLE) as u64;
     let l2_addr = core::ptr::addr_of!(L2_TABLE) as u64;
+    let physmap_l2_addr = core::ptr::addr_of!(PHYSMAP_L2_TABLE) as u64;
     let l0_desc = (l1_addr & !0xfffu64) | 0b11;
     // SAFETY: L0_TABLE is a private static boot table and this index is in bounds.
     unsafe {
@@ -360,11 +368,16 @@ unsafe fn setup_kernel_mapping() {
     unsafe {
         (*core::ptr::addr_of_mut!(L1_TABLE)).0[1] = l1_desc;
     }
+    let physmap_l1_desc = (physmap_l2_addr & !0xfffu64) | 0b11;
+    // SAFETY: L1_TABLE is a private static boot table and this index is in bounds.
+    unsafe {
+        (*core::ptr::addr_of_mut!(L1_TABLE)).0[2] = physmap_l1_desc;
+    }
 
     let user_l2_start = ((crate::process::USER_VA_BASE - 0x4000_0000u64) >> 21) as usize;
     let guard_l2_idx = user_l2_start.saturating_sub(1);
     for i in 0..512usize {
-        let block_addr = 0x4000_0000u64 + ((i as u64) << 21);
+        let block_addr = GUEST_PHYS_BASE + ((i as u64) << 21);
         // [1:0]=01 block, AttrIdx=0, SH=inner-shareable, AF=1
         let mut desc = block_addr | (1 << 10) | (0b11 << 8) | 0b01;
         if i != 0 && i != guard_l2_idx {
@@ -373,6 +386,15 @@ unsafe fn setup_kernel_mapping() {
         // SAFETY: L2 table has exactly 512 entries and loop index is bounded.
         unsafe {
             (*core::ptr::addr_of_mut!(L2_TABLE)).0[i] = desc;
+        }
+    }
+
+    for i in 0..512usize {
+        let block_addr = GUEST_PHYS_BASE + ((i as u64) << 21);
+        let desc = block_addr | (1 << 10) | (0b11 << 8) | PTE_UXN | PTE_PXN | DESC_BLOCK;
+        // SAFETY: PHYSMAP_L2_TABLE has exactly 512 entries and loop index is bounded.
+        unsafe {
+            (*core::ptr::addr_of_mut!(PHYSMAP_L2_TABLE)).0[i] = desc;
         }
     }
 }
@@ -424,28 +446,34 @@ unsafe fn enable_mmu() {
     let l0_addr = core::ptr::addr_of!(L0_TABLE) as u64;
     let l1_addr = core::ptr::addr_of!(L1_TABLE) as u64;
     let l2_addr = core::ptr::addr_of!(L2_TABLE) as u64;
-    let (l0e0, l1e1, l2e0, l2e1) =
+    let physmap_l2_addr = core::ptr::addr_of!(PHYSMAP_L2_TABLE) as u64;
+    let (l0e0, l1e1, l1e2, l2e0, l2e1, physmap_l2e0) =
         // SAFETY: page table statics are initialized above and read-only here.
         unsafe {
             (
                 (*core::ptr::addr_of!(L0_TABLE)).0[0],
                 (*core::ptr::addr_of!(L1_TABLE)).0[1],
+                (*core::ptr::addr_of!(L1_TABLE)).0[2],
                 (*core::ptr::addr_of!(L2_TABLE)).0[0],
                 (*core::ptr::addr_of!(L2_TABLE)).0[1],
+                (*core::ptr::addr_of!(PHYSMAP_L2_TABLE)).0[0],
             )
         };
     crate::kdebug!(
-        "mmu: L0_TABLE={:#x} L1_TABLE={:#x} L2_TABLE={:#x}",
+        "mmu: L0_TABLE={:#x} L1_TABLE={:#x} L2_TABLE={:#x} PHYSMAP_L2={:#x}",
         l0_addr,
         l1_addr,
-        l2_addr
+        l2_addr,
+        physmap_l2_addr
     );
     crate::kdebug!(
-        "mmu: L0[0]={:#x} L1[1]={:#x} L2[0]={:#x} L2[1]={:#x}",
+        "mmu: L0[0]={:#x} L1[1]={:#x} L1[2]={:#x} L2[0]={:#x} L2[1]={:#x} PHYSMAP_L2[0]={:#x}",
         l0e0,
         l1e1,
+        l1e2,
         l2e0,
-        l2e1
+        l2e1,
+        physmap_l2e0
     );
 
     let mut sctlr = read_system_control();
