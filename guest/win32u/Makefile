@@ -11,7 +11,10 @@ SPEC            := $(firstword $(wildcard $(LOCAL_SPEC) $(FALLBACK_SPEC)))
 SPEC_DEPS       := $(wildcard $(LOCAL_SPEC) $(FALLBACK_SPEC))
 PASSTHROUGH     := $(abspath $(CURDIR)/passthrough_exports.txt)
 PASSTHROUGH_DEP := $(wildcard $(PASSTHROUGH))
-SYSCALL_REF     ?= /Users/swift/Downloads/SyscallTables-master/data/Composition/ARM64/win32k/26100.txt
+# Windows build number — controls which win32k syscall reference table is used.
+# Override with: make WINDOWS_BUILD=26100
+WINDOWS_BUILD   ?= 22631
+SYSCALL_REF     ?= /Users/swift/Downloads/SyscallTables-master/data/Composition/ARM64/win32k/$(WINDOWS_BUILD).txt
 SYSCALL_REF_DEP := $(wildcard $(SYSCALL_REF))
 SYSCALL_REF_OPT := $(if $(SYSCALL_REF_DEP),--syscall-ref "$(SYSCALL_REF)",)
 GEN_C           := $(GEN_DIR)/win32u_exports.generated.c

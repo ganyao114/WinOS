@@ -1,11 +1,11 @@
 [meta]
 os = "Windows 11"
 arch = "ARM64"
-build = 22631
+build = 26100
 
-# NT syscall numbers for Windows 11 ARM64, build 22631.
+# NT syscall numbers for Windows 11 24H2 ARM64, build 26100.
 # Source: SyscallTables-master (authoritative).
-# Used by gen_nt_sysno.py to generate syscall_nrs_22631.h and nr_22631.rs.
+# Used by gen_nt_sysno.py to generate syscall_nrs_26100.h and nr_26100.rs.
 [nt]
 NtClose                          = 0x000F
 NtCreateFile                     = 0x0055
@@ -15,14 +15,14 @@ NtDeviceIoControlFile            = 0x0007
 NtWriteFile                      = 0x0008
 NtFlushBuffersFile               = 0x004B
 NtCancelIoFile                   = 0x005D
-NtLockFile                       = 0x0112
-NtUnlockFile                     = 0x01DA
+NtLockFile                       = 0x0114
+NtUnlockFile                     = 0x01DD
 NtQueryInformationFile           = 0x0011
 NtQueryAttributesFile            = 0x003D
-NtQueryFullAttributesFile        = 0x014F
+NtQueryFullAttributesFile        = 0x0151
 NtQueryVolumeInformationFile     = 0x0049
 NtQueryDirectoryFile             = 0x0035
-NtNotifyChangeDirectoryFile      = 0x011F
+NtNotifyChangeDirectoryFile      = 0x0121
 NtSetInformationFile             = 0x0027
 NtFsControlFile                  = 0x0039
 NtAllocateVirtualMemory          = 0x0018
@@ -37,15 +37,15 @@ NtCreateSection                  = 0x004A
 NtOpenSection                    = 0x0037
 NtQuerySection                   = 0x0051
 NtCreateProcessEx                = 0x004D
-NtCreateThreadEx                 = 0x00C7
-NtSuspendThread                  = 0x01CC
+NtCreateThreadEx                 = 0x00C9
+NtSuspendThread                  = 0x01CF
 NtResumeThread                   = 0x0052
 NtTerminateProcess               = 0x002C
 NtTerminateThread                = 0x0053
 NtQueryInformationProcess        = 0x0019
 NtSetInformationProcess          = 0x001C
 NtOpenProcess                    = 0x0026
-NtOpenProcessToken               = 0x0131
+NtOpenProcessToken               = 0x0133
 NtOpenProcessTokenEx             = 0x0030
 NtQueryInformationToken          = 0x0021
 NtAdjustPrivilegesToken          = 0x0041
@@ -59,23 +59,23 @@ NtWaitForSingleObject            = 0x0004
 NtWaitForMultipleObjects         = 0x005B
 NtCreateEvent                    = 0x0048
 NtSetEvent                       = 0x000E
-NtResetEvent                     = 0x0185
+NtResetEvent                     = 0x0187
 NtClearEvent                     = 0x003E
 NtOpenEvent                      = 0x0040
-NtCreateMutant                   = 0x00B8
+NtCreateMutant                   = 0x00BA
 NtReleaseMutant                  = 0x0020
-NtOpenMutant                     = 0x012D
-NtCreateSemaphore                = 0x00C5
+NtOpenMutant                     = 0x012F
+NtCreateSemaphore                = 0x00C7
 NtReleaseSemaphore               = 0x000A
-NtOpenSemaphore                  = 0x0134
+NtOpenSemaphore                  = 0x0136
 NtOpenKey                        = 0x0012
-NtOpenKeyEx                      = 0x0129
+NtOpenKeyEx                      = 0x012B
 NtCreateKey                      = 0x001D
 NtQueryKey                       = 0x0016
 NtQueryValueKey                  = 0x0017
 NtSetValueKey                    = 0x0060
-NtDeleteKey                      = 0x00DA
-NtDeleteValueKey                 = 0x00DD
+NtDeleteKey                      = 0x00DC
+NtDeleteValueKey                 = 0x00DF
 NtEnumerateKey                   = 0x0032
 NtEnumerateValueKey              = 0x0013
 NtDuplicateObject                = 0x003C
@@ -84,16 +84,7 @@ NtDelayExecution                 = 0x0034
 NtQuerySystemInformation         = 0x0036
 NtQuerySystemTime                = 0x005A
 NtQueryPerformanceCounter        = 0x0031
-NtAlertThreadByThreadId          = 0x0070
-NtWaitForAlertByThreadId         = 0x01E0
+NtAlertThreadByThreadId          = 0x0071
+NtWaitForAlertByThreadId         = 0x01E3
 NtContinue                       = 0x0043
-NtRaiseException                 = 0x0172
-
-[win32k]
-NtGdiCreateCompatibleDC          = 0x1012
-NtGdiBitBlt                      = 0x1001
-NtUserCreateWindowEx             = 0x1056
-NtUserShowWindow                 = 0x10C3
-NtUserMessageCall                = 0x1069
-NtUserDestroyWindow              = 0x1025
-NtUserInitializeClientPfnArrays  = 0x1127
+NtRaiseException                 = 0x0174

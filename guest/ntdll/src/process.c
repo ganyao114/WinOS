@@ -26,7 +26,7 @@ EXPORT NTSTATUS NtClose(HANDLE handle) {
 
 EXPORT NTSTATUS NtWaitForSingleObject(HANDLE handle, UCHAR alertable, int64_t* timeout) {
     return syscall6(
-        NR_WAIT_SINGLE,
+        NR_WAIT_FOR_SINGLE_OBJECT,
         (uint64_t)handle,
         (uint64_t)alertable,
         (uint64_t)timeout,
@@ -40,7 +40,7 @@ EXPORT NTSTATUS NtWaitForMultipleObjects(
     ULONG count, const HANDLE* handles, ULONG wait_type, UCHAR alertable, int64_t* timeout)
 {
     return syscall6(
-        NR_WAIT_MULTIPLE,
+        NR_WAIT_FOR_MULTIPLE_OBJECTS,
         (uint64_t)count,
         (uint64_t)handles,
         (uint64_t)wait_type,
