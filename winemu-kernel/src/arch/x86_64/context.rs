@@ -1,5 +1,5 @@
-use crate::arch::trap::SvcFrame;
 use crate::arch::context::{KernelContext, ThreadContext};
+use crate::arch::trap::SvcFrame;
 
 #[inline(always)]
 pub unsafe fn save_kernel_context(_ctx: *mut KernelContext) -> u64 {

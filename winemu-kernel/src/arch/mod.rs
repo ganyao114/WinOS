@@ -9,8 +9,8 @@ mod backend;
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 compile_error!("unsupported target_arch: add backend wiring in src/arch/mod.rs");
 
-mod contract;
 mod context_types;
+mod contract;
 mod trap_frame;
 
 // Arch capability surface exposed to the rest of the kernel.

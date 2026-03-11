@@ -6,13 +6,13 @@
 
 use core::arch::asm;
 
+use crate::arch::context::KernelContext;
 use crate::sched::context::drain_deferred_kstacks;
 use crate::sched::cpu::{set_current_tid, take_needs_reschedule, vcpu_id};
 use crate::sched::global::{with_thread, with_thread_mut, SCHED};
 use crate::sched::thread_control::reset_quantum_locked;
 use crate::sched::threads::free_terminated_threads_locked;
 use crate::sched::topology::set_thread_state_locked;
-use crate::arch::context::KernelContext;
 use crate::sched::types::ThreadState;
 use crate::sched::wait::check_wait_timeouts_locked;
 

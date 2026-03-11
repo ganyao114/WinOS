@@ -17,16 +17,16 @@ use crate::sched::types::KERNEL_STACK_SIZE;
 /// This call may return later when another thread switches back to `from`.
 #[inline(always)]
 pub unsafe fn __sched_switch_kernel_context(from: *mut u8, to: *const u8) {
-    use crate::arch::context::KernelContext;
     use crate::arch::context::switch_kernel_context;
+    use crate::arch::context::KernelContext;
     switch_kernel_context(from as *mut KernelContext, to as *const KernelContext);
 }
 
 /// Enter user mode from a fresh kernel stack. Does not return.
 #[inline(always)]
 pub unsafe fn __sched_enter_user_thread(ctx: *const u8) -> ! {
-    use crate::arch::context::ThreadContext;
     use crate::arch::context::enter_user_thread_context;
+    use crate::arch::context::ThreadContext;
     enter_user_thread_context(ctx as *const ThreadContext)
 }
 

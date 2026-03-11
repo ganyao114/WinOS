@@ -1,5 +1,5 @@
-use super::trap_frame::SvcFrame;
 use super::context_types::{KernelContext, ThreadContext};
+use super::trap_frame::SvcFrame;
 
 #[derive(Clone, Copy)]
 pub struct TrapFaultInfo {

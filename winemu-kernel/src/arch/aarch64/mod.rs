@@ -211,7 +211,10 @@ impl super::contract::ContextBackend for ArchBackend {
     }
 
     #[inline(always)]
-    fn restore_user_context_record(frame: &mut crate::arch::trap::SvcFrame, context_bytes: &[u8]) -> bool {
+    fn restore_user_context_record(
+        frame: &mut crate::arch::trap::SvcFrame,
+        context_bytes: &[u8],
+    ) -> bool {
         context::restore_user_context_record(frame, context_bytes)
     }
 
