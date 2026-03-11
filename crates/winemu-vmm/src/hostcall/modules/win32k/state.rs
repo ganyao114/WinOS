@@ -28,8 +28,10 @@ pub const WM_RBUTTONDOWN: u32 = 0x0204;
 pub const WM_RBUTTONUP: u32 = 0x0205;
 pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WM_KEYUP: u32 = 0x0101;
+#[allow(dead_code)]
 pub const WM_CHAR: u32 = 0x0102;
 pub const WM_DESTROY: u32 = 0x0002;
+#[allow(dead_code)]
 pub const WM_ERASEBKGND: u32 = 0x0014;
 
 // ── Guest MSG layout (matches Windows MSG struct) ────────────────────────────
@@ -41,6 +43,7 @@ pub struct GuestMsg {
     pub l_param: u64,
     pub time: u32,
     pub pt_x: i32,
+    #[allow(dead_code)]
     pub pt_y: i32,
 }
 
@@ -50,7 +53,9 @@ pub enum GdiKind {
     Bitmap,
     Brush,
     Pen,
+    #[allow(dead_code)]
     Font,
+    #[allow(dead_code)]
     Region,
     Other,
 }
@@ -475,6 +480,7 @@ impl Win32kState {
     }
 
     // ── NtGdiGetStockObject ──────────────────────────────────────────────────
+    #[allow(dead_code)]
     pub fn get_stock_object(&mut self, idx: u32) -> u64 {
         0x8000_0000u64 | idx as u64
     }
@@ -634,6 +640,7 @@ impl Win32kState {
     pub fn get_async_key_state(&self, _vk: u32) -> u64 {
         0
     }
+    #[allow(dead_code)]
     pub fn get_keyboard_state(&self, _buf_gpa: u64) -> u64 {
         1
     }
@@ -669,6 +676,7 @@ impl Win32kState {
     //   SPI_GETFONTSMOOTHING   = 0x004A → return 1
     //   SPI_GETICONTITLELOGFONT= 0x001F → stub
     //   SPI_GETANIMATION       = 0x0048 → stub
+    #[allow(dead_code)]
     pub fn system_parameters_info(&self, action: u32) -> (u64, Option<[i32; 4]>) {
         match action {
             0x0030 => (1, Some([0, 0, 1920, 1080])), // SPI_GETWORKAREA
