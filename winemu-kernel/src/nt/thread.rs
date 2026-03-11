@@ -1,23 +1,19 @@
 use crate::sched::{
-    self, current_tid, with_thread,
-    create_user_thread_locked, terminate_thread_locked,
-    suspend_thread_locked, resume_thread_locked,
-    set_thread_affinity_mask_locked, set_thread_priority_locked, ThreadState,
-    KSchedulerLock, thread_exists,
-    alert_thread_by_tid, wait_for_alert_by_tid,
-    timeout_to_deadline, WaitDeadline,
+    self, alert_thread_by_tid, create_user_thread_locked, current_tid, resume_thread_locked,
+    set_thread_affinity_mask_locked, set_thread_priority_locked, suspend_thread_locked,
+    terminate_thread_locked, thread_exists, timeout_to_deadline, wait_for_alert_by_tid,
+    with_thread, KSchedulerLock, ThreadState, WaitDeadline,
 };
 use winemu_shared::status;
 
+use super::common::GuestWriter;
 use super::constants::{
-    THREAD_BASIC_INFORMATION_SIZE, THREAD_INFO_CLASS_AFFINITY_MASK, THREAD_INFO_CLASS_BASE_PRIORITY,
-    THREAD_INFO_CLASS_PRIORITY,
+    THREAD_BASIC_INFORMATION_SIZE, THREAD_INFO_CLASS_AFFINITY_MASK,
+    THREAD_INFO_CLASS_BASE_PRIORITY, THREAD_INFO_CLASS_PRIORITY,
 };
-use crate::mm::usercopy::{
-    copy_to_current_user, read_current_user_bytes, read_current_user_value,
-    write_current_user_value,
-};
+use super::user_args::{SyscallArgs, UserInPtr, UserOutPtr};
 use super::SvcFrame;
+use crate::mm::usercopy::read_current_user_bytes;
 
 // ── Handle type constant ──────────────────────────────────────────────────────
 
@@ -47,10 +43,18 @@ fn sched_to_win_priority(prio: u8) -> u8 {
 pub fn resolve_thread_tid_from_handle(handle: u64) -> Option<u32> {
     if handle == u64::MAX {
         let tid = current_tid();
-        if tid != 0 { Some(tid) } else { None }
+        if tid != 0 {
+            Some(tid)
+        } else {
+            None
+        }
     } else {
         let tid = crate::nt::kobject::handle_to_tid(handle)?;
-        if thread_exists(tid) { Some(tid) } else { None }
+        if thread_exists(tid) {
+            Some(tid)
+        } else {
+            None
+        }
     }
 }
 
@@ -63,7 +67,11 @@ pub fn thread_basic_info(tid: u32) -> Option<[u8; THREAD_BASIC_INFORMATION_SIZE]
         (t.state, t.pid, t.priority, t.affinity_mask as u64)
     })?;
     let win_prio = sched_to_win_priority(prio);
-    let exit_status: u32 = if state == ThreadState::Terminated { 0 } else { status::STILL_ACTIVE };
+    let exit_status: u32 = if state == ThreadState::Terminated {
+        0
+    } else {
+        status::STILL_ACTIVE
+    };
     let mut buf = [0u8; THREAD_BASIC_INFORMATION_SIZE];
     // THREAD_BASIC_INFORMATION layout (Windows):
     // +0x00  NTSTATUS ExitStatus          (4 bytes)
@@ -96,8 +104,8 @@ pub fn create_user_thread(
     priority: u8,
 ) -> Result<u32, CreateThreadError> {
     // Allocate user stack via VM.
-    let stack_base = crate::nt::state::vm_alloc_stack(pid, stack_size)
-        .ok_or(CreateThreadError::NoMemory)?;
+    let stack_base =
+        crate::mm::vm_alloc_stack(pid, stack_size).ok_or(CreateThreadError::NoMemory)?;
     let teb_va = crate::teb::alloc_teb(pid).unwrap_or(0);
     let _lock = KSchedulerLock::lock();
     let params = sched::UserThreadParams {
@@ -115,19 +123,25 @@ pub fn create_user_thread(
 
 // ── terminate_current_thread ──────────────────────────────────────────────────
 
-pub fn terminate_current_thread() {
+pub fn terminate_current_thread() -> ! {
     let tid = current_tid();
-    if tid == 0 { return; }
+    if tid == 0 {
+        panic!("terminate_current_thread: no current thread");
+    }
     let _lock = KSchedulerLock::lock();
-    terminate_thread_locked(tid);
+    crate::sched::exit_thread_locked(tid);
 }
 
 // ── terminate_thread_by_tid ───────────────────────────────────────────────────
 
 pub fn terminate_thread_by_tid(tid: u32) -> Result<(), u32> {
-    if tid == 0 { return Err(status::INVALID_PARAMETER); }
+    if tid == 0 {
+        return Err(status::INVALID_PARAMETER);
+    }
     let _lock = KSchedulerLock::lock();
-    if !thread_exists(tid) { return Err(status::INVALID_HANDLE); }
+    if !thread_exists(tid) {
+        return Err(status::INVALID_HANDLE);
+    }
     terminate_thread_locked(tid);
     Ok(())
 }
@@ -135,8 +149,7 @@ pub fn terminate_thread_by_tid(tid: u32) -> Result<(), u32> {
 // ── suspend / resume by handle ────────────────────────────────────────────────
 
 pub fn suspend_thread_by_handle(handle: u64) -> Result<u32, u32> {
-    let tid = resolve_thread_tid_from_handle(handle)
-        .ok_or(status::INVALID_HANDLE)?;
+    let tid = resolve_thread_tid_from_handle(handle).ok_or(status::INVALID_HANDLE)?;
     let _lock = KSchedulerLock::lock();
     let prev = with_thread(tid, |t| t.suspend_count).unwrap_or(0);
     suspend_thread_locked(tid);
@@ -144,8 +157,7 @@ pub fn suspend_thread_by_handle(handle: u64) -> Result<u32, u32> {
 }
 
 pub fn resume_thread_by_handle(handle: u64) -> Result<u32, u32> {
-    let tid = resolve_thread_tid_from_handle(handle)
-        .ok_or(status::INVALID_HANDLE)?;
+    let tid = resolve_thread_tid_from_handle(handle).ok_or(status::INVALID_HANDLE)?;
     let _lock = KSchedulerLock::lock();
     let prev = with_thread(tid, |t| t.suspend_count).unwrap_or(0);
     resume_thread_locked(tid);
@@ -182,7 +194,9 @@ pub fn set_thread_affinity_by_handle(handle: u64, affinity_mask: u64) -> u32 {
 
 pub fn yield_current_thread() {
     let tid = current_tid();
-    if tid == 0 { return; }
+    if tid == 0 {
+        return;
+    }
     // Voluntary yield should request a reschedule, but keep the current thread
     // in Running until scheduler_round_locked decides whether to switch.
     // This preserves Yield semantics: switch to peer if available, otherwise
@@ -204,13 +218,11 @@ pub(crate) fn handle_query_information_thread(frame: &mut SvcFrame) {
     let info_class = frame.x[1] as u32;
     let buf = frame.x[2] as *mut u8;
     let buf_len = frame.x[3] as usize;
-    let ret_len = frame.x[4] as *mut u32;
+    let ret_len = UserOutPtr::from_raw(frame.x[4] as *mut u32);
     match info_class {
         0 => {
             if buf.is_null() || buf_len < THREAD_BASIC_INFORMATION_SIZE {
-                if !ret_len.is_null() {
-                    let _ = write_current_user_value(ret_len, THREAD_BASIC_INFORMATION_SIZE as u32);
-                }
+                let _ = ret_len.write_current_if_present(THREAD_BASIC_INFORMATION_SIZE as u32);
                 frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
                 return;
             }
@@ -222,13 +234,12 @@ pub(crate) fn handle_query_information_thread(frame: &mut SvcFrame) {
                 frame.x[0] = status::INVALID_HANDLE as u64;
                 return;
             };
-            if !copy_to_current_user(buf, tbi.as_ptr(), THREAD_BASIC_INFORMATION_SIZE) {
+            let Some(mut w) = GuestWriter::new(buf, buf_len, THREAD_BASIC_INFORMATION_SIZE) else {
                 frame.x[0] = status::INVALID_PARAMETER as u64;
                 return;
-            }
-            if !ret_len.is_null() {
-                let _ = write_current_user_value(ret_len, THREAD_BASIC_INFORMATION_SIZE as u32);
-            }
+            };
+            w.bytes(&tbi);
+            let _ = ret_len.write_current_if_present(THREAD_BASIC_INFORMATION_SIZE as u32);
             frame.x[0] = status::SUCCESS as u64;
         }
         _ => {
@@ -240,7 +251,7 @@ pub(crate) fn handle_query_information_thread(frame: &mut SvcFrame) {
 pub(crate) fn handle_set_information_thread(frame: &mut SvcFrame) {
     let thread_handle = frame.x[0];
     let info_class = frame.x[1] as u32;
-    let info_ptr = frame.x[2] as *const u8;
+    let info_ptr = UserInPtr::from_raw(frame.x[2] as *const u8);
     let info_len = frame.x[3] as usize;
 
     match info_class {
@@ -249,7 +260,8 @@ pub(crate) fn handle_set_information_thread(frame: &mut SvcFrame) {
                 frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
                 return;
             }
-            let Some(prio) = read_current_user_value(info_ptr as *const i32) else {
+            let Some(prio) = UserInPtr::from_raw(info_ptr.as_raw() as *const i32).read_current()
+            else {
                 frame.x[0] = status::INVALID_PARAMETER as u64;
                 return;
             };
@@ -260,7 +272,9 @@ pub(crate) fn handle_set_information_thread(frame: &mut SvcFrame) {
                 frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
                 return;
             }
-            let Some(affinity) = read_current_user_value(info_ptr as *const u64) else {
+            let Some(affinity) =
+                UserInPtr::from_raw(info_ptr.as_raw() as *const u64).read_current()
+            else {
                 frame.x[0] = status::INVALID_PARAMETER as u64;
                 return;
             };
@@ -278,17 +292,18 @@ pub(crate) fn handle_yield(frame: &mut SvcFrame) {
 }
 
 pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
-    let out_ptr = frame.x[0] as *mut u64;
+    let out_ptr = UserOutPtr::from_raw(frame.x[0] as *mut u64);
     let desired_access = frame.x[1] as u32;
     let process_handle = frame.x[3];
     let entry_va = frame.x[4];
     let arg = frame.x[5];
     let create_flags = frame.x[6] as u32;
-    let Some(stack_size_arg) = read_current_user_value(frame.sp_el0 as *const u64) else {
+    let args = SyscallArgs::new(frame);
+    let Some(stack_size_arg) = args.spill_u64(0) else {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     };
-    let Some(max_stack_size_arg) = read_current_user_value((frame.sp_el0 + 8) as *const u64) else {
+    let Some(max_stack_size_arg) = args.spill_u64(1) else {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     };
@@ -325,7 +340,7 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
         }
     };
     let handle = crate::nt::kobject::make_thread_handle(tid);
-    if !out_ptr.is_null() && !write_current_user_value(out_ptr, handle) {
+    if !out_ptr.write_current_if_present(handle) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
@@ -337,19 +352,16 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
     frame.x[0] = status::SUCCESS as u64;
 }
 
-pub(crate) fn handle_terminate_thread(frame: &mut SvcFrame) {
-    let cur = current_tid();
+pub(crate) fn handle_terminate_thread(_frame: &mut SvcFrame) -> ! {
     terminate_current_thread();
-    thread_notify_terminated(cur);
-    frame.x[0] = status::SUCCESS as u64;
 }
 
 pub(crate) fn handle_suspend_thread(frame: &mut SvcFrame) {
     let thread_handle = frame.x[0];
-    let prev_ptr = frame.x[1] as *mut u32;
+    let prev_ptr = UserOutPtr::from_raw(frame.x[1] as *mut u32);
     match suspend_thread_by_handle(thread_handle) {
         Ok(prev) => {
-            if !prev_ptr.is_null() && !write_current_user_value(prev_ptr, prev) {
+            if !prev_ptr.write_current_if_present(prev) {
                 frame.x[0] = status::INVALID_PARAMETER as u64;
                 return;
             }
@@ -361,10 +373,10 @@ pub(crate) fn handle_suspend_thread(frame: &mut SvcFrame) {
 
 pub(crate) fn handle_resume_thread(frame: &mut SvcFrame) {
     let thread_handle = frame.x[0];
-    let prev_ptr = frame.x[1] as *mut u32;
+    let prev_ptr = UserOutPtr::from_raw(frame.x[1] as *mut u32);
     match resume_thread_by_handle(thread_handle) {
         Ok(prev) => {
-            if !prev_ptr.is_null() && !write_current_user_value(prev_ptr, prev) {
+            if !prev_ptr.write_current_if_present(prev) {
                 frame.x[0] = status::INVALID_PARAMETER as u64;
                 return;
             }
@@ -382,11 +394,11 @@ pub(crate) fn handle_alert_thread_by_thread_id(frame: &mut SvcFrame) {
 
 // x0=ThreadId, x1=Timeout*
 pub(crate) fn handle_wait_for_alert_by_thread_id(frame: &mut SvcFrame) {
-    let timeout_ptr = frame.x[1] as *const i64;
+    let timeout_ptr = UserInPtr::from_raw(frame.x[1] as *const i64);
     let deadline = if timeout_ptr.is_null() {
         WaitDeadline::Infinite
     } else {
-        match read_current_user_value(timeout_ptr) {
+        match timeout_ptr.read_current() {
             Some(raw) => timeout_to_deadline(raw),
             None => WaitDeadline::Immediate,
         }
@@ -434,10 +446,8 @@ pub(crate) fn handle_raise_exception(frame: &mut SvcFrame) {
     // Resolve KiUserExceptionDispatcher from ntdll (cached by the caller on first use).
     // ARM64 calling convention: x0=ExceptionRecord*, x1=Context*
     // The pointers are already in guest memory (passed by the caller).
-    let dispatcher = crate::dll::resolve_import(
-        "ntdll.dll",
-        ImportRef::Name("KiUserExceptionDispatcher"),
-    );
+    let dispatcher =
+        crate::dll::resolve_import("ntdll.dll", ImportRef::Name("KiUserExceptionDispatcher"));
     match dispatcher {
         Some(addr) => {
             // Redirect EL0 return to KiUserExceptionDispatcher.

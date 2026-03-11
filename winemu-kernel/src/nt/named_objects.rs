@@ -6,6 +6,8 @@
 //
 // Thread-safety: all access is under the scheduler lock (same as sync objects).
 
+use core::cell::UnsafeCell;
+
 use crate::process::KObjectKind;
 
 const MAX_NAMED: usize = 256;
@@ -13,15 +15,15 @@ const MAX_NAME_BYTES: usize = 128;
 
 #[derive(Clone, Copy)]
 pub(crate) struct NamedEntry {
-    pub(crate) kind:     KObjectKind,
-    pub(crate) obj_idx:  u32,
+    pub(crate) kind: KObjectKind,
+    pub(crate) obj_idx: u32,
     pub(crate) name_len: u8,
-    pub(crate) name:     [u8; MAX_NAME_BYTES],
+    pub(crate) name: [u8; MAX_NAME_BYTES],
 }
 
 struct NameTable {
     entries: [Option<NamedEntry>; MAX_NAMED],
-    count:   usize,
+    count: usize,
 }
 
 impl NameTable {
@@ -33,16 +35,26 @@ impl NameTable {
     }
 }
 
-static mut NAME_TABLE: NameTable = NameTable::new();
+struct NameTableCell(UnsafeCell<NameTable>);
+
+unsafe impl Sync for NameTableCell {}
+
+static NAME_TABLE: NameTableCell = NameTableCell(UnsafeCell::new(NameTable::new()));
 
 fn table() -> &'static mut NameTable {
-    unsafe { &mut NAME_TABLE }
+    // SAFETY: Named object lookup/insert/remove are serialized by the scheduler
+    // lock; the UnsafeCell only replaces `static mut` storage.
+    unsafe { &mut *NAME_TABLE.0.get() }
 }
 
 // ── Name normalization ────────────────────────────────────────────────────────
 
 fn lower(b: u8) -> u8 {
-    if b >= b'A' && b <= b'Z' { b + 32 } else { b }
+    if b >= b'A' && b <= b'Z' {
+        b + 32
+    } else {
+        b
+    }
 }
 
 fn skip_prefix(name: &[u8], prefix: &[u8]) -> Option<usize> {
@@ -75,8 +87,12 @@ pub(crate) fn normalize_name(raw: &[u8], out: &mut [u8; MAX_NAME_BYTES]) -> usiz
     else if let Some(off) = skip_prefix(src, b"sessions\\") {
         // skip digits + backslash
         let mut i = off;
-        while i < src.len() && src[i].is_ascii_digit() { i += 1; }
-        if i < src.len() && src[i] == b'\\' { i += 1; }
+        while i < src.len() && src[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i < src.len() && src[i] == b'\\' {
+            i += 1;
+        }
         let rest = &src[i..];
         if let Some(off2) = skip_prefix(rest, b"basednamedobjects\\") {
             src = &rest[off2..];
@@ -103,7 +119,11 @@ pub(crate) fn normalize_name(raw: &[u8], out: &mut [u8; MAX_NAME_BYTES]) -> usiz
 // ── Table operations ──────────────────────────────────────────────────────────
 
 /// Look up a named object. Returns obj_idx if found.
-pub(crate) fn lookup(kind: KObjectKind, name: &[u8; MAX_NAME_BYTES], name_len: usize) -> Option<u32> {
+pub(crate) fn lookup(
+    kind: KObjectKind,
+    name: &[u8; MAX_NAME_BYTES],
+    name_len: usize,
+) -> Option<u32> {
     let t = table();
     for slot in t.entries.iter().flatten() {
         if slot.kind == kind
@@ -117,7 +137,12 @@ pub(crate) fn lookup(kind: KObjectKind, name: &[u8; MAX_NAME_BYTES], name_len: u
 }
 
 /// Insert a named object. Returns false if table is full.
-pub(crate) fn insert(kind: KObjectKind, obj_idx: u32, name: &[u8; MAX_NAME_BYTES], name_len: usize) -> bool {
+pub(crate) fn insert(
+    kind: KObjectKind,
+    obj_idx: u32,
+    name: &[u8; MAX_NAME_BYTES],
+    name_len: usize,
+) -> bool {
     let t = table();
     if t.count >= MAX_NAMED {
         return false;

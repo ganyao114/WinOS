@@ -1,9 +1,11 @@
+use core::cell::UnsafeCell;
+
 use crate::kobj::ObjectStore;
+use crate::process::{with_process_mut, KObjectKind, KObjectRef};
 use crate::rust_alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use crate::process::{KObjectKind, KObjectRef, with_process_mut};
 use winemu_shared::status;
 use winereg::{
     KeyNode, RegistryKey, RegistryValue, RegistryValueData, REG_BINARY, REG_DWORD, REG_EXPAND_SZ,
@@ -11,12 +13,12 @@ use winereg::{
 };
 
 use super::path::{
-    bytes_path_to_registry, normalize_registry_path, read_oa_path, read_unicode_direct,
+    bytes_path_to_registry, normalize_registry_path, ObjectAttributesView, UnicodeStringView,
 };
-use crate::mm::usercopy::{
-    read_current_user_bytes, read_current_user_value, write_current_user_value,
-};
+use super::user_args::UserOutPtr;
 use super::SvcFrame;
+use crate::mm::usercopy::read_current_user_bytes;
+use crate::nt::common::GuestWriter;
 
 const MAX_PATH: usize = 256;
 const MAX_NAME_BYTES: usize = 256;
@@ -33,23 +35,31 @@ struct RegistryState {
     handles: ObjectStore<KeyNode>,
 }
 
-static mut REG_STATE: Option<RegistryState> = None;
+struct RegistryStateCell(UnsafeCell<Option<RegistryState>>);
+
+unsafe impl Sync for RegistryStateCell {}
+
+static REG_STATE: RegistryStateCell = RegistryStateCell(UnsafeCell::new(None));
 
 fn ensure_state() -> &'static mut RegistryState {
+    // SAFETY: Registry state is process-global and accessed through the
+    // existing serialized kernel paths. UnsafeCell here removes `static mut`
+    // references but keeps the same runtime discipline.
     unsafe {
-        if REG_STATE.is_none() {
-            REG_STATE = Some(RegistryState {
+        let slot = &mut *REG_STATE.0.get();
+        if slot.is_none() {
+            *slot = Some(RegistryState {
                 root: RegistryKey::create_root(),
                 handles: ObjectStore::new(),
             });
         }
-        REG_STATE.as_mut().unwrap()
+        slot.as_mut().unwrap()
     }
 }
 
 fn read_value_name(us_ptr: u64) -> String {
     let mut raw = [0u8; MAX_NAME_BYTES];
-    let len = read_unicode_direct(us_ptr, &mut raw);
+    let len = UnicodeStringView::from_ptr(us_ptr).map_or(0, |us| us.read_ascii(&mut raw));
     let mut out = String::new();
     for &b in raw.iter().take(len) {
         out.push(b as char);
@@ -89,14 +99,10 @@ fn join_registry_path(base: &str, rel: &str) -> String {
     s
 }
 
-fn oa_full_path(oa_ptr: u64, state: &RegistryState) -> Option<String> {
-    if oa_ptr == 0 {
-        return Some(String::new());
-    }
-
-    let root_handle = read_current_user_value((oa_ptr + 0x8) as *const u64).unwrap_or(0);
+fn oa_full_path(oa: ObjectAttributesView, state: &RegistryState) -> Option<String> {
+    let root_handle = oa.root_directory();
     let mut rel = [0u8; MAX_PATH];
-    let rel_len_raw = read_oa_path(oa_ptr, &mut rel);
+    let rel_len_raw = oa.read_path(&mut rel);
     let (rel_len, abs) = normalize_registry_path(&mut rel, rel_len_raw);
     let rel_path = bytes_path_to_registry(&rel[..rel_len]);
 
@@ -207,9 +213,7 @@ fn utf16_byte_len(s: &str) -> usize {
 }
 
 fn write_ret_len(ptr: u64, len: usize) {
-    if ptr != 0 {
-        let _ = write_current_user_value(ptr as *mut u32, len as u32);
-    }
+    let _ = UserOutPtr::from_raw(ptr as *mut u32).write_current_if_present(len as u32);
 }
 
 #[inline(always)]
@@ -263,10 +267,13 @@ pub(crate) fn key_name_utf16(idx: u32) -> Option<Vec<u16>> {
 
 pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
     let state = ensure_state();
-    let out_ptr = frame.x[0] as *mut u64;
+    let out_ptr = UserOutPtr::from_raw(frame.x[0] as *mut u64);
     let desired_access = frame.x[1] as u32;
-    let oa_ptr = frame.x[2];
-    if out_ptr.is_null() || oa_ptr == 0 {
+    let Some(oa) = ObjectAttributesView::from_ptr(frame.x[2]) else {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    };
+    if out_ptr.is_null() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
@@ -275,7 +282,7 @@ pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
         return;
     }
 
-    let Some(path) = oa_full_path(oa_ptr, state) else {
+    let Some(path) = oa_full_path(oa, state) else {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     };
@@ -290,20 +297,21 @@ pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
         return;
     };
 
-    if !out_ptr.is_null() {
-        let pid = crate::process::current_pid();
-        let Some(h) = with_process_mut(pid, |p| {
-            p.handle_table.add(KObjectRef::key(handle_idx)).map(|v| v as u64)
-        }).flatten() else {
-            let _ = state.handles.free(handle_idx);
-            frame.x[0] = status::NO_MEMORY as u64;
-            return;
-        };
-        if !write_current_user_value(out_ptr, h) {
-            let _ = state.handles.free(handle_idx);
-            frame.x[0] = status::INVALID_PARAMETER as u64;
-            return;
-        }
+    let pid = crate::process::current_pid();
+    let Some(h) = with_process_mut(pid, |p| {
+        p.handle_table
+            .add(KObjectRef::key(handle_idx))
+            .map(|v| v as u64)
+    })
+    .flatten() else {
+        let _ = state.handles.free(handle_idx);
+        frame.x[0] = status::NO_MEMORY as u64;
+        return;
+    };
+    if !out_ptr.write_current(h) {
+        let _ = state.handles.free(handle_idx);
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     }
     frame.x[0] = status::SUCCESS as u64;
 }
@@ -316,11 +324,14 @@ pub(crate) fn handle_open_key_ex(frame: &mut SvcFrame) {
 
 pub(crate) fn handle_create_key(frame: &mut SvcFrame) {
     let state = ensure_state();
-    let out_ptr = frame.x[0] as *mut u64;
+    let out_ptr = UserOutPtr::from_raw(frame.x[0] as *mut u64);
     let desired_access = frame.x[1] as u32;
-    let oa_ptr = frame.x[2];
-    let disp_ptr = frame.x[6] as *mut u32;
-    if out_ptr.is_null() || oa_ptr == 0 {
+    let Some(oa) = ObjectAttributesView::from_ptr(frame.x[2]) else {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    };
+    let disp_ptr = UserOutPtr::from_raw(frame.x[6] as *mut u32);
+    if out_ptr.is_null() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
@@ -329,7 +340,7 @@ pub(crate) fn handle_create_key(frame: &mut SvcFrame) {
         return;
     }
 
-    let Some(path) = oa_full_path(oa_ptr, state) else {
+    let Some(path) = oa_full_path(oa, state) else {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     };
@@ -346,27 +357,26 @@ pub(crate) fn handle_create_key(frame: &mut SvcFrame) {
         return;
     };
 
-    if !disp_ptr.is_null() {
-        if !write_current_user_value(disp_ptr, disp) {
-            let _ = state.handles.free(handle_idx);
-            frame.x[0] = status::INVALID_PARAMETER as u64;
-            return;
-        }
+    if !disp_ptr.write_current_if_present(disp) {
+        let _ = state.handles.free(handle_idx);
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     }
-    if !out_ptr.is_null() {
-        let pid = crate::process::current_pid();
-        let Some(h) = with_process_mut(pid, |p| {
-            p.handle_table.add(KObjectRef::key(handle_idx)).map(|v| v as u64)
-        }).flatten() else {
-            let _ = state.handles.free(handle_idx);
-            frame.x[0] = status::NO_MEMORY as u64;
-            return;
-        };
-        if !write_current_user_value(out_ptr, h) {
-            let _ = state.handles.free(handle_idx);
-            frame.x[0] = status::INVALID_PARAMETER as u64;
-            return;
-        }
+    let pid = crate::process::current_pid();
+    let Some(h) = with_process_mut(pid, |p| {
+        p.handle_table
+            .add(KObjectRef::key(handle_idx))
+            .map(|v| v as u64)
+    })
+    .flatten() else {
+        let _ = state.handles.free(handle_idx);
+        frame.x[0] = status::NO_MEMORY as u64;
+        return;
+    };
+    if !out_ptr.write_current(h) {
+        let _ = state.handles.free(handle_idx);
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     }
     frame.x[0] = status::SUCCESS as u64;
 }
@@ -472,73 +482,63 @@ pub(crate) fn handle_query_value_key(frame: &mut SvcFrame) {
     let value_ty = value.reg_type();
     let value_data_len = value_data.len();
 
-    unsafe {
-        match info_class {
-            0 => {
-                let need = 12 + value_name_wlen;
-                write_ret_len(ret_len_ptr, need);
-                if out_ptr.is_null() || out_len < need {
-                    frame.x[0] = status::BUFFER_TOO_SMALL as u64;
-                    return;
-                }
-                (out_ptr as *mut u32).write_volatile(0);
-                (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
-                (out_ptr.add(8) as *mut u32).write_volatile(value_name_wlen as u32);
-                core::ptr::copy_nonoverlapping(
-                    value_name_w.as_ptr(),
-                    out_ptr.add(12),
-                    value_name_wlen,
-                );
-                frame.x[0] = status::SUCCESS as u64;
+    match info_class {
+        0 => {
+            let need = 12 + value_name_wlen;
+            write_ret_len(ret_len_ptr, need);
+            if out_ptr.is_null() || out_len < need {
+                frame.x[0] = status::BUFFER_TOO_SMALL as u64;
+                return;
             }
-            1 => {
-                let need = 20 + value_name_wlen + value_data_len;
-                write_ret_len(ret_len_ptr, need);
-                if out_ptr.is_null() || out_len < need {
-                    frame.x[0] = status::BUFFER_TOO_SMALL as u64;
-                    return;
-                }
-                (out_ptr as *mut u32).write_volatile(0);
-                (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
-                (out_ptr.add(8) as *mut u32).write_volatile((20 + value_name_wlen) as u32);
-                (out_ptr.add(12) as *mut u32).write_volatile(value_data_len as u32);
-                (out_ptr.add(16) as *mut u32).write_volatile(value_name_wlen as u32);
-                core::ptr::copy_nonoverlapping(
-                    value_name_w.as_ptr(),
-                    out_ptr.add(20),
-                    value_name_wlen,
-                );
-                if value_data_len != 0 {
-                    core::ptr::copy_nonoverlapping(
-                        value_data.as_ptr(),
-                        out_ptr.add(20 + value_name_wlen),
-                        value_data_len,
-                    );
-                }
-                frame.x[0] = status::SUCCESS as u64;
-            }
-            2 => {
-                let need = 12 + value_data_len;
-                write_ret_len(ret_len_ptr, need);
-                if out_ptr.is_null() || out_len < need {
-                    frame.x[0] = status::BUFFER_TOO_SMALL as u64;
-                    return;
-                }
-                (out_ptr as *mut u32).write_volatile(0);
-                (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
-                (out_ptr.add(8) as *mut u32).write_volatile(value_data_len as u32);
-                if value_data_len != 0 {
-                    core::ptr::copy_nonoverlapping(
-                        value_data.as_ptr(),
-                        out_ptr.add(12),
-                        value_data_len,
-                    );
-                }
-                frame.x[0] = status::SUCCESS as u64;
-            }
-            _ => {
+            let Some(mut w) = GuestWriter::new(out_ptr, out_len, need) else {
                 frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            };
+            w.u32(0)
+                .u32(value_ty)
+                .u32(value_name_wlen as u32)
+                .bytes(&value_name_w[..value_name_wlen]);
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        1 => {
+            let need = 20 + value_name_wlen + value_data_len;
+            write_ret_len(ret_len_ptr, need);
+            if out_ptr.is_null() || out_len < need {
+                frame.x[0] = status::BUFFER_TOO_SMALL as u64;
+                return;
             }
+            let Some(mut w) = GuestWriter::new(out_ptr, out_len, need) else {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            };
+            w.u32(0)
+                .u32(value_ty)
+                .u32((20 + value_name_wlen) as u32)
+                .u32(value_data_len as u32)
+                .u32(value_name_wlen as u32)
+                .bytes(&value_name_w[..value_name_wlen])
+                .bytes(&value_data);
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        2 => {
+            let need = 12 + value_data_len;
+            write_ret_len(ret_len_ptr, need);
+            if out_ptr.is_null() || out_len < need {
+                frame.x[0] = status::BUFFER_TOO_SMALL as u64;
+                return;
+            }
+            let Some(mut w) = GuestWriter::new(out_ptr, out_len, need) else {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            };
+            w.u32(0)
+                .u32(value_ty)
+                .u32(value_data_len as u32)
+                .bytes(&value_data);
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        _ => {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
         }
     }
 }
@@ -570,18 +570,11 @@ pub(crate) fn handle_query_key(frame: &mut SvcFrame) {
                 return;
             }
 
-            unsafe {
-                (out_ptr as *mut u64).write_volatile(0);
-                (out_ptr.add(8) as *mut u32).write_volatile(0);
-                (out_ptr.add(12) as *mut u32).write_volatile(name_w.len() as u32);
-                if !name_w.is_empty() {
-                    core::ptr::copy_nonoverlapping(
-                        name_w.as_ptr(),
-                        out_ptr.add(KEY_BASIC_INFORMATION_SIZE),
-                        name_w.len(),
-                    );
-                }
-            }
+            let Some(mut w) = GuestWriter::new(out_ptr, out_len, need) else {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            };
+            w.u64(0).u32(0).u32(name_w.len() as u32).bytes(&name_w);
             frame.x[0] = status::SUCCESS as u64;
         }
         KEY_INFORMATION_NAME => {
@@ -597,16 +590,11 @@ pub(crate) fn handle_query_key(frame: &mut SvcFrame) {
                 return;
             }
 
-            unsafe {
-                (out_ptr as *mut u32).write_volatile(name_w.len() as u32);
-                if !name_w.is_empty() {
-                    core::ptr::copy_nonoverlapping(
-                        name_w.as_ptr(),
-                        out_ptr.add(KEY_NAME_INFORMATION_SIZE),
-                        name_w.len(),
-                    );
-                }
-            }
+            let Some(mut w) = GuestWriter::new(out_ptr, out_len, need) else {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            };
+            w.u32(name_w.len() as u32).bytes(&name_w);
             frame.x[0] = status::SUCCESS as u64;
         }
         KEY_INFORMATION_FULL => {
@@ -644,18 +632,20 @@ pub(crate) fn handle_query_key(frame: &mut SvcFrame) {
                 return;
             }
 
-            unsafe {
-                (out_ptr as *mut u64).write_volatile(0);
-                (out_ptr.add(8) as *mut u32).write_volatile(0);
-                (out_ptr.add(12) as *mut u32).write_volatile(KEY_FULL_INFORMATION_SIZE as u32);
-                (out_ptr.add(16) as *mut u32).write_volatile(0);
-                (out_ptr.add(20) as *mut u32).write_volatile(subkeys);
-                (out_ptr.add(24) as *mut u32).write_volatile(max_name_len);
-                (out_ptr.add(28) as *mut u32).write_volatile(0);
-                (out_ptr.add(32) as *mut u32).write_volatile(values);
-                (out_ptr.add(36) as *mut u32).write_volatile(max_value_name_len);
-                (out_ptr.add(40) as *mut u32).write_volatile(max_value_data_len);
-            }
+            let Some(mut w) = GuestWriter::new(out_ptr, out_len, KEY_FULL_INFORMATION_SIZE) else {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            };
+            w.u64(0)
+                .u32(0)
+                .u32(KEY_FULL_INFORMATION_SIZE as u32)
+                .u32(0)
+                .u32(subkeys)
+                .u32(max_name_len)
+                .u32(0)
+                .u32(values)
+                .u32(max_value_name_len)
+                .u32(max_value_data_len);
             frame.x[0] = status::SUCCESS as u64;
         }
         _ => {
@@ -703,12 +693,14 @@ pub(crate) fn handle_enumerate_key(frame: &mut SvcFrame) {
         return;
     }
 
-    unsafe {
-        (out_ptr as *mut u64).write_volatile(0);
-        (out_ptr.add(8) as *mut u32).write_volatile(0);
-        (out_ptr.add(12) as *mut u32).write_volatile(child_name_wlen as u32);
-        core::ptr::copy_nonoverlapping(child_name_w.as_ptr(), out_ptr.add(16), child_name_wlen);
-    }
+    let Some(mut w) = GuestWriter::new(out_ptr, out_len, need) else {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    };
+    w.u64(0)
+        .u32(0)
+        .u32(child_name_wlen as u32)
+        .bytes(&child_name_w[..child_name_wlen]);
 
     frame.x[0] = status::SUCCESS as u64;
 }
@@ -742,73 +734,63 @@ pub(crate) fn handle_enumerate_value_key(frame: &mut SvcFrame) {
     let value_ty = value.reg_type();
     let value_data_len = value_data.len();
 
-    unsafe {
-        match info_class {
-            0 => {
-                let need = 12 + value_name_wlen;
-                write_ret_len(ret_len_ptr, need);
-                if out_ptr.is_null() || out_len < need {
-                    frame.x[0] = status::BUFFER_TOO_SMALL as u64;
-                    return;
-                }
-                (out_ptr as *mut u32).write_volatile(0);
-                (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
-                (out_ptr.add(8) as *mut u32).write_volatile(value_name_wlen as u32);
-                core::ptr::copy_nonoverlapping(
-                    value_name_w.as_ptr(),
-                    out_ptr.add(12),
-                    value_name_wlen,
-                );
-                frame.x[0] = status::SUCCESS as u64;
+    match info_class {
+        0 => {
+            let need = 12 + value_name_wlen;
+            write_ret_len(ret_len_ptr, need);
+            if out_ptr.is_null() || out_len < need {
+                frame.x[0] = status::BUFFER_TOO_SMALL as u64;
+                return;
             }
-            1 => {
-                let need = 20 + value_name_wlen + value_data_len;
-                write_ret_len(ret_len_ptr, need);
-                if out_ptr.is_null() || out_len < need {
-                    frame.x[0] = status::BUFFER_TOO_SMALL as u64;
-                    return;
-                }
-                (out_ptr as *mut u32).write_volatile(0);
-                (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
-                (out_ptr.add(8) as *mut u32).write_volatile((20 + value_name_wlen) as u32);
-                (out_ptr.add(12) as *mut u32).write_volatile(value_data_len as u32);
-                (out_ptr.add(16) as *mut u32).write_volatile(value_name_wlen as u32);
-                core::ptr::copy_nonoverlapping(
-                    value_name_w.as_ptr(),
-                    out_ptr.add(20),
-                    value_name_wlen,
-                );
-                if value_data_len != 0 {
-                    core::ptr::copy_nonoverlapping(
-                        value_data.as_ptr(),
-                        out_ptr.add(20 + value_name_wlen),
-                        value_data_len,
-                    );
-                }
-                frame.x[0] = status::SUCCESS as u64;
-            }
-            2 => {
-                let need = 12 + value_data_len;
-                write_ret_len(ret_len_ptr, need);
-                if out_ptr.is_null() || out_len < need {
-                    frame.x[0] = status::BUFFER_TOO_SMALL as u64;
-                    return;
-                }
-                (out_ptr as *mut u32).write_volatile(0);
-                (out_ptr.add(4) as *mut u32).write_volatile(value_ty);
-                (out_ptr.add(8) as *mut u32).write_volatile(value_data_len as u32);
-                if value_data_len != 0 {
-                    core::ptr::copy_nonoverlapping(
-                        value_data.as_ptr(),
-                        out_ptr.add(12),
-                        value_data_len,
-                    );
-                }
-                frame.x[0] = status::SUCCESS as u64;
-            }
-            _ => {
+            let Some(mut w) = GuestWriter::new(out_ptr, out_len, need) else {
                 frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            };
+            w.u32(0)
+                .u32(value_ty)
+                .u32(value_name_wlen as u32)
+                .bytes(&value_name_w[..value_name_wlen]);
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        1 => {
+            let need = 20 + value_name_wlen + value_data_len;
+            write_ret_len(ret_len_ptr, need);
+            if out_ptr.is_null() || out_len < need {
+                frame.x[0] = status::BUFFER_TOO_SMALL as u64;
+                return;
             }
+            let Some(mut w) = GuestWriter::new(out_ptr, out_len, need) else {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            };
+            w.u32(0)
+                .u32(value_ty)
+                .u32((20 + value_name_wlen) as u32)
+                .u32(value_data_len as u32)
+                .u32(value_name_wlen as u32)
+                .bytes(&value_name_w[..value_name_wlen])
+                .bytes(&value_data);
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        2 => {
+            let need = 12 + value_data_len;
+            write_ret_len(ret_len_ptr, need);
+            if out_ptr.is_null() || out_len < need {
+                frame.x[0] = status::BUFFER_TOO_SMALL as u64;
+                return;
+            }
+            let Some(mut w) = GuestWriter::new(out_ptr, out_len, need) else {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            };
+            w.u32(0)
+                .u32(value_ty)
+                .u32(value_data_len as u32)
+                .bytes(&value_data);
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        _ => {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
         }
     }
 }

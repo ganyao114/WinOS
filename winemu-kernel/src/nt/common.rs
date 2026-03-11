@@ -1,8 +1,11 @@
-use crate::process::{KObjectKind, with_process_mut};
+use crate::process::{with_process_mut, KObjectKind};
 
 use super::state::file_host_fd;
-use crate::mm::usercopy::{copy_to_process_user, current_pid, ensure_user_range_access};
-use super::state::VM_ACCESS_WRITE;
+use crate::mm::usercopy::{
+    copy_to_process_user, current_pid, ensure_user_range_access, write_user_value,
+};
+use crate::mm::UserVa;
+use crate::mm::VM_ACCESS_WRITE;
 
 pub(crate) const STD_INPUT_HANDLE: u64 = 0xFFFF_FFFF_FFFF_FFF6;
 pub(crate) const STD_OUTPUT_HANDLE: u64 = 0xFFFF_FFFF_FFFF_FFF5;
@@ -24,25 +27,66 @@ pub(crate) const MEM_DECOMMIT: u32 = 0x4000;
 pub(crate) const MEM_RELEASE: u32 = 0x8000;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct IoStatusBlock {
     pub(crate) status: u64,
     pub(crate) info: u64,
 }
+
+#[derive(Clone, Copy)]
+pub(crate) struct IoStatusBlockPtr(*mut IoStatusBlock);
 
 #[inline(always)]
 pub(crate) fn align_up_4k(v: u64) -> u64 {
     (v + 0xFFF) & !0xFFF
 }
 
-pub(crate) fn write_iosb(iosb_ptr: *mut IoStatusBlock, st: u32, info: u64) {
-    if !iosb_ptr.is_null() {
-        unsafe {
-            iosb_ptr.write_volatile(IoStatusBlock {
-                status: st as u64,
-                info,
-            });
-        }
+impl IoStatusBlockPtr {
+    #[inline]
+    pub(crate) fn from_raw(ptr: *mut IoStatusBlock) -> Self {
+        Self(ptr)
     }
+
+    #[inline]
+    pub(crate) fn as_raw(self) -> *mut IoStatusBlock {
+        self.0
+    }
+
+    #[inline]
+    pub(crate) fn write_current(self, st: u32, info: u64) {
+        let Some(pid) = current_pid() else {
+            return;
+        };
+        let _ = self.write_for_pid(pid, st, info);
+    }
+
+    #[inline]
+    pub(crate) fn write_for_pid(self, pid: u32, st: u32, info: u64) -> bool {
+        if !self.0.is_null() {
+            return write_user_value(
+                pid,
+                self.0,
+                IoStatusBlock {
+                    status: st as u64,
+                    info,
+                },
+            );
+        }
+        true
+    }
+}
+
+pub(crate) fn write_iosb(iosb_ptr: *mut IoStatusBlock, st: u32, info: u64) {
+    IoStatusBlockPtr::from_raw(iosb_ptr).write_current(st, info);
+}
+
+pub(crate) fn write_iosb_for_pid(
+    pid: u32,
+    iosb_ptr: *mut IoStatusBlock,
+    st: u32,
+    info: u64,
+) -> bool {
+    IoStatusBlockPtr::from_raw(iosb_ptr).write_for_pid(pid, st, info)
 }
 
 pub(crate) fn map_open_flags(access: u32, disposition: u32) -> u64 {
@@ -68,7 +112,8 @@ pub(crate) fn file_handle_to_host_fd_for_pid(owner_pid: u32, file_handle: u64) -
         STD_OUTPUT_HANDLE => Some(1),
         STD_ERROR_HANDLE => Some(2),
         _ => {
-            let obj = with_process_mut(owner_pid, |p| p.handle_table.get(file_handle as u32)).flatten();
+            let obj =
+                with_process_mut(owner_pid, |p| p.handle_table.get(file_handle as u32)).flatten();
             match obj {
                 Some(o) if o.kind == KObjectKind::File => file_host_fd(o.obj_idx),
                 _ => None,
@@ -91,7 +136,7 @@ pub(crate) fn file_handle_to_host_fd_for_pid(owner_pid: u32, file_handle: u64) -
 
 pub(crate) struct GuestWriter {
     pid: u32,
-    base: u64,
+    base: UserVa,
     offset: usize,
 }
 
@@ -100,24 +145,33 @@ impl GuestWriter {
     #[inline]
     pub(crate) fn new(buf: *mut u8, len: usize, required: usize) -> Option<Self> {
         let pid = current_pid()?;
+        Self::for_pid(pid, buf, len, required)
+    }
+
+    #[inline]
+    pub(crate) fn for_pid(pid: u32, buf: *mut u8, len: usize, required: usize) -> Option<Self> {
+        let base = UserVa::new(buf as u64);
         if buf.is_null()
             || len < required
-            || !ensure_user_range_access(pid, buf as u64, required, VM_ACCESS_WRITE)
+            || !ensure_user_range_access(pid, base, required, VM_ACCESS_WRITE)
         {
             None
         } else {
-            Some(Self { pid, base: buf as u64, offset: 0 })
+            Some(Self {
+                pid,
+                base,
+                offset: 0,
+            })
         }
     }
 
     #[inline]
     fn write_bytes(&mut self, bytes: &[u8]) -> &mut Self {
-        let ok = copy_to_process_user(
-            self.pid,
-            self.base.saturating_add(self.offset as u64),
-            bytes.as_ptr(),
-            bytes.len(),
-        );
+        let Some(dst_va) = self.base.checked_add(self.offset as u64) else {
+            debug_assert!(false, "guest writer address overflow");
+            return self;
+        };
+        let ok = copy_to_process_user(self.pid, dst_va, bytes.as_ptr(), bytes.len());
         debug_assert!(ok);
         self.offset += bytes.len();
         self
@@ -143,6 +197,11 @@ impl GuestWriter {
         self.write_bytes(&v.to_le_bytes())
     }
 
+    #[inline]
+    pub(crate) fn bytes(&mut self, bytes: &[u8]) -> &mut Self {
+        self.write_bytes(bytes)
+    }
+
     /// Zero-fill `n` bytes.
     #[inline]
     pub(crate) fn zeros(&mut self, n: usize) -> &mut Self {
@@ -166,12 +225,11 @@ impl GuestWriter {
     #[inline]
     pub(crate) fn write_struct<T: Copy>(&mut self, v: T) -> &mut Self {
         let size = core::mem::size_of::<T>();
-        let ok = copy_to_process_user(
-            self.pid,
-            self.base.saturating_add(self.offset as u64),
-            (&v as *const T).cast::<u8>(),
-            size,
-        );
+        let Some(dst_va) = self.base.checked_add(self.offset as u64) else {
+            debug_assert!(false, "guest writer address overflow");
+            return self;
+        };
+        let ok = copy_to_process_user(self.pid, dst_va, (&v as *const T).cast::<u8>(), size);
         debug_assert!(ok);
         self.offset += size;
         self

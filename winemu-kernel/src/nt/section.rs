@@ -1,3 +1,5 @@
+use core::cell::UnsafeCell;
+
 use crate::kobj::ObjectStore;
 use crate::mm::{vm_alloc_region_typed, vm_free_region, vm_set_section_backing, VmaType};
 use crate::process::{with_process_mut, KObjectKind, KObjectRef};
@@ -6,11 +8,10 @@ use winemu_shared::status;
 
 use super::common::{align_up_4k, GuestWriter};
 use super::constants::PAGE_SIZE_4K;
-use super::path::read_oa_path;
+use super::path::ObjectAttributesView;
 use super::state::{file_host_fd, section_alloc, section_free, section_get, view_alloc, view_free};
+use super::user_args::{SyscallArgs, UserInPtr, UserOutPtr};
 use super::SvcFrame;
-use crate::mm::usercopy::{read_current_user_value, write_current_user_value};
-
 // ── Guest-memory layout structs ───────────────────────────────────────────────
 
 #[repr(C)]
@@ -39,14 +40,22 @@ struct NamedSection {
     name: [u8; MAX_SECTION_NAME],
 }
 
-static mut NAMED_SECTIONS: Option<ObjectStore<NamedSection>> = None;
+struct NamedSectionsCell(UnsafeCell<Option<ObjectStore<NamedSection>>>);
+
+unsafe impl Sync for NamedSectionsCell {}
+
+static NAMED_SECTIONS: NamedSectionsCell = NamedSectionsCell(UnsafeCell::new(None));
 
 fn named_sections_mut() -> &'static mut ObjectStore<NamedSection> {
+    // SAFETY: Named section bookkeeping remains globally serialized by the
+    // existing kernel path; this narrows storage to UnsafeCell without altering
+    // runtime ownership rules.
     unsafe {
-        if NAMED_SECTIONS.is_none() {
-            NAMED_SECTIONS = Some(ObjectStore::new());
+        let slot = &mut *NAMED_SECTIONS.0.get();
+        if slot.is_none() {
+            *slot = Some(ObjectStore::new());
         }
-        NAMED_SECTIONS.as_mut().unwrap()
+        slot.as_mut().unwrap()
     }
 }
 
@@ -58,11 +67,14 @@ fn ascii_lower(b: u8) -> u8 {
     }
 }
 
-fn section_name_from_oa(oa_ptr: u64, out: &mut [u8; MAX_SECTION_NAME]) -> usize {
-    if oa_ptr == 0 {
+fn section_name_from_oa(
+    oa: Option<ObjectAttributesView>,
+    out: &mut [u8; MAX_SECTION_NAME],
+) -> usize {
+    let Some(oa) = oa else {
         return 0;
-    }
-    let len = read_oa_path(oa_ptr, out);
+    };
+    let len = oa.read_path(out);
     if len == 0 {
         return 0;
     }
@@ -147,10 +159,10 @@ fn named_section_remove_by_section(section_idx: u32) {
 
 // x0=*SectionHandle, x3=*MaximumSize, x4=Protection, x6=FileHandle
 pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
-    let out_ptr = frame.x[0] as *mut u64;
+    let out_ptr = UserOutPtr::from_raw(frame.x[0] as *mut u64);
     let desired_access = frame.x[1] as u32;
-    let oa_ptr = frame.x[2];
-    let max_size_ptr = frame.x[3] as *const u64;
+    let oa = ObjectAttributesView::from_ptr(frame.x[2]);
+    let max_size_ptr = UserInPtr::from_raw(frame.x[3] as *const u64);
     let prot = frame.x[4] as u32;
     let alloc_attrs = frame.x[5] as u32;
     let file_handle = frame.x[6];
@@ -162,7 +174,7 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
     }
 
     let mut section_name = [0u8; MAX_SECTION_NAME];
-    let section_name_len = section_name_from_oa(oa_ptr, &mut section_name);
+    let section_name_len = section_name_from_oa(oa, &mut section_name);
     named_section_gc_stale();
     if section_name_len != 0 && named_section_find(&section_name[..section_name_len]).is_some() {
         frame.x[0] = status::OBJECT_NAME_COLLISION as u64;
@@ -172,7 +184,7 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
     let size = if max_size_ptr.is_null() {
         PAGE_SIZE_4K
     } else {
-        let Some(max_size) = read_current_user_value(max_size_ptr) else {
+        let Some(max_size) = max_size_ptr.read_current() else {
             frame.x[0] = status::INVALID_PARAMETER as u64;
             return;
         };
@@ -226,22 +238,20 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
         frame.x[0] = status::NO_MEMORY as u64;
         return;
     };
-    if !out_ptr.is_null() {
-        if !write_current_user_value(out_ptr, handle) {
-            named_section_remove_by_section(idx);
-            section_free(idx);
-            frame.x[0] = status::INVALID_PARAMETER as u64;
-            return;
-        }
+    if !out_ptr.write_current_if_present(handle) {
+        named_section_remove_by_section(idx);
+        section_free(idx);
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     }
     frame.x[0] = status::SUCCESS as u64;
 }
 
 // x0=*SectionHandle, x1=DesiredAccess, x2=ObjectAttributes
 pub(crate) fn handle_open_section(frame: &mut SvcFrame) {
-    let out_ptr = frame.x[0] as *mut u64;
+    let out_ptr = UserOutPtr::from_raw(frame.x[0] as *mut u64);
     let desired_access = frame.x[1] as u32;
-    let oa_ptr = frame.x[2];
+    let oa = ObjectAttributesView::from_ptr(frame.x[2]);
 
     let meta = super::kobject::object_type_meta_for_kind(KObjectKind::Section);
     if (desired_access & !meta.valid_access_mask) != 0 {
@@ -250,7 +260,7 @@ pub(crate) fn handle_open_section(frame: &mut SvcFrame) {
     }
 
     let mut section_name = [0u8; MAX_SECTION_NAME];
-    let section_name_len = section_name_from_oa(oa_ptr, &mut section_name);
+    let section_name_len = section_name_from_oa(oa, &mut section_name);
     if section_name_len == 0 {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
@@ -277,11 +287,9 @@ pub(crate) fn handle_open_section(frame: &mut SvcFrame) {
         frame.x[0] = status::NO_MEMORY as u64;
         return;
     };
-    if !out_ptr.is_null() {
-        if !write_current_user_value(out_ptr, handle) {
-            frame.x[0] = status::INVALID_PARAMETER as u64;
-            return;
-        }
+    if !out_ptr.write_current_if_present(handle) {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     }
     frame.x[0] = status::SUCCESS as u64;
 }
@@ -307,10 +315,10 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
         }
     };
 
-    let base_ptr = frame.x[2] as *mut u64;
-    let view_size_ptr = frame.x[6] as *mut u64;
-    let offset_ptr = frame.x[5] as *const u64;
-    let Some(win32_protect) = read_current_user_value((frame.sp_el0 + 8) as *const u64) else {
+    let base_ptr = UserOutPtr::from_raw(frame.x[2] as *mut u64);
+    let view_size_ptr = UserOutPtr::from_raw(frame.x[6] as *mut u64);
+    let offset_ptr = UserInPtr::from_raw(frame.x[5] as *const u64);
+    let Some(win32_protect) = SyscallArgs::new(frame).spill_u64(1) else {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     };
@@ -318,7 +326,7 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     let section_offset = if offset_ptr.is_null() {
         0
     } else {
-        let Some(offset) = read_current_user_value(offset_ptr) else {
+        let Some(offset) = offset_ptr.read_current() else {
             frame.x[0] = status::INVALID_PARAMETER as u64;
             return;
         };
@@ -336,7 +344,7 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     let req_size = if view_size_ptr.is_null() {
         0
     } else {
-        let Some(size) = read_current_user_value(view_size_ptr as *const u64) else {
+        let Some(size) = view_size_ptr.read_current() else {
             frame.x[0] = status::INVALID_PARAMETER as u64;
             return;
         };
@@ -362,7 +370,7 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     };
     let owner_pid = crate::process::current_pid();
     let hint = if !base_ptr.is_null() {
-        let Some(base) = read_current_user_value(base_ptr as *const u64) else {
+        let Some(base) = base_ptr.read_current() else {
             frame.x[0] = status::INVALID_PARAMETER as u64;
             return;
         };
@@ -402,17 +410,13 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
         return;
     }
 
-    if !base_ptr.is_null() {
-        if !write_current_user_value(base_ptr, base) {
-            frame.x[0] = status::INVALID_PARAMETER as u64;
-            return;
-        }
+    if !base_ptr.write_current_if_present(base) {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     }
-    if !view_size_ptr.is_null() {
-        if !write_current_user_value(view_size_ptr, map_size) {
-            frame.x[0] = status::INVALID_PARAMETER as u64;
-            return;
-        }
+    if !view_size_ptr.write_current_if_present(map_size) {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
     }
     frame.x[0] = status::SUCCESS as u64;
 }
@@ -467,7 +471,7 @@ pub(crate) fn handle_query_section(frame: &mut SvcFrame) {
     let info_class = frame.x[1] as u32;
     let buf = frame.x[2] as *mut u8;
     let len = frame.x[3] as usize;
-    let ret_len = frame.x[4] as *mut u32;
+    let ret_len = UserOutPtr::from_raw(frame.x[4] as *mut u32);
 
     let pid = crate::process::current_pid();
     let obj = with_process_mut(pid, |p| p.handle_table.get(h as u32)).flatten();
@@ -490,9 +494,7 @@ pub(crate) fn handle_query_section(frame: &mut SvcFrame) {
         0 => {
             let required = core::mem::size_of::<SectionBasicInformation>();
             let Some(mut w) = GuestWriter::new(buf, len, required) else {
-                if !ret_len.is_null() {
-                    let _ = write_current_user_value(ret_len, required as u32);
-                }
+                let _ = ret_len.write_current_if_present(required as u32);
                 frame.x[0] = status::BUFFER_TOO_SMALL as u64;
                 return;
             };
@@ -502,24 +504,18 @@ pub(crate) fn handle_query_section(frame: &mut SvcFrame) {
                 _pad: 0,
                 maximum_size: sec.size,
             });
-            if !ret_len.is_null() {
-                let _ = write_current_user_value(ret_len, required as u32);
-            }
+            let _ = ret_len.write_current_if_present(required as u32);
             frame.x[0] = status::SUCCESS as u64;
         }
         1 => {
             let required = core::mem::size_of::<SectionImageInformation>();
             let Some(mut w) = GuestWriter::new(buf, len, required) else {
-                if !ret_len.is_null() {
-                    let _ = write_current_user_value(ret_len, required as u32);
-                }
+                let _ = ret_len.write_current_if_present(required as u32);
                 frame.x[0] = status::BUFFER_TOO_SMALL as u64;
                 return;
             };
             w.write_struct(SectionImageInformation { _data: [0u8; 40] });
-            if !ret_len.is_null() {
-                let _ = write_current_user_value(ret_len, required as u32);
-            }
+            let _ = ret_len.write_current_if_present(required as u32);
             frame.x[0] = status::SUCCESS as u64;
         }
         _ => {

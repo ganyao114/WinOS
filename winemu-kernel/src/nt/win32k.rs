@@ -6,8 +6,11 @@ use winemu_shared::hostcall as hc;
 use winemu_shared::status;
 use winemu_shared::win32k_sysno;
 
-use super::state::VM_ACCESS_READ;
+use super::user_args::SyscallArgs;
 use super::SvcFrame;
+use crate::mm::usercopy::ensure_user_range_access;
+use crate::mm::UserVa;
+use crate::mm::VM_ACCESS_READ;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ClientPfnArrays {
@@ -51,32 +54,10 @@ fn entries_mut() -> &'static mut ObjectStore<ClientPfnArrays> {
 }
 
 fn validate_user_ptr(pid: u32, va: u64) -> bool {
-    if va < crate::process::USER_ACCESS_BASE || va >= crate::process::USER_VA_LIMIT {
-        return false;
-    }
-    crate::process::with_process(pid, |p| {
-        p.address_space
-            .translate_user_va_for_access(va, VM_ACCESS_READ)
-    })
-    .flatten()
-    .is_some()
+    ensure_user_range_access(pid, UserVa::new(va), 1, VM_ACCESS_READ)
 }
 
-fn read_user_u64(pid: u32, va: u64) -> Option<u64> {
-    if va < crate::process::USER_ACCESS_BASE || va >= crate::process::USER_VA_LIMIT {
-        return None;
-    }
-    let gpa = crate::process::with_process(pid, |p| {
-        p.address_space
-            .translate_user_va_for_access(va, VM_ACCESS_READ)
-    })
-    .flatten()?;
-    let ptr = crate::mm::physmap::gpa_to_kva(gpa)?;
-    // SAFETY: the translated GPA is mapped through the shared kernel physmap.
-    Some(unsafe { ptr.cast::<u64>().read_volatile() })
-}
-
-fn collect_win32k_args(pid: u32, frame: &SvcFrame) -> [u64; hc::WIN32K_CALL_MAX_ARGS] {
+fn collect_win32k_args(frame: &SvcFrame) -> [u64; hc::WIN32K_CALL_MAX_ARGS] {
     let mut out = [0u64; hc::WIN32K_CALL_MAX_ARGS];
     let reg_count = core::cmp::min(8, hc::WIN32K_CALL_MAX_ARGS);
     out[..reg_count].copy_from_slice(&frame.x[..reg_count]);
@@ -86,11 +67,9 @@ fn collect_win32k_args(pid: u32, frame: &SvcFrame) -> [u64; hc::WIN32K_CALL_MAX_
 
     let spill = hc::WIN32K_CALL_MAX_ARGS - 8;
     let mut i = 0usize;
+    let args = SyscallArgs::new(frame);
     while i < spill {
-        let Some(spill_va) = frame.sp_el0.checked_add((i as u64) * 8) else {
-            break;
-        };
-        out[8 + i] = read_user_u64(pid, spill_va).unwrap_or(0);
+        out[8 + i] = args.spill_u64(i).unwrap_or(0);
         i += 1;
     }
     out
@@ -107,7 +86,7 @@ fn dispatch_win32k_hostcall(frame: &SvcFrame, nr: u16, table: u8) -> u32 {
     packet.arg_count = hc::WIN32K_CALL_MAX_ARGS as u32;
     packet.owner_pid = owner_pid;
     packet.owner_tid = crate::sched::current_tid();
-    packet.args = collect_win32k_args(owner_pid, frame);
+    packet.args = collect_win32k_args(frame);
 
     let submit = hostcall::call_sync(
         owner_pid,

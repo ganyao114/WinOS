@@ -9,10 +9,10 @@ use crate::sched::context::{
     alloc_kstack, defer_kstack_free, ensure_user_entry_continuation_locked,
     setup_idle_thread_continuation_locked,
 };
-use crate::sched::global::{with_thread, with_thread_mut, SCHED};
+use crate::sched::global::{with_thread, SCHED};
 use crate::sched::thread_control::terminate_thread_locked;
 use crate::sched::topology::set_thread_state_locked;
-use crate::sched::types::{alloc_tid, KThread, ThreadState, KERNEL_STACK_SIZE, MAX_VCPUS};
+use crate::sched::types::{KThread, ThreadState, MAX_VCPUS};
 
 // ── spawn ─────────────────────────────────────────────────────────────────────
 
@@ -38,13 +38,13 @@ pub fn spawn_locked(mut thread: KThread) -> Option<u32> {
 // ── create_user_thread ────────────────────────────────────────────────────────
 
 pub struct UserThreadParams {
-    pub pid:        u32,
-    pub entry:      u64,   // EL0 entry point (RtlUserThreadStart or similar)
-    pub stack_base: u64,   // EL0 stack top (high address)
+    pub pid: u32,
+    pub entry: u64,      // EL0 entry point (RtlUserThreadStart or similar)
+    pub stack_base: u64, // EL0 stack top (high address)
     pub stack_size: u64,
-    pub teb_va:     u64,
-    pub arg:        u64,   // x0 on entry
-    pub priority:   u8,
+    pub teb_va: u64,
+    pub arg: u64, // x0 on entry
+    pub priority: u8,
 }
 
 /// Allocate and register a new user-mode thread.
@@ -56,24 +56,25 @@ pub fn create_user_thread_locked(p: UserThreadParams) -> Option<u32> {
     let (kstack_base, kstack_size) = alloc_kstack();
 
     let mut t = KThread::new(0 /* filled by alloc_with */, p.pid);
-    t.stack_base  = p.stack_base;
-    t.stack_size  = p.stack_size;
+    t.stack_base = p.stack_base;
+    t.stack_size = p.stack_size;
     t.kstack_base = kstack_base;
     t.kstack_size = kstack_size as u64;
-    t.teb_va      = p.teb_va;
-    t.priority    = p.priority;
+    t.teb_va = p.teb_va;
+    t.priority = p.priority;
     t.base_priority = p.priority;
     t.last_vcpu_hint = 0;
 
     // Set up EL0 entry context.
-    t.ctx.pc      = p.entry;
+    t.ctx.pc = p.entry;
     // UserThreadParams::stack_base is the high-address top-of-stack.
-    t.ctx.sp      = p.stack_base;
-    t.ctx.x[0]    = p.arg;
+    t.ctx.sp = p.stack_base;
+    t.ctx.x[0] = p.arg;
     // SPSR: EL0t (0b0000), interrupts enabled.
-    t.ctx.pstate  = 0x0000_0000;
+    t.ctx.pstate = 0x0000_0000;
     // x18 = TEB (ARM64 Windows ABI).
-    t.ctx.x[18]   = p.teb_va;
+    t.ctx.x[18] = p.teb_va;
+    t.ctx.tpidr = p.teb_va;
 
     let tid = spawn_locked(t)?;
     if pid != 0 {
@@ -90,17 +91,19 @@ pub fn register_idle_thread_for_vcpu(vcpu_id: u32) -> u32 {
     let (kstack_base, kstack_size) = alloc_kstack();
 
     let store = unsafe { SCHED.threads_raw_mut() };
-    let tid = store.alloc(|id| {
-        let mut t = KThread::new(id, 0);
-        t.is_idle_thread = true;
-        t.priority       = 31; // lowest priority
-        t.base_priority  = 31;
-        t.last_vcpu_hint = vcpu_id as u8;
-        t.kstack_base    = kstack_base;
-        t.kstack_size    = kstack_size as u64;
-        t.state          = ThreadState::Ready;
-        t
-    }).expect("register_idle_thread_for_vcpu: OOM");
+    let tid = store
+        .alloc(|id| {
+            let mut t = KThread::new(id, 0);
+            t.is_idle_thread = true;
+            t.priority = 31; // lowest priority
+            t.base_priority = 31;
+            t.last_vcpu_hint = vcpu_id as u8;
+            t.kstack_base = kstack_base;
+            t.kstack_size = kstack_size as u64;
+            t.state = ThreadState::Ready;
+            t
+        })
+        .expect("register_idle_thread_for_vcpu: OOM");
 
     setup_idle_thread_continuation_locked(tid);
 
@@ -126,9 +129,8 @@ pub fn register_idle_thread_for_vcpu(vcpu_id: u32) -> u32 {
 /// Does NOT return.
 pub fn exit_thread_locked(tid: u32) -> ! {
     // Defer kstack free (still in use until context switch).
-    let (kstack_base, kstack_size) = with_thread(tid, |t| {
-        (t.kstack_base, t.kstack_size as usize)
-    }).unwrap_or((0, 0));
+    let (kstack_base, kstack_size) =
+        with_thread(tid, |t| (t.kstack_base, t.kstack_size as usize)).unwrap_or((0, 0));
 
     if kstack_base != 0 {
         defer_kstack_free(kstack_base, kstack_size);

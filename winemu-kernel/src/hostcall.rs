@@ -1,3 +1,5 @@
+use core::cell::UnsafeCell;
+
 use crate::hypercall;
 use crate::kobj::ObjectStore;
 use crate::rust_alloc::vec::Vec;
@@ -57,19 +59,27 @@ struct HostCallState {
     sync_done_heads: [u32; SYNC_DONE_BUCKETS],
 }
 
-static mut HOSTCALL_STATE: Option<HostCallState> = None;
+struct HostCallStateCell(UnsafeCell<Option<HostCallState>>);
+
+unsafe impl Sync for HostCallStateCell {}
+
+static HOSTCALL_STATE: HostCallStateCell = HostCallStateCell(UnsafeCell::new(None));
 
 fn state_mut() -> &'static mut HostCallState {
+    // SAFETY: Hostcall runtime state is a single global cell. Callers already
+    // serialize access through the existing kernel execution model; this only
+    // removes `static mut` references without changing that protocol.
     unsafe {
-        if HOSTCALL_STATE.is_none() {
-            HOSTCALL_STATE = Some(HostCallState {
+        let slot = &mut *HOSTCALL_STATE.0.get();
+        if slot.is_none() {
+            *slot = Some(HostCallState {
                 requests: ObjectStore::new(),
                 request_heads: [0u32; REQUEST_BUCKETS],
                 sync_done: ObjectStore::new(),
                 sync_done_heads: [0u32; SYNC_DONE_BUCKETS],
             });
         }
-        HOSTCALL_STATE.as_mut().unwrap()
+        slot.as_mut().unwrap()
     }
 }
 
@@ -141,7 +151,6 @@ pub fn call_sync(owner_pid: u32, args: SubmitArgs) -> Result<SubmitDone, u32> {
         }
     }
 }
-
 
 pub fn register_request(
     owner_pid: u32,
@@ -307,7 +316,6 @@ fn sync_done_remove_by_request(request_id: u64) -> Option<SyncCompletion> {
     }
     None
 }
-
 
 pub fn wait_current_for_request_pending(request_id: u64, timeout: WaitDeadline) -> u32 {
     let cur = sched::current_tid();

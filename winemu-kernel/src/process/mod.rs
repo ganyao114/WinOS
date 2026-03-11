@@ -1,19 +1,21 @@
 mod handle;
+pub mod handle_table;
 mod lifecycle;
 mod query;
 mod set;
-pub mod handle_table;
 
 use crate::kobj::ObjectStore;
+use crate::mm::UserVa;
 use core::cell::UnsafeCell;
 
 pub use handle::{current_pid, resolve_process_handle};
-pub use handle_table::{KHandleTable, KObjectRef, KObjectKind, encode_handle, decode_handle};
+pub use handle_table::{KHandleTable, KObjectKind, KObjectRef};
+pub(crate) use lifecycle::update_current_thread_stack_limit;
 pub use lifecycle::{
-    create_process, init_boot_process, last_handle_closed, on_thread_created, on_thread_terminated,
-    open_process, process_accepts_new_threads, process_exists, process_exit_status,
-    process_signaled, switch_to_thread_process, take_kernel_shutdown_exit_code,
-    terminate_process,
+    create_process, current_process_context_matches, init_boot_process, last_handle_closed,
+    on_thread_created, on_thread_terminated, open_process, process_accepts_new_threads,
+    process_exists, process_signaled, switch_to_thread_process,
+    take_kernel_shutdown_exit_code, terminate_process,
 };
 pub use query::query_information_process;
 pub use set::set_information_process;
@@ -70,7 +72,7 @@ impl KProcess {
             create_time_100ns,
             waiters: crate::sched::sync::WaitQueue::new(),
             address_space,
-            vm: ProcessVmManager::new(USER_VA_BASE, USER_VA_LIMIT),
+            vm: ProcessVmManager::new(UserVa::new(USER_VA_BASE), UserVa::new(USER_VA_LIMIT)),
             handle_table: KHandleTable::new(),
         }
     }
@@ -131,13 +133,9 @@ pub(crate) fn alloc_process(
     peb_va: u64,
     address_space: ProcessAddressSpace,
 ) -> Option<u32> {
-    crate::log::debug_u64(0xC503_0001);
     let create_time = crate::hypercall::query_mono_time_100ns();
-    crate::log::debug_u64(0xC503_0002);
     let store = process_store_mut();
-    crate::log::debug_u64(0xC503_0003);
     let (pid, ptr) = store.alloc_slot_with_id()?;
-    crate::log::debug_u64(0xC503_0004);
     unsafe {
         ptr.write(KProcess::new(
             pid,
@@ -148,7 +146,6 @@ pub(crate) fn alloc_process(
             create_time,
         ));
     }
-    crate::log::debug_u64(0xC503_0005);
     Some(pid)
 }
 
@@ -179,9 +176,7 @@ pub(crate) fn current_vcpu_pid(vcpu_id: usize) -> u32 {
     if vcpu_id >= crate::sched::MAX_VCPUS {
         return 0;
     }
-    unsafe {
-        (*PROCESS_RUNTIME.current_pid_by_vcpu.get())[vcpu_id]
-    }
+    unsafe { (*PROCESS_RUNTIME.current_pid_by_vcpu.get())[vcpu_id] }
 }
 
 pub(crate) fn for_each_process(mut f: impl FnMut(u32, &KProcess)) {

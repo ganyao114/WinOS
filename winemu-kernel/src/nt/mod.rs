@@ -18,6 +18,7 @@ pub mod sysno_table;
 pub mod system;
 pub mod thread;
 pub mod token;
+pub mod user_args;
 pub mod win32k;
 
 #[repr(C)]

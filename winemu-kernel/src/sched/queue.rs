@@ -3,19 +3,19 @@
 // Intrusive singly-linked list per priority via KThread::sched_next.
 // `present` bitmask enables O(1) highest-priority lookup.
 
-use crate::sched::types::{KThread, ThreadState};
+use crate::sched::types::KThread;
 
 pub struct KReadyQueue {
-    heads:   [u32; 32],
-    tails:   [u32; 32],
+    heads: [u32; 32],
+    tails: [u32; 32],
     present: u32, // bit i set ↔ priority i has ≥1 thread
 }
 
 impl KReadyQueue {
     pub const fn new() -> Self {
         Self {
-            heads:   [0u32; 32],
-            tails:   [0u32; 32],
+            heads: [0u32; 32],
+            tails: [0u32; 32],
             present: 0,
         }
     }

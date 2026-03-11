@@ -2,35 +2,32 @@
 //
 // All methods require the scheduler lock to be held.
 
+use crate::sched::global::with_thread;
 use crate::sched::sync::wait_queue::WaitQueue;
+use crate::sched::thread_control::{boost_thread_priority_locked, set_thread_priority_locked};
+use crate::sched::types::WaitDeadline;
 use crate::sched::wait::{
-    block_thread_locked, unblock_thread_locked,
-    STATUS_SUCCESS, STATUS_TIMEOUT, STATUS_ABANDONED_WAIT_0, STATUS_PENDING,
+    block_thread_locked, unblock_thread_locked, STATUS_ABANDONED_WAIT_0, STATUS_PENDING,
+    STATUS_SUCCESS, STATUS_TIMEOUT,
 };
-use crate::sched::global::{with_thread, with_thread_mut};
-use crate::sched::thread_control::{
-    boost_thread_priority_locked, set_thread_priority_locked,
-};
-use crate::sched::types::{ThreadState, WaitDeadline};
-use crate::sched::topology::set_thread_state_locked;
 
-pub const STATUS_MUTANT_NOT_OWNED:        u32 = 0xC000_0046;
+pub const STATUS_MUTANT_NOT_OWNED: u32 = 0xC000_0046;
 pub const STATUS_SEMAPHORE_LIMIT_EXCEEDED: u32 = 0xC000_0047;
 
 // ── KEvent ────────────────────────────────────────────────────────────────────
 
 pub struct KEvent {
-    pub signaled:   bool,
+    pub signaled: bool,
     pub auto_reset: bool,
-    pub waiters:    WaitQueue,
+    pub waiters: WaitQueue,
 }
 
 impl KEvent {
     pub const fn new(auto_reset: bool, initial_state: bool) -> Self {
         Self {
-            signaled:   initial_state,
+            signaled: initial_state,
             auto_reset,
-            waiters:    WaitQueue::new(),
+            waiters: WaitQueue::new(),
         }
     }
 
@@ -81,9 +78,9 @@ impl KEvent {
 // ── KMutex ────────────────────────────────────────────────────────────────────
 
 pub struct KMutex {
-    pub owner_tid:  u32,
-    pub recursion:  u32,
-    pub waiters:    WaitQueue,
+    pub owner_tid: u32,
+    pub recursion: u32,
+    pub waiters: WaitQueue,
     /// Priority the owner had before any inheritance boost.
     saved_owner_priority: u8,
 }
@@ -91,9 +88,9 @@ pub struct KMutex {
 impl KMutex {
     pub const fn new() -> Self {
         Self {
-            owner_tid:            0,
-            recursion:            0,
-            waiters:              WaitQueue::new(),
+            owner_tid: 0,
+            recursion: 0,
+            waiters: WaitQueue::new(),
             saved_owner_priority: 31,
         }
     }
@@ -101,10 +98,9 @@ impl KMutex {
     /// Acquire the mutex. Blocks if owned by another thread.
     pub fn acquire(&mut self, tid: u32, deadline: WaitDeadline) -> u32 {
         if self.owner_tid == 0 {
-            self.owner_tid            = tid;
-            self.recursion            = 1;
-            self.saved_owner_priority =
-                with_thread(tid, |t| t.priority).unwrap_or(8);
+            self.owner_tid = tid;
+            self.recursion = 1;
+            self.saved_owner_priority = with_thread(tid, |t| t.priority).unwrap_or(8);
             return STATUS_SUCCESS;
         }
         if self.owner_tid == tid {
@@ -113,7 +109,7 @@ impl KMutex {
         }
         // Priority inheritance: boost owner to max(owner_prio, waiter_prio).
         let waiter_prio = with_thread(tid, |t| t.priority).unwrap_or(8);
-        let owner_prio  = with_thread(self.owner_tid, |t| t.priority).unwrap_or(8);
+        let owner_prio = with_thread(self.owner_tid, |t| t.priority).unwrap_or(8);
         if waiter_prio < owner_prio {
             boost_thread_priority_locked(self.owner_tid, owner_prio - waiter_prio);
         }
@@ -139,10 +135,9 @@ impl KMutex {
         self.owner_tid = 0;
 
         if let Some(next) = self.waiters.dequeue_highest() {
-            self.owner_tid            = next;
-            self.recursion            = 1;
-            self.saved_owner_priority =
-                with_thread(next, |t| t.priority).unwrap_or(8);
+            self.owner_tid = next;
+            self.recursion = 1;
+            self.saved_owner_priority = with_thread(next, |t| t.priority).unwrap_or(8);
             unblock_thread_locked(next, STATUS_SUCCESS);
         }
         STATUS_SUCCESS
@@ -167,17 +162,17 @@ impl KMutex {
 // ── KSemaphore ────────────────────────────────────────────────────────────────
 
 pub struct KSemaphore {
-    pub count:     i32,
+    pub count: i32,
     pub max_count: i32,
-    pub waiters:   WaitQueue,
+    pub waiters: WaitQueue,
 }
 
 impl KSemaphore {
     pub const fn new(initial: i32, maximum: i32) -> Self {
         Self {
-            count:     initial,
+            count: initial,
             max_count: maximum,
-            waiters:   WaitQueue::new(),
+            waiters: WaitQueue::new(),
         }
     }
 
@@ -188,7 +183,9 @@ impl KSemaphore {
         }
         self.count += count;
         while self.count > 0 {
-            let Some(tid) = self.waiters.dequeue_highest() else { break };
+            let Some(tid) = self.waiters.dequeue_highest() else {
+                break;
+            };
             self.count -= 1;
             unblock_thread_locked(tid, STATUS_SUCCESS);
         }
