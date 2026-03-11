@@ -1,5 +1,5 @@
-use winemu_shared::status;
 use core::sync::atomic::{AtomicU32, Ordering};
+use winemu_shared::status;
 
 use super::{
     alloc_process, boot_pid, free_process, set_boot_pid, set_current_vcpu_pid, with_process,
@@ -8,6 +8,16 @@ use super::{
 
 // 0 = no shutdown request; otherwise stores (exit_code + 1).
 static KERNEL_SHUTDOWN_EXIT_CODE_PLUS1: AtomicU32 = AtomicU32::new(0);
+
+#[inline]
+fn ttbr0_root_matches(lhs: u64, rhs: u64) -> bool {
+    (lhs & !0xfff) == (rhs & !0xfff)
+}
+
+#[inline]
+fn process_ttbr0(pid: u32) -> Option<u64> {
+    with_process(pid, |p| p.address_space.ttbr0())
+}
 
 fn has_live_processes() -> bool {
     let mut live = false;
@@ -78,6 +88,16 @@ pub fn process_signaled(pid: u32) -> bool {
     with_process(pid, |p| p.state == ProcessState::Terminated).unwrap_or(false)
 }
 
+pub fn current_process_context_matches(pid: u32) -> bool {
+    if pid == 0 || super::handle::current_pid() != pid {
+        return false;
+    }
+    let Some(ttbr0) = process_ttbr0(pid) else {
+        return false;
+    };
+    ttbr0_root_matches(crate::arch::mmu::current_user_table_root(), ttbr0)
+}
+
 pub fn init_boot_process(image_base: u64, peb_va: u64) -> bool {
     let existing = boot_pid();
     if existing != 0 && process_exists(existing) {
@@ -100,7 +120,7 @@ pub fn init_boot_process(image_base: u64, peb_va: u64) -> bool {
     set_boot_pid(pid);
     set_current_vcpu_pid(0, pid);
 
-    let ttbr0 = with_process(pid, |p| p.address_space.ttbr0()).unwrap_or(0);
+    let ttbr0 = process_ttbr0(pid).unwrap_or(0);
     if ttbr0 != 0 {
         crate::mm::switch_process_ttbr0(ttbr0);
     }
@@ -109,23 +129,21 @@ pub fn init_boot_process(image_base: u64, peb_va: u64) -> bool {
 }
 
 pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> Result<u64, u32> {
-    crate::log::debug_u64(0xC502_0001);
     let Some(parent_pid) = super::resolve_process_handle(parent_handle) else {
-        crate::log::debug_u64(0xC502_E001);
         return Err(status::INVALID_HANDLE);
     };
-    crate::log::debug_u64(0xC502_0002);
 
     if section_handle != 0 {
-        use crate::process::{KObjectKind, with_process_mut};
+        use crate::process::{with_process_mut, KObjectKind};
         let ppid = super::resolve_process_handle(parent_handle).unwrap_or(0);
         let ok = with_process_mut(ppid, |p| {
-            p.handle_table.get(section_handle as u32)
+            p.handle_table
+                .get(section_handle as u32)
                 .map(|o| o.kind == KObjectKind::Section)
                 .unwrap_or(false)
-        }).unwrap_or(false);
+        })
+        .unwrap_or(false);
         if !ok {
-            crate::log::debug_u64(0xC502_E002);
             return Err(status::INVALID_HANDLE);
         }
     }
@@ -134,31 +152,27 @@ pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> R
         let child_as = ProcessAddressSpace::clone_from(&parent.address_space);
         (parent.state, parent.image_base, parent.peb_va, child_as)
     }) else {
-        crate::log::debug_u64(0xC502_E003);
         return Err(status::INVALID_HANDLE);
     };
-    crate::log::debug_u64(0xC502_0003);
 
     if state == ProcessState::Terminated || state == ProcessState::Terminating {
-        crate::log::debug_u64(0xC502_E004);
         return Err(status::INVALID_HANDLE);
     }
 
     let Some(address_space) = child_as else {
-        crate::log::debug_u64(0xC502_E005);
         return Err(status::NO_MEMORY);
     };
-    crate::log::debug_u64(0xC502_0004);
 
     let Some(pid) = alloc_process(parent_pid, image_base, peb_va, address_space) else {
-        crate::log::debug_u64(0xC502_E006);
         return Err(status::NO_MEMORY);
     };
-    crate::log::debug_u64(0xC502_0005);
 
     let _ = with_process_mut(pid, |p| p.state = ProcessState::Running);
-    if !crate::nt::state::vm_clone_external_mappings(parent_pid, pid) {
-        crate::log::debug_u64(0xC502_E008);
+    if !crate::nt::state::vm_clone_tracked_mappings(parent_pid, pid) {
+        let _ = free_process(pid);
+        return Err(status::NO_MEMORY);
+    }
+    if !crate::nt::state::vm_prepare_process_clone_cow(parent_pid, pid) {
         let _ = free_process(pid);
         return Err(status::NO_MEMORY);
     }
@@ -167,11 +181,9 @@ pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> R
         parent_pid,
         crate::process::KObjectRef::process(pid),
     ) else {
-        crate::log::debug_u64(0xC502_E007);
         let _ = free_process(pid);
         return Err(status::NO_MEMORY);
     };
-    crate::log::debug_u64(0xC502_0006);
 
     Ok(handle)
 }
@@ -246,13 +258,13 @@ pub fn switch_to_thread_process(tid: u32) {
     if pid == 0 {
         return;
     }
-    let Some(ttbr0) = with_process(pid, |p| p.address_space.ttbr0()) else {
+    let Some(ttbr0) = process_ttbr0(pid) else {
         return;
     };
 
     let vid = (crate::sched::vcpu_id() as usize).min(crate::sched::MAX_VCPUS - 1);
-    let cur_pid = super::current_vcpu_pid(vid);
-    if cur_pid == pid {
+    if ttbr0_root_matches(crate::arch::mmu::current_user_table_root(), ttbr0) {
+        set_current_vcpu_pid(vid, pid);
         return;
     }
 

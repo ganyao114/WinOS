@@ -4,10 +4,10 @@
 ///   - O(log n) 地址查找
 ///   - 自动 split/merge（支持 VirtualProtect 跨区边界）
 ///   - NT 完整语义：Reserve / Commit / Decommit / Release / Protect / Guard / COW
-
 use crate::mm::areaset::{AreaEntry, AreaSeg, AreaSet};
 use crate::mm::range::Range;
 use crate::mm::vm_area::{VmArea, VmKind, PAGE_SIZE};
+use crate::mm::{PhysAddr, UserVa};
 use crate::process::ProcessAddressSpace;
 use crate::rust_alloc::vec::Vec;
 use winemu_shared::status;
@@ -43,11 +43,8 @@ pub enum VmaType {
 
 pub(crate) fn vm_kind_from_vma_type(t: VmaType) -> VmKind {
     match t {
-        VmaType::Private
-        | VmaType::Kernel
-        | VmaType::ExeImage
-        | VmaType::DllImage
-        | VmaType::PageTable => VmKind::Private,
+        VmaType::Private | VmaType::Kernel | VmaType::PageTable => VmKind::Private,
+        VmaType::ExeImage | VmaType::DllImage => VmKind::Image,
         VmaType::Section | VmaType::FileMapped => VmKind::Section,
         VmaType::ThreadStack => VmKind::ThreadStack,
     }
@@ -57,13 +54,19 @@ pub(crate) fn vm_kind_from_vma_type(t: VmaType) -> VmKind {
 
 #[derive(Clone, Copy)]
 pub(crate) struct VmQueryInfo {
-    pub(crate) base: u64,
+    pub(crate) base: UserVa,
     pub(crate) size: u64,
-    pub(crate) allocation_base: u64,
+    pub(crate) allocation_base: UserVa,
     pub(crate) allocation_prot: u32,
     pub(crate) prot: u32,
     pub(crate) state: u32,
     pub(crate) mem_type: u32,
+}
+
+#[derive(Clone)]
+pub(crate) struct TrackedAreaSnapshot {
+    pub(crate) range: Range,
+    pub(crate) area: VmArea,
 }
 
 // ─── NT 保护属性工具 ──────────────────────────────────────────────────────────
@@ -80,12 +83,12 @@ pub(crate) fn vm_sanitize_nt_prot(prot: u32) -> u32 {
 
 pub(crate) fn vm_decode_nt_prot(prot: u32) -> (bool, bool, bool) {
     match prot & 0xFF {
-        0x01 => (false, false, false), // PAGE_NOACCESS
-        0x02 => (true, false, false),  // PAGE_READONLY
-        0x04 => (true, true, false),   // PAGE_READWRITE
-        0x08 => (true, false, false),  // PAGE_WRITECOPY → RO until COW
-        0x10 => (false, false, true),  // PAGE_EXECUTE
-        0x20 => (true, false, true),   // PAGE_EXECUTE_READ
+        0x01 => (false, false, false),      // PAGE_NOACCESS
+        0x02 => (true, false, false),       // PAGE_READONLY
+        0x04 => (true, true, false),        // PAGE_READWRITE
+        0x08 => (true, false, false),       // PAGE_WRITECOPY → RO until COW
+        0x10 => (false, false, true),       // PAGE_EXECUTE
+        0x20 => (true, false, true),        // PAGE_EXECUTE_READ
         0x40 | 0x80 => (true, false, true), // W^X: RX
         _ => (true, true, false),
     }
@@ -116,8 +119,19 @@ fn vm_promote_cow_prot(prot: u32) -> u32 {
     }
 }
 
+pub(crate) fn vm_clone_shared_nt_prot(prot: u32) -> u32 {
+    match vm_sanitize_nt_prot(prot) & 0xFF {
+        0x04 => (prot & !0xFF) | PAGE_WRITECOPY,
+        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY => {
+            (prot & !0xFF) | PAGE_EXECUTE_WRITECOPY
+        }
+        _ => prot,
+    }
+}
+
 fn vm_region_mem_type(area: &VmArea) -> u32 {
     match area.kind {
+        VmKind::Image => MEM_IMAGE_TYPE,
         VmKind::Section => {
             if area.section_is_image {
                 MEM_IMAGE_TYPE
@@ -131,7 +145,7 @@ fn vm_region_mem_type(area: &VmArea) -> u32 {
 
 // ─── 按页填充 section 数据 ────────────────────────────────────────────────────
 
-fn vm_fill_section_page(area: &VmArea, idx: usize, gpa: u64) -> bool {
+fn vm_fill_section_page(area: &VmArea, idx: usize, pa: PhysAddr) -> bool {
     if !area.section_file_backed {
         return true;
     }
@@ -142,25 +156,27 @@ fn vm_fill_section_page(area: &VmArea, idx: usize, gpa: u64) -> bool {
     let remain = area.section_view_size - page_off;
     let read_len = PAGE_SIZE.min(remain) as usize;
     let file_off = area.section_file_offset.saturating_add(page_off);
-    let read =
-        crate::hypercall::host_read(area.section_file_fd, gpa as *mut u8, read_len, file_off);
+    let read = crate::hypercall::host_read_phys(area.section_file_fd, pa, read_len, file_off);
     if read < read_len {
-        phys_memset(gpa.saturating_add(read as u64), 0, read_len - read);
+        let Some(zero_pa) = pa.checked_add(read as u64) else {
+            return false;
+        };
+        phys_memset(zero_pa, 0, read_len - read);
     }
     true
 }
 
 #[inline]
-fn phys_memset(gpa: u64, value: u8, len: usize) {
-    if !crate::mm::physmap::memset_gpa(gpa, value, len) {
-        let _ = crate::hypercall::host_memset(gpa, len, value);
+fn phys_memset(pa: PhysAddr, value: u8, len: usize) {
+    if !crate::mm::linear_map::memset_phys(pa, value, len) {
+        let _ = crate::hypercall::host_memset(pa.get(), len, value);
     }
 }
 
 #[inline]
-fn phys_memcpy(dst_gpa: u64, src_gpa: u64, len: usize) {
-    if !crate::mm::physmap::copy_gpa(dst_gpa, src_gpa, len) {
-        let _ = crate::hypercall::host_memcpy(dst_gpa, src_gpa, len);
+fn phys_memcpy(dst_pa: PhysAddr, src_pa: PhysAddr, len: usize) {
+    if !crate::mm::linear_map::copy_phys(dst_pa, src_pa, len) {
+        let _ = crate::hypercall::host_memcpy(dst_pa.get(), src_pa.get(), len);
     }
 }
 
@@ -171,9 +187,9 @@ pub struct ProcessVmManager {
 }
 
 impl ProcessVmManager {
-    pub fn new(base: u64, limit: u64) -> Self {
+    pub fn new(base: UserVa, limit: UserVa) -> Self {
         Self {
-            areas: AreaSet::new(base, limit.saturating_sub(base)),
+            areas: AreaSet::new(base.get(), limit.get().saturating_sub(base.get())),
         }
     }
 
@@ -281,7 +297,7 @@ impl ProcessVmManager {
 
         for i in 0..page_count {
             let idx = start_idx + i;
-            let va = r.start + (idx as u64) * PAGE_SIZE;
+            let va = UserVa::new(r.start + (idx as u64) * PAGE_SIZE);
             {
                 let area = seg.value_mut();
                 if idx < area.prot_pages.len() {
@@ -290,11 +306,11 @@ impl ProcessVmManager {
                 area.set_page_committed(idx, true);
             }
             if eager {
-                let gpa = seg.value().phys_pages.get(idx).copied().unwrap_or(0);
-                if gpa == 0 {
+                let pa = seg.value().phys_page(idx);
+                if pa.is_null() {
                     if !self.map_new_page_at(aspace, &seg, idx, va, prot) {
                         for rb in start_idx..idx {
-                            let rb_va = r.start + (rb as u64) * PAGE_SIZE;
+                            let rb_va = UserVa::new(r.start + (rb as u64) * PAGE_SIZE);
                             self.unmap_free_page_at(aspace, &seg, rb, rb_va);
                             seg.value_mut().set_page_committed(rb, false);
                         }
@@ -333,7 +349,7 @@ impl ProcessVmManager {
         let page_count = (size / PAGE_SIZE) as usize;
         for i in 0..page_count {
             let idx = start_idx + i;
-            let va = r.start + (idx as u64) * PAGE_SIZE;
+            let va = UserVa::new(r.start + (idx as u64) * PAGE_SIZE);
             self.unmap_free_page_at(aspace, &seg, idx, va);
             seg.value_mut().set_page_committed(idx, false);
         }
@@ -378,7 +394,12 @@ impl ProcessVmManager {
         true
     }
 
-    pub fn release_region(&mut self, aspace: &mut ProcessAddressSpace, pid: u32, base: u64) -> bool {
+    pub fn release_region(
+        &mut self,
+        aspace: &mut ProcessAddressSpace,
+        pid: u32,
+        base: u64,
+    ) -> bool {
         let _ = pid;
         let seg = self.areas.find_seg(base);
         if !seg.ok() || seg.range().start != base {
@@ -419,7 +440,12 @@ impl ProcessVmManager {
             return Err(status::NO_MEMORY);
         }
         for i in 0..page_count {
-            let pv = iso.value().prot_pages.get(i).copied().unwrap_or(iso.value().default_prot);
+            let pv = iso
+                .value()
+                .prot_pages
+                .get(i)
+                .copied()
+                .unwrap_or(iso.value().default_prot);
             old_prots.push(pv);
         }
         let old_first = old_prots.first().copied().unwrap_or(0);
@@ -437,8 +463,10 @@ impl ProcessVmManager {
                         area.prot_pages[i] = new_prot;
                     }
                 }
-                let gpa = iso.value().phys_pages.get(i).copied().unwrap_or(0);
-                if gpa != 0 && !aspace.protect_user_range(va, PAGE_SIZE, new_prot) {
+                let pa = iso.value().phys_page(i);
+                if !pa.is_null()
+                    && !aspace.protect_user_range(UserVa::new(va), PAGE_SIZE, new_prot)
+                {
                     self.rollback_prot(aspace, &iso, 0, i, &old_prots);
                     return Err(status::INVALID_PARAMETER);
                 }
@@ -455,17 +483,17 @@ impl ProcessVmManager {
         &mut self,
         aspace: &mut ProcessAddressSpace,
         pid: u32,
-        fault_va: u64,
+        fault_va: UserVa,
         access: u8,
     ) -> bool {
         let _ = pid;
-        let page_va = fault_va & !(PAGE_SIZE - 1);
-        let seg = self.areas.find_seg(page_va);
+        let page_va = UserVa::new(fault_va.get() & !(PAGE_SIZE - 1));
+        let seg = self.areas.find_seg(page_va.get());
         if !seg.ok() {
             return false;
         }
         let r = seg.range();
-        let idx = ((page_va - r.start) / PAGE_SIZE) as usize;
+        let idx = ((page_va.get() - r.start) / PAGE_SIZE) as usize;
         if !seg.value().is_page_committed(idx) {
             return false;
         }
@@ -492,35 +520,31 @@ impl ProcessVmManager {
             return false;
         }
 
-        let gpa = seg.value().phys_pages.get(idx).copied().unwrap_or(0);
-        if gpa != 0 {
-            let mapped = aspace.map_user_range(page_va, gpa, PAGE_SIZE, prot);
+        let pa = seg.value().phys_page(idx);
+        if !pa.is_null() {
+            let mapped = aspace.map_user_range(page_va, pa, PAGE_SIZE, prot);
             if mapped && had_guard && seg.value().kind == VmKind::ThreadStack {
                 self.on_thread_stack_guard_hit(aspace, pid, &seg, idx, page_va);
             }
             return mapped;
         }
 
-        let Some(new_gpa) = crate::mm::phys::alloc_pages(1) else {
+        let Some(new_pa) = crate::mm::phys::alloc_pages(1) else {
             return false;
         };
-        phys_memset(new_gpa, 0, PAGE_SIZE as usize);
-        if seg.value().kind == VmKind::Section
-            && !vm_fill_section_page(seg.value(), idx, new_gpa)
-        {
-            crate::mm::phys::free_pages(new_gpa, 1);
+        phys_memset(new_pa, 0, PAGE_SIZE as usize);
+        if seg.value().kind == VmKind::Section && !vm_fill_section_page(seg.value(), idx, new_pa) {
+            crate::mm::phys::free_pages(new_pa, 1);
             return false;
         }
-        if !aspace.map_user_range(page_va, new_gpa, PAGE_SIZE, prot) {
-            crate::mm::phys::free_pages(new_gpa, 1);
+        if !aspace.map_user_range(page_va, new_pa, PAGE_SIZE, prot) {
+            crate::mm::phys::free_pages(new_pa, 1);
             return false;
         }
-        crate::nt::state::vm_phys_page_add_ref(new_gpa);
+        crate::nt::state::vm_phys_page_add_ref(new_pa);
         {
             let a = seg.value_mut();
-            if idx < a.phys_pages.len() {
-                a.phys_pages[idx] = new_gpa;
-            }
+            a.set_phys_page(idx, new_pa);
         }
         if had_guard && seg.value().kind == VmKind::ThreadStack {
             self.on_thread_stack_guard_hit(aspace, pid, &seg, idx, page_va);
@@ -530,8 +554,8 @@ impl ProcessVmManager {
 
     // ── VirtualQuery ─────────────────────────────────────────────────────────
 
-    pub fn query(&self, addr: u64) -> Option<VmQueryInfo> {
-        let page_addr = addr & !(PAGE_SIZE - 1);
+    pub fn query(&self, addr: UserVa) -> Option<VmQueryInfo> {
+        let page_addr = addr.get() & !(PAGE_SIZE - 1);
         let user_access_base = crate::process::USER_ACCESS_BASE;
         let user_va_base = crate::process::USER_VA_BASE;
         let user_va_limit = crate::process::USER_VA_LIMIT;
@@ -549,7 +573,11 @@ impl ProcessVmManager {
                 return None;
             }
             let committed = area.is_page_committed(idx);
-            let prot = area.prot_pages.get(idx).copied().unwrap_or(area.default_prot);
+            let prot = area
+                .prot_pages
+                .get(idx)
+                .copied()
+                .unwrap_or(area.default_prot);
             let state = if committed { MEM_COMMIT } else { MEM_RESERVE };
 
             let mut start = idx;
@@ -560,7 +588,11 @@ impl ProcessVmManager {
                     break;
                 }
                 if committed {
-                    let pp = area.prot_pages.get(prev).copied().unwrap_or(area.default_prot);
+                    let pp = area
+                        .prot_pages
+                        .get(prev)
+                        .copied()
+                        .unwrap_or(area.default_prot);
                     if pp != prot {
                         break;
                     }
@@ -574,7 +606,11 @@ impl ProcessVmManager {
                     break;
                 }
                 if committed {
-                    let np = area.prot_pages.get(end).copied().unwrap_or(area.default_prot);
+                    let np = area
+                        .prot_pages
+                        .get(end)
+                        .copied()
+                        .unwrap_or(area.default_prot);
                     if np != prot {
                         break;
                     }
@@ -582,9 +618,9 @@ impl ProcessVmManager {
                 end += 1;
             }
             return Some(VmQueryInfo {
-                base: r.start + (start as u64) * PAGE_SIZE,
+                base: UserVa::new(r.start + (start as u64) * PAGE_SIZE),
                 size: ((end - start) as u64) * PAGE_SIZE,
-                allocation_base: area.alloc_base,
+                allocation_base: UserVa::new(area.alloc_base),
                 allocation_prot: area.default_prot,
                 prot: if committed { prot } else { 0 },
                 state,
@@ -605,9 +641,9 @@ impl ProcessVmManager {
             return None;
         }
         Some(VmQueryInfo {
-            base: gr.start,
+            base: UserVa::new(gr.start),
             size: gr.len,
-            allocation_base: 0,
+            allocation_base: UserVa::new(0),
             allocation_prot: 0,
             prot: 0,
             state: MEM_FREE,
@@ -617,21 +653,13 @@ impl ProcessVmManager {
 
     // ── 文件映射 ─────────────────────────────────────────────────────────────
 
-    pub fn track_file_mapping(
-        &mut self,
-        pid: u32,
-        base: u64,
-        size: u64,
-        prot: u32,
-    ) -> bool {
+    pub fn track_file_mapping(&mut self, pid: u32, base: u64, size: u64, prot: u32) -> bool {
         let prot = vm_sanitize_nt_prot(prot);
         // 已有同 base 的区域
         let existing = self.areas.find_seg(base);
         if existing.ok() && existing.range().start == base {
             let area = existing.value_mut();
-            if !area.owns_phys_pages
-                && area.page_count() == (size / PAGE_SIZE) as usize
-            {
+            if area.page_count() == (size / PAGE_SIZE) as usize {
                 area.default_prot = prot;
                 for p in area.prot_pages.iter_mut() {
                     *p = prot;
@@ -657,24 +685,24 @@ impl ProcessVmManager {
         let r = Range::new(base, size);
         let seg = self.areas.insert_without_merging(&gap, &r, area);
 
-        // 从当前页表翻译 GPA
+        // 从当前页表翻译物理页地址，并记录页基址。
         for i in 0..page_count {
             let va = base + (i as u64) * PAGE_SIZE;
-            let gpa = crate::process::with_process(pid, |p| {
+            let pa = crate::process::with_process(pid, |p| {
                 p.address_space
-                    .translate_user_va_for_access(va, crate::nt::state::VM_ACCESS_READ)
+                    .translate_user_va_for_access(UserVa::new(va), crate::nt::state::VM_ACCESS_READ)
             })
             .flatten()
-            .map(|pa| pa & !(PAGE_SIZE - 1))
-            .unwrap_or(0);
-            if gpa == 0 {
+            .map(|pa| pa.page_base(PAGE_SIZE))
+            .unwrap_or_default();
+            if pa.is_null() {
                 let _ = self.areas.remove(&seg);
                 return false;
             }
             {
                 let a = seg.value_mut();
-                if i < a.phys_pages.len() {
-                    a.phys_pages[i] = gpa;
+                a.set_phys_page(i, pa);
+                if i < a.prot_pages.len() {
                     a.prot_pages[i] = prot;
                 }
                 a.set_page_committed(i, true);
@@ -696,6 +724,48 @@ impl ProcessVmManager {
             seg = seg.next_seg();
         }
         out
+    }
+
+    pub fn collect_tracked_areas(&self) -> Vec<TrackedAreaSnapshot> {
+        let mut out = Vec::new();
+        let mut seg = self.areas.first_seg();
+        while seg.ok() {
+            let _ = out.try_reserve(1);
+            out.push(TrackedAreaSnapshot {
+                range: seg.range(),
+                area: seg.value().clone(),
+            });
+            seg = seg.next_seg();
+        }
+        out
+    }
+
+    pub fn install_tracked_areas(&mut self, areas: &[TrackedAreaSnapshot]) -> bool {
+        if !self.areas.is_empty() {
+            return false;
+        }
+        for snapshot in areas {
+            let gap = self.areas.find_gap(snapshot.range.start);
+            if !gap.ok() {
+                return false;
+            }
+            let gap_range = gap.range();
+            if gap_range.start > snapshot.range.start || gap_range.end() < snapshot.range.end() {
+                return false;
+            }
+            let area = snapshot.area.clone();
+            if area.owns_phys_pages {
+                for pa in area.phys_pages.iter().copied() {
+                    if !pa.is_null() {
+                        crate::nt::state::vm_phys_page_add_ref(pa);
+                    }
+                }
+            }
+            let _ = self
+                .areas
+                .insert_without_merging(&gap, &snapshot.range, area);
+        }
+        true
     }
 
     // ── Section 元信息 ────────────────────────────────────────────────────────
@@ -749,9 +819,9 @@ impl ProcessVmManager {
         }
         let page_count = (r.len / PAGE_SIZE) as usize;
         for i in 0..page_count {
-            let gpa = seg.value().phys_pages.get(i).copied().unwrap_or(0);
-            if gpa != 0 {
-                let va = r.start + (i as u64) * PAGE_SIZE;
+            let pa = seg.value().phys_page(i);
+            if !pa.is_null() {
+                let va = UserVa::new(r.start + (i as u64) * PAGE_SIZE);
                 if !aspace.protect_user_range(va, PAGE_SIZE, prot) {
                     return false;
                 }
@@ -769,13 +839,13 @@ impl ProcessVmManager {
         page_va: u64,
     ) -> bool {
         let _ = pid;
-        let page_va = page_va & !(PAGE_SIZE - 1);
-        let seg = self.areas.find_seg(page_va);
+        let page_va = UserVa::new(page_va & !(PAGE_SIZE - 1));
+        let seg = self.areas.find_seg(page_va.get());
         if !seg.ok() {
             return false;
         }
         let r = seg.range();
-        let idx = ((page_va - r.start) / PAGE_SIZE) as usize;
+        let idx = ((page_va.get() - r.start) / PAGE_SIZE) as usize;
         if !seg.value().is_page_committed(idx) {
             return false;
         }
@@ -818,12 +888,12 @@ impl ProcessVmManager {
         let owns = seg.value().owns_phys_pages;
         let page_count = seg.value().page_count();
         for i in 0..page_count {
-            let va = r.start + (i as u64) * PAGE_SIZE;
-            let gpa = seg.value().phys_pages.get(i).copied().unwrap_or(0);
-            if gpa != 0 {
+            let va = UserVa::new(r.start + (i as u64) * PAGE_SIZE);
+            let pa = seg.value().phys_page(i);
+            if !pa.is_null() {
                 let _ = aspace.unmap_user_range(va, PAGE_SIZE);
                 if owns {
-                    crate::nt::state::vm_phys_page_release(gpa);
+                    crate::nt::state::vm_phys_page_release(pa);
                 }
             }
         }
@@ -834,28 +904,24 @@ impl ProcessVmManager {
         aspace: &mut ProcessAddressSpace,
         seg: &AreaSeg<VmArea>,
         idx: usize,
-        va: u64,
+        va: UserVa,
         prot: u32,
     ) -> bool {
-        let Some(gpa) = crate::mm::phys::alloc_pages(1) else {
+        let Some(pa) = crate::mm::phys::alloc_pages(1) else {
             return false;
         };
-        phys_memset(gpa, 0, PAGE_SIZE as usize);
-        if seg.value().kind == VmKind::Section
-            && !vm_fill_section_page(seg.value(), idx, gpa)
-        {
-            crate::mm::phys::free_pages(gpa, 1);
+        phys_memset(pa, 0, PAGE_SIZE as usize);
+        if seg.value().kind == VmKind::Section && !vm_fill_section_page(seg.value(), idx, pa) {
+            crate::mm::phys::free_pages(pa, 1);
             return false;
         }
-        if !aspace.map_user_range(va, gpa, PAGE_SIZE, prot) {
-            crate::mm::phys::free_pages(gpa, 1);
+        if !aspace.map_user_range(va, pa, PAGE_SIZE, prot) {
+            crate::mm::phys::free_pages(pa, 1);
             return false;
         }
-        crate::nt::state::vm_phys_page_add_ref(gpa);
+        crate::nt::state::vm_phys_page_add_ref(pa);
         let area = seg.value_mut();
-        if idx < area.phys_pages.len() {
-            area.phys_pages[idx] = gpa;
-        }
+        area.set_phys_page(idx, pa);
         true
     }
 
@@ -864,20 +930,18 @@ impl ProcessVmManager {
         aspace: &mut ProcessAddressSpace,
         seg: &AreaSeg<VmArea>,
         idx: usize,
-        va: u64,
+        va: UserVa,
     ) {
-        let gpa = seg.value().phys_pages.get(idx).copied().unwrap_or(0);
-        if gpa == 0 {
+        let pa = seg.value().phys_page(idx);
+        if pa.is_null() {
             return;
         }
         let _ = aspace.unmap_user_range(va, PAGE_SIZE);
         if seg.value().owns_phys_pages {
-            crate::nt::state::vm_phys_page_release(gpa);
+            crate::nt::state::vm_phys_page_release(pa);
         }
         let area = seg.value_mut();
-        if idx < area.phys_pages.len() {
-            area.phys_pages[idx] = 0;
-        }
+        area.set_phys_page(idx, PhysAddr::default());
     }
 
     fn rollback_prot(
@@ -899,9 +963,9 @@ impl ProcessVmManager {
                     area.prot_pages[i] = old_prots[i];
                 }
             }
-            let gpa = seg.value().phys_pages.get(i).copied().unwrap_or(0);
-            if gpa != 0 {
-                let va = r.start + (i as u64) * PAGE_SIZE;
+            let pa = seg.value().phys_page(i);
+            if !pa.is_null() {
+                let va = UserVa::new(r.start + (i as u64) * PAGE_SIZE);
                 let _ = aspace.protect_user_range(va, PAGE_SIZE, old_prots[i]);
             }
         }
@@ -912,38 +976,36 @@ impl ProcessVmManager {
         aspace: &mut ProcessAddressSpace,
         seg: &AreaSeg<VmArea>,
         idx: usize,
-        page_va: u64,
+        page_va: UserVa,
         prot: u32,
     ) -> bool {
-        let old_gpa = seg.value().phys_pages.get(idx).copied().unwrap_or(0);
-        let Some(new_gpa) = crate::mm::phys::alloc_pages(1) else {
+        let old_pa = seg.value().phys_page(idx);
+        let Some(new_pa) = crate::mm::phys::alloc_pages(1) else {
             return false;
         };
-        if old_gpa != 0 {
-            phys_memcpy(new_gpa, old_gpa, PAGE_SIZE as usize);
+        if !old_pa.is_null() {
+            phys_memcpy(new_pa, old_pa, PAGE_SIZE as usize);
         } else {
-            phys_memset(new_gpa, 0, PAGE_SIZE as usize);
+            phys_memset(new_pa, 0, PAGE_SIZE as usize);
             if seg.value().kind == VmKind::Section
-                && !vm_fill_section_page(seg.value(), idx, new_gpa)
+                && !vm_fill_section_page(seg.value(), idx, new_pa)
             {
-                crate::mm::phys::free_pages(new_gpa, 1);
+                crate::mm::phys::free_pages(new_pa, 1);
                 return false;
             }
         }
         let promoted = vm_promote_cow_prot(prot);
-        if !aspace.map_user_range(page_va, new_gpa, PAGE_SIZE, promoted) {
-            crate::mm::phys::free_pages(new_gpa, 1);
+        if !aspace.map_user_range(page_va, new_pa, PAGE_SIZE, promoted) {
+            crate::mm::phys::free_pages(new_pa, 1);
             return false;
         }
-        crate::nt::state::vm_phys_page_add_ref(new_gpa);
-        if old_gpa != 0 {
-            crate::nt::state::vm_phys_page_release(old_gpa);
+        crate::nt::state::vm_phys_page_add_ref(new_pa);
+        if !old_pa.is_null() {
+            crate::nt::state::vm_phys_page_release(old_pa);
         }
         {
             let a = seg.value_mut();
-            if idx < a.phys_pages.len() {
-                a.phys_pages[idx] = new_gpa;
-            }
+            a.set_phys_page(idx, new_pa);
             if idx < a.prot_pages.len() {
                 a.prot_pages[idx] = promoted;
             }
@@ -957,9 +1019,9 @@ impl ProcessVmManager {
         pid: u32,
         seg: &AreaSeg<VmArea>,
         idx: usize,
-        page_va: u64,
+        page_va: UserVa,
     ) {
-        crate::nt::state::vm_update_current_thread_stack_limit(pid, page_va);
+        crate::nt::state::vm_update_current_thread_stack_limit(pid, page_va.get());
         if idx == 0 {
             return;
         }
@@ -967,10 +1029,14 @@ impl ProcessVmManager {
         if !seg.value().is_page_committed(next_idx) {
             return;
         }
-        let next_va = seg.range().start + (next_idx as u64) * PAGE_SIZE;
+        let next_va = UserVa::new(seg.range().start + (next_idx as u64) * PAGE_SIZE);
         let next_prot = {
             let a = seg.value();
-            let p = a.prot_pages.get(next_idx).copied().unwrap_or(a.default_prot);
+            let p = a
+                .prot_pages
+                .get(next_idx)
+                .copied()
+                .unwrap_or(a.default_prot);
             vm_sanitize_nt_prot(p) & !PAGE_GUARD
         };
         {

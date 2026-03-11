@@ -1,7 +1,11 @@
 use crate::hypercall;
 use crate::kobj::ObjectStore;
-use crate::mm::vaspace::{vm_kind_from_vma_type, vm_sanitize_nt_prot, VmaType};
+use crate::mm::vaspace::{
+    vm_clone_shared_nt_prot, vm_kind_from_vma_type, vm_sanitize_nt_prot, TrackedAreaSnapshot,
+    VmaType,
+};
 use crate::mm::vm_area::VmKind;
+use crate::mm::PhysAddr;
 use crate::rust_alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
@@ -27,7 +31,7 @@ pub(crate) struct GuestSection {
 
 #[derive(Clone, Copy)]
 struct PhysPageRef {
-    gpa: u64,
+    pa: PhysAddr,
     refs: u32,
 }
 
@@ -106,14 +110,14 @@ fn page_refs_store_mut() -> &'static mut ObjectStore<PhysPageRef> {
 
 // ─── 物理页引用计数（供 mm::vaspace 调用）────────────────────────────────────
 
-pub(crate) fn vm_phys_page_add_ref(gpa: u64) {
-    if gpa == 0 {
+pub(crate) fn vm_phys_page_add_ref(pa: PhysAddr) {
+    if pa.is_null() {
         return;
     }
     let store = page_refs_store_mut();
     let mut found = 0u32;
     store.for_each_live_ptr(|id, ptr| unsafe {
-        if (*ptr).gpa == gpa {
+        if (*ptr).pa == pa {
             found = id;
         }
     });
@@ -126,25 +130,25 @@ pub(crate) fn vm_phys_page_add_ref(gpa: u64) {
         }
         return;
     }
-    let _ = store.alloc_with(|_| PhysPageRef { gpa, refs: 1 });
+    let _ = store.alloc_with(|_| PhysPageRef { pa, refs: 1 });
 }
 
-pub(crate) fn vm_phys_page_release(gpa: u64) {
-    if gpa == 0 {
+pub(crate) fn vm_phys_page_release(pa: PhysAddr) {
+    if pa.is_null() {
         return;
     }
     let store = page_refs_store_mut();
     let mut found = 0u32;
     let mut refs = 0u32;
     store.for_each_live_ptr(|id, ptr| unsafe {
-        if (*ptr).gpa == gpa {
+        if (*ptr).pa == pa {
             found = id;
             refs = (*ptr).refs;
         }
     });
 
     if found == 0 {
-        crate::mm::phys::free_pages(gpa, 1);
+        crate::mm::phys::free_pages(pa, 1);
         return;
     }
 
@@ -159,7 +163,7 @@ pub(crate) fn vm_phys_page_release(gpa: u64) {
     }
 
     let _ = store.free(found);
-    crate::mm::phys::free_pages(gpa, 1);
+    crate::mm::phys::free_pages(pa, 1);
 }
 
 // ─── 线程栈 limit 更新（供 mm::vaspace 调用）─────────────────────────────────
@@ -169,13 +173,13 @@ pub(crate) fn vm_update_current_thread_stack_limit(owner_pid: u32, new_limit: u6
     if tid == 0 || !crate::sched::thread_exists(tid) {
         return;
     }
-    let teb_va = crate::sched::with_thread(tid, |t| if t.pid == owner_pid { t.teb_va } else { 0 }).unwrap_or(0);
+    let teb_va = crate::sched::with_thread(tid, |t| if t.pid == owner_pid { t.teb_va } else { 0 })
+        .unwrap_or(0);
     if teb_va == 0 {
         return;
     }
-    unsafe {
-        ((teb_va + winemu_shared::teb::STACK_LIMIT as u64) as *mut u64).write_volatile(new_limit);
-    }
+    let user_ptr = (teb_va + winemu_shared::teb::STACK_LIMIT as u64) as *mut u64;
+    let _ = crate::mm::usercopy::write_user_value(owner_pid, user_ptr, new_limit);
 }
 
 // ─── VM 公共接口（thin wrappers → p.vm.*）────────────────────────────────────
@@ -228,9 +232,10 @@ pub(crate) fn vm_debug_find_region_any(addr: u64) -> Option<(u32, u64, u64, u8)>
             let r = seg.range();
             let kind_byte: u8 = match seg.value().kind {
                 VmKind::Private => 1,
-                VmKind::Section => 2,
-                VmKind::ThreadStack => 3,
-                VmKind::Other => 4,
+                VmKind::Image => 2,
+                VmKind::Section => 3,
+                VmKind::ThreadStack => 4,
+                VmKind::Other => 5,
             };
             out = Some((pid, r.start, r.len, kind_byte));
         }
@@ -276,21 +281,59 @@ pub(crate) fn vm_track_existing_file_mapping(
     .unwrap_or(false)
 }
 
-pub(crate) fn vm_clone_external_mappings(src_pid: u32, dst_pid: u32) -> bool {
+pub(crate) fn vm_clone_tracked_mappings(src_pid: u32, dst_pid: u32) -> bool {
     if src_pid == 0 || dst_pid == 0 {
         return false;
     }
-    // Collect file mappings from src (non-owning, i.e. external)
-    let mappings: Vec<(u64, u64, u32)> = crate::process::with_process(src_pid, |p| {
-        p.vm.collect_file_mappings()
+    let mappings: Vec<TrackedAreaSnapshot> =
+        crate::process::with_process(src_pid, |p| p.vm.collect_tracked_areas()).unwrap_or_default();
+    crate::process::with_process_mut(dst_pid, |p| p.vm.install_tracked_areas(&mappings))
+        .unwrap_or(false)
+}
+
+pub(crate) fn vm_prepare_process_clone_cow(src_pid: u32, dst_pid: u32) -> bool {
+    if src_pid == 0 || dst_pid == 0 {
+        return false;
+    }
+
+    let shared_writable_pages: Vec<(u64, u32)> = crate::process::with_process(src_pid, |p| {
+        let mut out = Vec::new();
+        let areas = p.vm.collect_tracked_areas();
+        for snapshot in areas {
+            let area = snapshot.area;
+            if !area.owns_phys_pages {
+                continue;
+            }
+            for (idx, pa) in area.phys_pages.iter().copied().enumerate() {
+                if pa.is_null() || !area.is_page_committed(idx) {
+                    continue;
+                }
+                let prot = area
+                    .prot_pages
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(area.default_prot);
+                let cow_prot = vm_clone_shared_nt_prot(prot);
+                if cow_prot == prot {
+                    continue;
+                }
+                let _ = out.try_reserve(1);
+                out.push((snapshot.range.start + (idx as u64) * PAGE_SIZE_4K, cow_prot));
+            }
+        }
+        out
     })
     .unwrap_or_default();
 
-    for (base, size, prot) in mappings {
-        if !vm_track_existing_file_mapping(dst_pid, base, size, prot) {
+    for (va, cow_prot) in shared_writable_pages {
+        if vm_protect_range(src_pid, va, PAGE_SIZE_4K, cow_prot).is_err() {
+            return false;
+        }
+        if vm_protect_range(dst_pid, va, PAGE_SIZE_4K, cow_prot).is_err() {
             return false;
         }
     }
+
     true
 }
 
@@ -336,7 +379,11 @@ pub(crate) fn vm_commit_private(owner_pid: u32, base: u64, size: u64, prot: u32)
         vm.commit_pages(aspace, owner_pid, base, size, prot, false)
     })
     .unwrap_or(false);
-    if ok { status::SUCCESS } else { status::NO_MEMORY }
+    if ok {
+        status::SUCCESS
+    } else {
+        status::NO_MEMORY
+    }
 }
 
 pub(crate) fn vm_decommit_private(owner_pid: u32, base: u64, size: u64) -> u32 {
@@ -357,7 +404,11 @@ pub(crate) fn vm_decommit_private(owner_pid: u32, base: u64, size: u64) -> u32 {
         vm.decommit_pages(aspace, owner_pid, base, size)
     })
     .unwrap_or(false);
-    if ok { status::SUCCESS } else { status::INVALID_PARAMETER }
+    if ok {
+        status::SUCCESS
+    } else {
+        status::INVALID_PARAMETER
+    }
 }
 
 pub(crate) fn vm_release_private(owner_pid: u32, base: u64) -> u32 {
@@ -373,7 +424,11 @@ pub(crate) fn vm_release_private(owner_pid: u32, base: u64) -> u32 {
         vm.release_at_base(aspace, owner_pid, base, Some(VmKind::Private))
     })
     .unwrap_or(false);
-    if ok { status::SUCCESS } else { status::INVALID_PARAMETER }
+    if ok {
+        status::SUCCESS
+    } else {
+        status::INVALID_PARAMETER
+    }
 }
 
 pub(crate) fn vm_protect_range(
@@ -393,12 +448,16 @@ pub(crate) fn vm_protect_range(
 
 pub(crate) fn vm_query_region(
     owner_pid: u32,
-    addr: u64,
+    addr: crate::mm::UserVa,
 ) -> Option<crate::mm::vaspace::VmQueryInfo> {
     crate::process::with_process(owner_pid, |p| p.vm.query(addr)).flatten()
 }
 
-pub(crate) fn vm_handle_page_fault(owner_pid: u32, fault_addr: u64, access: u8) -> bool {
+pub(crate) fn vm_handle_page_fault(
+    owner_pid: u32,
+    fault_addr: crate::mm::UserVa,
+    access: u8,
+) -> bool {
     crate::process::with_process_mut(owner_pid, |p| {
         let (vm, aspace) = (&mut p.vm, &mut p.address_space);
         vm.handle_page_fault(aspace, owner_pid, fault_addr, access)
