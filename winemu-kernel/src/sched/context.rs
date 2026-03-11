@@ -120,8 +120,10 @@ pub fn ensure_user_entry_continuation_locked(tid: u32) {
         }
         // Set up a fresh kernel continuation that will ERET into EL0.
         let kstack_top = t.kstack_base + t.kstack_size as u64;
-        t.kctx
-            .set_continuation(kstack_top, thread_user_entry_continuation as *const () as u64);
+        t.kctx.set_continuation(
+            kstack_top,
+            thread_user_entry_continuation as *const () as u64,
+        );
     });
 }
 

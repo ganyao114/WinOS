@@ -24,6 +24,8 @@ pub const KERNEL_VM_BASE: u64 = super::backend::mmu::KERNEL_VM_BASE;
 pub const KERNEL_VM_LIMIT: u64 = super::backend::mmu::KERNEL_VM_LIMIT;
 pub const KERNEL_KMAP_BASE: u64 = super::backend::mmu::KERNEL_KMAP_BASE;
 pub const KERNEL_KMAP_LIMIT: u64 = super::backend::mmu::KERNEL_KMAP_LIMIT;
+pub const KERNEL_FIXMAP_BASE: u64 = super::backend::mmu::KERNEL_FIXMAP_BASE;
+pub const KERNEL_FIXMAP_LIMIT: u64 = super::backend::mmu::KERNEL_FIXMAP_LIMIT;
 pub const KERNEL_VMAP_BASE: u64 = super::backend::mmu::KERNEL_VMAP_BASE;
 pub const KERNEL_VMAP_LIMIT: u64 = super::backend::mmu::KERNEL_VMAP_LIMIT;
 

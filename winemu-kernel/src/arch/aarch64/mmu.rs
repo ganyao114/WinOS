@@ -40,6 +40,8 @@ pub const KERNEL_VM_BASE: u64 = 0xC000_0000;
 pub const KERNEL_VM_LIMIT: u64 = KERNEL_VM_BASE + L1_BLOCK_SIZE;
 pub const KERNEL_KMAP_BASE: u64 = KERNEL_VM_BASE;
 pub const KERNEL_KMAP_LIMIT: u64 = KERNEL_KMAP_BASE + L2_BLOCK_SIZE;
+pub const KERNEL_FIXMAP_BASE: u64 = KERNEL_KMAP_BASE;
+pub const KERNEL_FIXMAP_LIMIT: u64 = KERNEL_KMAP_LIMIT;
 pub const KERNEL_VMAP_BASE: u64 = KERNEL_KMAP_LIMIT;
 pub const KERNEL_VMAP_LIMIT: u64 = KERNEL_VM_LIMIT;
 
@@ -341,15 +343,28 @@ pub fn l2_index_in_user_window(user_va_base: u64, user_va_limit: u64, idx: usize
 pub unsafe fn install_process_root_tables(l0_pa: u64, l1_pa: u64, l2_pa: u64) {
     let physmap_l2 = core::ptr::addr_of!(PHYSMAP_L2_TABLE) as u64;
     let kernel_vm_l2 = core::ptr::addr_of!(KERNEL_VM_L2_TABLE) as u64;
-    // SAFETY: caller guarantees l0/l1 point to valid 4KB page tables.
-    let l0 = table_pa_to_kva(l0_pa);
-    let l1 = table_pa_to_kva(l1_pa);
-    unsafe {
-        *l0.as_mut_ptr::<u64>().add(0) = make_table_desc(l1_pa);
-        *l1.as_mut_ptr::<u64>().add(1) = make_table_desc(l2_pa);
-        *l1.as_mut_ptr::<u64>().add(2) = make_table_desc(physmap_l2);
-        *l1.as_mut_ptr::<u64>().add(KERNEL_VM_L1_INDEX) = make_table_desc(kernel_vm_l2);
-    }
+    let l0_ok = crate::mm::kmap::write_fixmap_u64(
+        crate::mm::PhysAddr::new(l0_pa),
+        0,
+        make_table_desc(l1_pa),
+    );
+    let l1_ok = crate::mm::kmap::write_fixmap_u64(
+        crate::mm::PhysAddr::new(l1_pa),
+        1,
+        make_table_desc(l2_pa),
+    ) && crate::mm::kmap::write_fixmap_u64(
+        crate::mm::PhysAddr::new(l1_pa),
+        2,
+        make_table_desc(physmap_l2),
+    ) && crate::mm::kmap::write_fixmap_u64(
+        crate::mm::PhysAddr::new(l1_pa),
+        KERNEL_VM_L1_INDEX,
+        make_table_desc(kernel_vm_l2),
+    );
+    assert!(
+        l0_ok && l1_ok,
+        "install_process_root_tables: failed to map root tables"
+    );
 }
 
 pub fn map_kernel_pages(va: u64, pa: u64, pages: usize) -> bool {
@@ -632,16 +647,19 @@ fn kernel_vm_range_valid(va: u64, pages: usize) -> bool {
     if pages == 0 || !is_page_aligned(va) {
         return false;
     }
-    if va < KERNEL_VM_BASE || va >= KERNEL_VM_LIMIT {
-        return false;
-    }
     let Some(size) = (pages as u64).checked_mul(PAGE_SIZE_4K) else {
         return false;
     };
     let Some(end) = va.checked_add(size) else {
         return false;
     };
-    end <= KERNEL_VM_LIMIT
+    kernel_subrange_valid(va, end, KERNEL_KMAP_BASE, KERNEL_KMAP_LIMIT)
+        || kernel_subrange_valid(va, end, KERNEL_VMAP_BASE, KERNEL_VMAP_LIMIT)
+}
+
+#[inline(always)]
+fn kernel_subrange_valid(va: u64, end: u64, base: u64, limit: u64) -> bool {
+    va >= base && va < limit && end <= limit
 }
 
 fn lock_kernel_tables() -> KernelTablesGuard {
@@ -688,12 +706,4 @@ fn kernel_vm_pte_ptr(va: u64) -> Option<*mut u64> {
     let idx = l3_index(va);
     // SAFETY: `l3` points to a live L3 page table and `idx < 512`.
     Some(unsafe { l3.add(idx) })
-}
-
-fn table_pa_to_kva(pa: u64) -> crate::mm::KernelVa {
-    if let Some(kva) = crate::mm::linear_map::phys_to_kva(crate::mm::PhysAddr::new(pa)) {
-        kva
-    } else {
-        crate::mm::KernelVa::new(pa)
-    }
 }

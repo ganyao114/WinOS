@@ -3,14 +3,15 @@ use core::hint::spin_loop;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::arch::mmu::{KERNEL_KMAP_BASE, KERNEL_KMAP_LIMIT};
+use crate::arch::mmu::{KERNEL_FIXMAP_BASE, KERNEL_FIXMAP_LIMIT};
 use crate::mm::{KernelVa, PhysAddr};
 use crate::nt::constants::PAGE_SIZE_4K;
 use crate::sched::types::MAX_VCPUS;
 
 const PAGE_SIZE: u64 = PAGE_SIZE_4K;
-const KMAP_LOCAL_SLOTS_PER_CPU: usize = 8;
-const KMAP_PAGE_COUNT: usize = ((KERNEL_KMAP_LIMIT - KERNEL_KMAP_BASE) / PAGE_SIZE_4K) as usize;
+pub const FIXMAP_LOCAL_SLOTS_PER_CPU: usize = 8;
+const FIXMAP_PAGE_COUNT: usize =
+    ((KERNEL_FIXMAP_LIMIT - KERNEL_FIXMAP_BASE) / PAGE_SIZE_4K) as usize;
 
 struct KmapState {
     used_masks: [u16; MAX_VCPUS],
@@ -66,6 +67,38 @@ impl KmapGuard {
     }
 }
 
+pub struct MappedPage {
+    kva: KernelVa,
+    _guard: Option<KmapGuard>,
+}
+
+impl MappedPage {
+    pub fn from_phys(pa: PhysAddr) -> Option<Self> {
+        let page_base = pa.page_base(PAGE_SIZE);
+        if let Some(kva) = crate::mm::linear_map::phys_to_kva(page_base) {
+            return Some(Self { kva, _guard: None });
+        }
+
+        let guard = kmap_local_page(page_base)?;
+        Some(Self {
+            kva: guard.kva(),
+            _guard: Some(guard),
+        })
+    }
+
+    pub fn kva(&self) -> KernelVa {
+        self.kva
+    }
+
+    pub fn as_ptr<T>(&self) -> *const T {
+        self.kva.as_ptr()
+    }
+
+    pub fn as_mut_ptr<T>(&mut self) -> *mut T {
+        self.kva.as_mut_ptr()
+    }
+}
+
 impl Drop for KmapGuard {
     fn drop(&mut self) {
         let _guard = lock_kmap();
@@ -76,7 +109,64 @@ impl Drop for KmapGuard {
 }
 
 pub fn init() {
-    debug_assert!(MAX_VCPUS * KMAP_LOCAL_SLOTS_PER_CPU <= KMAP_PAGE_COUNT);
+    debug_assert!(MAX_VCPUS * FIXMAP_LOCAL_SLOTS_PER_CPU <= FIXMAP_PAGE_COUNT);
+    debug_assert!(KERNEL_FIXMAP_BASE < KERNEL_FIXMAP_LIMIT);
+}
+
+pub fn with_mapped_page<R>(pa: PhysAddr, f: impl FnOnce(&mut MappedPage) -> R) -> Option<R> {
+    let mut mapped = MappedPage::from_phys(pa)?;
+    Some(f(&mut mapped))
+}
+
+pub fn with_fixmap_page<R>(pa: PhysAddr, f: impl FnOnce(&mut KmapGuard) -> R) -> Option<R> {
+    let mut mapped = kmap_local_page(pa)?;
+    Some(f(&mut mapped))
+}
+
+pub fn read_page_u64(pa: PhysAddr, index: usize) -> Option<u64> {
+    if index >= (PAGE_SIZE as usize / core::mem::size_of::<u64>()) {
+        return None;
+    }
+    with_mapped_page(pa, |page| {
+        // SAFETY: `index` is bounded to the current 4K page.
+        unsafe { *page.as_ptr::<u64>().add(index) }
+    })
+}
+
+pub fn write_page_u64(pa: PhysAddr, index: usize, value: u64) -> bool {
+    if index >= (PAGE_SIZE as usize / core::mem::size_of::<u64>()) {
+        return false;
+    }
+    with_mapped_page(pa, |page| {
+        // SAFETY: `index` is bounded to the current 4K page.
+        unsafe {
+            *page.as_mut_ptr::<u64>().add(index) = value;
+        }
+    })
+    .is_some()
+}
+
+pub fn read_fixmap_u64(pa: PhysAddr, index: usize) -> Option<u64> {
+    if index >= (PAGE_SIZE as usize / core::mem::size_of::<u64>()) {
+        return None;
+    }
+    with_fixmap_page(pa, |page| {
+        // SAFETY: `index` is bounded to the current 4K page.
+        unsafe { *page.as_ptr::<u64>().add(index) }
+    })
+}
+
+pub fn write_fixmap_u64(pa: PhysAddr, index: usize, value: u64) -> bool {
+    if index >= (PAGE_SIZE as usize / core::mem::size_of::<u64>()) {
+        return false;
+    }
+    with_fixmap_page(pa, |page| {
+        // SAFETY: `index` is bounded to the current 4K page.
+        unsafe {
+            *page.as_mut_ptr::<u64>().add(index) = value;
+        }
+    })
+    .is_some()
 }
 
 pub fn kmap_local_page(pa: PhysAddr) -> Option<KmapGuard> {
@@ -110,7 +200,7 @@ pub fn kmap_local_page(pa: PhysAddr) -> Option<KmapGuard> {
 
 fn find_free_slot(state: &KmapState, cpu: usize) -> Option<usize> {
     let mut slot = 0usize;
-    while slot < KMAP_LOCAL_SLOTS_PER_CPU {
+    while slot < FIXMAP_LOCAL_SLOTS_PER_CPU {
         if (state.used_masks[cpu] & (1u16 << slot)) == 0 {
             return Some(slot);
         }
@@ -121,13 +211,17 @@ fn find_free_slot(state: &KmapState, cpu: usize) -> Option<usize> {
 
 fn slot_kva(cpu: usize, slot: usize) -> Option<KernelVa> {
     let slot_index = cpu
-        .checked_mul(KMAP_LOCAL_SLOTS_PER_CPU)?
+        .checked_mul(FIXMAP_LOCAL_SLOTS_PER_CPU)?
         .checked_add(slot)?;
-    if slot_index >= KMAP_PAGE_COUNT {
+    if slot_index >= FIXMAP_PAGE_COUNT {
         return None;
     }
     let offset = (slot_index as u64).checked_mul(PAGE_SIZE)?;
-    KERNEL_KMAP_BASE.checked_add(offset).map(KernelVa::new)
+    KERNEL_FIXMAP_BASE.checked_add(offset).map(KernelVa::new)
+}
+
+pub fn contains(kva: KernelVa) -> bool {
+    kva.get() >= KERNEL_FIXMAP_BASE && kva.get() < KERNEL_FIXMAP_LIMIT
 }
 
 fn is_page_aligned(addr: u64) -> bool {

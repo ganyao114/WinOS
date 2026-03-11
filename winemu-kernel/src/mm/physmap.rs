@@ -4,48 +4,6 @@ use crate::arch::mmu::{
 use crate::mm::{KernelVa, PhysAddr};
 use crate::nt::constants::PAGE_SIZE_4K;
 
-enum PhysPageMapping {
-    Linear(KernelVa),
-    Local(crate::mm::kmap::KmapGuard),
-}
-
-impl PhysPageMapping {
-    fn map(pa: PhysAddr) -> Option<Self> {
-        let page_base = pa.page_base(PAGE_SIZE_4K);
-        if let Some(kva) = phys_to_kva(page_base) {
-            Some(Self::Linear(kva))
-        } else {
-            crate::mm::kmap::kmap_local_page(page_base).map(Self::Local)
-        }
-    }
-
-    fn src_ptr(&self, offset: usize) -> *const u8 {
-        match self {
-            Self::Linear(kva) => {
-                // SAFETY: caller ensures `offset < PAGE_SIZE_4K`.
-                unsafe { kva.as_ptr::<u8>().add(offset) }
-            }
-            Self::Local(guard) => {
-                // SAFETY: caller ensures `offset < PAGE_SIZE_4K`.
-                unsafe { guard.as_ptr::<u8>().add(offset) }
-            }
-        }
-    }
-
-    fn dst_ptr(&mut self, offset: usize) -> *mut u8 {
-        match self {
-            Self::Linear(kva) => {
-                // SAFETY: caller ensures `offset < PAGE_SIZE_4K`.
-                unsafe { kva.as_mut_ptr::<u8>().add(offset) }
-            }
-            Self::Local(guard) => {
-                // SAFETY: caller ensures `offset < PAGE_SIZE_4K`.
-                unsafe { guard.as_mut_ptr::<u8>().add(offset) }
-            }
-        }
-    }
-}
-
 /// Canonical kernel linear-map helpers for guest RAM.
 ///
 /// Even though this module is still named `physmap.rs`, callers should use the
@@ -111,13 +69,17 @@ pub fn copy_from_phys(dst: *mut u8, src_pa: PhysAddr, len: usize) -> bool {
                 core::ptr::copy_nonoverlapping(src.as_ptr::<u8>(), dst.add(done), chunk);
             }
         } else {
-            let Some(src_map) = PhysPageMapping::map(cur_pa) else {
+            let Some(src_map) = crate::mm::kmap::MappedPage::from_phys(cur_pa) else {
                 return false;
             };
             // SAFETY: `src_map` keeps the temporary mapping alive for the duration of
             // the copy, and `dst.add(done)` points into a caller-provided kernel buffer.
             unsafe {
-                core::ptr::copy_nonoverlapping(src_map.src_ptr(page_off), dst.add(done), chunk);
+                core::ptr::copy_nonoverlapping(
+                    src_map.as_ptr::<u8>().add(page_off),
+                    dst.add(done),
+                    chunk,
+                );
             }
         }
         done += chunk;
@@ -141,10 +103,12 @@ pub fn copy_to_phys(dst_pa: PhysAddr, src: *const u8, len: usize) -> bool {
         };
         let page_off = phys_page_offset(cur_pa);
         let chunk = page_chunk_len(cur_pa, len - done);
-        let Some(mut dst_map) = PhysPageMapping::map(cur_pa) else {
+        let Some(mut dst_map) = crate::mm::kmap::MappedPage::from_phys(cur_pa) else {
             return false;
         };
-        let dst_ptr = dst_map.dst_ptr(page_off);
+        let dst_ptr =
+            // SAFETY: `page_off < PAGE_SIZE_4K` for the current chunk.
+            unsafe { dst_map.as_mut_ptr::<u8>().add(page_off) };
         // SAFETY: `src.add(done)` points into the caller-provided kernel buffer and
         // `dst_ptr` points into a mapped physical page window with `chunk` bytes available.
         unsafe {
@@ -178,16 +142,20 @@ pub fn copy_phys(dst_pa: PhysAddr, src_pa: PhysAddr, len: usize) -> bool {
             page_chunk_len(cur_src_pa, len - done),
             page_chunk_len(cur_dst_pa, len - done),
         );
-        let Some(src_map) = PhysPageMapping::map(cur_src_pa) else {
+        let Some(src_map) = crate::mm::kmap::MappedPage::from_phys(cur_src_pa) else {
             return false;
         };
-        let Some(mut dst_map) = PhysPageMapping::map(cur_dst_pa) else {
+        let Some(mut dst_map) = crate::mm::kmap::MappedPage::from_phys(cur_dst_pa) else {
             return false;
         };
         // SAFETY: both pointers point into mapped physical page windows with `chunk`
         // bytes available. `ptr::copy` preserves overlap semantics.
         unsafe {
-            core::ptr::copy(src_map.src_ptr(src_off), dst_map.dst_ptr(dst_off), chunk);
+            core::ptr::copy(
+                src_map.as_ptr::<u8>().add(src_off),
+                dst_map.as_mut_ptr::<u8>().add(dst_off),
+                chunk,
+            );
         }
         done += chunk;
     }
@@ -210,13 +178,13 @@ pub fn memset_phys(dst_pa: PhysAddr, value: u8, len: usize) -> bool {
         };
         let page_off = phys_page_offset(cur_pa);
         let chunk = page_chunk_len(cur_pa, len - done);
-        let Some(mut dst_map) = PhysPageMapping::map(cur_pa) else {
+        let Some(mut dst_map) = crate::mm::kmap::MappedPage::from_phys(cur_pa) else {
             return false;
         };
         // SAFETY: `dst_ptr` points into a mapped physical page window with `chunk`
         // bytes available.
         unsafe {
-            core::ptr::write_bytes(dst_map.dst_ptr(page_off), value, chunk);
+            core::ptr::write_bytes(dst_map.as_mut_ptr::<u8>().add(page_off), value, chunk);
         }
         done += chunk;
     }

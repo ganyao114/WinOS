@@ -17,19 +17,13 @@ pub mod wait;
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 // Types
-pub use types::{
-    KernelContext, ThreadContext, ThreadState, WaitDeadline, MAX_VCPUS,
-};
+pub use types::{KernelContext, ThreadContext, ThreadState, WaitDeadline, MAX_VCPUS};
 
 // Global scheduler
-pub use global::{
-    init_scheduler, thread_exists, with_thread, with_thread_mut, SCHED,
-};
+pub use global::{init_scheduler, thread_exists, with_thread, with_thread_mut, SCHED};
 
 // Per-vCPU TLS
-pub use cpu::{
-    current_tid, init_cpu_local, set_current_tid, set_needs_reschedule, vcpu_id,
-};
+pub use cpu::{current_tid, init_cpu_local, set_current_tid, set_needs_reschedule, vcpu_id};
 
 // Scheduler lock
 pub use lock::{KSchedulerLock, SCHED_LOCK};
@@ -40,9 +34,7 @@ pub use topology::{
 };
 
 // Context switch
-pub use context::{
-    drain_deferred_kstacks, set_thread_in_kernel_locked,
-};
+pub use context::{drain_deferred_kstacks, set_thread_in_kernel_locked};
 
 // Wait / unblock
 pub use wait::{

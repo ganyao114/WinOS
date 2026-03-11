@@ -196,19 +196,15 @@ impl ProcessAddressSpace {
             // SAFETY: l2 is a valid page table and idx is loop-bounded.
             let l2e = read_table_entry(self.l2.kva, idx);
             if mmu::desc_kind(l2e) == PageTableEntryKind::TableOrPage {
-                let Some(src_l3) = table_desc_kva(l2e) else {
+                let Some(src_l3_pa) = table_desc_pa(l2e) else {
                     return false;
                 };
                 let Some(new_l3) = alloc_table() else {
                     return false;
                 };
-                // SAFETY: src_l3/new_l3 are valid 4KB tables and idx is in bounds.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        src_l3.as_ptr::<u64>(),
-                        new_l3.kva.as_mut_ptr::<u64>(),
-                        PAGE_TABLE_ENTRIES,
-                    );
+                if !copy_table_page(new_l3.kva, src_l3_pa) {
+                    dealloc_table(new_l3);
+                    return false;
                 }
                 write_table_entry(self.l2.kva, idx, mmu::make_table_desc(new_l3.pa.get()));
                 self.l3_tables[idx] = new_l3;
@@ -251,7 +247,7 @@ impl ProcessAddressSpace {
         if mmu::desc_kind(l2e) != PageTableEntryKind::TableOrPage {
             return true;
         }
-        let Some(l3) = table_desc_kva(l2e) else {
+        let Some(l3) = self.l3_kva(l2_idx, l2e) else {
             return false;
         };
         write_table_entry(l3, mmu::l3_index(va.get()), 0);
@@ -279,7 +275,7 @@ impl ProcessAddressSpace {
             PageTableEntryKind::TableOrPage => {}
         }
 
-        let Some(l3) = table_desc_kva(l2e) else {
+        let Some(l3) = self.l3_kva(l2_idx, l2e) else {
             return true;
         };
 
@@ -301,7 +297,7 @@ impl ProcessAddressSpace {
         // SAFETY: l2 points to a live table and l2_idx is bounded by caller.
         let l2e = read_table_entry(self.l2.kva, l2_idx);
         match mmu::desc_kind(l2e) {
-            PageTableEntryKind::TableOrPage => table_desc_kva(l2e),
+            PageTableEntryKind::TableOrPage => self.l3_kva(l2_idx, l2e),
             PageTableEntryKind::Block => self.split_l2_block(l2_idx, l2e),
             _ => self.alloc_empty_l3(l2_idx),
         }
@@ -337,12 +333,22 @@ impl ProcessAddressSpace {
         self.l3_tables[l2_idx] = l3;
         Some(l3.kva)
     }
+
+    fn l3_kva(&self, l2_idx: usize, l2e: u64) -> Option<KernelVa> {
+        if mmu::desc_kind(l2e) != PageTableEntryKind::TableOrPage {
+            return None;
+        }
+        let owned = self.l3_tables[l2_idx];
+        if owned.is_allocated() {
+            return Some(owned.kva);
+        }
+        table_desc_pa(l2e).and_then(crate::mm::linear_map::phys_to_kva)
+    }
 }
 
 pub(crate) fn translate_current_user_va_for_access(va: UserVa, access: u8) -> Option<PhysAddr> {
     let ttbr0 = PhysAddr::new(mmu::current_user_table_root() & PAGE_MASK_4K);
-    let l0 = crate::mm::linear_map::phys_to_kva(ttbr0)?;
-    translate_user_va_in_table(l0, va, access)
+    translate_user_va_in_root_table(ttbr0, va, access)
 }
 
 impl Drop for ProcessAddressSpace {
@@ -386,18 +392,22 @@ fn dealloc_table(table: TablePage) {
     crate::mm::phys::free_pages(table.pa, 1);
 }
 
-fn table_desc_kva(desc: u64) -> Option<KernelVa> {
+fn table_desc_pa(desc: u64) -> Option<PhysAddr> {
     let raw = mmu::table_addr(desc);
     if raw == 0 {
         None
     } else {
-        crate::mm::linear_map::phys_to_kva(PhysAddr::new(raw)).or(Some(KernelVa::new(raw)))
+        Some(PhysAddr::new(raw))
     }
 }
 
 fn read_table_entry(table: KernelVa, idx: usize) -> u64 {
     // SAFETY: caller provides a live page-table KVA and a bounded index.
     unsafe { *table.as_ptr::<u64>().add(idx) }
+}
+
+fn read_table_entry_pa(table_pa: PhysAddr, idx: usize) -> Option<u64> {
+    crate::mm::kmap::read_fixmap_u64(table_pa, idx)
 }
 
 fn translate_user_va_in_table(l0: KernelVa, va: UserVa, access: u8) -> Option<PhysAddr> {
@@ -409,7 +419,7 @@ fn translate_user_va_in_table(l0: KernelVa, va: UserVa, access: u8) -> Option<Ph
     if mmu::desc_kind(l0e) != PageTableEntryKind::TableOrPage {
         return None;
     }
-    let l1 = table_desc_kva(l0e)?;
+    let l1 = table_desc_pa(l0e).and_then(crate::mm::linear_map::phys_to_kva)?;
 
     let l1e = read_table_entry(l1, mmu::l1_index(va.get()));
     match mmu::desc_kind(l1e) {
@@ -422,7 +432,7 @@ fn translate_user_va_in_table(l0: KernelVa, va: UserVa, access: u8) -> Option<Ph
         PageTableEntryKind::Reserved => return None,
     }
 
-    let l2 = table_desc_kva(l1e)?;
+    let l2 = table_desc_pa(l1e).and_then(crate::mm::linear_map::phys_to_kva)?;
     let l2e = read_table_entry(l2, mmu::l2_index(va.get()));
     match mmu::desc_kind(l2e) {
         PageTableEntryKind::Invalid => return None,
@@ -434,12 +444,70 @@ fn translate_user_va_in_table(l0: KernelVa, va: UserVa, access: u8) -> Option<Ph
         PageTableEntryKind::Reserved => return None,
     }
 
-    let l3 = table_desc_kva(l2e)?;
+    let l3 = table_desc_pa(l2e).and_then(crate::mm::linear_map::phys_to_kva)?;
     let l3e = read_table_entry(l3, mmu::l3_index(va.get()));
     if mmu::desc_kind(l3e) != PageTableEntryKind::TableOrPage {
         return None;
     }
     mmu::translate_user_desc(l3e, va.get(), UserDescLevel::L3Page, access).map(PhysAddr::new)
+}
+
+fn translate_user_va_in_root_table(root_pa: PhysAddr, va: UserVa, access: u8) -> Option<PhysAddr> {
+    if !is_user_accessible_va(va.get()) {
+        return None;
+    }
+
+    let l0e = read_table_entry_pa(root_pa, mmu::l0_index(va.get()))?;
+    if mmu::desc_kind(l0e) != PageTableEntryKind::TableOrPage {
+        return None;
+    }
+
+    let l1_pa = table_desc_pa(l0e)?;
+    let l1e = read_table_entry_pa(l1_pa, mmu::l1_index(va.get()))?;
+    match mmu::desc_kind(l1e) {
+        PageTableEntryKind::Invalid => return None,
+        PageTableEntryKind::Block => {
+            return mmu::translate_user_desc(l1e, va.get(), UserDescLevel::L1Block, access)
+                .map(PhysAddr::new);
+        }
+        PageTableEntryKind::TableOrPage => {}
+        PageTableEntryKind::Reserved => return None,
+    }
+
+    let l2_pa = table_desc_pa(l1e)?;
+    let l2e = read_table_entry_pa(l2_pa, mmu::l2_index(va.get()))?;
+    match mmu::desc_kind(l2e) {
+        PageTableEntryKind::Invalid => return None,
+        PageTableEntryKind::Block => {
+            return mmu::translate_user_desc(l2e, va.get(), UserDescLevel::L2Block, access)
+                .map(PhysAddr::new);
+        }
+        PageTableEntryKind::TableOrPage => {}
+        PageTableEntryKind::Reserved => return None,
+    }
+
+    let l3_pa = table_desc_pa(l2e)?;
+    let l3e = read_table_entry_pa(l3_pa, mmu::l3_index(va.get()))?;
+    if mmu::desc_kind(l3e) != PageTableEntryKind::TableOrPage {
+        return None;
+    }
+    mmu::translate_user_desc(l3e, va.get(), UserDescLevel::L3Page, access).map(PhysAddr::new)
+}
+
+fn copy_table_page(dst: KernelVa, src_pa: PhysAddr) -> bool {
+    crate::mm::kmap::with_fixmap_page(src_pa, |src| {
+        // SAFETY: `src` is a temporary fixmap mapping of a single 4KB table
+        // page, and `dst` is a live destination table page KVA with the same
+        // size.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr::<u64>(),
+                dst.as_mut_ptr::<u64>(),
+                PAGE_TABLE_ENTRIES,
+            );
+        }
+    })
+    .is_some()
 }
 
 fn write_table_entry(table: KernelVa, idx: usize, value: u64) {
