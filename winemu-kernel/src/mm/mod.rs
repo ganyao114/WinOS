@@ -5,6 +5,7 @@ pub mod clone_plan;
 pub mod kernel_vm;
 pub mod kmalloc;
 pub mod kmap;
+pub(crate) mod page_table_access;
 pub mod phys;
 pub mod physmap;
 pub mod process_vm;
@@ -32,7 +33,7 @@ pub const VM_ACCESS_READ: u8 = 1;
 pub const VM_ACCESS_WRITE: u8 = 2;
 pub const VM_ACCESS_EXEC: u8 = 3;
 
-pub fn bootstrap_user_tables() -> (*const u64, *const u64, *const u64) {
+pub fn bootstrap_user_tables() -> (KernelVa, KernelVa, KernelVa) {
     crate::arch::mmu::bootstrap_user_tables()
 }
 
