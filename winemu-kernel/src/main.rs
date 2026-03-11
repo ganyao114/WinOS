@@ -17,6 +17,7 @@ mod mm;
 mod nt;
 mod process;
 mod sched;
+mod spin;
 mod teb;
 mod timer;
 mod vectors;

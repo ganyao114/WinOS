@@ -3,11 +3,9 @@
 // 每个 chunk = 64 个 4KB 页 = 256KB，用 u64 bitmap 管理。
 // no_std，固定大小数组，零堆分配。
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
-
 use crate::hypercall;
 use crate::mm::PhysAddr;
+use crate::spin::SpinLock;
 
 /// 每个 chunk 包含的 4KB 页数（= u64 bitmap 位数）
 const CHUNK_PAGES: usize = 64;
@@ -254,53 +252,12 @@ fn find_contiguous(bitmap: u64, n: usize, mask: u64) -> Option<u32> {
     None
 }
 
-struct SpinLock {
-    locked: AtomicBool,
-}
-
-impl SpinLock {
-    const fn new() -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-        }
-    }
-
-    fn lock(&self) -> SpinGuard<'_> {
-        while self.locked.swap(true, Ordering::Acquire) {
-            while self.locked.load(Ordering::Relaxed) {
-                core::hint::spin_loop();
-            }
-        }
-        SpinGuard { lock: self }
-    }
-}
-
-struct SpinGuard<'a> {
-    lock: &'a SpinLock,
-}
-
-impl Drop for SpinGuard<'_> {
-    fn drop(&mut self) {
-        self.lock.locked.store(false, Ordering::Release);
-    }
-}
-
-struct PhysGlobal {
-    lock: SpinLock,
-    inner: UnsafeCell<PhysAllocator>,
-}
-
-unsafe impl Sync for PhysGlobal {}
-
-static PHYS_GLOBAL: PhysGlobal = PhysGlobal {
-    lock: SpinLock::new(),
-    inner: UnsafeCell::new(PhysAllocator::new()),
-};
+static PHYS_GLOBAL: SpinLock<PhysAllocator> = SpinLock::new(PhysAllocator::new());
 
 #[inline]
 fn with_phys_mut<R>(f: impl FnOnce(&mut PhysAllocator) -> R) -> R {
-    let _guard = PHYS_GLOBAL.lock.lock();
-    unsafe { f(&mut *PHYS_GLOBAL.inner.get()) }
+    let mut guard = PHYS_GLOBAL.lock();
+    f(&mut guard)
 }
 
 pub fn alloc_pages(num_pages: usize) -> Option<PhysAddr> {

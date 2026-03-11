@@ -1,8 +1,7 @@
-use core::cell::UnsafeCell;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::mm::{KernelVa, PhysAddr};
+use crate::spin::SpinLock;
 
 const PAGE_SIZE: usize = 4096;
 const NONE_I16: i16 = -1;
@@ -122,41 +121,6 @@ fn pages_for_bytes(bytes: usize) -> Option<usize> {
         .max(1)
         .checked_add(PAGE_SIZE - 1)
         .map(|n| n / PAGE_SIZE)
-}
-
-struct SpinLock {
-    locked: AtomicBool,
-}
-
-impl SpinLock {
-    const fn new() -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-        }
-    }
-
-    fn lock(&self) -> SpinGuard<'_> {
-        while self.locked.swap(true, Ordering::Acquire) {
-            while self.locked.load(Ordering::Relaxed) {
-                core::hint::spin_loop();
-            }
-        }
-        SpinGuard { lock: self }
-    }
-
-    fn unlock(&self) {
-        self.locked.store(false, Ordering::Release);
-    }
-}
-
-struct SpinGuard<'a> {
-    lock: &'a SpinLock,
-}
-
-impl Drop for SpinGuard<'_> {
-    fn drop(&mut self) {
-        self.lock.unlock();
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1669,22 +1633,12 @@ impl KmallocManager {
     }
 }
 
-struct GlobalKmalloc {
-    lock: SpinLock,
-    state: UnsafeCell<KmallocManager>,
-}
-
-unsafe impl Sync for GlobalKmalloc {}
-
-static KMALLOC: GlobalKmalloc = GlobalKmalloc {
-    lock: SpinLock::new(),
-    state: UnsafeCell::new(KmallocManager::new()),
-};
+static KMALLOC: SpinLock<KmallocManager> = SpinLock::new(KmallocManager::new());
 
 #[inline]
 fn with_state_mut<R>(f: impl FnOnce(&mut KmallocManager) -> R) -> R {
-    let _guard = KMALLOC.lock.lock();
-    unsafe { f(&mut *KMALLOC.state.get()) }
+    let mut guard = KMALLOC.lock();
+    f(&mut guard)
 }
 
 fn drain_pending_frees(pending: &[PendingPhysFree; MAX_PENDING_PHYS_FREES], pending_count: usize) {
@@ -1737,8 +1691,7 @@ pub fn init(heap_base: usize, heap_size: usize) {
 
 pub fn alloc(size: usize, align: usize) -> *mut u8 {
     let plan = {
-        let _guard = KMALLOC.lock.lock();
-        let state = unsafe { &mut *KMALLOC.state.get() };
+        let mut state = KMALLOC.lock();
         state.alloc_plan(size, align.max(1))
     };
 
@@ -1752,8 +1705,7 @@ pub fn alloc(size: usize, align: usize) -> *mut u8 {
             let mut pending = [const { PendingPhysFree::empty() }; MAX_PENDING_PHYS_FREES];
             let mut pending_count = 0usize;
             let ptr = {
-                let _guard = KMALLOC.lock.lock();
-                let state = unsafe { &mut *KMALLOC.state.get() };
+                let mut state = KMALLOC.lock();
                 state.finish_grow_and_alloc(
                     size,
                     align.max(1),
@@ -1776,8 +1728,7 @@ pub fn dealloc(ptr: *mut u8) {
     let mut pending = [const { PendingPhysFree::empty() }; MAX_PENDING_PHYS_FREES];
     let mut pending_count = 0usize;
     {
-        let _guard = KMALLOC.lock.lock();
-        let state = unsafe { &mut *KMALLOC.state.get() };
+        let mut state = KMALLOC.lock();
         state.dealloc(ptr, &mut pending, &mut pending_count);
     }
     drain_pending_frees(&pending, pending_count);
@@ -1787,8 +1738,7 @@ pub fn reclaim_idle_dynamic() {
     let mut pending = [const { PendingPhysFree::empty() }; MAX_PENDING_PHYS_FREES];
     let mut pending_count = 0usize;
     {
-        let _guard = KMALLOC.lock.lock();
-        let state = unsafe { &mut *KMALLOC.state.get() };
+        let mut state = KMALLOC.lock();
         state.maybe_collect_reclaim_candidates(&mut pending, &mut pending_count, true);
     }
     drain_pending_frees(&pending, pending_count);
