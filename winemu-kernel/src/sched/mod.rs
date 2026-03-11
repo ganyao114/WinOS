@@ -17,7 +17,7 @@ pub mod wait;
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
 // Types
-pub use types::{KernelContext, ThreadContext, ThreadState, WaitDeadline, MAX_VCPUS};
+pub use types::{ThreadState, WaitDeadline, MAX_VCPUS};
 
 // Global scheduler
 pub use global::{init_scheduler, thread_exists, with_thread, with_thread_mut, SCHED};

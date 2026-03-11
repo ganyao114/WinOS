@@ -39,11 +39,11 @@ pub fn spawn_locked(mut thread: KThread) -> Option<u32> {
 
 pub struct UserThreadParams {
     pub pid: u32,
-    pub entry: u64,      // EL0 entry point (RtlUserThreadStart or similar)
-    pub stack_base: u64, // EL0 stack top (high address)
+    pub entry: u64,      // user entry point (RtlUserThreadStart or similar)
+    pub stack_base: u64, // user stack top (high address)
     pub stack_size: u64,
     pub teb_va: u64,
-    pub arg: u64, // x0 on entry
+    pub arg: u64, // first user argument on entry
     pub priority: u8,
 }
 
@@ -65,16 +65,16 @@ pub fn create_user_thread_locked(p: UserThreadParams) -> Option<u32> {
     t.base_priority = p.priority;
     t.last_vcpu_hint = 0;
 
-    // Set up EL0 entry context.
-    t.ctx.pc = p.entry;
-    // UserThreadParams::stack_base is the high-address top-of-stack.
-    t.ctx.sp = p.stack_base;
-    t.ctx.x[0] = p.arg;
-    // SPSR: EL0t (0b0000), interrupts enabled.
-    t.ctx.pstate = 0x0000_0000;
-    // x18 = TEB (ARM64 Windows ABI).
-    t.ctx.x[18] = p.teb_va;
-    t.ctx.tpidr = p.teb_va;
+    crate::arch::context::initialize_user_thread_context(
+        &mut t.ctx,
+        crate::arch::context::UserThreadStart {
+            program_counter: p.entry,
+            stack_pointer: p.stack_base,
+            thread_pointer: p.teb_va,
+            arg0: p.arg,
+            arg1: 0,
+        },
+    );
 
     let tid = spawn_locked(t)?;
     if pid != 0 {

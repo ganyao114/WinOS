@@ -1,4 +1,4 @@
-use crate::nt::SvcFrame;
+use crate::arch::trap::SvcFrame;
 
 #[inline(always)]
 fn unsupported() -> ! {

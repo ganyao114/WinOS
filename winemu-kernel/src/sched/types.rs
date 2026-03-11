@@ -1,6 +1,8 @@
-// sched/types.rs — Core scheduler types: ThreadState, ThreadContext, KernelContext, KThread
+// sched/types.rs — Core scheduler types: ThreadState, WaitDeadline, KThread
 
 use core::sync::atomic::{AtomicU32, Ordering};
+
+use crate::arch::context::{KernelContext, ThreadContext};
 
 pub const MAX_VCPUS: usize = 8;
 pub const MAX_WAIT_HANDLES: usize = 64;
@@ -79,70 +81,6 @@ impl WaitState {
     }
 }
 
-// ── ThreadContext (EL0 registers) ────────────────────────────────────────────
-
-/// EL0 user-mode register snapshot saved on SVC entry.
-/// Layout must match arch/aarch64/context.rs __winemu_enter_user_thread_context.
-#[repr(C)]
-pub struct ThreadContext {
-    pub x: [u64; 31], // x0–x30  @ 0x000
-    pub sp: u64,      // sp_el0  @ 0x0f8
-    pub pc: u64,      // elr_el1 @ 0x100
-    pub pstate: u64,  // spsr_el1@ 0x108
-    pub tpidr: u64,   // tpidr_el0 @ 0x110
-}
-
-impl ThreadContext {
-    pub const fn new() -> Self {
-        Self {
-            x: [0u64; 31],
-            sp: 0,
-            pc: 0,
-            pstate: 0,
-            tpidr: 0,
-        }
-    }
-}
-
-// ── KernelContext (EL1 callee-saved) ─────────────────────────────────────────
-
-/// EL1 kernel continuation context.
-/// Layout must match arch/aarch64/context.rs assembly exactly:
-///   [0x00] x19–x29 (11 × u64)
-///   [0x58] x30 / lr  (continuation entry)
-///   [0x60] sp_el1
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct KernelContext {
-    pub x19_x29: [u64; 11], // x19–x29 @ 0x00
-    pub lr: u64,            // x30     @ 0x58
-    pub sp_el1: u64,        // sp_el1  @ 0x60
-}
-
-impl KernelContext {
-    pub const fn new() -> Self {
-        Self {
-            x19_x29: [0u64; 11],
-            lr: 0,
-            sp_el1: 0,
-        }
-    }
-    #[inline]
-    pub fn has_continuation(&self) -> bool {
-        self.sp_el1 != 0 && self.lr != 0
-    }
-    #[inline]
-    pub fn set_continuation(&mut self, sp_top: u64, entry: u64) {
-        self.sp_el1 = sp_top;
-        self.lr = entry;
-        self.x19_x29 = [0u64; 11];
-    }
-    #[inline]
-    pub fn clear(&mut self) {
-        *self = Self::new();
-    }
-}
-
 // ── KThread ──────────────────────────────────────────────────────────────────
 
 pub struct KThread {
@@ -154,12 +92,12 @@ pub struct KThread {
     pub base_priority: u8,
     pub is_idle_thread: bool,
 
-    // EL0 context
+    // user execution context
     pub ctx: ThreadContext,
 
-    // EL1 kernel continuation context
+    // kernel continuation context
     pub kctx: KernelContext,
-    /// true = kctx is valid / thread is executing in EL1
+    /// true = kctx is valid / thread is currently executing in kernel mode
     pub in_kernel: bool,
 
     // stacks

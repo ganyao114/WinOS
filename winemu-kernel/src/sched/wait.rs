@@ -120,7 +120,7 @@ pub fn check_wait_timeouts_locked() -> u32 {
 
 // ── Tick source ───────────────────────────────────────────────────────────────
 
-/// Read the current monotonic tick counter (100ns units, from CNTVCT_EL0).
+/// Read the current monotonic tick counter (100ns units, from the backend timer counter).
 #[inline]
 pub fn current_ticks() -> u64 {
     let v: u64;

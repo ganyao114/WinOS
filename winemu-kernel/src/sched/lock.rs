@@ -85,7 +85,7 @@ impl KSchedulerLock {
     }
 
     /// Lock without going through cpu_local (safe during early init before
-    /// TPIDR_EL1 is set up — uses vid=0).
+    /// the backend CPU-local register is set up — uses vid=0).
     #[inline]
     pub fn lock_vid0() -> Self {
         let depth = LOCK_DEPTH[0].fetch_add(1, Ordering::Relaxed);

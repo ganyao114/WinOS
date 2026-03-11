@@ -1,4 +1,19 @@
 #[inline(always)]
+pub fn read_mpidr_el1() -> u64 {
+    let val: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, mpidr_el1", out(reg) val, options(nostack, nomem));
+    }
+    val
+}
+
+#[inline(always)]
+pub fn boot_vcpu_id() -> u32 {
+    let aff0 = (read_mpidr_el1() & 0xff) as u32;
+    aff0.min((crate::sched::MAX_VCPUS - 1) as u32)
+}
+
+#[inline(always)]
 pub fn read_tpidr_el1() -> u64 {
     let val: u64;
     unsafe {

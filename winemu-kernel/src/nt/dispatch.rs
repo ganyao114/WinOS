@@ -1,6 +1,5 @@
-// svc_dispatch — EL1 SVC 分发器
-// 由 vectors.rs 的 SVC handler 汇编调用，处理所有来自 EL0 的 syscall。
-// 若需要线程切换，直接修改 SvcFrame 中的寄存器，ERET 后进入新线程。
+// Trap/syscall dispatch glue used by arch trap entry code.
+// This layer owns generic syscall dispatch and post-trap scheduling policy.
 
 use crate::hypercall;
 use crate::sched::{
@@ -13,9 +12,9 @@ use crate::timer;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::constants::{
-    EL0_FAULT_ELR_TAG, EL0_FAULT_ESR_TAG, EL0_FAULT_FAR_TAG, EL0_FAULT_SPSR_TAG, EL1_FAULT_ELR_TAG,
-    EL1_FAULT_ESR_TAG, EL1_FAULT_FAR_TAG, EL1_FAULT_SPSR_TAG, SVC_TAG_NR_MASK, SVC_TAG_TABLE_MASK,
-    SVC_TAG_TABLE_SHIFT,
+    KERNEL_FAULT_ADDRESS_TAG, KERNEL_FAULT_PC_TAG, KERNEL_FAULT_STATE_TAG,
+    KERNEL_FAULT_SYNDROME_TAG, SVC_TAG_NR_MASK, SVC_TAG_TABLE_MASK, SVC_TAG_TABLE_SHIFT,
+    USER_FAULT_ADDRESS_TAG, USER_FAULT_PC_TAG, USER_FAULT_STATE_TAG, USER_FAULT_SYNDROME_TAG,
 };
 use super::sysno;
 use super::sysno_table::{lookup, NtHandlerId, HANDLER_NONE};
@@ -35,7 +34,7 @@ static TRAP_SCHED_ACTIVE: [AtomicU32; 8] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
 ];
-static TIMER_EL0_LAST_ELR: [AtomicU64; 8] = [
+static USER_IRQ_LAST_PC: [AtomicU64; 8] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -45,7 +44,7 @@ static TIMER_EL0_LAST_ELR: [AtomicU64; 8] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
-static TIMER_EL0_REPEAT_COUNT: [AtomicU32; 8] = [
+static USER_IRQ_REPEAT_COUNT: [AtomicU32; 8] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
     AtomicU32::new(0),
@@ -57,7 +56,7 @@ static TIMER_EL0_REPEAT_COUNT: [AtomicU32; 8] = [
 ];
 
 #[inline]
-fn trace_repeated_timer_el0_pc(vid: usize, tid: u32, frame: &SvcFrame) {
+fn trace_repeated_user_irq_pc(vid: usize, tid: u32, frame: &SvcFrame) {
     if tid == 0 || vid >= TRAP_SCHED_ACTIVE.len() {
         return;
     }
@@ -65,12 +64,12 @@ fn trace_repeated_timer_el0_pc(vid: usize, tid: u32, frame: &SvcFrame) {
         return;
     }
 
-    let last_elr = TIMER_EL0_LAST_ELR[vid].load(Ordering::Acquire);
-    let repeat = if last_elr == frame.elr {
-        TIMER_EL0_REPEAT_COUNT[vid].fetch_add(1, Ordering::AcqRel) + 1
+    let last_pc = USER_IRQ_LAST_PC[vid].load(Ordering::Acquire);
+    let repeat = if last_pc == frame.program_counter() {
+        USER_IRQ_REPEAT_COUNT[vid].fetch_add(1, Ordering::AcqRel) + 1
     } else {
-        TIMER_EL0_LAST_ELR[vid].store(frame.elr, Ordering::Release);
-        TIMER_EL0_REPEAT_COUNT[vid].store(1, Ordering::Release);
+        USER_IRQ_LAST_PC[vid].store(frame.program_counter(), Ordering::Release);
+        USER_IRQ_REPEAT_COUNT[vid].store(1, Ordering::Release);
         1
     };
 
@@ -79,13 +78,13 @@ fn trace_repeated_timer_el0_pc(vid: usize, tid: u32, frame: &SvcFrame) {
     }
 
     crate::kwarn!(
-        "timer_el0_repeat: vid={} repeat={} tid={} pid={} elr={:#x} sp={:#x} x0={:#x} x1={:#x} ttbr0={:#x}",
+        "user_irq_repeat: vid={} repeat={} tid={} pid={} pc={:#x} user_sp={:#x} x0={:#x} x1={:#x} user_root={:#x}",
         vid,
         repeat,
         tid,
         crate::sched::thread_pid(tid),
-        frame.elr,
-        frame.sp_el0,
+        frame.program_counter(),
+        frame.user_sp(),
         frame.x[0],
         frame.x[1],
         crate::arch::mmu::current_user_table_root(),
@@ -137,7 +136,7 @@ pub extern "C" fn svc_migrate_frame_to_thread_stack(_frame_ptr: u64, _frame_size
 }
 
 #[no_mangle]
-pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
+pub extern "C" fn syscall_dispatch(frame: &mut SvcFrame) {
     let cur = current_tid();
     if cur != 0 {
         set_thread_in_kernel_locked(cur, true);
@@ -341,10 +340,10 @@ fn trace_syscall_error(nr: u16, table: u8, frame: &SvcFrame) {
         return;
     }
     crate::kerror!(
-        "nt: syscall error nr={:#x} st={:#x} elr={:#x} lr={:#x}",
+        "nt: syscall error nr={:#x} st={:#x} pc={:#x} lr={:#x}",
         nr,
         status,
-        frame.elr,
+        frame.program_counter(),
         frame.x[30]
     );
 }
@@ -354,11 +353,11 @@ fn save_ctx_for(tid: u32, frame: &SvcFrame) {
         return;
     }
     with_thread_mut(tid, |t| {
-        t.ctx.x.copy_from_slice(&frame.x);
-        t.ctx.sp = frame.sp_el0;
-        t.ctx.pc = frame.elr;
-        t.ctx.pstate = frame.spsr;
-        t.ctx.tpidr = frame.tpidr;
+        t.ctx.copy_general_registers_from(&frame.x);
+        t.ctx.set_user_sp(frame.user_sp());
+        t.ctx.set_program_counter(frame.program_counter());
+        t.ctx.set_processor_state(frame.processor_state());
+        t.ctx.set_thread_pointer(frame.thread_pointer());
     });
 }
 
@@ -367,11 +366,11 @@ fn restore_ctx_to_frame(tid: u32, frame: &mut SvcFrame) {
         return;
     }
     with_thread_mut(tid, |t| {
-        frame.x.copy_from_slice(&t.ctx.x);
-        frame.sp_el0 = t.ctx.sp;
-        frame.elr = t.ctx.pc;
-        frame.spsr = t.ctx.pstate;
-        frame.tpidr = t.ctx.tpidr;
+        frame.x.copy_from_slice(t.ctx.general_registers());
+        frame.set_user_sp(t.ctx.user_sp());
+        frame.set_program_counter(t.ctx.program_counter());
+        frame.set_processor_state(t.ctx.processor_state());
+        frame.set_thread_pointer(t.ctx.thread_pointer());
     });
 }
 
@@ -561,17 +560,15 @@ fn schedule_from_trap(
 }
 
 #[no_mangle]
-pub extern "C" fn timer_irq_dispatch(frame: &mut SvcFrame) {
+pub extern "C" fn user_irq_dispatch(frame: &mut SvcFrame) {
     let vid = vcpu_id() as usize;
     let cur = current_tid();
     let in_nested_trap_sched = TRAP_SCHED_ACTIVE[vid].load(Ordering::Acquire) != 0;
-    // SPSR.M[3:0] == 0b0000 means interrupted from EL0t (user mode).
-    // If we interrupted EL1, defer preemption to avoid nested kernel re-entry.
-    let interrupted_from_el0 = (frame.spsr & 0xF) == 0;
-    if interrupted_from_el0 {
-        trace_repeated_timer_el0_pc(vid, cur, frame);
+    let interrupted_user = crate::arch::trap::interrupted_user_mode(frame);
+    if interrupted_user {
+        trace_repeated_user_irq_pc(vid, cur, frame);
     }
-    if in_nested_trap_sched || !interrupted_from_el0 {
+    if in_nested_trap_sched || !interrupted_user {
         set_needs_reschedule();
         let now = crate::sched::wait::current_ticks();
         // Nested-trap / in-kernel IRQ path cannot switch immediately.
@@ -593,24 +590,22 @@ pub extern "C" fn timer_irq_dispatch(frame: &mut SvcFrame) {
 }
 
 #[no_mangle]
-pub extern "C" fn el1_fault_dispatch(frame: &mut SvcFrame) {
-    let esr = crate::arch::cpu::current_fault_syndrome();
-    let far = crate::arch::cpu::current_fault_address();
-    crate::log::debug_u64(EL1_FAULT_ESR_TAG | esr);
-    crate::log::debug_u64(EL1_FAULT_FAR_TAG | far);
-    crate::log::debug_u64(EL1_FAULT_ELR_TAG | frame.elr);
-    crate::log::debug_u64(EL1_FAULT_SPSR_TAG | frame.spsr);
+pub extern "C" fn kernel_fault_dispatch(frame: &mut SvcFrame) {
+    let fault = crate::arch::trap::current_fault_info();
+    crate::log::debug_u64(KERNEL_FAULT_SYNDROME_TAG | fault.syndrome);
+    crate::log::debug_u64(KERNEL_FAULT_ADDRESS_TAG | fault.address);
+    crate::log::debug_u64(KERNEL_FAULT_PC_TAG | frame.program_counter());
+    crate::log::debug_u64(KERNEL_FAULT_STATE_TAG | frame.processor_state());
     hypercall::process_exit(0xE1);
 }
 
 #[no_mangle]
-pub extern "C" fn el0_fault_dispatch(frame: &mut SvcFrame) {
-    let esr = crate::arch::cpu::current_fault_syndrome();
-    let far = crate::arch::cpu::current_fault_address();
-    crate::log::debug_u64(EL0_FAULT_ESR_TAG | esr);
-    crate::log::debug_u64(EL0_FAULT_FAR_TAG | far);
-    crate::log::debug_u64(EL0_FAULT_ELR_TAG | frame.elr);
-    crate::log::debug_u64(EL0_FAULT_SPSR_TAG | frame.spsr);
+pub extern "C" fn user_fault_dispatch(frame: &mut SvcFrame) {
+    let fault = crate::arch::trap::current_fault_info();
+    crate::log::debug_u64(USER_FAULT_SYNDROME_TAG | fault.syndrome);
+    crate::log::debug_u64(USER_FAULT_ADDRESS_TAG | fault.address);
+    crate::log::debug_u64(USER_FAULT_PC_TAG | frame.program_counter());
+    crate::log::debug_u64(USER_FAULT_STATE_TAG | frame.processor_state());
     hypercall::process_exit(0xFF);
 }
 

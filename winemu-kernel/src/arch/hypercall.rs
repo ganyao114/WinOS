@@ -1,4 +1,4 @@
-use crate::nt::SvcFrame;
+use super::trap::SvcFrame;
 
 type Backend = super::backend::ArchBackend;
 

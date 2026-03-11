@@ -1,6 +1,11 @@
 type Backend = super::backend::ArchBackend;
 
 #[inline(always)]
+pub fn boot_vcpu_id() -> u32 {
+    <Backend as super::contract::CpuBackend>::boot_vcpu_id()
+}
+
+#[inline(always)]
 pub fn current_cpu_local() -> u64 {
     <Backend as super::contract::CpuBackend>::cpu_local_read()
 }

@@ -65,7 +65,7 @@ global_asm!(
 );
 
 // Lower-EL IRQ path:
-// build SvcFrame and invoke Rust timer_irq_dispatch so timer IRQ can drive
+// build SvcFrame and invoke Rust user_irq_dispatch so timer IRQ can drive
 // preempt scheduling without waiting for the next syscall.
 global_asm!(
     ".section .text.timer,\"ax\"",
@@ -110,9 +110,9 @@ global_asm!(
     // Keep frame base in x28 (callee-saved) and run EL1 call stack below it.
     "mov x28, x0",
     "sub sp, x28, #0x10",
-    // Call Rust dispatcher: timer_irq_dispatch(&mut frame)
+    // Call Rust dispatcher: user_irq_dispatch(&mut frame)
     "mov x0, x28",
-    "bl timer_irq_dispatch",
+    "bl user_irq_dispatch",
     // Restore ELR/SPSR/SP_EL0/TPIDR_EL0 from potentially modified frame.
     "ldr x16, [x28, #0x100]",
     "msr elr_el1, x16",

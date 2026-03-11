@@ -1,6 +1,7 @@
 use core::arch::global_asm;
 
-use crate::sched::{KernelContext, ThreadContext};
+use crate::arch::context::{KernelContext, ThreadContext};
+use crate::arch::trap::SvcFrame;
 
 global_asm!(
     ".section .text.context,\"ax\"",
@@ -118,4 +119,49 @@ pub unsafe fn enter_kernel_context(ctx: *const KernelContext) -> ! {
 #[inline(always)]
 pub unsafe fn enter_user_thread_context(ctx: *const ThreadContext) -> ! {
     __winemu_enter_user_thread_context(ctx)
+}
+
+#[inline]
+pub fn restore_user_context_record(frame: &mut SvcFrame, context: &[u8]) -> bool {
+    if context.len() < 272 {
+        return false;
+    }
+
+    // Guest CONTEXT layout:
+    // ContextFlags(4)+pad(4)+X0..X28(29x8)+Fp(8)+Lr(8)+Sp(8)+Pc(8)+Cpsr(4)+pad(4)
+    let read_u64 = |off: usize| -> u64 {
+        let bytes = &context[off..off + 8];
+        u64::from_le_bytes(bytes.try_into().unwrap())
+    };
+    let read_u32 = |off: usize| -> u32 {
+        let bytes = &context[off..off + 4];
+        u32::from_le_bytes(bytes.try_into().unwrap())
+    };
+
+    for i in 0u64..19 {
+        frame.x[i as usize] = read_u64(8 + i as usize * 8);
+    }
+    frame.set_program_counter(read_u64(256));
+    frame.set_user_sp(read_u64(248));
+    frame.set_processor_state(read_u32(264) as u64);
+    true
+}
+
+#[inline]
+pub fn initialize_user_thread_context(
+    ctx: &mut ThreadContext,
+    program_counter: u64,
+    stack_pointer: u64,
+    thread_pointer: u64,
+    arg0: u64,
+    arg1: u64,
+) {
+    *ctx = ThreadContext::new();
+    ctx.set_program_counter(program_counter);
+    ctx.set_user_sp(stack_pointer);
+    ctx.set_processor_state(0);
+    ctx.set_thread_pointer(thread_pointer);
+    ctx.set_general_register(0, arg0);
+    ctx.set_general_register(1, arg1);
+    ctx.set_general_register(18, thread_pointer);
 }

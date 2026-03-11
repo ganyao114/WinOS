@@ -4,6 +4,11 @@ fn unsupported() -> ! {
 }
 
 #[inline(always)]
+pub fn boot_vcpu_id() -> u32 {
+    unsupported()
+}
+
+#[inline(always)]
 pub fn cpu_local_read() -> u64 {
     unsupported()
 }

@@ -5,11 +5,17 @@ pub mod hypercall;
 pub mod mmu;
 pub mod spin;
 pub mod timer;
+pub mod trap;
 pub mod vectors;
 
 pub struct ArchBackend;
 
 impl super::contract::CpuBackend for ArchBackend {
+    #[inline(always)]
+    fn boot_vcpu_id() -> u32 {
+        cpu::boot_vcpu_id()
+    }
+
     #[inline(always)]
     fn cpu_local_read() -> u64 {
         cpu::cpu_local_read()
@@ -125,7 +131,7 @@ impl super::contract::HypercallBackend for ArchBackend {
     }
 
     #[inline(always)]
-    fn forward_nt_syscall(frame: &crate::nt::SvcFrame, nr: u16, table: u8) -> u64 {
+    fn forward_nt_syscall(frame: &crate::arch::trap::SvcFrame, nr: u16, table: u8) -> u64 {
         hypercall::forward_nt_syscall(frame, nr, table)
     }
 }
@@ -156,6 +162,18 @@ impl super::contract::TimerBackend for ArchBackend {
     }
 }
 
+impl super::contract::TrapBackend for ArchBackend {
+    #[inline(always)]
+    fn interrupted_user_mode(frame: &crate::arch::trap::SvcFrame) -> bool {
+        trap::interrupted_user_mode(frame)
+    }
+
+    #[inline(always)]
+    fn current_fault_info() -> super::contract::TrapFaultInfo {
+        trap::current_fault_info()
+    }
+}
+
 impl super::contract::VectorsBackend for ArchBackend {
     #[inline(always)]
     fn install_exception_vectors() {
@@ -170,25 +188,49 @@ impl super::contract::VectorsBackend for ArchBackend {
 
 impl super::contract::ContextBackend for ArchBackend {
     #[inline(always)]
-    unsafe fn save_kernel_context(ctx: *mut crate::sched::KernelContext) -> u64 {
+    unsafe fn save_kernel_context(ctx: *mut crate::arch::context::KernelContext) -> u64 {
         context::save_kernel_context(ctx)
     }
 
     #[inline(always)]
     unsafe fn switch_kernel_context(
-        from: *mut crate::sched::KernelContext,
-        to: *const crate::sched::KernelContext,
+        from: *mut crate::arch::context::KernelContext,
+        to: *const crate::arch::context::KernelContext,
     ) {
         context::switch_kernel_context(from, to);
     }
 
     #[inline(always)]
-    unsafe fn enter_kernel_context(ctx: *const crate::sched::KernelContext) -> ! {
+    unsafe fn enter_kernel_context(ctx: *const crate::arch::context::KernelContext) -> ! {
         context::enter_kernel_context(ctx)
     }
 
     #[inline(always)]
-    unsafe fn enter_user_thread_context(ctx: *const crate::sched::ThreadContext) -> ! {
+    unsafe fn enter_user_thread_context(ctx: *const crate::arch::context::ThreadContext) -> ! {
         context::enter_user_thread_context(ctx)
+    }
+
+    #[inline(always)]
+    fn restore_user_context_record(frame: &mut crate::arch::trap::SvcFrame, context_bytes: &[u8]) -> bool {
+        context::restore_user_context_record(frame, context_bytes)
+    }
+
+    #[inline(always)]
+    fn initialize_user_thread_context(
+        ctx: &mut crate::arch::context::ThreadContext,
+        program_counter: u64,
+        stack_pointer: u64,
+        thread_pointer: u64,
+        arg0: u64,
+        arg1: u64,
+    ) {
+        context::initialize_user_thread_context(
+            ctx,
+            program_counter,
+            stack_pointer,
+            thread_pointer,
+            arg0,
+            arg1,
+        )
     }
 }

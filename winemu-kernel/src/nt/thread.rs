@@ -417,27 +417,9 @@ pub(crate) fn handle_continue(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     };
-    // ARM64 CONTEXT layout: ContextFlags(4)+pad(4)+X0..X28(29×8)+Fp(8)+Lr(8)+Sp(8)+Pc(8)+Cpsr(4)+pad(4)
-    // Offset of X0 = 8, Pc = 8 + 31*8 = 256, Sp = 8 + 30*8 = 248, Cpsr = 264
-    let read_u64 = |off: usize| -> u64 {
-        let bytes = &ctx[off..off + 8];
-        u64::from_le_bytes(bytes.try_into().unwrap())
-    };
-    let read_u32 = |off: usize| -> u32 {
-        let bytes = &ctx[off..off + 4];
-        u32::from_le_bytes(bytes.try_into().unwrap())
-    };
-    let pc = read_u64(256);
-    let sp = read_u64(248);
-    let cpsr = read_u32(264);
-    // Restore general-purpose registers x0..x18 from context
-    for i in 0u64..19 {
-        frame.x[i as usize] = read_u64(8 + i as usize * 8);
+    if !crate::arch::context::restore_user_context_record(frame, &ctx) {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
     }
-    frame.elr = pc;
-    frame.sp_el0 = sp;
-    frame.spsr = cpsr as u64;
-    // x0 will be overwritten by the restored value above; status is in the restored context
 }
 
 // x0=ExceptionRecord*, x1=ContextRecord*, x2=FirstChance
@@ -450,9 +432,9 @@ pub(crate) fn handle_raise_exception(frame: &mut SvcFrame) {
         crate::dll::resolve_import("ntdll.dll", ImportRef::Name("KiUserExceptionDispatcher"));
     match dispatcher {
         Some(addr) => {
-            // Redirect EL0 return to KiUserExceptionDispatcher.
+            // Redirect the next user-mode return to KiUserExceptionDispatcher.
             // x0 and x1 already hold ExceptionRecord* and Context* from the syscall args.
-            frame.elr = addr;
+            frame.set_program_counter(addr);
             frame.x[0] = status::SUCCESS as u64;
         }
         None => {

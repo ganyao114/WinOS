@@ -10,6 +10,8 @@ mod backend;
 compile_error!("unsupported target_arch: add backend wiring in src/arch/mod.rs");
 
 mod contract;
+mod context_types;
+mod trap_frame;
 
 // Arch capability surface exposed to the rest of the kernel.
 // Each backend must provide modules: cpu/hypercall/mmu/spin/timer/vectors.
@@ -19,4 +21,5 @@ pub mod hypercall;
 pub mod mmu;
 pub mod spin;
 pub mod timer;
+pub mod trap;
 pub mod vectors;

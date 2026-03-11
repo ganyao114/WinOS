@@ -163,7 +163,7 @@ global_asm!(
     "mrs x0, far_el1",
     "mrs x1, esr_el1",
     "mrs x2, elr_el1",
-    "bl el1_sync_fault",
+    "bl kernel_sync_fault_dispatch",
     "b .",
     // ── SVC from EL0 ───────────────────────────────────────────
     // Build SvcFrame on SVC stack and call guest EL1 dispatcher.
@@ -213,9 +213,9 @@ global_asm!(
     // overlap between continuation stack slots and mutable SvcFrame bytes.
     "mov x28, x0",
     "sub sp, x28, #0x10",
-    // Call Rust dispatcher: svc_dispatch(&mut frame)
+    // Call Rust dispatcher: syscall_dispatch(&mut frame)
     "mov x0, x28",
-    "bl svc_dispatch",
+    "bl syscall_dispatch",
     // Restore ELR/SPSR/SP_EL0/TPIDR_EL0 from possibly modified frame.
     "ldr x16, [x28, #0x100]",
     "msr elr_el1, x16",
@@ -290,7 +290,7 @@ global_asm!(
     "mrs x1, esr_el1",
     "ldr x2, [sp, #0x0f8]",
     "mov x3, sp",
-    "bl el0_page_fault",
+    "bl user_page_fault_dispatch",
     // x0 == 0 => unresolved EL0 fault. For now, skip one A64 instruction.
     "cbz x0, 90f",
     // Restore ELR/SPSR
@@ -329,7 +329,7 @@ global_asm!(
     "mrs x1, esr_el1",
     "mrs x2, elr_el1",
     "mov x3, xzr",
-    "bl el0_page_fault",
+    "bl user_page_fault_dispatch",
     "b .",
     // ── EC=0x00 compat skip path ──────────────────────────────
     "93:",

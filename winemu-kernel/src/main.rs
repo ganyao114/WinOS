@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 extern crate alloc as rust_alloc;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 mod alloc;
 mod arch;
@@ -24,63 +24,10 @@ mod vectors;
 
 #[no_mangle]
 pub static __boot_primary_ready: AtomicU32 = AtomicU32::new(0);
-static EL0_FAULT_LAST_FAR: [AtomicU64; sched::MAX_VCPUS] =
-    [const { AtomicU64::new(0) }; sched::MAX_VCPUS];
-static EL0_FAULT_LAST_ELR: [AtomicU64; sched::MAX_VCPUS] =
-    [const { AtomicU64::new(0) }; sched::MAX_VCPUS];
-static EL0_FAULT_REPEAT_COUNT: [AtomicU32; sched::MAX_VCPUS] =
-    [const { AtomicU32::new(0) }; sched::MAX_VCPUS];
-
-#[inline]
-fn trace_el0_fault_repeat(far: u64, elr: u64, access: u8, owner_pid: u32) {
-    let vid = (sched::vcpu_id() as usize).min(sched::MAX_VCPUS - 1);
-    let last_far = EL0_FAULT_LAST_FAR[vid].load(Ordering::Acquire);
-    let last_elr = EL0_FAULT_LAST_ELR[vid].load(Ordering::Acquire);
-    let repeat = if last_far == far && last_elr == elr {
-        EL0_FAULT_REPEAT_COUNT[vid].fetch_add(1, Ordering::AcqRel) + 1
-    } else {
-        EL0_FAULT_LAST_FAR[vid].store(far, Ordering::Release);
-        EL0_FAULT_LAST_ELR[vid].store(elr, Ordering::Release);
-        EL0_FAULT_REPEAT_COUNT[vid].store(1, Ordering::Release);
-        1
-    };
-
-    if repeat < 64 || (repeat & (repeat - 1)) != 0 {
-        return;
-    }
-
-    crate::kwarn!(
-        "el0_fault_repeat: vid={} repeat={} far={:#x} elr={:#x} access={} pid={} tid={} ttbr0={:#x}",
-        vid,
-        repeat,
-        far,
-        elr,
-        access,
-        owner_pid,
-        crate::sched::current_tid(),
-        crate::arch::mmu::current_user_table_root(),
-    );
-}
-
 #[inline(always)]
 fn set_primary_boot_ready() {
     __boot_primary_ready.store(1, Ordering::Release);
     crate::arch::cpu::send_event();
-}
-
-#[inline(always)]
-fn boot_vcpu_id_from_mpidr() -> u32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let mpidr: u64;
-        unsafe {
-            core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nostack, nomem));
-        }
-        let aff0 = (mpidr & 0xff) as u32;
-        return aff0.min((sched::MAX_VCPUS - 1) as u32);
-    }
-    #[allow(unreachable_code)]
-    0
 }
 
 #[no_mangle]
@@ -92,146 +39,13 @@ pub extern "C" fn kernel_secondary_main() -> ! {
     // MMU/system control registers are per-CPU; secondary CPUs need local MMU
     // init before touching scheduler global state under virtual addresses.
     mm::init_per_cpu();
-    // TPIDR_EL1 must be initialized before any scheduler API usage.
-    let boot_vid = boot_vcpu_id_from_mpidr();
+    // The backend CPU-local register must be initialized before any scheduler
+    // API usage.
+    let boot_vid = crate::arch::cpu::boot_vcpu_id();
     sched::init_cpu_local(boot_vid);
     let vid = (sched::vcpu_id() as usize).min(sched::MAX_VCPUS - 1);
     sched::register_idle_thread_for_vcpu(vid as u32);
     sched::enter_core_scheduler_entry(vid)
-}
-
-/// EL0 Data Abort / Instruction Abort handler.
-/// Called from assembly with: far=faulting address, esr=syndrome, elr=faulting PC.
-/// Returns 1 if fault resolved (demand paging), 0 if unresolvable.
-#[no_mangle]
-pub extern "C" fn el0_page_fault(far: u64, esr: u64, elr: u64, frame_ptr: u64) -> u64 {
-    let ec = (esr >> 26) & 0x3F;
-    let iss = esr & 0x01FF_FFFF;
-    let fsc = iss & 0x3F;
-    let wnr = (iss >> 6) & 1;
-
-    let is_el0_abort = ec == 0x20 || ec == 0x24;
-    let is_translation_fault = (0x04..=0x07).contains(&fsc);
-    let is_access_flag_fault = fsc == 0x09 || fsc == 0x0B;
-    let is_permission_fault = (0x0C..=0x0F).contains(&fsc);
-    if is_el0_abort && (is_translation_fault || is_access_flag_fault || is_permission_fault) {
-        let access = if ec == 0x20 {
-            crate::mm::VM_ACCESS_EXEC
-        } else if wnr != 0 {
-            crate::mm::VM_ACCESS_WRITE
-        } else {
-            crate::mm::VM_ACCESS_READ
-        };
-        let owner_pid = crate::process::current_pid();
-        trace_el0_fault_repeat(far, elr, access, owner_pid);
-        let tid = crate::sched::current_tid();
-        if tid != 0 {
-            crate::process::switch_to_thread_process(tid);
-        }
-        if owner_pid != 0
-            && crate::mm::handle_process_page_fault(owner_pid, crate::mm::UserVa::new(far), access)
-        {
-            if tid != 0 {
-                crate::process::switch_to_thread_process(tid);
-            }
-            return 1;
-        }
-    }
-
-    // kernelbase!init_locale compatibility:
-    // Some startup paths dereference [x23+8] with x23==NULL while the module's
-    // fallback slot is still zero but locale table pointer is already populated.
-    // Patch slot from table and retry the faulting instruction once.
-    if far == 0x8 && elr == 0x4042_a058 {
-        use crate::mm::usercopy::{
-            read_current_user_mapped_value, write_current_user_mapped_value,
-        };
-
-        let kb_slot_va = 0x4053_f938u64;
-        let kb_table_va = 0x4053_f950u64;
-        let fault_x23 = if frame_ptr != 0 {
-            unsafe { (frame_ptr as *const u64).add(23).read_volatile() }
-        } else {
-            0
-        };
-        let slot = read_current_user_mapped_value(kb_slot_va as *const u64).unwrap_or(0);
-        let table = read_current_user_mapped_value(kb_table_va as *const u64).unwrap_or(0);
-        let replacement = if slot != 0 { slot } else { table };
-        if fault_x23 == 0 && replacement != 0 {
-            unsafe {
-                if frame_ptr != 0 {
-                    (frame_ptr as *mut u64).add(23).write_volatile(replacement);
-                }
-            }
-            if slot == 0 {
-                let _ = write_current_user_mapped_value(kb_slot_va as *mut u64, replacement);
-            }
-            return 1;
-        }
-    }
-
-    crate::log::debug_print("PAGE_FAULT_UNRESOLVED FAR=");
-    crate::log::debug_u64(far);
-    crate::log::debug_print(" ESR=");
-    crate::log::debug_u64(esr);
-    crate::log::debug_print(" ELR=");
-    crate::log::debug_u64(elr);
-    let owner_pid = crate::process::current_pid();
-    crate::log::debug_print(" PID=");
-    crate::log::debug_u64(owner_pid as u64);
-    crate::log::debug_print(" TID=");
-    crate::log::debug_u64(crate::sched::current_tid() as u64);
-    crate::log::debug_print("\n");
-    hypercall::process_exit(0xFF)
-}
-
-/// EL1 synchronous exception handler for kernel faults.
-/// Called from vectors with: far=fault address, esr=syndrome, elr=faulting PC.
-#[no_mangle]
-pub extern "C" fn el1_sync_fault(
-    far: u64,
-    esr: u64,
-    elr: u64,
-    lr: u64,
-    x0: u64,
-    x1: u64,
-    x2: u64,
-) -> ! {
-    const KERNEL_TEXT_MIN: u64 = 0x4000_0000;
-    const KERNEL_TEXT_MAX: u64 = 0x5000_0000;
-    let mut insn_m2 = 0u64;
-    let mut insn_m1 = 0u64;
-    let mut insn = 0u64;
-    let mut insn_p1 = 0u64;
-    let mut insn_p2 = 0u64;
-    if elr >= KERNEL_TEXT_MIN && elr + 8 < KERNEL_TEXT_MAX && (elr & 0x3) == 0 {
-        insn_m2 = unsafe { (elr.wrapping_sub(8) as *const u32).read_volatile() as u64 };
-        insn_m1 = unsafe { (elr.wrapping_sub(4) as *const u32).read_volatile() as u64 };
-        insn = unsafe { (elr as *const u32).read_volatile() as u64 };
-        insn_p1 = unsafe { (elr.wrapping_add(4) as *const u32).read_volatile() as u64 };
-        insn_p2 = unsafe { (elr.wrapping_add(8) as *const u32).read_volatile() as u64 };
-    }
-    let vid = crate::sched::vcpu_id();
-    let tid = crate::sched::current_tid();
-    crate::kerror!(
-        "KERNEL_FAULT far={:#x} esr={:#x} elr={:#x} lr={:#x} x0={:#x} x1={:#x} x2={:#x} insn={:#x} win=[{:#x},{:#x},{:#x},{:#x},{:#x}] vcpu={} tid={}",
-        far,
-        esr,
-        elr,
-        lr,
-        x0,
-        x1,
-        x2,
-        insn,
-        insn_m2,
-        insn_m1,
-        insn,
-        insn_p1,
-        insn_p2,
-        vid,
-        tid
-    );
-    hypercall::process_exit(0xE1)
 }
 
 #[no_mangle]
@@ -245,7 +59,7 @@ pub extern "C" fn kernel_main() -> ! {
     // early Vec allocations may fall back to untracked direct pages.
     alloc::init();
     // Primary vCPU scheduler bootstrap.
-    sched::init_cpu_local(boot_vcpu_id_from_mpidr());
+    sched::init_cpu_local(crate::arch::cpu::boot_vcpu_id());
     sched::init_scheduler();
     sched::init_sync_state();
     crate::kinfo!("kernel_main: mmu ok");
@@ -427,18 +241,21 @@ pub extern "C" fn kernel_main() -> ! {
         // unified scheduler entry below.
         sched::SCHED_LOCK.acquire();
         sched::with_thread_mut(thread0_tid, |t| {
-            t.ctx.pc = start_thunk_va;
-            t.ctx.sp = teb_peb.stack_base;
-            t.ctx.x[0] = app_entry_va;
-            t.ctx.x[1] = teb_peb.peb_va;
-            t.ctx.x[18] = teb_peb.teb_va;
-            t.ctx.tpidr = teb_peb.teb_va;
-            t.ctx.pstate = 0;
+            crate::arch::context::initialize_user_thread_context(
+                &mut t.ctx,
+                crate::arch::context::UserThreadStart {
+                    program_counter: start_thunk_va,
+                    stack_pointer: teb_peb.stack_base,
+                    thread_pointer: teb_peb.teb_va,
+                    arg0: app_entry_va,
+                    arg1: teb_peb.peb_va,
+                },
+            );
             t.slice_remaining_100ns = timer::DEFAULT_TIMESLICE_100NS;
             t.last_start_100ns = now;
             t.in_kernel = false;
         });
-        // Re-queue thread0 only after its EL0 context is complete.
+        // Re-queue thread0 only after its user context is complete.
         sched::set_thread_state_locked(thread0_tid, sched::ThreadState::Ready);
         sched::SCHED_LOCK.release();
     }

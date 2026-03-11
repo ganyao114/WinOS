@@ -119,7 +119,7 @@ impl<'a> SyscallArgs<'a> {
     #[inline]
     pub(crate) fn spill_u64(self, index: usize) -> Option<u64> {
         let offset = (index as u64).checked_mul(core::mem::size_of::<u64>() as u64)?;
-        let spill_va = self.frame.sp_el0.checked_add(offset)?;
+        let spill_va = self.frame.user_sp().checked_add(offset)?;
         read_current_user_value(spill_va as *const u64)
     }
 

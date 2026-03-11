@@ -1,11 +1,11 @@
 // sched/context.rs — Kernel context switch helpers
 //
 // Provides:
-//   ensure_user_entry_continuation_locked(tid)  — set up kctx for first EL0 entry
+//   ensure_user_entry_continuation_locked(tid)  — set up kctx for first user entry
 //   setup_idle_thread_continuation_locked(tid)  — set up kctx for idle loop
 //   set_thread_in_kernel_locked(tid, val)        — update in_kernel flag
 //
-// The actual assembly context-switch routines are in arch/aarch64/context.rs.
+// The actual backend context-switch routines live under arch/*/context.rs.
 
 use crate::sched::global::with_thread_mut;
 use crate::sched::types::KERNEL_STACK_SIZE;
@@ -17,16 +17,16 @@ use crate::sched::types::KERNEL_STACK_SIZE;
 /// This call may return later when another thread switches back to `from`.
 #[inline(always)]
 pub unsafe fn __sched_switch_kernel_context(from: *mut u8, to: *const u8) {
+    use crate::arch::context::KernelContext;
     use crate::arch::context::switch_kernel_context;
-    use crate::sched::types::KernelContext;
     switch_kernel_context(from as *mut KernelContext, to as *const KernelContext);
 }
 
-/// Enter EL0 from a fresh kernel stack. Does not return.
+/// Enter user mode from a fresh kernel stack. Does not return.
 #[inline(always)]
 pub unsafe fn __sched_enter_user_thread(ctx: *const u8) -> ! {
+    use crate::arch::context::ThreadContext;
     use crate::arch::context::enter_user_thread_context;
-    use crate::sched::types::ThreadContext;
     enter_user_thread_context(ctx as *const ThreadContext)
 }
 
@@ -35,17 +35,17 @@ pub unsafe fn __sched_enter_user_thread(ctx: *const u8) -> ! {
 pub unsafe extern "C" fn thread_user_entry_continuation() -> ! {
     let tid = crate::sched::cpu::current_tid();
     let ctx_ptr = crate::sched::global::with_thread(tid, |t| {
-        &t.ctx as *const crate::sched::types::ThreadContext as usize
+        &t.ctx as *const crate::arch::context::ThreadContext as usize
     })
     .unwrap_or(0) as *const u8;
-    // A fresh EL0 entry can follow a TTBR0 handoff from another process/core.
+    // A fresh user entry can follow a TTBR0 handoff from another process/core.
     // Flush local translations immediately before ERET so the first user fetch
-    // cannot observe a stale EL0 translation on this CPU.
+    // cannot observe a stale user translation on this CPU.
     crate::arch::mmu::flush_tlb_global();
     __sched_enter_user_thread(ctx_ptr)
 }
 
-/// Entry point for idle threads — EL1 loop.
+/// Entry point for idle threads — kernel loop.
 #[no_mangle]
 pub unsafe extern "C" fn idle_thread_fn() -> ! {
     loop {
@@ -118,7 +118,7 @@ pub fn ensure_user_entry_continuation_locked(tid: u32) {
         if t.in_kernel || t.kctx.has_continuation() {
             return;
         }
-        // Set up a fresh kernel continuation that will ERET into EL0.
+        // Set up a fresh kernel continuation that will return into user mode.
         let kstack_top = t.kstack_base + t.kstack_size as u64;
         t.kctx.set_continuation(
             kstack_top,
@@ -134,7 +134,7 @@ pub fn setup_idle_thread_continuation_locked(tid: u32) {
         let kstack_top = t.kstack_base + t.kstack_size as u64;
         t.kctx
             .set_continuation(kstack_top, idle_thread_fn as *const () as u64);
-        t.in_kernel = true; // idle thread always lives in EL1
+        t.in_kernel = true; // idle thread always stays in kernel mode
     });
 }
 

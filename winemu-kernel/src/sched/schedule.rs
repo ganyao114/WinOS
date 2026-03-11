@@ -12,7 +12,8 @@ use crate::sched::global::{with_thread, with_thread_mut, SCHED};
 use crate::sched::thread_control::reset_quantum_locked;
 use crate::sched::threads::free_terminated_threads_locked;
 use crate::sched::topology::set_thread_state_locked;
-use crate::sched::types::{KernelContext, ThreadState};
+use crate::arch::context::KernelContext;
+use crate::sched::types::ThreadState;
 use crate::sched::wait::check_wait_timeouts_locked;
 
 // ── SchedulerRoundAction ──────────────────────────────────────────────────────
@@ -358,8 +359,8 @@ pub unsafe fn enter_kernel_continuation_noreturn(to_tid: u32) -> ! {
         asm!(
             "mov sp, {sp}",
             "br  {lr}",
-            sp = in(reg) kctx.sp_el1,
-            lr = in(reg) kctx.lr,
+            sp = in(reg) kctx.stack_pointer(),
+            lr = in(reg) kctx.resume_pc(),
             options(noreturn),
         );
     }

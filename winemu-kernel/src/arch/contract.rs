@@ -1,7 +1,14 @@
-use crate::nt::SvcFrame;
-use crate::sched::{KernelContext, ThreadContext};
+use super::trap_frame::SvcFrame;
+use super::context_types::{KernelContext, ThreadContext};
+
+#[derive(Clone, Copy)]
+pub struct TrapFaultInfo {
+    pub syndrome: u64,
+    pub address: u64,
+}
 
 pub trait CpuBackend {
+    fn boot_vcpu_id() -> u32;
     fn cpu_local_read() -> u64;
     fn cpu_local_write(value: u64);
     fn fault_syndrome_read() -> u64;
@@ -44,29 +51,48 @@ pub trait TimerBackend {
     fn idle_wait_until_deadline_100ns(now_100ns: u64, next_deadline_100ns: u64);
 }
 
+pub trait TrapBackend {
+    fn interrupted_user_mode(frame: &SvcFrame) -> bool;
+    fn current_fault_info() -> TrapFaultInfo;
+}
+
 pub trait VectorsBackend {
     fn install_exception_vectors();
     fn default_kernel_stack_top() -> u64;
 }
 
 pub trait ContextBackend {
-    // Capture current EL1 kernel continuation into ctx.
+    // Capture current kernel continuation into ctx.
     // Returns 0 on initial capture; non-zero when resumed through
     // switch_kernel_context().
     unsafe fn save_kernel_context(ctx: *mut KernelContext) -> u64;
 
-    // Non-local context switch between two EL1 kernel continuations.
+    // Non-local context switch between two kernel continuations.
     // Safety: pointers must refer to valid KernelContext objects that live
     // across switches.
     unsafe fn switch_kernel_context(from: *mut KernelContext, to: *const KernelContext);
 
-    // Enter an EL1 kernel continuation directly without saving current context.
+    // Enter a kernel continuation directly without saving current context.
     // Safety: ctx must point to a live continuation context prepared by scheduler.
     unsafe fn enter_kernel_context(ctx: *const KernelContext) -> !;
 
-    // Restore full EL0 register state from ThreadContext and return to EL0.
+    // Restore full user register state from ThreadContext and enter user mode.
     // Safety: ctx must point to a live thread context owned by scheduler state.
     unsafe fn enter_user_thread_context(ctx: *const ThreadContext) -> !;
+
+    // Apply a guest user CONTEXT record onto the current trap frame.
+    // Returns false when the byte layout is invalid for this backend.
+    fn restore_user_context_record(frame: &mut SvcFrame, context: &[u8]) -> bool;
+
+    // Initialize a fresh user thread start context using the backend ABI.
+    fn initialize_user_thread_context(
+        ctx: &mut ThreadContext,
+        program_counter: u64,
+        stack_pointer: u64,
+        thread_pointer: u64,
+        arg0: u64,
+        arg1: u64,
+    );
 }
 
 pub trait KernelArchBackend:
@@ -75,6 +101,7 @@ pub trait KernelArchBackend:
     + HypercallBackend
     + SpinBackend
     + TimerBackend
+    + TrapBackend
     + VectorsBackend
     + ContextBackend
 {
@@ -86,6 +113,7 @@ impl<T> KernelArchBackend for T where
         + HypercallBackend
         + SpinBackend
         + TimerBackend
+        + TrapBackend
         + VectorsBackend
         + ContextBackend
 {

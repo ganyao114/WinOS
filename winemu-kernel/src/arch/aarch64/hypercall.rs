@@ -1,4 +1,4 @@
-use crate::nt::SvcFrame;
+use crate::arch::trap::SvcFrame;
 
 /// Generic HVC ABI: x0=nr, x1-x6=args, return in x0.
 #[inline(always)]

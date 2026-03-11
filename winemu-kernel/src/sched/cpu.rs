@@ -1,6 +1,7 @@
-// sched/cpu.rs — Per-vCPU thread-local state via TPIDR_EL1
+// sched/cpu.rs — Per-vCPU thread-local state via arch CPU-local register
 //
-// Each vCPU host thread stores a pointer to its KCpuLocal in TPIDR_EL1.
+// Each vCPU host thread stores a pointer to its KCpuLocal in the backend's
+// CPU-local register.
 // This gives O(1) access to current_tid and vcpu_id without touching
 // the global scheduler lock.
 
@@ -18,9 +19,9 @@ pub struct KCpuLocal {
     /// True while executing the idle loop.
     pub in_idle: bool,
     _pad: [u8; 2],
-    /// Number of EL1 WFI/WFE traps safely skipped in idle wait path.
+    /// Number of kernel-mode WFI/WFE traps safely skipped in idle wait path.
     pub wfx_skip_count: u32,
-    /// Number of unexpected EL1 WFI/WFE traps (not in idle wait path).
+    /// Number of unexpected kernel-mode WFI/WFE traps (not in idle wait path).
     pub wfx_unexpected_count: u32,
 }
 
@@ -55,34 +56,21 @@ static mut CPU_LOCALS: [KCpuLocal; MAX_VCPUS] = {
     ]
 };
 
-// ── TPIDR_EL1 accessors ───────────────────────────────────────────────────────
+// ── CPU-local register accessors ─────────────────────────────────────────────
 
-/// Install this vCPU's KCpuLocal pointer into TPIDR_EL1.
+/// Install this vCPU's KCpuLocal pointer into the backend CPU-local register.
 /// Must be called once per vCPU host thread before any scheduler use.
 pub fn init_cpu_local(vcpu_id: u32) {
     debug_assert!((vcpu_id as usize) < MAX_VCPUS);
     let ptr = unsafe { &mut CPU_LOCALS[vcpu_id as usize] as *mut KCpuLocal };
-    unsafe {
-        core::arch::asm!(
-            "msr tpidr_el1, {0}",
-            in(reg) ptr as u64,
-            options(nostack, nomem),
-        );
-    }
+    crate::arch::cpu::set_current_cpu_local(ptr as u64);
 }
 
-/// Read the current vCPU's KCpuLocal pointer from TPIDR_EL1.
+/// Read the current vCPU's KCpuLocal pointer from the backend CPU-local register.
 #[inline(always)]
 pub fn cpu_local() -> &'static mut KCpuLocal {
-    let ptr: u64;
-    unsafe {
-        core::arch::asm!(
-            "mrs {0}, tpidr_el1",
-            out(reg) ptr,
-            options(nostack, readonly),
-        );
-        &mut *(ptr as *mut KCpuLocal)
-    }
+    let ptr = crate::arch::cpu::current_cpu_local();
+    unsafe { &mut *(ptr as *mut KCpuLocal) }
 }
 
 /// Returns the current vCPU id (0-based).
