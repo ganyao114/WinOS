@@ -1,3 +1,5 @@
+use crate::mm::PhysAddr;
+
 type Backend = super::backend::ArchBackend;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -109,7 +111,11 @@ pub fn instruction_barrier() {
 }
 
 #[inline(always)]
-pub fn bootstrap_user_tables() -> (*const u64, *const u64, *const u64) {
+pub fn bootstrap_user_tables() -> (
+    crate::mm::KernelVa,
+    crate::mm::KernelVa,
+    crate::mm::KernelVa,
+) {
     super::backend::mmu::bootstrap_user_tables()
 }
 
@@ -144,12 +150,12 @@ pub fn l3_index(va: u64) -> usize {
 }
 
 #[inline(always)]
-pub fn table_addr(desc: u64) -> u64 {
+pub fn table_addr(desc: u64) -> PhysAddr {
     super::backend::mmu::table_addr(desc)
 }
 
 #[inline(always)]
-pub fn make_table_desc(table_pa: u64) -> u64 {
+pub fn make_table_desc(table_pa: PhysAddr) -> u64 {
     super::backend::mmu::make_table_desc(table_pa)
 }
 
@@ -164,7 +170,12 @@ pub fn desc_kind(desc: u64) -> PageTableEntryKind {
 }
 
 #[inline(always)]
-pub fn translate_user_desc(desc: u64, va: u64, level: UserDescLevel, access: u8) -> Option<u64> {
+pub fn translate_user_desc(
+    desc: u64,
+    va: u64,
+    level: UserDescLevel,
+    access: u8,
+) -> Option<PhysAddr> {
     let level_raw = match level {
         UserDescLevel::L1Block => 1,
         UserDescLevel::L2Block => 2,
@@ -174,12 +185,12 @@ pub fn translate_user_desc(desc: u64, va: u64, level: UserDescLevel, access: u8)
 }
 
 #[inline(always)]
-pub fn build_user_pte(pa: u64, prot: u32) -> u64 {
+pub fn build_user_pte(pa: PhysAddr, prot: u32) -> u64 {
     super::backend::mmu::build_user_pte(pa, prot)
 }
 
 #[inline(always)]
-pub fn split_l2_block_entry_to_l3_page(block_desc: u64, page_pa: u64) -> u64 {
+pub fn split_l2_block_entry_to_l3_page(block_desc: u64, page_pa: PhysAddr) -> u64 {
     super::backend::mmu::split_l2_block_entry_to_l3_page(block_desc, page_pa)
 }
 
@@ -189,12 +200,16 @@ pub fn l2_index_in_user_window(user_va_base: u64, user_va_limit: u64, idx: usize
 }
 
 #[inline(always)]
-pub unsafe fn install_process_root_tables(l0_pa: u64, l1_pa: u64, l2_pa: u64) {
+pub unsafe fn install_process_root_tables(
+    l0_pa: crate::mm::PhysAddr,
+    l1_pa: crate::mm::PhysAddr,
+    l2_pa: crate::mm::PhysAddr,
+) {
     super::backend::mmu::install_process_root_tables(l0_pa, l1_pa, l2_pa);
 }
 
 #[inline(always)]
-pub fn map_kernel_pages(va: u64, pa: u64, pages: usize) -> bool {
+pub fn map_kernel_pages(va: u64, pa: PhysAddr, pages: usize) -> bool {
     super::backend::mmu::map_kernel_pages(va, pa, pages)
 }
 

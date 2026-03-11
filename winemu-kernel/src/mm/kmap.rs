@@ -185,7 +185,7 @@ pub fn kmap_local_page(pa: PhysAddr) -> Option<KmapGuard> {
     let kva = slot_kva(cpu, slot)?;
 
     state.used_masks[cpu] |= 1u16 << slot;
-    if crate::arch::mmu::map_kernel_pages(kva.get(), pa.get(), 1) {
+    if crate::arch::mmu::map_kernel_pages(kva.get(), pa, 1) {
         Some(KmapGuard {
             cpu,
             slot,

@@ -60,7 +60,7 @@ pub fn kvmap_pages(pa: PhysAddr, pages: usize, align: usize) -> Option<KernelVa>
     mark_range(state, start, pages, true);
 
     let base = page_index_to_kva(start)?;
-    if crate::arch::mmu::map_kernel_pages(base.get(), pa.get(), pages) {
+    if crate::arch::mmu::map_kernel_pages(base.get(), pa, pages) {
         Some(base)
     } else {
         mark_range(state, start, pages, false);

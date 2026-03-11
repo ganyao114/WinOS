@@ -1,6 +1,8 @@
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use crate::mm::page_table_access::{self as pt, TableEntryRef, TablePageRef};
+use crate::mm::KernelVa;
 use crate::nt::constants::PAGE_SIZE_4K;
 
 #[derive(Clone, Copy)]
@@ -209,15 +211,12 @@ pub fn instruction_barrier() {
     isb();
 }
 
-pub fn bootstrap_user_tables() -> (*const u64, *const u64, *const u64) {
-    // SAFETY: boot page tables are static and live for the entire kernel lifetime.
-    unsafe {
-        (
-            (*core::ptr::addr_of!(L0_TABLE)).0.as_ptr(),
-            (*core::ptr::addr_of!(L1_TABLE)).0.as_ptr(),
-            (*core::ptr::addr_of!(L2_TABLE)).0.as_ptr(),
-        )
-    }
+pub fn bootstrap_user_tables() -> (KernelVa, KernelVa, KernelVa) {
+    (
+        static_table_kva(core::ptr::addr_of!(L0_TABLE)),
+        static_table_kva(core::ptr::addr_of!(L1_TABLE)),
+        static_table_kva(core::ptr::addr_of!(L2_TABLE)),
+    )
 }
 
 pub fn init_global_bootstrap() {
@@ -267,13 +266,13 @@ pub fn l3_index(va: u64) -> usize {
 }
 
 #[inline(always)]
-pub fn table_addr(desc: u64) -> u64 {
-    desc & TABLE_ADDR_MASK
+pub fn table_addr(desc: u64) -> crate::mm::PhysAddr {
+    crate::mm::PhysAddr::new(desc & TABLE_ADDR_MASK)
 }
 
 #[inline(always)]
-pub fn make_table_desc(table_pa: u64) -> u64 {
-    (table_pa & TABLE_ADDR_MASK) | DESC_TABLE_OR_PAGE
+pub fn make_table_desc(table_pa: crate::mm::PhysAddr) -> u64 {
+    (table_pa.get() & TABLE_ADDR_MASK) | DESC_TABLE_OR_PAGE
 }
 
 #[inline(always)]
@@ -286,7 +285,12 @@ pub fn desc_kind_raw(desc: u64) -> u8 {
     }
 }
 
-pub fn translate_user_desc(desc: u64, va: u64, level: u8, access: u8) -> Option<u64> {
+pub fn translate_user_desc(
+    desc: u64,
+    va: u64,
+    level: u8,
+    access: u8,
+) -> Option<crate::mm::PhysAddr> {
     let (base_mask, span) = match level {
         1 => (L1_BLOCK_MASK, L1_BLOCK_SIZE),
         2 => (L2_BLOCK_MASK, L2_BLOCK_SIZE),
@@ -304,12 +308,12 @@ pub fn translate_user_desc(desc: u64, va: u64, level: u8, access: u8) -> Option<
 
     let base = desc & base_mask & DESC_ADDR_MASK;
     let offset = va & (span - 1);
-    base.checked_add(offset)
+    base.checked_add(offset).map(crate::mm::PhysAddr::new)
 }
 
-pub fn build_user_pte(pa: u64, prot: u32) -> u64 {
+pub fn build_user_pte(pa: crate::mm::PhysAddr, prot: u32) -> u64 {
     let (read, write, exec) = decode_nt_prot(prot);
-    let mut desc = (pa & TABLE_ADDR_MASK) | PTE_COMMON | DESC_TABLE_OR_PAGE;
+    let mut desc = (pa.get() & TABLE_ADDR_MASK) | PTE_COMMON | DESC_TABLE_OR_PAGE;
 
     if write {
         desc |= AP_EL0_RW;
@@ -326,9 +330,9 @@ pub fn build_user_pte(pa: u64, prot: u32) -> u64 {
     desc
 }
 
-pub fn split_l2_block_entry_to_l3_page(block_desc: u64, page_pa: u64) -> u64 {
+pub fn split_l2_block_entry_to_l3_page(block_desc: u64, page_pa: crate::mm::PhysAddr) -> u64 {
     let attrs = block_desc & ATTR_MASK_PAGE;
-    (page_pa & TABLE_ADDR_MASK) | attrs | DESC_TABLE_OR_PAGE
+    (page_pa.get() & TABLE_ADDR_MASK) | attrs | DESC_TABLE_OR_PAGE
 }
 
 pub fn l2_index_in_user_window(user_va_base: u64, user_va_limit: u64, idx: usize) -> bool {
@@ -340,38 +344,30 @@ pub fn l2_index_in_user_window(user_va_base: u64, user_va_limit: u64, idx: usize
     idx >= start && idx <= end
 }
 
-pub unsafe fn install_process_root_tables(l0_pa: u64, l1_pa: u64, l2_pa: u64) {
+pub unsafe fn install_process_root_tables(
+    l0_pa: crate::mm::PhysAddr,
+    l1_pa: crate::mm::PhysAddr,
+    l2_pa: crate::mm::PhysAddr,
+) {
     let physmap_l2 = core::ptr::addr_of!(PHYSMAP_L2_TABLE) as u64;
     let kernel_vm_l2 = core::ptr::addr_of!(KERNEL_VM_L2_TABLE) as u64;
-    let l0_ok = crate::mm::kmap::write_fixmap_u64(
-        crate::mm::PhysAddr::new(l0_pa),
-        0,
-        make_table_desc(l1_pa),
-    );
-    let l1_ok = crate::mm::kmap::write_fixmap_u64(
-        crate::mm::PhysAddr::new(l1_pa),
-        1,
-        make_table_desc(l2_pa),
-    ) && crate::mm::kmap::write_fixmap_u64(
-        crate::mm::PhysAddr::new(l1_pa),
-        2,
-        make_table_desc(physmap_l2),
-    ) && crate::mm::kmap::write_fixmap_u64(
-        crate::mm::PhysAddr::new(l1_pa),
-        KERNEL_VM_L1_INDEX,
-        make_table_desc(kernel_vm_l2),
-    );
+    let l0_ok = pt::table_entry(TablePageRef::phys(l0_pa), 0).write(make_table_desc(l1_pa));
+    let l1_ok = pt::table_entry(TablePageRef::phys(l1_pa), 1).write(make_table_desc(l2_pa))
+        && pt::table_entry(TablePageRef::phys(l1_pa), 2)
+            .write(make_table_desc(crate::mm::PhysAddr::new(physmap_l2)))
+        && pt::table_entry(TablePageRef::phys(l1_pa), KERNEL_VM_L1_INDEX)
+            .write(make_table_desc(crate::mm::PhysAddr::new(kernel_vm_l2)));
     assert!(
         l0_ok && l1_ok,
         "install_process_root_tables: failed to map root tables"
     );
 }
 
-pub fn map_kernel_pages(va: u64, pa: u64, pages: usize) -> bool {
+pub fn map_kernel_pages(va: u64, pa: crate::mm::PhysAddr, pages: usize) -> bool {
     if MM_GLOBAL_READY.load(Ordering::Acquire) == 0 || !kernel_vm_range_valid(va, pages) {
         return false;
     }
-    if !is_page_aligned(pa) {
+    if !is_page_aligned(pa.get()) {
         return false;
     }
 
@@ -387,19 +383,21 @@ pub fn map_kernel_pages(va: u64, pa: u64, pages: usize) -> bool {
             rollback_kernel_pages(va, mapped);
             return false;
         };
-        let Some(pte) = kernel_vm_pte_ptr(cur_va) else {
+        let Some(pte) = kernel_vm_pte_entry(cur_va) else {
             rollback_kernel_pages(va, mapped);
             return false;
         };
-        // SAFETY: `pte` points into the shared kernel L3 table for `cur_va`.
-        let old = unsafe { *pte };
+        let Some(old) = pte.read() else {
+            rollback_kernel_pages(va, mapped);
+            return false;
+        };
         if desc_kind_raw(old) != 0 {
             rollback_kernel_pages(va, mapped);
             return false;
         }
-        // SAFETY: `pte` points into the shared kernel L3 table for `cur_va`.
-        unsafe {
-            *pte = build_kernel_rw_pte(cur_pa);
+        if !pte.write(build_kernel_rw_pte(cur_pa)) {
+            rollback_kernel_pages(va, mapped);
+            return false;
         }
         mapped += 1;
     }
@@ -418,15 +416,15 @@ pub fn unmap_kernel_pages(va: u64, pages: usize) -> bool {
     let mut i = 0usize;
     while i < pages {
         let cur_va = va + (i as u64) * PAGE_SIZE_4K;
-        let Some(pte) = kernel_vm_pte_ptr(cur_va) else {
+        let Some(pte) = kernel_vm_pte_entry(cur_va) else {
             return false;
         };
-        // SAFETY: `pte` points into the shared kernel L3 table for `cur_va`.
-        let old = unsafe { *pte };
+        let Some(old) = pte.read() else {
+            return false;
+        };
         if desc_kind_raw(old) == 3 {
-            // SAFETY: `pte` points into the shared kernel L3 table for `cur_va`.
-            unsafe {
-                *pte = 0;
+            if !pte.write(0) {
+                return false;
             }
             unmapped = true;
         }
@@ -524,7 +522,8 @@ unsafe fn setup_kernel_mapping() {
             unsafe { core::ptr::addr_of!((*core::ptr::addr_of!(KERNEL_VM_L3_TABLES))[i]) as u64 };
         // SAFETY: KERNEL_VM_L2_TABLE has exactly 512 entries and `i` is bounded.
         unsafe {
-            (*core::ptr::addr_of_mut!(KERNEL_VM_L2_TABLE)).0[i] = make_table_desc(l3_addr);
+            (*core::ptr::addr_of_mut!(KERNEL_VM_L2_TABLE)).0[i] =
+                make_table_desc(crate::mm::PhysAddr::new(l3_addr));
         }
     }
 }
@@ -633,8 +632,8 @@ unsafe fn enable_mmu() {
 }
 
 #[inline(always)]
-fn build_kernel_rw_pte(pa: u64) -> u64 {
-    (pa & TABLE_ADDR_MASK) | PTE_COMMON | AP_EL1_RW | PTE_UXN | PTE_PXN | DESC_TABLE_OR_PAGE
+fn build_kernel_rw_pte(pa: crate::mm::PhysAddr) -> u64 {
+    (pa.get() & TABLE_ADDR_MASK) | PTE_COMMON | AP_EL1_RW | PTE_UXN | PTE_PXN | DESC_TABLE_OR_PAGE
 }
 
 #[inline(always)]
@@ -676,17 +675,14 @@ fn rollback_kernel_pages(base_va: u64, pages: usize) {
     let mut i = 0usize;
     while i < pages {
         let cur_va = base_va + (i as u64) * PAGE_SIZE_4K;
-        if let Some(pte) = kernel_vm_pte_ptr(cur_va) {
-            // SAFETY: `pte` points into the shared kernel L3 table for `cur_va`.
-            unsafe {
-                *pte = 0;
-            }
+        if let Some(pte) = kernel_vm_pte_entry(cur_va) {
+            let _ = pte.write(0);
         }
         i += 1;
     }
 }
 
-fn kernel_vm_pte_ptr(va: u64) -> Option<*mut u64> {
+fn kernel_vm_pte_entry(va: u64) -> Option<TableEntryRef> {
     if !kernel_vm_range_valid(va, 1) || l1_index(va) != KERNEL_VM_L1_INDEX {
         return None;
     }
@@ -698,12 +694,20 @@ fn kernel_vm_pte_ptr(va: u64) -> Option<*mut u64> {
         return None;
     }
 
-    let l3 = table_addr(l2e) as *mut u64;
+    let l3 = table_addr(l2e);
     if l3.is_null() {
         return None;
     }
 
     let idx = l3_index(va);
-    // SAFETY: `l3` points to a live L3 page table and `idx < 512`.
-    Some(unsafe { l3.add(idx) })
+    Some(pt::table_entry(
+        TablePageRef::kernel(KernelVa::new(l3.get())),
+        idx,
+    ))
+}
+
+#[inline(always)]
+fn static_table_kva(table: *const PageTable) -> KernelVa {
+    let ptr = table.cast::<u64>();
+    KernelVa::new(ptr as u64)
 }
