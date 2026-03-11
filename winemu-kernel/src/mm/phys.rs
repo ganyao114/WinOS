@@ -7,6 +7,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::hypercall;
+use crate::mm::PhysAddr;
 
 /// 每个 chunk 包含的 4KB 页数（= u64 bitmap 位数）
 const CHUNK_PAGES: usize = 64;
@@ -22,14 +23,14 @@ const HIGH_PAGES: usize = 128;
 
 #[derive(Clone, Copy)]
 struct PhysChunk {
-    base_gpa: u64,
+    base_pa: PhysAddr,
     bitmap: u64, // 1 = free, 0 = allocated
 }
 
 impl PhysChunk {
     const fn empty() -> Self {
         Self {
-            base_gpa: 0,
+            base_pa: PhysAddr::new(0),
             bitmap: 0,
         }
     }
@@ -50,8 +51,8 @@ impl PhysAllocator {
         }
     }
 
-    /// Allocate a single 4KB physical page. Returns GPA or None.
-    pub fn alloc_page(&mut self) -> Option<u64> {
+    /// Allocate a single 4KB physical page.
+    pub fn alloc_page(&mut self) -> Option<PhysAddr> {
         if self.free_page_count < LOW_PAGES {
             self.grow();
         }
@@ -61,7 +62,7 @@ impl PhysAllocator {
                 let bit = chunk.bitmap.trailing_zeros() as u64;
                 chunk.bitmap &= !(1u64 << bit);
                 self.free_page_count = self.free_page_count.saturating_sub(1);
-                return Some(chunk.base_gpa + bit * PAGE_SIZE);
+                return chunk.base_pa.checked_add(bit * PAGE_SIZE);
             }
         }
         // Pool empty even after grow attempt — try once more
@@ -72,7 +73,7 @@ impl PhysAllocator {
                 let bit = chunk.bitmap.trailing_zeros() as u64;
                 chunk.bitmap &= !(1u64 << bit);
                 self.free_page_count = self.free_page_count.saturating_sub(1);
-                return Some(chunk.base_gpa + bit * PAGE_SIZE);
+                return chunk.base_pa.checked_add(bit * PAGE_SIZE);
             }
         }
         None
@@ -80,8 +81,8 @@ impl PhysAllocator {
 
     /// Allocate n contiguous 4KB pages. Small requests use chunk cache;
     /// large requests bypass cache and request directly from VMM.
-    /// Returns GPA of first page, or None.
-    pub fn alloc_pages(&mut self, n: usize) -> Option<u64> {
+    /// Returns the first physical page address, or None.
+    pub fn alloc_pages(&mut self, n: usize) -> Option<PhysAddr> {
         if n == 0 {
             return None;
         }
@@ -105,7 +106,7 @@ impl PhysAllocator {
                     let clear_mask = mask << bit;
                     self.chunks[i].bitmap &= !clear_mask;
                     self.free_page_count = self.free_page_count.saturating_sub(n);
-                    return Some(self.chunks[i].base_gpa + (bit as u64) * PAGE_SIZE);
+                    return self.chunks[i].base_pa.checked_add((bit as u64) * PAGE_SIZE);
                 }
             }
             if attempt == 0 {
@@ -116,11 +117,11 @@ impl PhysAllocator {
     }
 
     /// Free a single 4KB page.
-    pub fn free_page(&mut self, gpa: u64) {
-        if (gpa & (PAGE_SIZE - 1)) != 0 {
+    pub fn free_page(&mut self, pa: PhysAddr) {
+        if (pa.get() & (PAGE_SIZE - 1)) != 0 {
             return;
         }
-        if let Some((idx, bit)) = self.locate(gpa) {
+        if let Some((idx, bit)) = self.locate(pa) {
             let mask = 1u64 << bit;
             if (self.chunks[idx].bitmap & mask) != 0 {
                 return; // double free / invalid free
@@ -131,16 +132,16 @@ impl PhysAllocator {
         }
     }
 
-    /// Free n contiguous 4KB pages starting at gpa.
-    pub fn free_pages(&mut self, gpa: u64, n: usize) {
-        if n == 0 || (gpa & (PAGE_SIZE - 1)) != 0 {
+    /// Free n contiguous 4KB pages starting at `pa`.
+    pub fn free_pages(&mut self, pa: PhysAddr, n: usize) {
+        if n == 0 || (pa.get() & (PAGE_SIZE - 1)) != 0 {
             return;
         }
         if n > CHUNK_PAGES {
-            self.free_pages_direct(gpa, n);
+            self.free_pages_direct(pa, n);
             return;
         }
-        if let Some((idx, start_bit)) = self.locate(gpa) {
+        if let Some((idx, start_bit)) = self.locate(pa) {
             let start = start_bit as usize;
             if start + n > CHUNK_PAGES {
                 return;
@@ -165,32 +166,32 @@ impl PhysAllocator {
     }
 
     /// Locate which chunk and bit index a GPA belongs to.
-    fn locate(&self, gpa: u64) -> Option<(usize, u32)> {
+    fn locate(&self, pa: PhysAddr) -> Option<(usize, u32)> {
         for i in 0..self.chunk_count {
             let c = &self.chunks[i];
-            if gpa >= c.base_gpa && gpa < c.base_gpa + CHUNK_SIZE as u64 {
-                let bit = ((gpa - c.base_gpa) / PAGE_SIZE) as u32;
+            if pa.get() >= c.base_pa.get() && pa.get() < c.base_pa.get() + CHUNK_SIZE as u64 {
+                let bit = ((pa.get() - c.base_pa.get()) / PAGE_SIZE) as u32;
                 return Some((i, bit));
             }
         }
         None
     }
 
-    fn alloc_pages_direct(&mut self, n: usize) -> Option<u64> {
+    fn alloc_pages_direct(&mut self, n: usize) -> Option<PhysAddr> {
         let pages = u64::try_from(n).ok()?;
-        let gpa = hypercall::alloc_phys_pages(pages);
-        if gpa == 0 {
+        let pa = PhysAddr::new(hypercall::alloc_phys_pages(pages));
+        if pa.is_null() {
             None
         } else {
-            Some(gpa)
+            Some(pa)
         }
     }
 
-    fn free_pages_direct(&mut self, gpa: u64, n: usize) {
+    fn free_pages_direct(&mut self, pa: PhysAddr, n: usize) {
         let Some(pages) = u64::try_from(n).ok() else {
             return;
         };
-        let _ = hypercall::free_phys_pages(gpa, pages);
+        let _ = hypercall::free_phys_pages(pa.get(), pages);
     }
 
     /// Request a new chunk from VMM via ALLOC_PHYS_PAGES hypercall.
@@ -198,13 +199,13 @@ impl PhysAllocator {
         if self.chunk_count >= MAX_CHUNKS {
             return;
         }
-        let gpa = hypercall::alloc_phys_pages(CHUNK_PAGES as u64);
-        if gpa == 0 {
+        let pa = PhysAddr::new(hypercall::alloc_phys_pages(CHUNK_PAGES as u64));
+        if pa.is_null() {
             return;
         }
         let idx = self.chunk_count;
         self.chunks[idx] = PhysChunk {
-            base_gpa: gpa,
+            base_pa: pa,
             bitmap: u64::MAX, // all 64 pages free
         };
         self.chunk_count += 1;
@@ -226,8 +227,8 @@ impl PhysAllocator {
                 Some(i) => i,
                 None => break, // no fully-free chunk
             };
-            let gpa = self.chunks[idx].base_gpa;
-            hypercall::free_phys_pages(gpa, CHUNK_PAGES as u64);
+            let pa = self.chunks[idx].base_pa;
+            hypercall::free_phys_pages(pa.get(), CHUNK_PAGES as u64);
             // Remove by swapping with last
             self.chunk_count -= 1;
             if idx < self.chunk_count {
@@ -302,12 +303,12 @@ fn with_phys_mut<R>(f: impl FnOnce(&mut PhysAllocator) -> R) -> R {
     unsafe { f(&mut *PHYS_GLOBAL.inner.get()) }
 }
 
-pub fn alloc_pages(num_pages: usize) -> Option<u64> {
+pub fn alloc_pages(num_pages: usize) -> Option<PhysAddr> {
     with_phys_mut(|p| p.alloc_pages(num_pages))
 }
 
-pub fn free_pages(gpa: u64, num_pages: usize) {
-    with_phys_mut(|p| p.free_pages(gpa, num_pages));
+pub fn free_pages(pa: PhysAddr, num_pages: usize) {
+    with_phys_mut(|p| p.free_pages(pa, num_pages));
 }
 
 pub fn free_page_count() -> usize {

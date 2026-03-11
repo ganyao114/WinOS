@@ -7,9 +7,14 @@
 use crate::mm::areaset::{AreaEntry, AreaSeg, AreaSet};
 use crate::mm::range::Range;
 use crate::mm::vm_area::{VmArea, VmKind, PAGE_SIZE};
-use crate::mm::{PhysAddr, UserVa};
+use crate::mm::{
+    vm_access_allowed, vm_is_copy_on_write_prot, vm_promote_cow_prot, vm_sanitize_nt_prot,
+    PhysAddr, UserVa, VmQueryInfo,
+};
 use crate::process::ProcessAddressSpace;
 use crate::rust_alloc::vec::Vec;
+use core::cell::UnsafeCell;
+use crate::kobj::ObjectStore;
 use winemu_shared::status;
 
 // ─── NT 常量 ─────────────────────────────────────────────────────────────────
@@ -22,111 +27,98 @@ const MEM_MAPPED_TYPE: u32 = 0x0004_0000;
 const MEM_IMAGE_TYPE: u32 = 0x0100_0000;
 
 const PAGE_GUARD: u32 = 0x100;
-const PAGE_WRITECOPY: u32 = 0x08;
-const PAGE_EXECUTE_READWRITE: u32 = 0x40;
-const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
-
-// ─── VmaType（向后兼容公共接口）──────────────────────────────────────────────
-
-/// VMA 用途类型（保留原名供外部调用方使用）
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum VmaType {
-    Kernel,
-    ExeImage,
-    DllImage,
-    ThreadStack,
-    Section,
-    FileMapped,
-    Private,
-    PageTable,
-}
-
-pub(crate) fn vm_kind_from_vma_type(t: VmaType) -> VmKind {
-    match t {
-        VmaType::Private | VmaType::Kernel | VmaType::PageTable => VmKind::Private,
-        VmaType::ExeImage | VmaType::DllImage => VmKind::Image,
-        VmaType::Section | VmaType::FileMapped => VmKind::Section,
-        VmaType::ThreadStack => VmKind::ThreadStack,
-    }
-}
-
-// ─── VmQueryInfo ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
-pub(crate) struct VmQueryInfo {
-    pub(crate) base: UserVa,
-    pub(crate) size: u64,
-    pub(crate) allocation_base: UserVa,
-    pub(crate) allocation_prot: u32,
-    pub(crate) prot: u32,
-    pub(crate) state: u32,
-    pub(crate) mem_type: u32,
+struct SharedPhysPageRef {
+    pa: PhysAddr,
+    refs: u32,
 }
 
-#[derive(Clone)]
-pub(crate) struct TrackedAreaSnapshot {
-    pub(crate) range: Range,
-    pub(crate) area: VmArea,
+struct SharedPhysPageRefRuntime {
+    page_refs: UnsafeCell<Option<ObjectStore<SharedPhysPageRef>>>,
 }
 
-// ─── NT 保护属性工具 ──────────────────────────────────────────────────────────
+unsafe impl Sync for SharedPhysPageRefRuntime {}
 
-pub(crate) fn vm_sanitize_nt_prot(prot: u32) -> u32 {
-    let base = prot & 0xFF;
-    let sanitized = match base {
-        PAGE_EXECUTE_READWRITE => 0x20, // 降为 PAGE_EXECUTE_READ
-        0 => 0x04,                      // 默认 PAGE_READWRITE
-        _ => base,
-    };
-    (prot & !0xFF) | sanitized
-}
+static SHARED_PHYS_PAGE_REFS: SharedPhysPageRefRuntime = SharedPhysPageRefRuntime {
+    page_refs: UnsafeCell::new(None),
+};
 
-pub(crate) fn vm_decode_nt_prot(prot: u32) -> (bool, bool, bool) {
-    match prot & 0xFF {
-        0x01 => (false, false, false),      // PAGE_NOACCESS
-        0x02 => (true, false, false),       // PAGE_READONLY
-        0x04 => (true, true, false),        // PAGE_READWRITE
-        0x08 => (true, false, false),       // PAGE_WRITECOPY → RO until COW
-        0x10 => (false, false, true),       // PAGE_EXECUTE
-        0x20 => (true, false, true),        // PAGE_EXECUTE_READ
-        0x40 | 0x80 => (true, false, true), // W^X: RX
-        _ => (true, true, false),
-    }
-}
-
-pub(crate) fn vm_access_allowed(prot: u32, access: u8) -> bool {
-    use crate::nt::state::{VM_ACCESS_EXEC, VM_ACCESS_READ, VM_ACCESS_WRITE};
-    if access == VM_ACCESS_WRITE && vm_is_copy_on_write_prot(prot) {
-        return true;
-    }
-    let (read, write, exec) = vm_decode_nt_prot(prot);
-    match access {
-        VM_ACCESS_READ => read,
-        VM_ACCESS_WRITE => write,
-        VM_ACCESS_EXEC => exec,
-        _ => false,
-    }
-}
-
-pub(crate) fn vm_is_copy_on_write_prot(prot: u32) -> bool {
-    matches!(prot & 0xFF, PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)
-}
-
-fn vm_promote_cow_prot(prot: u32) -> u32 {
-    match prot & 0xFF {
-        PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY => (prot & !0xFF) | 0x04,
-        _ => prot,
-    }
-}
-
-pub(crate) fn vm_clone_shared_nt_prot(prot: u32) -> u32 {
-    match vm_sanitize_nt_prot(prot) & 0xFF {
-        0x04 => (prot & !0xFF) | PAGE_WRITECOPY,
-        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY => {
-            (prot & !0xFF) | PAGE_EXECUTE_WRITECOPY
+fn shared_phys_page_refs_mut() -> &'static mut ObjectStore<SharedPhysPageRef> {
+    // SAFETY: kernel runs with a single global VM metadata domain here; this
+    // matches the existing ObjectStore + UnsafeCell ownership model used by the
+    // rest of the kernel runtime stores.
+    unsafe {
+        let slot = &mut *SHARED_PHYS_PAGE_REFS.page_refs.get();
+        if slot.is_none() {
+            *slot = Some(ObjectStore::new());
         }
-        _ => prot,
+        slot.as_mut().unwrap()
     }
+}
+
+fn shared_phys_page_add_ref(pa: PhysAddr) {
+    if pa.is_null() {
+        return;
+    }
+    let store = shared_phys_page_refs_mut();
+    let mut found = 0u32;
+    store.for_each_live_ptr(|id, ptr| {
+        // SAFETY: ObjectStore guarantees live pointers during iteration.
+        unsafe {
+            if (*ptr).pa == pa {
+                found = id;
+            }
+        }
+    });
+    if found != 0 {
+        let ptr = store.get_ptr(found);
+        if !ptr.is_null() {
+            // SAFETY: `found` came from the same live ObjectStore iteration.
+            unsafe {
+                (*ptr).refs = (*ptr).refs.saturating_add(1);
+            }
+        }
+        return;
+    }
+    let _ = store.alloc_with(|_| SharedPhysPageRef { pa, refs: 1 });
+}
+
+fn shared_phys_page_release(pa: PhysAddr) {
+    if pa.is_null() {
+        return;
+    }
+    let store = shared_phys_page_refs_mut();
+    let mut found = 0u32;
+    let mut refs = 0u32;
+    store.for_each_live_ptr(|id, ptr| {
+        // SAFETY: ObjectStore guarantees live pointers during iteration.
+        unsafe {
+            if (*ptr).pa == pa {
+                found = id;
+                refs = (*ptr).refs;
+            }
+        }
+    });
+
+    if found == 0 {
+        crate::mm::phys::free_pages(pa, 1);
+        return;
+    }
+
+    if refs > 1 {
+        let ptr = store.get_ptr(found);
+        if !ptr.is_null() {
+            // SAFETY: `found` came from the same live ObjectStore iteration.
+            unsafe {
+                (*ptr).refs = refs - 1;
+            }
+        }
+        return;
+    }
+
+    let _ = store.free(found);
+    crate::mm::phys::free_pages(pa, 1);
 }
 
 fn vm_region_mem_type(area: &VmArea) -> u32 {
@@ -513,7 +505,7 @@ impl ProcessVmManager {
             raw_prot
         };
 
-        if access == crate::nt::state::VM_ACCESS_WRITE && vm_is_copy_on_write_prot(prot) {
+        if access == crate::mm::VM_ACCESS_WRITE && vm_is_copy_on_write_prot(prot) {
             return self.handle_cow_fault(aspace, &seg, idx, page_va, prot);
         }
         if !vm_access_allowed(prot, access) {
@@ -541,7 +533,7 @@ impl ProcessVmManager {
             crate::mm::phys::free_pages(new_pa, 1);
             return false;
         }
-        crate::nt::state::vm_phys_page_add_ref(new_pa);
+        shared_phys_page_add_ref(new_pa);
         {
             let a = seg.value_mut();
             a.set_phys_page(idx, new_pa);
@@ -690,7 +682,7 @@ impl ProcessVmManager {
             let va = base + (i as u64) * PAGE_SIZE;
             let pa = crate::process::with_process(pid, |p| {
                 p.address_space
-                    .translate_user_va_for_access(UserVa::new(va), crate::nt::state::VM_ACCESS_READ)
+                    .translate_user_va_for_access(UserVa::new(va), crate::mm::VM_ACCESS_READ)
             })
             .flatten()
             .map(|pa| pa.page_base(PAGE_SIZE))
@@ -726,12 +718,12 @@ impl ProcessVmManager {
         out
     }
 
-    pub fn collect_tracked_areas(&self) -> Vec<TrackedAreaSnapshot> {
+    pub(crate) fn collect_tracked_areas(&self) -> Vec<crate::mm::clone_plan::TrackedAreaSnapshot> {
         let mut out = Vec::new();
         let mut seg = self.areas.first_seg();
         while seg.ok() {
             let _ = out.try_reserve(1);
-            out.push(TrackedAreaSnapshot {
+            out.push(crate::mm::clone_plan::TrackedAreaSnapshot {
                 range: seg.range(),
                 area: seg.value().clone(),
             });
@@ -740,7 +732,10 @@ impl ProcessVmManager {
         out
     }
 
-    pub fn install_tracked_areas(&mut self, areas: &[TrackedAreaSnapshot]) -> bool {
+    pub(crate) fn install_tracked_areas(
+        &mut self,
+        areas: &[crate::mm::clone_plan::TrackedAreaSnapshot],
+    ) -> bool {
         if !self.areas.is_empty() {
             return false;
         }
@@ -757,7 +752,7 @@ impl ProcessVmManager {
             if area.owns_phys_pages {
                 for pa in area.phys_pages.iter().copied() {
                     if !pa.is_null() {
-                        crate::nt::state::vm_phys_page_add_ref(pa);
+                        shared_phys_page_add_ref(pa);
                     }
                 }
             }
@@ -893,7 +888,7 @@ impl ProcessVmManager {
             if !pa.is_null() {
                 let _ = aspace.unmap_user_range(va, PAGE_SIZE);
                 if owns {
-                    crate::nt::state::vm_phys_page_release(pa);
+                    shared_phys_page_release(pa);
                 }
             }
         }
@@ -919,7 +914,7 @@ impl ProcessVmManager {
             crate::mm::phys::free_pages(pa, 1);
             return false;
         }
-        crate::nt::state::vm_phys_page_add_ref(pa);
+        shared_phys_page_add_ref(pa);
         let area = seg.value_mut();
         area.set_phys_page(idx, pa);
         true
@@ -938,7 +933,7 @@ impl ProcessVmManager {
         }
         let _ = aspace.unmap_user_range(va, PAGE_SIZE);
         if seg.value().owns_phys_pages {
-            crate::nt::state::vm_phys_page_release(pa);
+            shared_phys_page_release(pa);
         }
         let area = seg.value_mut();
         area.set_phys_page(idx, PhysAddr::default());
@@ -999,9 +994,9 @@ impl ProcessVmManager {
             crate::mm::phys::free_pages(new_pa, 1);
             return false;
         }
-        crate::nt::state::vm_phys_page_add_ref(new_pa);
+        shared_phys_page_add_ref(new_pa);
         if !old_pa.is_null() {
-            crate::nt::state::vm_phys_page_release(old_pa);
+            shared_phys_page_release(old_pa);
         }
         {
             let a = seg.value_mut();
@@ -1021,7 +1016,7 @@ impl ProcessVmManager {
         idx: usize,
         page_va: UserVa,
     ) {
-        crate::nt::state::vm_update_current_thread_stack_limit(pid, page_va.get());
+        crate::process::update_current_thread_stack_limit(pid, page_va.get());
         if idx == 0 {
             return;
         }

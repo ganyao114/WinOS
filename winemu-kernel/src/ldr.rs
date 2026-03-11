@@ -3,6 +3,9 @@
 
 use crate::alloc;
 use crate::hypercall;
+use crate::mm::{UserVa, VM_ACCESS_READ, VM_ACCESS_WRITE, vm_alloc_region_typed, vm_protect_range};
+use crate::mm::usercopy::{current_pid as current_user_pid, current_process_user_ptr, translate_user_va};
+use crate::mm::VmaType;
 use winemu_shared::pe::{self, PeError, PeHeaders};
 
 // ── 错误类型 ─────────────────────────────────────────────────
@@ -14,6 +17,7 @@ pub enum LdrError {
     AllocFailed,
     BadReloc,
     BadImport,
+    ProtectFailed,
     IoError,
 }
 
@@ -24,6 +28,133 @@ impl From<PeError> for LdrError {
 }
 
 pub type LdrResult<T> = Result<T, LdrError>;
+
+const HEADER_VIEW_SIZE: usize = 4096;
+const PAGE_SIZE: u64 = 0x1000;
+const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+
+struct ImageBuffer {
+    base: u64,
+    ptr: *mut u8,
+    size: usize,
+    owner_pid: Option<u32>,
+}
+
+fn alloc_image_buffer(size: usize, vma_type: VmaType) -> LdrResult<ImageBuffer> {
+    if let Some(pid) = current_user_pid() {
+        let Some(base) = vm_alloc_region_typed(pid, 0, size as u64, 0x04, vma_type) else {
+            return Err(LdrError::AllocFailed);
+        };
+        let Some(ptr) = current_process_user_ptr(pid, UserVa::new(base), size, VM_ACCESS_WRITE)
+        else {
+            return Err(LdrError::AllocFailed);
+        };
+        return Ok(ImageBuffer {
+            base,
+            ptr,
+            size,
+            owner_pid: Some(pid),
+        });
+    }
+
+    let ptr = alloc::alloc_zeroed(size, PAGE_SIZE as usize).ok_or(LdrError::AllocFailed)?;
+    Ok(ImageBuffer {
+        base: ptr as u64,
+        ptr,
+        size,
+        owner_pid: None,
+    })
+}
+
+fn read_file_into_image(
+    fd: u64,
+    image: &ImageBuffer,
+    image_off: u64,
+    len: usize,
+    file_off: u64,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Some(end) = image_off.checked_add(len as u64) else {
+        return false;
+    };
+    if end > image.size as u64 {
+        return false;
+    }
+
+    if let Some(pid) = image.owner_pid {
+        let mut done = 0usize;
+        while done < len {
+            let Some(cur_va) = UserVa::new(image.base).checked_add(image_off + done as u64) else {
+                return false;
+            };
+            let Some(dst_pa) = translate_user_va(pid, cur_va, VM_ACCESS_WRITE) else {
+                return false;
+            };
+            let page_off = (cur_va.get() as usize) & ((PAGE_SIZE as usize) - 1);
+            let chunk = core::cmp::min(len - done, (PAGE_SIZE as usize) - page_off);
+            let got = hypercall::host_read_phys(fd, dst_pa, chunk, file_off + done as u64);
+            if got != chunk {
+                return false;
+            }
+            done += chunk;
+        }
+        true
+    } else {
+        // SAFETY: bounds were checked above and the buffer belongs to this loader.
+        let dst = unsafe { image.ptr.add(image_off as usize) };
+        hypercall::host_read(fd, dst, len, file_off) == len
+    }
+}
+
+fn section_nt_prot(chars: u32) -> u32 {
+    let exec = (chars & IMAGE_SCN_MEM_EXECUTE) != 0;
+    let read = (chars & IMAGE_SCN_MEM_READ) != 0;
+    let write = (chars & IMAGE_SCN_MEM_WRITE) != 0;
+    match (exec, read, write) {
+        (true, _, true) => 0x40,
+        (true, true, false) => 0x20,
+        (true, false, false) => 0x10,
+        (false, _, true) => 0x04,
+        (false, true, false) => 0x02,
+        _ => 0x01,
+    }
+}
+
+pub fn finalize_loaded_image(image_base: u64) -> LdrResult<()> {
+    let Some(pid) = current_user_pid() else {
+        return Ok(());
+    };
+    let Some(ptr) =
+        current_process_user_ptr(pid, UserVa::new(image_base), HEADER_VIEW_SIZE, VM_ACCESS_READ)
+    else {
+        return Err(LdrError::ProtectFailed);
+    };
+    // SAFETY: the current process mapping was validated above for header access.
+    let hdrs = unsafe {
+        PeHeaders::from_slice(core::slice::from_raw_parts(ptr as *const u8, HEADER_VIEW_SIZE))?
+    };
+
+    if vm_protect_range(pid, image_base, hdrs.size_of_headers as u64, 0x02).is_err() {
+        return Err(LdrError::ProtectFailed);
+    }
+
+    for sec in hdrs.sections() {
+        let sec_size = u64::from(sec.vsize.max(sec.raw_size));
+        if sec_size == 0 {
+            continue;
+        }
+        let sec_base = image_base.saturating_add(sec.vaddr as u64);
+        if vm_protect_range(pid, sec_base, sec_size, section_nt_prot(sec.chars)).is_err() {
+            return Err(LdrError::ProtectFailed);
+        }
+    }
+
+    Ok(())
+}
 
 // ── 已加载镜像描述符 ─────────────────────────────────────────
 
@@ -48,12 +179,12 @@ pub enum ImportRef<'a> {
 pub unsafe fn load_from_fd(
     fd: u64,
     file_size: u64,
+    vma_type: VmaType,
     resolve_import: impl Fn(&str, ImportRef) -> Option<u64>,
 ) -> LdrResult<LoadedImage> {
     // 1. 读取 PE 头部（4KB 足够覆盖 DOS + PE + section table）
-    const HDR_BUF_SIZE: usize = 4096;
-    let hdr_buf = alloc::alloc_zeroed(HDR_BUF_SIZE, 16).ok_or(LdrError::AllocFailed)?;
-    let read_len = HDR_BUF_SIZE.min(file_size as usize);
+    let hdr_buf = alloc::alloc_zeroed(HEADER_VIEW_SIZE, 16).ok_or(LdrError::AllocFailed)?;
+    let read_len = HEADER_VIEW_SIZE.min(file_size as usize);
     let got = hypercall::host_read(fd, hdr_buf, read_len, 0);
     if got == 0 {
         crate::kerror!("ldr: failed to read PE headers");
@@ -70,21 +201,21 @@ pub unsafe fn load_from_fd(
     }
 
     // 3. 分配镜像内存
-    let buf =
-        alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096).ok_or(LdrError::AllocFailed)?;
-    let load_base = buf as u64;
+    let image = alloc_image_buffer(hdrs.size_of_image as usize, vma_type)?;
+    let buf = image.ptr;
+    let load_base = image.base;
 
     // 4. 复制头部到镜像基址
     let hdr_copy = (hdrs.size_of_headers as usize).min(got);
+    // SAFETY: `buf` points to a writable image buffer of at least `hdr_copy` bytes.
     core::ptr::copy_nonoverlapping(hdr_buf as *const u8, buf, hdr_copy);
 
     // 5. 逐 section 从 fd 读取
     for sec in hdrs.sections() {
         if sec.raw_size > 0 && sec.raw_off > 0 {
-            let dst = buf.add(sec.vaddr as usize);
             let read_size = (sec.raw_size as usize).min(sec.vsize as usize);
-            let n = hypercall::host_read(fd, dst, read_size, sec.raw_off as u64);
-            if n == 0 && read_size > 0 {
+            if !read_file_into_image(fd, &image, sec.vaddr as u64, read_size, sec.raw_off as u64)
+            {
                 crate::kerror!("ldr: section read failed");
                 return Err(LdrError::IoError);
             }
@@ -108,6 +239,8 @@ pub unsafe fn load_from_fd(
         }
     }
 
+    finalize_loaded_image(load_base)?;
+
     Ok(LoadedImage {
         base: load_base,
         size: hdrs.size_of_image as usize,
@@ -119,6 +252,7 @@ pub unsafe fn load_from_fd(
 
 pub unsafe fn load(
     image: &[u8],
+    vma_type: VmaType,
     resolve_import: impl Fn(&str, ImportRef) -> Option<u64>,
 ) -> LdrResult<LoadedImage> {
     let hdrs = PeHeaders::from_slice(image)?;
@@ -128,14 +262,15 @@ pub unsafe fn load(
         return Err(LdrError::NotArm64);
     }
 
-    let buf =
-        alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096).ok_or(LdrError::AllocFailed)?;
+    let image_buf = alloc_image_buffer(hdrs.size_of_image as usize, vma_type)?;
+    let buf = image_buf.ptr;
     crate::kdebug!("ldr: alloc ok");
-    let load_base = buf as u64;
+    let load_base = image_buf.base;
 
     // 先复制 PE headers（导出解析依赖 DOS/NT 头）
     let hdr_copy = (hdrs.size_of_headers as usize).min(image.len());
     if hdr_copy > 0 {
+        // SAFETY: `buf` points to a writable image buffer of at least `hdr_copy` bytes.
         core::ptr::copy_nonoverlapping(image.as_ptr(), buf, hdr_copy);
     }
 
@@ -146,6 +281,7 @@ pub unsafe fn load(
             let dst_off = sec.vaddr as usize;
             let copy_len = (sec.raw_size as usize).min(sec.vsize as usize);
             if src_off + copy_len <= image.len() {
+                // SAFETY: source/destination bounds are checked above and both buffers are valid.
                 core::ptr::copy_nonoverlapping(
                     image.as_ptr().add(src_off),
                     buf.add(dst_off),
@@ -172,6 +308,8 @@ pub unsafe fn load(
         }
     }
 
+    finalize_loaded_image(load_base)?;
+
     Ok(LoadedImage {
         base: load_base,
         size: hdrs.size_of_image as usize,
@@ -180,10 +318,13 @@ pub unsafe fn load(
 }
 
 /// Load PE image into memory (with relocations) but do not resolve IAT yet.
-pub unsafe fn load_from_fd_unlinked(fd: u64, file_size: u64) -> LdrResult<LoadedImage> {
-    const HDR_BUF_SIZE: usize = 4096;
-    let hdr_buf = alloc::alloc_zeroed(HDR_BUF_SIZE, 16).ok_or(LdrError::AllocFailed)?;
-    let read_len = HDR_BUF_SIZE.min(file_size as usize);
+pub unsafe fn load_from_fd_unlinked(
+    fd: u64,
+    file_size: u64,
+    vma_type: VmaType,
+) -> LdrResult<LoadedImage> {
+    let hdr_buf = alloc::alloc_zeroed(HEADER_VIEW_SIZE, 16).ok_or(LdrError::AllocFailed)?;
+    let read_len = HEADER_VIEW_SIZE.min(file_size as usize);
     let got = hypercall::host_read(fd, hdr_buf, read_len, 0);
     if got == 0 {
         crate::kerror!("ldr: failed to read PE headers");
@@ -197,20 +338,20 @@ pub unsafe fn load_from_fd_unlinked(fd: u64, file_size: u64) -> LdrResult<Loaded
         return Err(LdrError::NotArm64);
     }
 
-    let buf =
-        alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096).ok_or(LdrError::AllocFailed)?;
+    let image = alloc_image_buffer(hdrs.size_of_image as usize, vma_type)?;
+    let buf = image.ptr;
     crate::kdebug!("ldr: alloc ok");
-    let load_base = buf as u64;
+    let load_base = image.base;
 
     let hdr_copy = (hdrs.size_of_headers as usize).min(got);
+    // SAFETY: `buf` points to a writable image buffer of at least `hdr_copy` bytes.
     core::ptr::copy_nonoverlapping(hdr_buf as *const u8, buf, hdr_copy);
 
     for sec in hdrs.sections() {
         if sec.raw_size > 0 && sec.raw_off > 0 {
-            let dst = buf.add(sec.vaddr as usize);
             let read_size = (sec.raw_size as usize).min(sec.vsize as usize);
-            let n = hypercall::host_read(fd, dst, read_size, sec.raw_off as u64);
-            if n == 0 && read_size > 0 {
+            if !read_file_into_image(fd, &image, sec.vaddr as u64, read_size, sec.raw_off as u64)
+            {
                 crate::kerror!("ldr: section read failed");
                 return Err(LdrError::IoError);
             }
@@ -234,7 +375,7 @@ pub unsafe fn load_from_fd_unlinked(fd: u64, file_size: u64) -> LdrResult<Loaded
 }
 
 /// Load PE image into memory (with relocations) but do not resolve IAT yet.
-pub unsafe fn load_unlinked(image: &[u8]) -> LdrResult<LoadedImage> {
+pub unsafe fn load_unlinked(image: &[u8], vma_type: VmaType) -> LdrResult<LoadedImage> {
     let hdrs = PeHeaders::from_slice(image)?;
     crate::kdebug!("ldr: parsed PE headers");
 
@@ -242,13 +383,14 @@ pub unsafe fn load_unlinked(image: &[u8]) -> LdrResult<LoadedImage> {
         return Err(LdrError::NotArm64);
     }
 
-    let buf =
-        alloc::alloc_zeroed(hdrs.size_of_image as usize, 4096).ok_or(LdrError::AllocFailed)?;
+    let image_buf = alloc_image_buffer(hdrs.size_of_image as usize, vma_type)?;
+    let buf = image_buf.ptr;
     crate::kdebug!("ldr: alloc ok");
-    let load_base = buf as u64;
+    let load_base = image_buf.base;
 
     let hdr_copy = (hdrs.size_of_headers as usize).min(image.len());
     if hdr_copy > 0 {
+        // SAFETY: `buf` points to a writable image buffer of at least `hdr_copy` bytes.
         core::ptr::copy_nonoverlapping(image.as_ptr(), buf, hdr_copy);
     }
 
@@ -258,6 +400,7 @@ pub unsafe fn load_unlinked(image: &[u8]) -> LdrResult<LoadedImage> {
             let dst_off = sec.vaddr as usize;
             let copy_len = (sec.raw_size as usize).min(sec.vsize as usize);
             if src_off + copy_len <= image.len() {
+                // SAFETY: source/destination bounds are checked above and both buffers are valid.
                 core::ptr::copy_nonoverlapping(
                     image.as_ptr().add(src_off),
                     buf.add(dst_off),

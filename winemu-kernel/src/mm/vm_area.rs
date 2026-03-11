@@ -8,6 +8,7 @@
 ///   - 可选的 section/文件映射元信息
 use crate::mm::areaset::AreaValue;
 use crate::mm::range::Range;
+use crate::mm::PhysAddr;
 use crate::rust_alloc::vec::Vec;
 
 pub(crate) const PAGE_SIZE: u64 = crate::nt::constants::PAGE_SIZE_4K;
@@ -17,6 +18,7 @@ pub(crate) const PAGE_SIZE: u64 = crate::nt::constants::PAGE_SIZE_4K;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VmKind {
     Private,
+    Image,
     Section,
     ThreadStack,
     Other,
@@ -34,8 +36,8 @@ pub struct VmArea {
     /// false = 文件映射（不释放物理页引用）
     pub owns_phys_pages: bool,
 
-    /// 每页 GPA；0 = 尚未映射
-    pub phys_pages: Vec<u64>,
+    /// 每页物理页地址；`PhysAddr::default()` = 尚未映射
+    pub phys_pages: Vec<PhysAddr>,
     /// 每页 NT 保护标志
     pub prot_pages: Vec<u32>,
     /// commit 位图：bit i = 1 → 第 i 页已提交
@@ -64,7 +66,7 @@ impl VmArea {
         phys_pages.try_reserve_exact(page_count).ok()?;
         prot_pages.try_reserve_exact(page_count).ok()?;
         commit_bits.try_reserve_exact(cwords).ok()?;
-        phys_pages.resize(page_count, 0u64);
+        phys_pages.resize(page_count, PhysAddr::default());
         prot_pages.resize(page_count, default_prot);
         commit_bits.resize(cwords, 0u64);
         Some(Self {
@@ -97,7 +99,7 @@ impl VmArea {
         phys_pages.try_reserve_exact(page_count).ok()?;
         prot_pages.try_reserve_exact(page_count).ok()?;
         commit_bits.try_reserve_exact(cwords).ok()?;
-        phys_pages.resize(page_count, 0u64);
+        phys_pages.resize(page_count, PhysAddr::default());
         prot_pages.resize(page_count, prot);
         commit_bits.resize(cwords, 0u64);
         Some(Self {
@@ -118,6 +120,16 @@ impl VmArea {
 
     pub fn page_count(&self) -> usize {
         self.phys_pages.len()
+    }
+
+    pub fn phys_page(&self, idx: usize) -> PhysAddr {
+        self.phys_pages.get(idx).copied().unwrap_or_default()
+    }
+
+    pub fn set_phys_page(&mut self, idx: usize, pa: PhysAddr) {
+        if idx < self.phys_pages.len() {
+            self.phys_pages[idx] = pa;
+        }
     }
 
     pub fn is_page_committed(&self, idx: usize) -> bool {
@@ -149,7 +161,7 @@ impl VmArea {
     }
 
     pub fn has_any_phys(&self) -> bool {
-        self.phys_pages.iter().any(|&p| p != 0)
+        self.phys_pages.iter().any(|&p| !p.is_null())
     }
 }
 
@@ -219,7 +231,7 @@ impl AreaValue for VmArea {
         phys_pages.try_reserve_exact(total_pages).ok()?;
         prot_pages.try_reserve_exact(total_pages).ok()?;
         commit_bits.try_reserve_exact(cwords).ok()?;
-        phys_pages.resize(total_pages, 0u64);
+        phys_pages.resize(total_pages, PhysAddr::default());
         prot_pages.resize(total_pages, self.default_prot);
         commit_bits.resize(cwords, 0u64);
         Some(Self {

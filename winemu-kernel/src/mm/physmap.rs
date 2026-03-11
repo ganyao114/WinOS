@@ -1,106 +1,235 @@
 use crate::arch::mmu::{
     GUEST_PHYS_BASE, GUEST_PHYS_LIMIT, KERNEL_PHYSMAP_BASE, KERNEL_PHYSMAP_LIMIT,
 };
+use crate::mm::{KernelVa, PhysAddr};
+use crate::nt::constants::PAGE_SIZE_4K;
+
+enum PhysPageMapping {
+    Linear(KernelVa),
+    Local(crate::mm::kmap::KmapGuard),
+}
+
+impl PhysPageMapping {
+    fn map(pa: PhysAddr) -> Option<Self> {
+        let page_base = pa.page_base(PAGE_SIZE_4K);
+        if let Some(kva) = phys_to_kva(page_base) {
+            Some(Self::Linear(kva))
+        } else {
+            crate::mm::kmap::kmap_local_page(page_base).map(Self::Local)
+        }
+    }
+
+    fn src_ptr(&self, offset: usize) -> *const u8 {
+        match self {
+            Self::Linear(kva) => {
+                // SAFETY: caller ensures `offset < PAGE_SIZE_4K`.
+                unsafe { kva.as_ptr::<u8>().add(offset) }
+            }
+            Self::Local(guard) => {
+                // SAFETY: caller ensures `offset < PAGE_SIZE_4K`.
+                unsafe { guard.as_ptr::<u8>().add(offset) }
+            }
+        }
+    }
+
+    fn dst_ptr(&mut self, offset: usize) -> *mut u8 {
+        match self {
+            Self::Linear(kva) => {
+                // SAFETY: caller ensures `offset < PAGE_SIZE_4K`.
+                unsafe { kva.as_mut_ptr::<u8>().add(offset) }
+            }
+            Self::Local(guard) => {
+                // SAFETY: caller ensures `offset < PAGE_SIZE_4K`.
+                unsafe { guard.as_mut_ptr::<u8>().add(offset) }
+            }
+        }
+    }
+}
+
+/// Canonical kernel linear-map helpers for guest RAM.
+///
+/// Even though this module is still named `physmap.rs`, callers should use the
+/// semantic alias `crate::mm::linear_map::*`.
 
 #[inline(always)]
-pub fn gpa_to_kva(gpa: u64) -> Option<*mut u8> {
-    if !(GUEST_PHYS_BASE..GUEST_PHYS_LIMIT).contains(&gpa) {
+pub fn phys_to_kva(pa: PhysAddr) -> Option<KernelVa> {
+    if !(GUEST_PHYS_BASE..GUEST_PHYS_LIMIT).contains(&pa.get()) {
         return None;
     }
-    let offset = gpa.checked_sub(GUEST_PHYS_BASE)?;
+    let offset = pa.get().checked_sub(GUEST_PHYS_BASE)?;
     let kva = KERNEL_PHYSMAP_BASE.checked_add(offset)?;
     if !(KERNEL_PHYSMAP_BASE..KERNEL_PHYSMAP_LIMIT).contains(&kva) {
         return None;
     }
-    Some(kva as *mut u8)
+    Some(KernelVa::new(kva))
 }
 
 #[inline(always)]
-pub fn gpa_range_valid(gpa: u64, len: usize) -> bool {
-    if len == 0 {
-        return (GUEST_PHYS_BASE..GUEST_PHYS_LIMIT).contains(&gpa);
+pub fn kva_to_phys(kva: KernelVa) -> Option<PhysAddr> {
+    if !(KERNEL_PHYSMAP_BASE..KERNEL_PHYSMAP_LIMIT).contains(&kva.get()) {
+        return None;
     }
-    let Some(end) = gpa.checked_add((len as u64).saturating_sub(1)) else {
+    let offset = kva.get().checked_sub(KERNEL_PHYSMAP_BASE)?;
+    let pa = GUEST_PHYS_BASE.checked_add(offset)?;
+    if !(GUEST_PHYS_BASE..GUEST_PHYS_LIMIT).contains(&pa) {
+        return None;
+    }
+    Some(PhysAddr::new(pa))
+}
+
+#[inline(always)]
+pub fn phys_range_valid(pa: PhysAddr, len: usize) -> bool {
+    if len == 0 {
+        return (GUEST_PHYS_BASE..GUEST_PHYS_LIMIT).contains(&pa.get());
+    }
+    let Some(end) = pa.get().checked_add((len as u64).saturating_sub(1)) else {
         return false;
     };
-    gpa >= GUEST_PHYS_BASE && end < GUEST_PHYS_LIMIT
+    pa.get() >= GUEST_PHYS_BASE && end < GUEST_PHYS_LIMIT
 }
 
 #[inline(always)]
-pub fn copy_from_gpa(dst: *mut u8, src_gpa: u64, len: usize) -> bool {
+pub fn copy_from_phys(dst: *mut u8, src_pa: PhysAddr, len: usize) -> bool {
     if len == 0 {
         return true;
     }
-    if dst.is_null() || !gpa_range_valid(src_gpa, len) {
+    if dst.is_null() || !phys_range_valid(src_pa, len) {
         return false;
     }
-    let Some(src) = gpa_to_kva(src_gpa) else {
-        return false;
-    };
-    // SAFETY: source GPA range is validated and translated into the dedicated
-    // kernel physmap; destination is a caller-provided kernel buffer.
-    unsafe {
-        core::ptr::copy_nonoverlapping(src.cast::<u8>(), dst, len);
+
+    let mut done = 0usize;
+    while done < len {
+        let Some(cur_pa) = src_pa.checked_add(done as u64) else {
+            return false;
+        };
+        let page_off = phys_page_offset(cur_pa);
+        let chunk = page_chunk_len(cur_pa, len - done);
+        if let Some(src) = phys_to_kva(cur_pa) {
+            // SAFETY: `src` points into the permanent linear map and `dst.add(done)`
+            // points into a caller-provided kernel buffer with `chunk` bytes available.
+            unsafe {
+                core::ptr::copy_nonoverlapping(src.as_ptr::<u8>(), dst.add(done), chunk);
+            }
+        } else {
+            let Some(src_map) = PhysPageMapping::map(cur_pa) else {
+                return false;
+            };
+            // SAFETY: `src_map` keeps the temporary mapping alive for the duration of
+            // the copy, and `dst.add(done)` points into a caller-provided kernel buffer.
+            unsafe {
+                core::ptr::copy_nonoverlapping(src_map.src_ptr(page_off), dst.add(done), chunk);
+            }
+        }
+        done += chunk;
     }
     true
 }
 
 #[inline(always)]
-pub fn copy_to_gpa(dst_gpa: u64, src: *const u8, len: usize) -> bool {
+pub fn copy_to_phys(dst_pa: PhysAddr, src: *const u8, len: usize) -> bool {
     if len == 0 {
         return true;
     }
-    if src.is_null() || !gpa_range_valid(dst_gpa, len) {
+    if src.is_null() || !phys_range_valid(dst_pa, len) {
         return false;
     }
-    let Some(dst) = gpa_to_kva(dst_gpa) else {
-        return false;
-    };
-    // SAFETY: destination GPA range is validated and translated into the
-    // dedicated kernel physmap; source is a caller-provided kernel buffer.
-    unsafe {
-        core::ptr::copy_nonoverlapping(src, dst.cast::<u8>(), len);
+
+    let mut done = 0usize;
+    while done < len {
+        let Some(cur_pa) = dst_pa.checked_add(done as u64) else {
+            return false;
+        };
+        let page_off = phys_page_offset(cur_pa);
+        let chunk = page_chunk_len(cur_pa, len - done);
+        let Some(mut dst_map) = PhysPageMapping::map(cur_pa) else {
+            return false;
+        };
+        let dst_ptr = dst_map.dst_ptr(page_off);
+        // SAFETY: `src.add(done)` points into the caller-provided kernel buffer and
+        // `dst_ptr` points into a mapped physical page window with `chunk` bytes available.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.add(done), dst_ptr, chunk);
+        }
+        done += chunk;
     }
     true
 }
 
 #[inline(always)]
-pub fn copy_gpa(dst_gpa: u64, src_gpa: u64, len: usize) -> bool {
+pub fn copy_phys(dst_pa: PhysAddr, src_pa: PhysAddr, len: usize) -> bool {
     if len == 0 {
         return true;
     }
-    if !gpa_range_valid(src_gpa, len) || !gpa_range_valid(dst_gpa, len) {
+    if !phys_range_valid(src_pa, len) || !phys_range_valid(dst_pa, len) {
         return false;
     }
-    let Some(src) = gpa_to_kva(src_gpa) else {
-        return false;
-    };
-    let Some(dst) = gpa_to_kva(dst_gpa) else {
-        return false;
-    };
-    // SAFETY: both GPA ranges are validated and translated into the dedicated
-    // kernel physmap. Use overlap-safe semantics conservatively.
-    unsafe {
-        core::ptr::copy(src.cast::<u8>(), dst.cast::<u8>(), len);
+
+    let mut done = 0usize;
+    while done < len {
+        let Some(cur_src_pa) = src_pa.checked_add(done as u64) else {
+            return false;
+        };
+        let Some(cur_dst_pa) = dst_pa.checked_add(done as u64) else {
+            return false;
+        };
+        let src_off = phys_page_offset(cur_src_pa);
+        let dst_off = phys_page_offset(cur_dst_pa);
+        let chunk = core::cmp::min(
+            page_chunk_len(cur_src_pa, len - done),
+            page_chunk_len(cur_dst_pa, len - done),
+        );
+        let Some(src_map) = PhysPageMapping::map(cur_src_pa) else {
+            return false;
+        };
+        let Some(mut dst_map) = PhysPageMapping::map(cur_dst_pa) else {
+            return false;
+        };
+        // SAFETY: both pointers point into mapped physical page windows with `chunk`
+        // bytes available. `ptr::copy` preserves overlap semantics.
+        unsafe {
+            core::ptr::copy(src_map.src_ptr(src_off), dst_map.dst_ptr(dst_off), chunk);
+        }
+        done += chunk;
     }
     true
 }
 
 #[inline(always)]
-pub fn memset_gpa(dst_gpa: u64, value: u8, len: usize) -> bool {
+pub fn memset_phys(dst_pa: PhysAddr, value: u8, len: usize) -> bool {
     if len == 0 {
         return true;
     }
-    if !gpa_range_valid(dst_gpa, len) {
+    if !phys_range_valid(dst_pa, len) {
         return false;
     }
-    let Some(dst) = gpa_to_kva(dst_gpa) else {
-        return false;
-    };
-    // SAFETY: destination GPA range is validated and translated into the
-    // dedicated kernel physmap.
-    unsafe {
-        core::ptr::write_bytes(dst, value, len);
+
+    let mut done = 0usize;
+    while done < len {
+        let Some(cur_pa) = dst_pa.checked_add(done as u64) else {
+            return false;
+        };
+        let page_off = phys_page_offset(cur_pa);
+        let chunk = page_chunk_len(cur_pa, len - done);
+        let Some(mut dst_map) = PhysPageMapping::map(cur_pa) else {
+            return false;
+        };
+        // SAFETY: `dst_ptr` points into a mapped physical page window with `chunk`
+        // bytes available.
+        unsafe {
+            core::ptr::write_bytes(dst_map.dst_ptr(page_off), value, chunk);
+        }
+        done += chunk;
     }
     true
+}
+
+#[inline(always)]
+fn phys_page_offset(pa: PhysAddr) -> usize {
+    (pa.get() & (PAGE_SIZE_4K - 1)) as usize
+}
+
+#[inline(always)]
+fn page_chunk_len(pa: PhysAddr, remaining: usize) -> usize {
+    let page_remaining = (PAGE_SIZE_4K as usize).saturating_sub(phys_page_offset(pa));
+    core::cmp::min(page_remaining, remaining)
 }

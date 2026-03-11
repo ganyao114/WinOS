@@ -2,9 +2,10 @@
 // 参考: Wine dlls/ntdll/unix/signal_arm64.c call_init_thunk
 //       Wine dlls/ntdll/unix/virtual.c init_teb / init_peb
 
-use crate::mm::vaspace::VmaType;
+use crate::mm::{vm_alloc_region_typed, vm_free_region, vm_make_guard_page};
+use crate::mm::VmaType;
 use crate::nt::constants::PAGE_SIZE_4K;
-use crate::nt::state::{vm_alloc_region_typed, vm_free_region, vm_make_guard_page};
+use crate::mm::usercopy::write_user_value;
 use winemu_shared::{peb, teb};
 
 /// 已初始化的 TEB/PEB 描述符
@@ -542,17 +543,16 @@ fn align_up(v: u64, align: u64) -> u64 {
 /// Returns the TEB VA on success, or None on OOM.
 pub fn alloc_teb(pid: u32) -> Option<u64> {
     use winemu_shared::teb as teb_off;
-    let teb_va = crate::nt::state::vm_alloc_region_typed(
+    let teb_va = crate::mm::vm_alloc_region_typed(
         pid,
         0,
         teb_off::SIZE as u64,
         0x04,
         VmaType::Private,
     )?;
-    // Write TEB.Self pointer
-    let buf = unsafe {
-        core::slice::from_raw_parts_mut(teb_va as *mut u8, teb_off::SIZE)
-    };
-    wu64(buf, teb_off::SELF, teb_va);
+    if !write_user_value(pid, (teb_va + teb_off::SELF as u64) as *mut u64, teb_va) {
+        let _ = vm_free_region(pid, teb_va);
+        return None;
+    }
     Some(teb_va)
 }

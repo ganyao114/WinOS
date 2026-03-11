@@ -188,11 +188,11 @@ fn load_mapped_dll(
         if map_base != 0 {
             let _ = hypercall::host_munmap(map_base, file_size);
         }
-        unsafe { ldr::load_from_fd_unlinked(fd, file_size) }
+        unsafe { ldr::load_from_fd_unlinked(fd, file_size, crate::mm::VmaType::DllImage) }
     } else {
         let image =
             unsafe { core::slice::from_raw_parts(map_base as *const u8, file_size as usize) };
-        let out = unsafe { ldr::load_unlinked(image) };
+        let out = unsafe { ldr::load_unlinked(image, crate::mm::VmaType::DllImage) };
         let _ = hypercall::host_munmap(map_base, file_size);
         out
     }?;
@@ -207,22 +207,6 @@ fn load_mapped_dll(
     if !remember_loaded(dll_name, loaded.base, loaded.size as u32, entry) {
         return Err(ldr::LdrError::BadImport);
     }
-    let owner_pid = crate::process::current_pid();
-    if owner_pid != 0 {
-        if !crate::nt::state::vm_track_existing_file_mapping(
-            owner_pid,
-            loaded.base,
-            loaded.size as u64,
-            crate::nt::state::VM_FILE_MAPPING_DEFAULT_PROT,
-        ) {
-            crate::kwarn!(
-                "dll: vm_track_existing_file_mapping failed base={:#x} size={:#x}",
-                loaded.base,
-                loaded.size
-            );
-        }
-    }
-
     let linked = unsafe {
         ldr::link_imports(loaded.base, |dep_name, dep_imp| {
             resolve_import(dep_name, dep_imp)
@@ -234,6 +218,10 @@ fn load_mapped_dll(
     }
 
     apply_runtime_compat_bootstrap(dll_name, loaded.base, loaded.size as u64);
+    if ldr::finalize_loaded_image(loaded.base).is_err() {
+        forget_loaded(dll_name);
+        return Err(ldr::LdrError::ProtectFailed);
+    }
 
     Ok(loaded)
 }

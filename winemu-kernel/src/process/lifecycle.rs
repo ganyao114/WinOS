@@ -98,6 +98,21 @@ pub fn current_process_context_matches(pid: u32) -> bool {
     ttbr0_root_matches(crate::arch::mmu::current_user_table_root(), ttbr0)
 }
 
+pub(crate) fn update_current_thread_stack_limit(owner_pid: u32, new_limit: u64) {
+    let tid = crate::sched::current_tid();
+    if tid == 0 || !crate::sched::thread_exists(tid) {
+        return;
+    }
+    let teb_va =
+        crate::sched::with_thread(tid, |t| if t.pid == owner_pid { t.teb_va } else { 0 })
+            .unwrap_or(0);
+    if teb_va == 0 {
+        return;
+    }
+    let user_ptr = (teb_va + winemu_shared::teb::STACK_LIMIT as u64) as *mut u64;
+    let _ = crate::mm::usercopy::write_user_value(owner_pid, user_ptr, new_limit);
+}
+
 pub fn init_boot_process(image_base: u64, peb_va: u64) -> bool {
     let existing = boot_pid();
     if existing != 0 && process_exists(existing) {
@@ -168,11 +183,7 @@ pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> R
     };
 
     let _ = with_process_mut(pid, |p| p.state = ProcessState::Running);
-    if !crate::nt::state::vm_clone_tracked_mappings(parent_pid, pid) {
-        let _ = free_process(pid);
-        return Err(status::NO_MEMORY);
-    }
-    if !crate::nt::state::vm_prepare_process_clone_cow(parent_pid, pid) {
+    if !crate::mm::clone_process_vm_for_fork(parent_pid, pid) {
         let _ = free_process(pid);
         return Err(status::NO_MEMORY);
     }

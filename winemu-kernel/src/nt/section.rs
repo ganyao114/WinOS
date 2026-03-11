@@ -1,28 +1,25 @@
 use crate::kobj::ObjectStore;
-use crate::process::{KObjectKind, KObjectRef, with_process_mut};
+use crate::mm::{vm_alloc_region_typed, vm_free_region, vm_set_section_backing, VmaType};
+use crate::process::{with_process_mut, KObjectKind, KObjectRef};
 use crate::rust_alloc::vec::Vec;
 use winemu_shared::status;
 
 use super::common::{align_up_4k, GuestWriter};
 use super::constants::PAGE_SIZE_4K;
 use super::path::read_oa_path;
-use super::state::{
-    file_host_fd, section_alloc, section_free, section_get, view_alloc, view_free,
-    vm_alloc_region_typed, vm_free_region, vm_set_section_backing,
-};
-use crate::mm::usercopy::{read_current_user_value, write_current_user_value};
+use super::state::{file_host_fd, section_alloc, section_free, section_get, view_alloc, view_free};
 use super::SvcFrame;
-use crate::mm::vaspace::VmaType;
+use crate::mm::usercopy::{read_current_user_value, write_current_user_value};
 
 // ── Guest-memory layout structs ───────────────────────────────────────────────
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct SectionBasicInformation {
-    base_address:         u64,
+    base_address: u64,
     allocation_attributes: u32,
-    _pad:                 u32,
-    maximum_size:         u64,
+    _pad: u32,
+    maximum_size: u64,
 }
 
 #[repr(C)]
@@ -190,7 +187,10 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
         let obj = with_process_mut(pid, |p| p.handle_table.get(file_handle as u32)).flatten();
         match obj {
             Some(o) if o.kind == KObjectKind::File => file_host_fd(o.obj_idx),
-            _ => { frame.x[0] = status::INVALID_HANDLE as u64; return; }
+            _ => {
+                frame.x[0] = status::INVALID_HANDLE as u64;
+                return;
+            }
         }
     };
     if file_handle != 0 && file_fd.is_none() {
@@ -216,8 +216,11 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
     }
     let pid = crate::process::current_pid();
     let Some(handle) = with_process_mut(pid, |p| {
-        p.handle_table.add(KObjectRef::section(idx)).map(|v| v as u64)
-    }).flatten() else {
+        p.handle_table
+            .add(KObjectRef::section(idx))
+            .map(|v| v as u64)
+    })
+    .flatten() else {
         named_section_remove_by_section(idx);
         section_free(idx);
         frame.x[0] = status::NO_MEMORY as u64;
@@ -266,8 +269,11 @@ pub(crate) fn handle_open_section(frame: &mut SvcFrame) {
 
     let pid = crate::process::current_pid();
     let Some(handle) = with_process_mut(pid, |p| {
-        p.handle_table.add(KObjectRef::section(section_idx)).map(|v| v as u64)
-    }).flatten() else {
+        p.handle_table
+            .add(KObjectRef::section(section_idx))
+            .map(|v| v as u64)
+    })
+    .flatten() else {
         frame.x[0] = status::NO_MEMORY as u64;
         return;
     };
@@ -288,7 +294,10 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     let obj = with_process_mut(pid, |p| p.handle_table.get(h as u32)).flatten();
     let sec_idx = match obj {
         Some(o) if o.kind == KObjectKind::Section => o.obj_idx,
-        _ => { frame.x[0] = status::INVALID_HANDLE as u64; return; }
+        _ => {
+            frame.x[0] = status::INVALID_HANDLE as u64;
+            return;
+        }
     };
     let sec = match section_get(sec_idx) {
         Some(s) => s,
@@ -464,11 +473,17 @@ pub(crate) fn handle_query_section(frame: &mut SvcFrame) {
     let obj = with_process_mut(pid, |p| p.handle_table.get(h as u32)).flatten();
     let sec_idx = match obj {
         Some(o) if o.kind == KObjectKind::Section => o.obj_idx,
-        _ => { frame.x[0] = status::INVALID_HANDLE as u64; return; }
+        _ => {
+            frame.x[0] = status::INVALID_HANDLE as u64;
+            return;
+        }
     };
     let sec = match section_get(sec_idx) {
         Some(s) => s,
-        None => { frame.x[0] = status::INVALID_HANDLE as u64; return; }
+        None => {
+            frame.x[0] = status::INVALID_HANDLE as u64;
+            return;
+        }
     };
 
     match info_class {
@@ -507,6 +522,8 @@ pub(crate) fn handle_query_section(frame: &mut SvcFrame) {
             }
             frame.x[0] = status::SUCCESS as u64;
         }
-        _ => { frame.x[0] = status::INVALID_PARAMETER as u64; }
+        _ => {
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+        }
     }
 }

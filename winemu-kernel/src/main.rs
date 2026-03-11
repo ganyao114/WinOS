@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 extern crate alloc as rust_alloc;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 mod alloc;
 mod arch;
@@ -23,6 +23,43 @@ mod vectors;
 
 #[no_mangle]
 pub static __boot_primary_ready: AtomicU32 = AtomicU32::new(0);
+static EL0_FAULT_LAST_FAR: [AtomicU64; sched::MAX_VCPUS] =
+    [const { AtomicU64::new(0) }; sched::MAX_VCPUS];
+static EL0_FAULT_LAST_ELR: [AtomicU64; sched::MAX_VCPUS] =
+    [const { AtomicU64::new(0) }; sched::MAX_VCPUS];
+static EL0_FAULT_REPEAT_COUNT: [AtomicU32; sched::MAX_VCPUS] =
+    [const { AtomicU32::new(0) }; sched::MAX_VCPUS];
+
+#[inline]
+fn trace_el0_fault_repeat(far: u64, elr: u64, access: u8, owner_pid: u32) {
+    let vid = (sched::vcpu_id() as usize).min(sched::MAX_VCPUS - 1);
+    let last_far = EL0_FAULT_LAST_FAR[vid].load(Ordering::Acquire);
+    let last_elr = EL0_FAULT_LAST_ELR[vid].load(Ordering::Acquire);
+    let repeat = if last_far == far && last_elr == elr {
+        EL0_FAULT_REPEAT_COUNT[vid].fetch_add(1, Ordering::AcqRel) + 1
+    } else {
+        EL0_FAULT_LAST_FAR[vid].store(far, Ordering::Release);
+        EL0_FAULT_LAST_ELR[vid].store(elr, Ordering::Release);
+        EL0_FAULT_REPEAT_COUNT[vid].store(1, Ordering::Release);
+        1
+    };
+
+    if repeat < 64 || (repeat & (repeat - 1)) != 0 {
+        return;
+    }
+
+    crate::kwarn!(
+        "el0_fault_repeat: vid={} repeat={} far={:#x} elr={:#x} access={} pid={} tid={} ttbr0={:#x}",
+        vid,
+        repeat,
+        far,
+        elr,
+        access,
+        owner_pid,
+        crate::sched::current_tid(),
+        crate::arch::mmu::current_user_table_root(),
+    );
+}
 
 #[inline(always)]
 fn set_primary_boot_ready() {
@@ -78,14 +115,24 @@ pub extern "C" fn el0_page_fault(far: u64, esr: u64, elr: u64, frame_ptr: u64) -
     let is_permission_fault = (0x0C..=0x0F).contains(&fsc);
     if is_el0_abort && (is_translation_fault || is_access_flag_fault || is_permission_fault) {
         let access = if ec == 0x20 {
-            crate::nt::state::VM_ACCESS_EXEC
+            crate::mm::VM_ACCESS_EXEC
         } else if wnr != 0 {
-            crate::nt::state::VM_ACCESS_WRITE
+            crate::mm::VM_ACCESS_WRITE
         } else {
-            crate::nt::state::VM_ACCESS_READ
+            crate::mm::VM_ACCESS_READ
         };
         let owner_pid = crate::process::current_pid();
-        if owner_pid != 0 && crate::nt::state::vm_handle_page_fault(owner_pid, far, access) {
+        trace_el0_fault_repeat(far, elr, access, owner_pid);
+        let tid = crate::sched::current_tid();
+        if tid != 0 {
+            crate::process::switch_to_thread_process(tid);
+        }
+        if owner_pid != 0
+            && crate::mm::handle_process_page_fault(owner_pid, crate::mm::UserVa::new(far), access)
+        {
+            if tid != 0 {
+                crate::process::switch_to_thread_process(tid);
+            }
             return 1;
         }
     }
@@ -182,41 +229,6 @@ pub extern "C" fn el1_sync_fault(
     hypercall::process_exit(0xE1)
 }
 
-fn register_process_boot_file_mappings(owner_pid: u32, exe_base: u64, exe_size: u64) {
-    if owner_pid == 0 {
-        return;
-    }
-    if !crate::nt::state::vm_track_existing_file_mapping(
-        owner_pid,
-        exe_base,
-        exe_size,
-        crate::nt::state::VM_FILE_MAPPING_DEFAULT_PROT,
-    ) {
-        crate::kwarn!(
-            "kernel: track exe file mapping failed base={:#x} size={:#x}",
-            exe_base,
-            exe_size
-        );
-    }
-    dll::for_each_loaded(|_name, base, size, _entry| {
-        if base == 0 || size == 0 {
-            return;
-        }
-        if !crate::nt::state::vm_track_existing_file_mapping(
-            owner_pid,
-            base,
-            size as u64,
-            crate::nt::state::VM_FILE_MAPPING_DEFAULT_PROT,
-        ) {
-            crate::kwarn!(
-                "kernel: track dll file mapping failed base={:#x} size={:#x}",
-                base,
-                size
-            );
-        }
-    });
-}
-
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
     crate::kinfo!("kernel_main: start");
@@ -253,8 +265,7 @@ pub extern "C" fn kernel_main() -> ! {
             // Scheduler-internal priority is inverted from NT (smaller = higher).
             priority: 23,
         };
-        let tid = sched::create_user_thread_locked(params)
-            .expect("kernel: thread0 alloc failed");
+        let tid = sched::create_user_thread_locked(params).expect("kernel: thread0 alloc failed");
         // Keep thread0 bound to bootstrap execution context, but do not leave
         // it in the ready queue before its user entry is fully initialized.
         sched::set_thread_state_locked(tid, sched::ThreadState::Running);
@@ -302,7 +313,7 @@ pub extern "C" fn kernel_main() -> ! {
     };
 
     let loaded = unsafe {
-        ldr::load_from_fd(exe_fd, exe_size, |dll_name, imp| {
+        ldr::load_from_fd(exe_fd, exe_size, crate::mm::VmaType::ExeImage, |dll_name, imp| {
             dll::resolve_import(dll_name, imp)
         })
     };
@@ -328,7 +339,6 @@ pub extern "C" fn kernel_main() -> ! {
         crate::kerror!("kernel: boot pid invalid");
         hypercall::process_exit(1);
     }
-    register_process_boot_file_mappings(boot_pid, loaded.base, loaded.size as u64);
 
     let teb_peb = match teb::init(
         loaded.base,
@@ -380,12 +390,12 @@ pub extern "C" fn kernel_main() -> ! {
 
     // Compatibility reservation: keep prior user VA layout stable.
     const SECONDARY_STACK_SIZE: u64 = 0x10000;
-    let _ = crate::nt::state::vm_alloc_region_typed(
+    let _ = crate::mm::vm_alloc_region_typed(
         boot_pid,
         0,
         SECONDARY_STACK_SIZE,
         0x04,
-        crate::mm::vaspace::VmaType::ThreadStack,
+        crate::mm::VmaType::ThreadStack,
     );
 
     // KERNEL_READY is notify-only: it should not own thread0 launch semantics.
@@ -431,7 +441,10 @@ pub extern "C" fn kernel_main() -> ! {
     set_primary_boot_ready();
 
     let vid = (sched::vcpu_id() as usize).min(sched::MAX_VCPUS - 1);
-    crate::kinfo!("kernel: thread0 tid={} enter bootstrap dispatch", thread0_tid);
+    crate::kinfo!(
+        "kernel: thread0 tid={} enter bootstrap dispatch",
+        thread0_tid
+    );
     sched::register_idle_thread_for_vcpu(vid as u32);
     sched::enter_core_scheduler_entry(vid)
 }

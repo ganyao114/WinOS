@@ -2,6 +2,8 @@ use core::cell::UnsafeCell;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::mm::{KernelVa, PhysAddr};
+
 const PAGE_SIZE: usize = 4096;
 const NONE_I16: i16 = -1;
 const NONE_U16: u16 = u16::MAX;
@@ -90,7 +92,8 @@ pub struct KmallocSnapshot {
 #[derive(Clone, Copy)]
 struct PendingPhysFree {
     valid: bool,
-    gpa: u64,
+    pa: PhysAddr,
+    kva: KernelVa,
     pages: usize,
 }
 
@@ -98,7 +101,8 @@ impl PendingPhysFree {
     const fn empty() -> Self {
         Self {
             valid: false,
-            gpa: 0,
+            pa: PhysAddr::new(0),
+            kva: KernelVa::new(0),
             pages: 0,
         }
     }
@@ -203,7 +207,7 @@ impl PageMeta {
 
 struct AllocState {
     initialized: bool,
-    heap_base: usize,
+    heap_base: KernelVa,
     heap_pages: usize,
     free_heads: [i16; NUM_ORDERS],
     pages: [PageMeta; MAX_PAGES],
@@ -224,7 +228,7 @@ impl AllocState {
     const fn new() -> Self {
         Self {
             initialized: false,
-            heap_base: 0,
+            heap_base: KernelVa::new(0),
             heap_pages: 0,
             free_heads: [NONE_I16; NUM_ORDERS],
             pages: [const { PageMeta::empty() }; MAX_PAGES],
@@ -242,7 +246,7 @@ impl AllocState {
         }
     }
 
-    fn init(&mut self, heap_base: usize, heap_size: usize) {
+    fn init(&mut self, heap_base: KernelVa, heap_size: usize) {
         self.initialized = false;
         self.heap_base = heap_base;
         self.heap_pages = core::cmp::min(MAX_PAGES, heap_size / PAGE_SIZE);
@@ -287,15 +291,16 @@ impl AllocState {
         self.initialized = true;
     }
 
-    fn page_addr(&self, page_idx: usize) -> usize {
-        self.heap_base + page_idx * PAGE_SIZE
+    fn page_addr(&self, page_idx: usize) -> KernelVa {
+        KernelVa::new(self.heap_base.get() + (page_idx * PAGE_SIZE) as u64)
     }
 
     fn ptr_to_page(&self, ptr: usize) -> Option<usize> {
-        if ptr < self.heap_base {
+        let heap_base = self.heap_base.get() as usize;
+        if ptr < heap_base {
             return None;
         }
-        let off = ptr - self.heap_base;
+        let off = ptr - heap_base;
         let idx = off / PAGE_SIZE;
         if idx >= self.heap_pages {
             return None;
@@ -509,7 +514,7 @@ impl AllocState {
             total: total as u16,
         };
 
-        let page_base = self.page_addr(page_idx);
+        let page_base = self.page_addr(page_idx).get() as usize;
         let mut i = 0usize;
         while i < total {
             let ptr = (page_base + i * obj_size) as *mut u8;
@@ -552,7 +557,7 @@ impl AllocState {
             return null_mut();
         }
 
-        let obj_ptr = (self.page_addr(pidx) + obj_idx as usize * obj_size) as *mut u8;
+        let obj_ptr = (self.page_addr(pidx).get() as usize + obj_idx as usize * obj_size) as *mut u8;
         let next = unsafe { (obj_ptr as *const u16).read_unaligned() };
         if next != NONE_U16 && next >= total {
             // Corrupted next pointer; stop using this slab page for allocation.
@@ -579,7 +584,7 @@ impl AllocState {
             return;
         }
         let obj_size = self.caches[cache_idx].obj_size as usize;
-        let page_base = self.page_addr(page_idx);
+        let page_base = self.page_addr(page_idx).get() as usize;
         if ptr < page_base || ptr >= page_base + PAGE_SIZE {
             self.mark_invalid_free_bad_ptr();
             return;
@@ -640,7 +645,7 @@ impl AllocState {
         if total == 0 {
             return Err(());
         }
-        let page_base = self.page_addr(page_idx);
+        let page_base = self.page_addr(page_idx).get() as usize;
         let mut cur = self.pages[page_idx].free_obj;
         let mut steps = 0usize;
         while cur != NONE_U16 {
@@ -711,11 +716,11 @@ impl AllocState {
         self.mark_large_block(idx, order);
         self.stats.large_allocs = self.stats.large_allocs.saturating_add(1);
         self.large_alloc_by_order[order] = self.large_alloc_by_order[order].saturating_add(1);
-        self.page_addr(idx) as *mut u8
+        self.page_addr(idx).as_mut_ptr::<u8>()
     }
 
     fn free_large(&mut self, page_idx: usize, ptr: usize) -> bool {
-        let page_base = self.page_addr(page_idx);
+        let page_base = self.page_addr(page_idx).get() as usize;
         if ptr != page_base {
             return false;
         }
@@ -900,7 +905,8 @@ impl AllocState {
 struct ArenaMeta {
     active: bool,
     dynamic: bool,
-    base_gpa: u64,
+    base_kva: KernelVa,
+    backing_pa: PhysAddr,
     pages: usize,
 }
 
@@ -909,7 +915,8 @@ impl ArenaMeta {
         Self {
             active: false,
             dynamic: false,
-            base_gpa: 0,
+            base_kva: KernelVa::new(0),
+            backing_pa: PhysAddr::new(0),
             pages: 0,
         }
     }
@@ -917,16 +924,16 @@ impl ArenaMeta {
 
 #[derive(Clone, Copy)]
 struct ArenaRange {
-    start: usize,
-    end: usize,
+    start: KernelVa,
+    end: KernelVa,
     arena_idx: u8,
 }
 
 impl ArenaRange {
     const fn empty() -> Self {
         Self {
-            start: 0,
-            end: 0,
+            start: KernelVa::new(0),
+            end: KernelVa::new(0),
             arena_idx: 0,
         }
     }
@@ -935,9 +942,9 @@ impl ArenaRange {
 #[derive(Clone, Copy)]
 struct DirectAllocMeta {
     active: bool,
-    user_ptr: usize,
+    base_kva: KernelVa,
     size: usize,
-    base_gpa: u64,
+    backing_pa: PhysAddr,
     pages: usize,
 }
 
@@ -945,15 +952,15 @@ impl DirectAllocMeta {
     const fn empty() -> Self {
         Self {
             active: false,
-            user_ptr: 0,
+            base_kva: KernelVa::new(0),
             size: 0,
-            base_gpa: 0,
+            backing_pa: PhysAddr::new(0),
             pages: 0,
         }
     }
 
-    fn end(&self) -> usize {
-        self.user_ptr.saturating_add(self.size)
+    fn end_kva(&self) -> KernelVa {
+        KernelVa::new(self.base_kva.get().saturating_add(self.size as u64))
     }
 }
 
@@ -1011,6 +1018,7 @@ impl KmallocManager {
     }
 
     fn init(&mut self, heap_base: usize, heap_size: usize) {
+        let heap_base = KernelVa::new(heap_base as u64);
         let mut i = 0usize;
         while i < MAX_ARENAS {
             self.arenas[i].reset();
@@ -1024,15 +1032,20 @@ impl KmallocManager {
         let mut slot = 0usize;
         while slot < MAX_ARENAS && pages_left != 0 {
             let pages = core::cmp::min(MAX_PAGES, pages_left);
-            let base = heap_base + page_cursor * PAGE_SIZE;
+            let base = KernelVa::new(heap_base.get() + (page_cursor * PAGE_SIZE) as u64);
             self.arenas[slot].init(base, pages * PAGE_SIZE);
             self.metas[slot] = ArenaMeta {
                 active: true,
                 dynamic: false,
-                base_gpa: base as u64,
+                base_kva: base,
+                backing_pa: PhysAddr::new(0),
                 pages,
             };
-            self.insert_range(slot, base, base + pages * PAGE_SIZE);
+            self.insert_range(
+                slot,
+                base,
+                KernelVa::new(base.get() + (pages * PAGE_SIZE) as u64),
+            );
 
             page_cursor += pages;
             pages_left -= pages;
@@ -1061,12 +1074,12 @@ impl KmallocManager {
         self.direct_alloc_failures = 0;
     }
 
-    fn insert_range(&mut self, arena_idx: usize, start: usize, end: usize) {
-        if self.range_count >= MAX_ARENAS || start >= end {
+    fn insert_range(&mut self, arena_idx: usize, start: KernelVa, end: KernelVa) {
+        if self.range_count >= MAX_ARENAS || start.get() >= end.get() {
             return;
         }
         let mut pos = 0usize;
-        while pos < self.range_count && self.ranges[pos].start < start {
+        while pos < self.range_count && self.ranges[pos].start.get() < start.get() {
             pos += 1;
         }
         let mut i = self.range_count;
@@ -1105,11 +1118,12 @@ impl KmallocManager {
         if self.range_count == 0 {
             return None;
         }
+        let ptr = KernelVa::new(ptr as u64);
         let mut lo = 0usize;
         let mut hi = self.range_count;
         while lo < hi {
             let mid = lo + ((hi - lo) >> 1);
-            if self.ranges[mid].start <= ptr {
+            if self.ranges[mid].start.get() <= ptr.get() {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -1119,7 +1133,7 @@ impl KmallocManager {
             return None;
         }
         let entry = self.ranges[lo - 1];
-        if ptr < entry.end {
+        if ptr.get() < entry.end.get() {
             Some(entry.arena_idx as usize)
         } else {
             None
@@ -1162,16 +1176,22 @@ impl KmallocManager {
         Self::choose_dynamic_arena_pages(needed_pages)
     }
 
-    fn install_dynamic_arena(&mut self, gpa: u64, pages: usize) -> Option<usize> {
+    fn install_dynamic_arena(&mut self, pa: PhysAddr, pages: usize) -> Option<usize> {
         let slot = self.find_free_slot()?;
-        self.arenas[slot].init(gpa as usize, pages * PAGE_SIZE);
+        let kva = crate::mm::linear_map::phys_to_kva(pa)?;
+        self.arenas[slot].init(kva, pages * PAGE_SIZE);
         self.metas[slot] = ArenaMeta {
             active: true,
             dynamic: true,
-            base_gpa: gpa,
+            base_kva: kva,
+            backing_pa: pa,
             pages,
         };
-        self.insert_range(slot, gpa as usize, gpa as usize + pages * PAGE_SIZE);
+        self.insert_range(
+            slot,
+            kva,
+            KernelVa::new(kva.get() + (pages * PAGE_SIZE) as u64),
+        );
         self.dynamic_pages_total = self.dynamic_pages_total.saturating_add(pages);
         if self.dynamic_pages_total > self.dynamic_pages_peak {
             self.dynamic_pages_peak = self.dynamic_pages_total;
@@ -1195,7 +1215,8 @@ impl KmallocManager {
         self.dynamic_arena_release_count = self.dynamic_arena_release_count.saturating_add(1);
         PendingPhysFree {
             valid: true,
-            gpa: meta.base_gpa,
+            pa: meta.backing_pa,
+            kva: KernelVa::new(0),
             pages: meta.pages,
         }
     }
@@ -1205,7 +1226,7 @@ impl KmallocManager {
         pending_count: &mut usize,
         rec: PendingPhysFree,
     ) {
-        if !rec.valid || *pending_count >= MAX_PENDING_PHYS_FREES {
+        if !rec.valid || rec.pa.is_null() || *pending_count >= MAX_PENDING_PHYS_FREES {
             return;
         }
         pending[*pending_count] = rec;
@@ -1306,18 +1327,19 @@ impl KmallocManager {
         &mut self,
         size: usize,
         align: usize,
-        gpa: u64,
+        pa: PhysAddr,
         pages: usize,
         pending: &mut [PendingPhysFree; MAX_PENDING_PHYS_FREES],
         pending_count: &mut usize,
     ) -> *mut u8 {
-        let Some(slot) = self.install_dynamic_arena(gpa, pages) else {
+        let Some(slot) = self.install_dynamic_arena(pa, pages) else {
             Self::push_pending_free(
                 pending,
                 pending_count,
                 PendingPhysFree {
                     valid: true,
-                    gpa,
+                    pa,
+                    kva: KernelVa::new(0),
                     pages,
                 },
             );
@@ -1374,11 +1396,11 @@ impl KmallocManager {
         None
     }
 
-    fn find_direct_alloc_exact(&self, ptr: usize) -> Option<usize> {
+    fn find_direct_alloc_exact(&self, ptr: KernelVa) -> Option<usize> {
         let mut i = 0usize;
         while i < MAX_DIRECT_ALLOCS {
             let meta = self.direct_allocs[i];
-            if meta.active && meta.user_ptr == ptr {
+            if meta.active && meta.base_kva == ptr {
                 return Some(i);
             }
             i += 1;
@@ -1386,11 +1408,12 @@ impl KmallocManager {
         None
     }
 
-    fn contains_direct_range(&self, ptr: usize) -> bool {
+    fn contains_direct_range(&self, ptr: KernelVa) -> bool {
         let mut i = 0usize;
         while i < MAX_DIRECT_ALLOCS {
             let meta = self.direct_allocs[i];
-            if meta.active && ptr >= meta.user_ptr && ptr < meta.end() {
+            if meta.active && ptr.get() >= meta.base_kva.get() && ptr.get() < meta.end_kva().get()
+            {
                 return true;
             }
             i += 1;
@@ -1400,9 +1423,9 @@ impl KmallocManager {
 
     fn alloc_direct_install(
         &mut self,
-        user_ptr: usize,
+        base_kva: KernelVa,
         size: usize,
-        gpa: u64,
+        pa: PhysAddr,
         pages: usize,
     ) -> bool {
         let Some(slot) = self.find_free_direct_slot() else {
@@ -1411,9 +1434,9 @@ impl KmallocManager {
         };
         self.direct_allocs[slot] = DirectAllocMeta {
             active: true,
-            user_ptr,
+            base_kva,
             size,
-            base_gpa: gpa,
+            backing_pa: pa,
             pages,
         };
         self.direct_active_allocs = self.direct_active_allocs.saturating_add(1);
@@ -1439,7 +1462,8 @@ impl KmallocManager {
         self.direct_free_count = self.direct_free_count.saturating_add(1);
         PendingPhysFree {
             valid: true,
-            gpa: meta.base_gpa,
+            pa: meta.backing_pa,
+            kva: meta.base_kva,
             pages: meta.pages,
         }
     }
@@ -1458,14 +1482,14 @@ impl KmallocManager {
             return;
         }
 
-        let addr = ptr as usize;
+        let addr = KernelVa::new(ptr as u64);
         if let Some(slot) = self.find_direct_alloc_exact(addr) {
             let rec = self.remove_direct_alloc(slot);
             Self::push_pending_free(pending, pending_count, rec);
             return;
         }
 
-        if let Some(idx) = self.find_arena_by_ptr(addr) {
+        if let Some(idx) = self.find_arena_by_ptr(addr.get() as usize) {
             self.arenas[idx].free(ptr);
             if self.metas[idx].dynamic {
                 self.maybe_collect_reclaim_candidates(pending, pending_count, false);
@@ -1490,8 +1514,8 @@ impl KmallocManager {
         if ptr.is_null() {
             return false;
         }
-        let addr = ptr as usize;
-        if self.find_arena_by_ptr(addr).is_some() {
+        let addr = KernelVa::new(ptr as u64);
+        if self.find_arena_by_ptr(addr.get() as usize).is_some() {
             return true;
         }
         self.contains_direct_range(addr)
@@ -1668,20 +1692,43 @@ fn drain_pending_frees(pending: &[PendingPhysFree; MAX_PENDING_PHYS_FREES], pend
     while i < pending_count {
         let rec = pending[i];
         if rec.valid {
-            crate::mm::phys::free_pages(rec.gpa, rec.pages);
+            if !rec.kva.is_null() {
+                let _ = crate::mm::kernel_vm::kvunmap(rec.kva, rec.pages);
+            }
+            crate::mm::phys::free_pages(rec.pa, rec.pages);
         }
         i += 1;
     }
 }
 
 fn alloc_direct(size: usize, align: usize) -> *mut u8 {
-    let _ = (size, align);
-    // Direct physical pages are guest-physical addresses and are not guaranteed
-    // to be permanently accessible in EL1 VA space across process TTBR0 tables.
-    // Until we add a dedicated kernel VA mapping for direct chunks, treat this
-    // path as allocation failure instead of returning an invalid pointer.
-    with_state_mut(|s| s.note_direct_alloc_failure());
-    null_mut()
+    if size == 0 {
+        with_state_mut(|s| s.note_direct_alloc_failure());
+        return null_mut();
+    }
+
+    let Some(pages) = pages_for_bytes(size) else {
+        with_state_mut(|s| s.note_direct_alloc_failure());
+        return null_mut();
+    };
+    let Some(pa) = crate::mm::phys::alloc_pages(pages) else {
+        with_state_mut(|s| s.note_direct_alloc_failure());
+        return null_mut();
+    };
+    let Some(kva) = crate::mm::kernel_vm::kvmap_pages(pa, pages, align.max(1)) else {
+        crate::mm::phys::free_pages(pa, pages);
+        with_state_mut(|s| s.note_direct_alloc_failure());
+        return null_mut();
+    };
+
+    let installed = with_state_mut(|s| s.alloc_direct_install(kva, size, pa, pages));
+    if installed {
+        kva.as_mut_ptr::<u8>()
+    } else {
+        let _ = crate::mm::kernel_vm::kvunmap(kva, pages);
+        crate::mm::phys::free_pages(pa, pages);
+        null_mut()
+    }
 }
 
 pub fn init(heap_base: usize, heap_size: usize) {
@@ -1699,7 +1746,7 @@ pub fn alloc(size: usize, align: usize) -> *mut u8 {
         AllocPlan::Ready(ptr) => ptr,
         AllocPlan::Direct => alloc_direct(size, align),
         AllocPlan::GrowDynamic { pages } => {
-            let Some(gpa) = crate::mm::phys::alloc_pages(pages) else {
+            let Some(pa) = crate::mm::phys::alloc_pages(pages) else {
                 return alloc_direct(size, align);
             };
             let mut pending = [const { PendingPhysFree::empty() }; MAX_PENDING_PHYS_FREES];
@@ -1710,7 +1757,7 @@ pub fn alloc(size: usize, align: usize) -> *mut u8 {
                 state.finish_grow_and_alloc(
                     size,
                     align.max(1),
-                    gpa,
+                    pa,
                     pages,
                     &mut pending,
                     &mut pending_count,
