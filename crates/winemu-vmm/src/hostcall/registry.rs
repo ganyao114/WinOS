@@ -15,11 +15,8 @@ pub struct OpcodeEntry {
 
     /// Synchronous handler.  `payload` is Some only when the job was queued
     /// async and a payload was pre-captured (Path / Bytes).
-    pub handler: fn(
-        ctx: &HandlerCtx<'_>,
-        args: [u64; 4],
-        payload: Option<&WorkerPayload>,
-    ) -> (u64, u64),
+    pub handler:
+        fn(ctx: &HandlerCtx<'_>, args: [u64; 4], payload: Option<&WorkerPayload>) -> (u64, u64),
 
     /// Returns true when this opcode may be executed asynchronously.
     /// `args` are the raw submit args so the decision can be size-dependent.
@@ -55,7 +52,9 @@ pub struct HandlerRegistry {
 
 impl HandlerRegistry {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Register all opcodes from a module.  Panics on duplicate opcode.

@@ -1,13 +1,15 @@
-use super::modules::file_io::FileIoModule;
 use super::handlers::HandlerCtx;
-use super::registry::HandlerRegistry;
-use super::types::{HostCallCompletion, HostCallOpStats, HostCallStatsSnapshot, SubmitResult, WorkerPayload};
+use super::modules::file_io::FileIoModule;
 use super::modules::win32k::Win32kModule;
+use super::registry::HandlerRegistry;
+use super::types::{
+    HostCallCompletion, HostCallOpStats, HostCallStatsSnapshot, SubmitResult, WorkerPayload,
+};
 use crate::host_file::HostFileTable;
+use crate::hostcall::modules::win32k::Win32kState;
 use crate::memory::GuestMemory;
 use crate::sched::Scheduler;
 use crate::vaspace::VaSpace;
-use crate::hostcall::modules::win32k::Win32kState;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -126,32 +128,46 @@ impl BrokerStats {
     }
 
     fn with_op(&self, opcode: u64, f: impl FnOnce(&OpCounters)) {
-        if let Some(op) = self.per_op.get(opcode as usize) { f(op); }
+        if let Some(op) = self.per_op.get(opcode as usize) {
+            f(op);
+        }
     }
 
     fn on_submit_sync(&self, op: u64) {
         self.submit_sync_total.fetch_add(1, Ordering::Relaxed);
-        self.with_op(op, |c| { c.submit_sync.fetch_add(1, Ordering::Relaxed); });
+        self.with_op(op, |c| {
+            c.submit_sync.fetch_add(1, Ordering::Relaxed);
+        });
     }
     fn on_submit_async(&self, op: u64) {
         self.submit_async_total.fetch_add(1, Ordering::Relaxed);
-        self.with_op(op, |c| { c.submit_async.fetch_add(1, Ordering::Relaxed); });
+        self.with_op(op, |c| {
+            c.submit_async.fetch_add(1, Ordering::Relaxed);
+        });
     }
     fn on_complete_sync(&self, op: u64) {
         self.complete_sync_total.fetch_add(1, Ordering::Relaxed);
-        self.with_op(op, |c| { c.complete_sync.fetch_add(1, Ordering::Relaxed); });
+        self.with_op(op, |c| {
+            c.complete_sync.fetch_add(1, Ordering::Relaxed);
+        });
     }
     fn on_complete_async(&self, op: u64) {
         self.complete_async_total.fetch_add(1, Ordering::Relaxed);
-        self.with_op(op, |c| { c.complete_async.fetch_add(1, Ordering::Relaxed); });
+        self.with_op(op, |c| {
+            c.complete_async.fetch_add(1, Ordering::Relaxed);
+        });
     }
     fn on_cancel(&self, op: u64) {
         self.cancel_total.fetch_add(1, Ordering::Relaxed);
-        self.with_op(op, |c| { c.cancel.fetch_add(1, Ordering::Relaxed); });
+        self.with_op(op, |c| {
+            c.cancel.fetch_add(1, Ordering::Relaxed);
+        });
     }
     fn on_backpressure(&self, op: u64) {
         self.backpressure_total.fetch_add(1, Ordering::Relaxed);
-        self.with_op(op, |c| { c.backpressure.fetch_add(1, Ordering::Relaxed); });
+        self.with_op(op, |c| {
+            c.backpressure.fetch_add(1, Ordering::Relaxed);
+        });
     }
     fn reset(&self) {
         self.submit_sync_total.store(0, Ordering::Relaxed);
@@ -211,17 +227,15 @@ impl HostCallBroker {
         for _ in 0..workers {
             let inner2 = Arc::clone(&inner);
             let rx = Arc::clone(&io_rx);
-            thread::spawn(move || {
-                loop {
-                    let job = { rx.lock().unwrap().recv() };
-                    match job {
-                        Ok(job) => {
-                            if run_job(&inner2, job) {
-                                inner2.scheduler.unpark_one_vcpu();
-                            }
+            thread::spawn(move || loop {
+                let job = { rx.lock().unwrap().recv() };
+                match job {
+                    Ok(job) => {
+                        if run_job(&inner2, job) {
+                            inner2.scheduler.unpark_one_vcpu();
                         }
-                        Err(_) => break,
                     }
+                    Err(_) => break,
                 }
             });
         }
@@ -242,25 +256,26 @@ impl HostCallBroker {
 // ── submit / execute_sync ─────────────────────────────────────────────────────
 
 impl HostCallBroker {
-    pub fn submit(
-        &self,
-        opcode: u64,
-        flags: u64,
-        args: [u64; 4],
-        user_tag: u64,
-    ) -> SubmitResult {
+    pub fn submit(&self, opcode: u64, flags: u64, args: [u64; 4], user_tag: u64) -> SubmitResult {
         let inner = &*self.inner;
 
         if !inner.registry.is_supported(opcode) {
-            return SubmitResult::Completed { host_result: hc::HC_INVALID, aux: 0 };
+            return SubmitResult::Completed {
+                host_result: hc::HC_INVALID,
+                aux: 0,
+            };
         }
 
         let force_async = (flags & hc::FLAG_FORCE_ASYNC) != 0;
         let allow_async = force_async || (flags & hc::FLAG_ALLOW_ASYNC) != 0;
-        let main_thread = (flags & hc::FLAG_MAIN_THREAD) != 0
-            || inner.registry.requires_main_thread(opcode);
+        let main_thread =
+            (flags & hc::FLAG_MAIN_THREAD) != 0 || inner.registry.requires_main_thread(opcode);
 
-        let exec_class = if main_thread { ExecClass::MainThread } else { ExecClass::Io };
+        let exec_class = if main_thread {
+            ExecClass::MainThread
+        } else {
+            ExecClass::Io
+        };
 
         let do_async = allow_async && inner.registry.async_eligible(opcode, args);
 
@@ -276,13 +291,21 @@ impl HostCallBroker {
                     .unwrap_or((hc::HC_INVALID, 0))
             };
             inner.stats.on_complete_sync(opcode);
-            return SubmitResult::Completed { host_result: r0, aux: r1 };
+            return SubmitResult::Completed {
+                host_result: r0,
+                aux: r1,
+            };
         }
 
         // Async path: pre-capture payload, then enqueue.
         let payload = match inner.registry.prepare_payload(opcode, &inner.memory, args) {
             Ok(p) => p,
-            Err((r0, r1)) => return SubmitResult::Completed { host_result: r0, aux: r1 },
+            Err((r0, r1)) => {
+                return SubmitResult::Completed {
+                    host_result: r0,
+                    aux: r1,
+                }
+            }
         };
 
         let request_id = inner.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -290,7 +313,10 @@ impl HostCallBroker {
 
         inner.inflight.lock().unwrap().insert(
             request_id,
-            InflightReq { cancel: Arc::clone(&cancel), opcode },
+            InflightReq {
+                cancel: Arc::clone(&cancel),
+                opcode,
+            },
         );
 
         let job = WorkerJob {
@@ -323,11 +349,17 @@ impl HostCallBroker {
             Err(QueueSendError::Full) => {
                 inner.inflight.lock().unwrap().remove(&request_id);
                 inner.stats.on_backpressure(opcode);
-                SubmitResult::Completed { host_result: hc::HC_BUSY, aux: 0 }
+                SubmitResult::Completed {
+                    host_result: hc::HC_BUSY,
+                    aux: 0,
+                }
             }
             Err(QueueSendError::Disconnected) => {
                 inner.inflight.lock().unwrap().remove(&request_id);
-                SubmitResult::Completed { host_result: hc::HC_IO_ERROR, aux: 0 }
+                SubmitResult::Completed {
+                    host_result: hc::HC_IO_ERROR,
+                    aux: 0,
+                }
             }
         }
     }
@@ -482,18 +514,26 @@ impl HostCallBroker {
             complete_async_total: s.complete_async_total.load(Ordering::Relaxed),
             cancel_total: s.cancel_total.load(Ordering::Relaxed),
             backpressure_total: s.backpressure_total.load(Ordering::Relaxed),
-            completion_queue_high_watermark: self.inner.completion_queue_hwm.load(Ordering::Relaxed) as usize,
-            op_stats: s.per_op.iter().enumerate().map(|(i, op)| HostCallOpStats {
-                opcode: i as u64,
-                submit_sync: op.submit_sync.load(Ordering::Relaxed),
-                submit_async: op.submit_async.load(Ordering::Relaxed),
-                complete_sync: op.complete_sync.load(Ordering::Relaxed),
-                complete_async: op.complete_async.load(Ordering::Relaxed),
-                cancel: op.cancel.load(Ordering::Relaxed),
-                backpressure: op.backpressure.load(Ordering::Relaxed),
-            }).collect(),
+            completion_queue_high_watermark: self.inner.completion_queue_hwm.load(Ordering::Relaxed)
+                as usize,
+            op_stats: s
+                .per_op
+                .iter()
+                .enumerate()
+                .map(|(i, op)| HostCallOpStats {
+                    opcode: i as u64,
+                    submit_sync: op.submit_sync.load(Ordering::Relaxed),
+                    submit_async: op.submit_async.load(Ordering::Relaxed),
+                    complete_sync: op.complete_sync.load(Ordering::Relaxed),
+                    complete_async: op.complete_async.load(Ordering::Relaxed),
+                    cancel: op.cancel.load(Ordering::Relaxed),
+                    backpressure: op.backpressure.load(Ordering::Relaxed),
+                })
+                .collect(),
         };
-        if reset { s.reset(); }
+        if reset {
+            s.reset();
+        }
         snap
     }
 }
@@ -529,13 +569,13 @@ fn run_job(inner: &BrokerInner, job: WorkerJob) -> bool {
     // Special case: OP_NOTIFY_DIR uses a blocking poll loop.
     let (r0, r1) = if job.opcode == winemu_shared::hostcall::OP_NOTIFY_DIR {
         let cancel_flag = Arc::clone(&job.cancel);
-        super::handlers::poll_notify_dir_until_change(
-            &ctx,
-            job.args,
-            move || cancel_flag.load(Ordering::Relaxed),
-        )
+        super::handlers::poll_notify_dir_until_change(&ctx, job.args, move || {
+            cancel_flag.load(Ordering::Relaxed)
+        })
     } else {
-        inner.registry.dispatch(&ctx, job.opcode, job.args, Some(&job.payload))
+        inner
+            .registry
+            .dispatch(&ctx, job.opcode, job.args, Some(&job.payload))
             .unwrap_or((hc::HC_INVALID, 0))
     };
 
@@ -596,10 +636,5 @@ fn push_completion(
 
 fn host_ui_main_thread_mode() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("WINEMU_HOST_UI_MAIN_THREAD")
-            .ok()
-            .as_deref()
-            == Some("1")
-    })
+    *FLAG.get_or_init(|| std::env::var("WINEMU_HOST_UI_MAIN_THREAD").ok().as_deref() == Some("1"))
 }

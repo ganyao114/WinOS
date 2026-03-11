@@ -9,10 +9,10 @@ use winemu_shared::hostcall as hc;
 use winemu_shared::status;
 
 use crate::host_file::HostFileTable;
+use crate::hostcall::modules::win32k::state::GuestMsg;
+use crate::hostcall::modules::win32k::Win32kState;
 use crate::memory::GuestMemory;
 use crate::vaspace::VaSpace;
-use crate::hostcall::modules::win32k::Win32kState;
-use crate::hostcall::modules::win32k::state::GuestMsg;
 
 pub(super) const MAX_HOST_PATH: usize = 1024;
 pub(super) const MAX_IO_SIZE: usize = 64 * 1024 * 1024;
@@ -22,10 +22,10 @@ pub(super) const NOTIFY_OPT_FILTER_MASK: u64 = 0xFFFF_FFFF;
 
 // ── Shared context passed to every handler ────────────────────────────────────
 pub(super) struct HandlerCtx<'a> {
-    pub memory:     &'a Arc<RwLock<GuestMemory>>,
+    pub memory: &'a Arc<RwLock<GuestMemory>>,
     pub host_files: &'a Arc<HostFileTable>,
-    pub vaspace:    &'a Arc<Mutex<VaSpace>>,
-    pub win32k:     &'a Mutex<Win32kState>,
+    pub vaspace: &'a Arc<Mutex<VaSpace>>,
+    pub win32k: &'a Mutex<Win32kState>,
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
@@ -171,7 +171,9 @@ pub(super) fn execute_notify_dir(ctx: &HandlerCtx<'_>, args: [u64; 4]) -> (u64, 
     let watch_tree = (opts & NOTIFY_OPT_WATCH_TREE) != 0;
     let completion_filter = (opts & NOTIFY_OPT_FILTER_MASK) as u32;
     let mut buf = vec![0u8; len];
-    let ret = ctx.host_files.notify_dir_change(fd, &mut buf, watch_tree, completion_filter);
+    let ret = ctx
+        .host_files
+        .notify_dir_change(fd, &mut buf, watch_tree, completion_filter);
     if ret == u64::MAX {
         return (hc::HC_IO_ERROR, 0);
     }
@@ -205,7 +207,10 @@ pub(super) fn execute_mmap(ctx: &HandlerCtx<'_>, args: [u64; 4]) -> (u64, u64) {
             }
             log::debug!(
                 "HOSTCALL_MMAP: fd={} off={:#x} size={:#x} -> gpa={:#x}",
-                fd, offset, size, gpa
+                fd,
+                offset,
+                size,
+                gpa
             );
             (hc::HC_OK, gpa)
         }
@@ -219,7 +224,11 @@ pub(super) fn execute_mmap(ctx: &HandlerCtx<'_>, args: [u64; 4]) -> (u64, u64) {
 pub(super) fn execute_munmap(ctx: &HandlerCtx<'_>, args: [u64; 4]) -> (u64, u64) {
     let base = args[0];
     let ok = ctx.vaspace.lock().unwrap().free(base);
-    if ok { (hc::HC_OK, 0) } else { (hc::HC_IO_ERROR, 0) }
+    if ok {
+        (hc::HC_OK, 0)
+    } else {
+        (hc::HC_IO_ERROR, 0)
+    }
 }
 
 // ── Notify dir async loop ─────────────────────────────────────────────────────
@@ -262,12 +271,30 @@ pub(super) fn execute_win32k_call(ctx: &HandlerCtx<'_>, args: [u64; 4]) -> (u64,
         return (hc::HC_INVALID, 0);
     }
 
-    let version    = match read_u32_le(&bytes, 0)  { Some(v) => v, None => return (hc::HC_INVALID, 0) };
-    let table      = match read_u32_le(&bytes, 4)  { Some(v) => v, None => return (hc::HC_INVALID, 0) };
-    let syscall_nr = match read_u32_le(&bytes, 8)  { Some(v) => v, None => return (hc::HC_INVALID, 0) };
-    let arg_count  = match read_u32_le(&bytes, 12) { Some(v) => v as usize, None => return (hc::HC_INVALID, 0) };
-    let _owner_pid = match read_u32_le(&bytes, 16) { Some(v) => v, None => return (hc::HC_INVALID, 0) };
-    let owner_tid  = match read_u32_le(&bytes, 20) { Some(v) => v, None => return (hc::HC_INVALID, 0) };
+    let version = match read_u32_le(&bytes, 0) {
+        Some(v) => v,
+        None => return (hc::HC_INVALID, 0),
+    };
+    let table = match read_u32_le(&bytes, 4) {
+        Some(v) => v,
+        None => return (hc::HC_INVALID, 0),
+    };
+    let syscall_nr = match read_u32_le(&bytes, 8) {
+        Some(v) => v,
+        None => return (hc::HC_INVALID, 0),
+    };
+    let arg_count = match read_u32_le(&bytes, 12) {
+        Some(v) => v as usize,
+        None => return (hc::HC_INVALID, 0),
+    };
+    let _owner_pid = match read_u32_le(&bytes, 16) {
+        Some(v) => v,
+        None => return (hc::HC_INVALID, 0),
+    };
+    let owner_tid = match read_u32_le(&bytes, 20) {
+        Some(v) => v,
+        None => return (hc::HC_INVALID, 0),
+    };
 
     if version != hc::WIN32K_CALL_PACKET_VERSION {
         return (hc::HC_INVALID, 0);
@@ -380,9 +407,11 @@ pub(super) fn execute_win32k_call(ctx: &HandlerCtx<'_>, args: [u64; 4]) -> (u64,
         (0, w::NT_GDI_BIT_BLT) => w32.bit_blt(call_args[0] as u32),
         (0, w::NT_GDI_STRETCH_BLT) => w32.stretch_blt(call_args[0] as u32),
         (0, w::NT_GDI_CREATE_COMPATIBLE_DC) => w32.create_compatible_dc(call_args[0] as u32),
-        (0, w::NT_GDI_CREATE_COMPATIBLE_BITMAP) => {
-            w32.create_compatible_bitmap(call_args[0] as u32, call_args[1] as u32, call_args[2] as u32)
-        }
+        (0, w::NT_GDI_CREATE_COMPATIBLE_BITMAP) => w32.create_compatible_bitmap(
+            call_args[0] as u32,
+            call_args[1] as u32,
+            call_args[2] as u32,
+        ),
         (0, w::NT_GDI_CREATE_RECT_RGN) => w32.alloc_gdi_handle(),
         (0, w::NT_GDI_SELECT_BITMAP) => w32.select_object(call_args[0] as u32, call_args[1] as u32),
         (0, w::NT_GDI_SELECT_BRUSH) => w32.select_object(call_args[0] as u32, call_args[1] as u32),
@@ -395,13 +424,21 @@ pub(super) fn execute_win32k_call(ctx: &HandlerCtx<'_>, args: [u64; 4]) -> (u64,
             call_args[3] as i32,
             call_args[4] as i32,
         ),
-        (0, w::NT_GDI_MOVE_TO) => w32.move_to(call_args[0] as u32, call_args[1] as i32, call_args[2] as i32),
-        (0, w::NT_GDI_LINE_TO) => w32.line_to(call_args[0] as u32, call_args[1] as i32, call_args[2] as i32),
+        (0, w::NT_GDI_MOVE_TO) => w32.move_to(
+            call_args[0] as u32,
+            call_args[1] as i32,
+            call_args[2] as i32,
+        ),
+        (0, w::NT_GDI_LINE_TO) => w32.line_to(
+            call_args[0] as u32,
+            call_args[1] as i32,
+            call_args[2] as i32,
+        ),
         (0, w::NT_GDI_GET_AND_SET_DCDWORD) => {
             // iType: 3=BkColor, 4=TextColor (Windows internal)
             let itype = call_args[1] as u32;
             let value = call_args[2] as u32;
-            let hdc   = call_args[0] as u32;
+            let hdc = call_args[0] as u32;
             match itype {
                 3 => w32.set_bk_color(hdc, value),
                 4 => w32.set_text_color(hdc, value),
@@ -410,9 +447,9 @@ pub(super) fn execute_win32k_call(ctx: &HandlerCtx<'_>, args: [u64; 4]) -> (u64,
         }
         (0, w::NT_GDI_SET_PIXEL) => {
             // SetPixel(hdc, x, y, color) — draw single pixel
-            let hdc   = call_args[0] as u32;
-            let x     = call_args[1] as i32;
-            let y     = call_args[2] as i32;
+            let hdc = call_args[0] as u32;
+            let x = call_args[1] as i32;
+            let y = call_args[2] as i32;
             let color = call_args[3] as u32;
             w32.gdi_rectangle(hdc, x, y, x + 1, y + 1);
             let _ = (x, y, color);
@@ -423,7 +460,7 @@ pub(super) fn execute_win32k_call(ctx: &HandlerCtx<'_>, args: [u64; 4]) -> (u64,
 
         // ── NtUserGetUpdateRect ──────────────────────────────────────────────
         (1, w::NT_USER_GET_UPDATE_RECT) => {
-            let hwnd    = call_args[0] as u32;
+            let hwnd = call_args[0] as u32;
             let out_gpa = call_args[1];
             let (has_update, x0, y0, x1, y1) = w32.get_update_rect(hwnd);
             if out_gpa != 0 {
@@ -435,12 +472,16 @@ pub(super) fn execute_win32k_call(ctx: &HandlerCtx<'_>, args: [u64; 4]) -> (u64,
                 let mut mem = ctx.memory.write().unwrap();
                 mem.write_bytes(Gpa(out_gpa), &buf);
             }
-            if has_update { 1 } else { 0 }
+            if has_update {
+                1
+            } else {
+                0
+            }
         }
 
         // ── NtUserGetWindowPlacement ─────────────────────────────────────────
         (1, w::NT_USER_GET_WINDOW_PLACEMENT) => {
-            let hwnd    = call_args[0] as u32;
+            let hwnd = call_args[0] as u32;
             let out_gpa = call_args[1];
             let (x, y, w, h) = w32.get_window_placement(hwnd);
             if out_gpa != 0 {
@@ -460,7 +501,7 @@ pub(super) fn execute_win32k_call(ctx: &HandlerCtx<'_>, args: [u64; 4]) -> (u64,
         }
 
         // ── NtUserGetKeyState / NtUserGetAsyncKeyState ───────────────────────
-        (1, w::NT_USER_GET_KEY_STATE)       => w32.get_key_state(call_args[0] as u32),
+        (1, w::NT_USER_GET_KEY_STATE) => w32.get_key_state(call_args[0] as u32),
         (1, w::NT_USER_GET_ASYNC_KEY_STATE) => w32.get_async_key_state(call_args[0] as u32),
 
         // ── NtUserGetKeyboardState ───────────────────────────────────────────

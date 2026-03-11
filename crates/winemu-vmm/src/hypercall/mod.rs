@@ -354,9 +354,7 @@ impl HypercallManager {
                 self.sched.kick_vcpu_mask(args[0] as u32);
                 HypercallResult::Sync(0)
             }
-            nr::QUERY_WINDOWS_BUILD => {
-                HypercallResult::Sync(self.windows_build as u64)
-            }
+            nr::QUERY_WINDOWS_BUILD => HypercallResult::Sync(self.windows_build as u64),
             nr::LOAD_DLL_IMAGE | nr::GET_PROC_ADDRESS => HypercallResult::Sync(u64::MAX),
             nr::PROCESS_CREATE => {
                 // args[0] = image_base_gva
@@ -913,7 +911,11 @@ impl HypercallManager {
                 if cap == 0 {
                     return HypercallResult::Sync(0);
                 }
-                let batch = self.hostcall.poll_completion().into_iter().collect::<Vec<_>>();
+                let batch = self
+                    .hostcall
+                    .poll_completion()
+                    .into_iter()
+                    .collect::<Vec<_>>();
                 if batch.is_empty() {
                     return HypercallResult::Sync(0);
                 }
@@ -929,7 +931,8 @@ impl HypercallManager {
                     return HypercallResult::Sync(0);
                 }
                 let mut batch = Vec::new();
-                self.hostcall.poll_completions_batch(&mut batch, cap_entries);
+                self.hostcall
+                    .poll_completions_batch(&mut batch, cap_entries);
                 if batch.is_empty() {
                     return HypercallResult::Sync(0);
                 }

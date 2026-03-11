@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -70,7 +70,8 @@ impl ApplicationHandler<()> for HostUiApp {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        self.hypercall_mgr.handle_host_window_event(window_id, &event);
+        self.hypercall_mgr
+            .handle_host_window_event(window_id, &event);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -114,9 +115,7 @@ fn run_vmm_with_host_ui(mut vmm: winemu_vmm::Vmm) -> Result<()> {
     let mut event_loop = match event_loop_builder.build() {
         Ok(v) => v,
         Err(e) => {
-            log::warn!(
-                "host UI event loop unavailable ({e}); fallback to headless mode"
-            );
+            log::warn!("host UI event loop unavailable ({e}); fallback to headless mode");
             std::env::remove_var("WINEMU_HOST_UI_MAIN_THREAD");
             vmm.run().context("VMM run failed")?;
             return Ok(());
@@ -136,9 +135,9 @@ fn run_vmm_with_host_ui(mut vmm: winemu_vmm::Vmm) -> Result<()> {
         .name("winemu-exit-watch".to_string())
         .spawn(move || match done_rx.recv() {
             Ok(done) => exit_after_host_ui_run(done),
-            Err(_) => exit_after_host_ui_run(Err(
-                "VMM completion channel disconnected".to_string(),
-            )),
+            Err(_) => {
+                exit_after_host_ui_run(Err("VMM completion channel disconnected".to_string()))
+            }
         })
         .context("failed to spawn VMM exit watcher")?;
 
@@ -153,9 +152,7 @@ fn run_vmm_with_host_ui(mut vmm: winemu_vmm::Vmm) -> Result<()> {
                 log::warn!("host-ui: event loop requested exit code={code}");
                 hypercall_mgr.sched.request_shutdown();
                 hypercall_mgr.force_exit_vcpus_if_shutdown();
-                exit_after_host_ui_run(Err(format!(
-                    "host UI event loop exited with code {code}"
-                )));
+                exit_after_host_ui_run(Err(format!("host UI event loop exited with code {code}")));
             }
         }
     }

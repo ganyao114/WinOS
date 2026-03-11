@@ -8,15 +8,13 @@ use super::super::registry::{HandlerModule, OpcodeEntry};
 use super::super::types::WorkerPayload;
 use winemu_shared::hostcall as hc;
 
-fn h_win32k_call(
-    ctx: &HandlerCtx<'_>,
-    args: [u64; 4],
-    _: Option<&WorkerPayload>,
-) -> (u64, u64) {
+fn h_win32k_call(ctx: &HandlerCtx<'_>, args: [u64; 4], _: Option<&WorkerPayload>) -> (u64, u64) {
     super::super::handlers::execute_win32k_call(ctx, args)
 }
 
-fn no_async(_args: [u64; 4]) -> bool { false }
+fn no_async(_args: [u64; 4]) -> bool {
+    false
+}
 
 static ENTRIES: &[OpcodeEntry] = &[OpcodeEntry {
     opcode: hc::OP_WIN32K_CALL,

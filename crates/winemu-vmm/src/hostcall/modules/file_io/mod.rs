@@ -14,16 +14,28 @@ use winemu_core::addr::Gpa;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn no_async(_args: [u64; 4]) -> bool { false }
-fn always_async(_args: [u64; 4]) -> bool { true }
-fn large_io_async(args: [u64; 4]) -> bool { (args[2] as usize) >= 128 * 1024 }
-fn large_mmap_async(args: [u64; 4]) -> bool { (args[2] as usize) >= 2 * 1024 * 1024 }
+fn no_async(_args: [u64; 4]) -> bool {
+    false
+}
+fn always_async(_args: [u64; 4]) -> bool {
+    true
+}
+fn large_io_async(args: [u64; 4]) -> bool {
+    (args[2] as usize) >= 128 * 1024
+}
+fn large_mmap_async(args: [u64; 4]) -> bool {
+    (args[2] as usize) >= 2 * 1024 * 1024
+}
 
 // ── handler fns ───────────────────────────────────────────────────────────────
 
 fn h_open(ctx: &HandlerCtx<'_>, args: [u64; 4], payload: Option<&WorkerPayload>) -> (u64, u64) {
     let path = payload.and_then(|p| {
-        if let WorkerPayload::Path(s) = p { Some(s.as_ref()) } else { None }
+        if let WorkerPayload::Path(s) = p {
+            Some(s.as_ref())
+        } else {
+            None
+        }
     });
     handlers::execute_open(ctx, args, path)
 }
@@ -34,7 +46,11 @@ fn h_read(ctx: &HandlerCtx<'_>, args: [u64; 4], _: Option<&WorkerPayload>) -> (u
 
 fn h_write(ctx: &HandlerCtx<'_>, args: [u64; 4], payload: Option<&WorkerPayload>) -> (u64, u64) {
     let bytes = payload.and_then(|p| {
-        if let WorkerPayload::Bytes(b) = p { Some(b.as_ref()) } else { None }
+        if let WorkerPayload::Bytes(b) = p {
+            Some(b.as_ref())
+        } else {
+            None
+        }
     });
     handlers::execute_write(ctx, args, bytes)
 }
@@ -86,7 +102,9 @@ fn prep_write(
     }
     let data = {
         let mem = memory.read().unwrap();
-        mem.read_bytes(Gpa(args[1]), len).to_vec().into_boxed_slice()
+        mem.read_bytes(Gpa(args[1]), len)
+            .to_vec()
+            .into_boxed_slice()
     };
     Ok(WorkerPayload::Bytes(data))
 }

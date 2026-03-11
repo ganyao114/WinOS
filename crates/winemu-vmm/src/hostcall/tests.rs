@@ -1,13 +1,13 @@
 #[cfg(test)]
 mod tests {
-    use crate::hostcall::{HostCallBroker, SubmitResult};
     use crate::host_file::HostFileTable;
+    use crate::hostcall::{HostCallBroker, SubmitResult};
     use crate::memory::GuestMemory;
     use crate::sched::Scheduler;
     use crate::vaspace::VaSpace;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex, RwLock};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
     use winemu_core::addr::Gpa;
     use winemu_shared::hostcall as hc;

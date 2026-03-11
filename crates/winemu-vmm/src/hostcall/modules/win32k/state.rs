@@ -16,32 +16,32 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
 // ── WM_ constants ─────────────────────────────────────────────────────────────
-pub const WM_PAINT:         u32 = 0x000F;
-pub const WM_TIMER:         u32 = 0x0113;
-pub const WM_QUIT:          u32 = 0x0012;
-pub const WM_SIZE:          u32 = 0x0005;
-pub const WM_CLOSE:         u32 = 0x0010;
-pub const WM_MOUSEMOVE:     u32 = 0x0200;
-pub const WM_LBUTTONDOWN:   u32 = 0x0201;
-pub const WM_LBUTTONUP:     u32 = 0x0202;
-pub const WM_RBUTTONDOWN:   u32 = 0x0204;
-pub const WM_RBUTTONUP:     u32 = 0x0205;
-pub const WM_KEYDOWN:       u32 = 0x0100;
-pub const WM_KEYUP:         u32 = 0x0101;
-pub const WM_CHAR:          u32 = 0x0102;
-pub const WM_DESTROY:       u32 = 0x0002;
-pub const WM_ERASEBKGND:    u32 = 0x0014;
+pub const WM_PAINT: u32 = 0x000F;
+pub const WM_TIMER: u32 = 0x0113;
+pub const WM_QUIT: u32 = 0x0012;
+pub const WM_SIZE: u32 = 0x0005;
+pub const WM_CLOSE: u32 = 0x0010;
+pub const WM_MOUSEMOVE: u32 = 0x0200;
+pub const WM_LBUTTONDOWN: u32 = 0x0201;
+pub const WM_LBUTTONUP: u32 = 0x0202;
+pub const WM_RBUTTONDOWN: u32 = 0x0204;
+pub const WM_RBUTTONUP: u32 = 0x0205;
+pub const WM_KEYDOWN: u32 = 0x0100;
+pub const WM_KEYUP: u32 = 0x0101;
+pub const WM_CHAR: u32 = 0x0102;
+pub const WM_DESTROY: u32 = 0x0002;
+pub const WM_ERASEBKGND: u32 = 0x0014;
 
 // ── Guest MSG layout (matches Windows MSG struct) ────────────────────────────
 #[derive(Clone, Copy, Default)]
 pub struct GuestMsg {
-    pub hwnd:    u64,
+    pub hwnd: u64,
     pub message: u32,
     pub w_param: u64,
     pub l_param: u64,
-    pub time:    u32,
-    pub pt_x:    i32,
-    pub pt_y:    i32,
+    pub time: u32,
+    pub pt_x: i32,
+    pub pt_y: i32,
 }
 
 // ── GDI object kinds ──────────────────────────────────────────────────────────
@@ -61,52 +61,52 @@ struct GdiObject {
 
 // ── DC state ──────────────────────────────────────────────────────────────────
 struct DcState {
-    hwnd:          u32,
-    sel_bitmap:    u32,
-    sel_brush:     u32,
-    sel_pen:       u32,
-    sel_font:      u32,
-    bk_color:      u32,
-    text_color:    u32,
-    cur_x:         i32,
-    cur_y:         i32,
+    hwnd: u32,
+    sel_bitmap: u32,
+    sel_brush: u32,
+    sel_pen: u32,
+    sel_font: u32,
+    bk_color: u32,
+    text_color: u32,
+    cur_x: i32,
+    cur_y: i32,
 }
 
 impl DcState {
     fn new(hwnd: u32) -> Self {
         Self {
             hwnd,
-            sel_bitmap:  0,
-            sel_brush:   0,
-            sel_pen:     0,
-            sel_font:    0,
-            bk_color:    0x00FF_FFFF,
-            text_color:  0x0000_0000,
-            cur_x:       0,
-            cur_y:       0,
+            sel_bitmap: 0,
+            sel_brush: 0,
+            sel_pen: 0,
+            sel_font: 0,
+            bk_color: 0x00FF_FFFF,
+            text_color: 0x0000_0000,
+            cur_x: 0,
+            cur_y: 0,
         }
     }
 }
 
 // ── Timer ─────────────────────────────────────────────────────────────────────
 struct Timer {
-    hwnd:     u32,
-    tid:      u32,
+    hwnd: u32,
+    tid: u32,
     timer_id: u64,
     interval: u32, // ms
-    elapsed:  u32,
+    elapsed: u32,
 }
 
 // ── Window state ─────────────────────────────────────────────────────────────
 struct WinState {
-    window:    Arc<Window>,
-    surface:   Surface<Arc<Window>, Arc<Window>>,
-    width:     u32,
-    height:    u32,
-    visible:   bool,
+    window: Arc<Window>,
+    surface: Surface<Arc<Window>, Arc<Window>>,
+    width: u32,
+    height: u32,
+    visible: bool,
     owner_tid: u32,
     // Framebuffer: XRGB8888, row-major
-    framebuf:  Vec<u32>,
+    framebuf: Vec<u32>,
 }
 
 impl WinState {
@@ -124,7 +124,9 @@ impl WinState {
     fn present(&mut self) {
         let w = self.width.max(1);
         let h = self.height.max(1);
-        if ws_resize_surface(&mut self.surface, w, h).is_err() { return; }
+        if ws_resize_surface(&mut self.surface, w, h).is_err() {
+            return;
+        }
         if let Ok(mut buf) = self.surface.buffer_mut() {
             let src = &self.framebuf;
             let len = (w as usize * h as usize).min(buf.len()).min(src.len());
@@ -136,49 +138,49 @@ impl WinState {
 
 fn ws_resize_surface(
     surface: &mut Surface<Arc<Window>, Arc<Window>>,
-    w: u32, h: u32,
+    w: u32,
+    h: u32,
 ) -> Result<(), ()> {
-    surface.resize(
-        NonZeroU32::new(w).ok_or(())?,
-        NonZeroU32::new(h).ok_or(())?,
-    ).map_err(|_| ())
+    surface
+        .resize(NonZeroU32::new(w).ok_or(())?, NonZeroU32::new(h).ok_or(())?)
+        .map_err(|_| ())
 }
 
 // ── Win32kState ───────────────────────────────────────────────────────────────
 pub struct Win32kState {
-    windows:        HashMap<u32, WinState>,
-    dcs:            HashMap<u32, DcState>,
-    gdi_objects:    HashMap<u32, GdiObject>,
-    msg_queues:     HashMap<u32, VecDeque<GuestMsg>>,
-    timers:         Vec<Timer>,
-    next_hwnd:      u32,
-    next_hdc:       u32,
-    next_gdi:       u32,
-    foreground:     u32,
+    windows: HashMap<u32, WinState>,
+    dcs: HashMap<u32, DcState>,
+    gdi_objects: HashMap<u32, GdiObject>,
+    msg_queues: HashMap<u32, VecDeque<GuestMsg>>,
+    timers: Vec<Timer>,
+    next_hwnd: u32,
+    next_hdc: u32,
+    next_gdi: u32,
+    foreground: u32,
     pending_create: VecDeque<(u32, u32)>, // (hwnd, owner_tid)
     pending_visibility: HashMap<u32, bool>,
-    tick_ms:        u32,
-    brush_colors:   HashMap<u32, u32>,
-    pen_colors:     HashMap<u32, u32>,
+    tick_ms: u32,
+    brush_colors: HashMap<u32, u32>,
+    pen_colors: HashMap<u32, u32>,
 }
 
 impl Win32kState {
     pub fn new() -> Self {
         Self {
-            windows:        HashMap::new(),
-            dcs:            HashMap::new(),
-            gdi_objects:    HashMap::new(),
-            msg_queues:     HashMap::new(),
-            timers:         Vec::new(),
-            next_hwnd:      0x1000,
-            next_hdc:       0x2000,
-            next_gdi:       0x3000,
-            foreground:     0,
+            windows: HashMap::new(),
+            dcs: HashMap::new(),
+            gdi_objects: HashMap::new(),
+            msg_queues: HashMap::new(),
+            timers: Vec::new(),
+            next_hwnd: 0x1000,
+            next_hdc: 0x2000,
+            next_gdi: 0x3000,
+            foreground: 0,
             pending_create: VecDeque::new(),
             pending_visibility: HashMap::new(),
-            tick_ms:        0,
-            brush_colors:   HashMap::new(),
-            pen_colors:     HashMap::new(),
+            tick_ms: 0,
+            brush_colors: HashMap::new(),
+            pen_colors: HashMap::new(),
         }
     }
 
@@ -214,9 +216,7 @@ impl Win32kState {
 
     fn flush_pending_creates(
         &mut self,
-        mut create_window: impl FnMut(
-            winit::window::WindowAttributes,
-        ) -> Result<Window, OsError>,
+        mut create_window: impl FnMut(winit::window::WindowAttributes) -> Result<Window, OsError>,
     ) {
         while let Some((hwnd, owner_tid)) = self.pending_create.pop_front() {
             let title = format!("WinEmu hwnd={:#x}", hwnd);
@@ -277,7 +277,7 @@ impl Win32kState {
             for (hwnd, tid, timer_id) in fired {
                 let q = self.msg_queues.entry(tid).or_default();
                 q.push_back(GuestMsg {
-                    hwnd:    hwnd as u64,
+                    hwnd: hwnd as u64,
                     message: WM_TIMER,
                     w_param: timer_id,
                     ..Default::default()
@@ -313,9 +313,15 @@ impl Win32kState {
         if let Some(ws) = self.windows.remove(&hwnd) {
             let tid = ws.owner_tid;
             let q = self.msg_queues.entry(tid).or_default();
-            q.push_back(GuestMsg { hwnd: hwnd as u64, message: WM_DESTROY, ..Default::default() });
+            q.push_back(GuestMsg {
+                hwnd: hwnd as u64,
+                message: WM_DESTROY,
+                ..Default::default()
+            });
         }
-        if self.foreground == hwnd { self.foreground = 0; }
+        if self.foreground == hwnd {
+            self.foreground = 0;
+        }
         1u64
     }
 
@@ -351,11 +357,12 @@ impl Win32kState {
         if let Some(ws) = self.windows.get_mut(&hwnd) {
             if w > 0 && h > 0 {
                 let _ = ws.window.request_inner_size(PhysicalSize::new(w, h));
-                ws.width  = w;
+                ws.width = w;
                 ws.height = h;
                 ws.ensure_fb();
             }
-            ws.window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+            ws.window
+                .set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
         }
         0u64
     }
@@ -374,7 +381,9 @@ impl Win32kState {
     }
 
     // ── NtUserValidateRect ───────────────────────────────────────────────────
-    pub fn validate_rect(&mut self, _hwnd: u32) -> u64 { 1u64 }
+    pub fn validate_rect(&mut self, _hwnd: u32) -> u64 {
+        1u64
+    }
 
     // ── NtUserPostQuitMessage ────────────────────────────────────────────────
     pub fn post_quit(&mut self, tid: u32, exit_code: i32) {
@@ -388,23 +397,39 @@ impl Win32kState {
 
     // ── NtUserSetTimer ───────────────────────────────────────────────────────
     pub fn set_timer(&mut self, hwnd: u32, tid: u32, timer_id: u64, interval_ms: u32) -> u64 {
-        self.timers.retain(|t| !(t.hwnd == hwnd && t.timer_id == timer_id));
-        self.timers.push(Timer { hwnd, tid, timer_id, interval: interval_ms.max(1), elapsed: 0 });
+        self.timers
+            .retain(|t| !(t.hwnd == hwnd && t.timer_id == timer_id));
+        self.timers.push(Timer {
+            hwnd,
+            tid,
+            timer_id,
+            interval: interval_ms.max(1),
+            elapsed: 0,
+        });
         timer_id
     }
 
     // ── NtUserKillTimer ──────────────────────────────────────────────────────
     pub fn kill_timer(&mut self, hwnd: u32, timer_id: u64) -> u64 {
         let before = self.timers.len();
-        self.timers.retain(|t| !(t.hwnd == hwnd && t.timer_id == timer_id));
-        if self.timers.len() < before { 1 } else { 0 }
+        self.timers
+            .retain(|t| !(t.hwnd == hwnd && t.timer_id == timer_id));
+        if self.timers.len() < before {
+            1
+        } else {
+            0
+        }
     }
 
     // ── NtUserSetCursor ──────────────────────────────────────────────────────
-    pub fn set_cursor(&mut self, _hcursor: u32) -> u64 { 0 }
+    pub fn set_cursor(&mut self, _hcursor: u32) -> u64 {
+        0
+    }
 
     // ── NtUserGetForegroundWindow ─────────────────────────────────────────────
-    pub fn foreground_hwnd(&self) -> u32 { self.foreground }
+    pub fn foreground_hwnd(&self) -> u32 {
+        self.foreground
+    }
 
     // ── NtGdiDeleteObjectApp ─────────────────────────────────────────────────
     pub fn delete_object(&mut self, h: u32) -> u64 {
@@ -415,14 +440,34 @@ impl Win32kState {
 
     // ── NtGdiSelectBitmap/Brush/Pen/Font ─────────────────────────────────────
     pub fn select_object(&mut self, hdc: u32, hobj: u32) -> u64 {
-        let kind = self.gdi_objects.get(&hobj).map(|o| o.kind).unwrap_or(GdiKind::Other);
+        let kind = self
+            .gdi_objects
+            .get(&hobj)
+            .map(|o| o.kind)
+            .unwrap_or(GdiKind::Other);
         if let Some(dc) = self.dcs.get_mut(&hdc) {
             let prev = match kind {
-                GdiKind::Bitmap => { let p = dc.sel_bitmap; dc.sel_bitmap = hobj; p }
-                GdiKind::Brush  => { let p = dc.sel_brush;  dc.sel_brush  = hobj; p }
-                GdiKind::Pen    => { let p = dc.sel_pen;    dc.sel_pen    = hobj; p }
-                GdiKind::Font   => { let p = dc.sel_font;   dc.sel_font   = hobj; p }
-                _               => 0,
+                GdiKind::Bitmap => {
+                    let p = dc.sel_bitmap;
+                    dc.sel_bitmap = hobj;
+                    p
+                }
+                GdiKind::Brush => {
+                    let p = dc.sel_brush;
+                    dc.sel_brush = hobj;
+                    p
+                }
+                GdiKind::Pen => {
+                    let p = dc.sel_pen;
+                    dc.sel_pen = hobj;
+                    p
+                }
+                GdiKind::Font => {
+                    let p = dc.sel_font;
+                    dc.sel_font = hobj;
+                    p
+                }
+                _ => 0,
             };
             return prev as u64;
         }
@@ -460,7 +505,9 @@ impl Win32kState {
     }
 
     // ── NtGdiStretchBlt ──────────────────────────────────────────────────────
-    pub fn stretch_blt(&mut self, hdc: u32) -> u64 { self.bit_blt(hdc) }
+    pub fn stretch_blt(&mut self, hdc: u32) -> u64 {
+        self.bit_blt(hdc)
+    }
 
     // ── NtGdiRectangle ───────────────────────────────────────────────────────
     pub fn gdi_rectangle(&mut self, hdc: u32, x0: i32, y0: i32, x1: i32, y1: i32) -> u64 {
@@ -491,27 +538,39 @@ impl Win32kState {
     // ── NtGdiSetBkColor / NtGdiSetTextColor ──────────────────────────────────
     pub fn set_bk_color(&mut self, hdc: u32, color: u32) -> u64 {
         if let Some(dc) = self.dcs.get_mut(&hdc) {
-            let prev = dc.bk_color; dc.bk_color = color; return prev as u64;
+            let prev = dc.bk_color;
+            dc.bk_color = color;
+            return prev as u64;
         }
         0u64
     }
 
     pub fn set_text_color(&mut self, hdc: u32, color: u32) -> u64 {
         if let Some(dc) = self.dcs.get_mut(&hdc) {
-            let prev = dc.text_color; dc.text_color = color; return prev as u64;
+            let prev = dc.text_color;
+            dc.text_color = color;
+            return prev as u64;
         }
         0u64
     }
 
     // ── NtGdiMoveTo / NtGdiLineTo ─────────────────────────────────────────────
     pub fn move_to(&mut self, hdc: u32, x: i32, y: i32) -> u64 {
-        if let Some(dc) = self.dcs.get_mut(&hdc) { dc.cur_x = x; dc.cur_y = y; }
+        if let Some(dc) = self.dcs.get_mut(&hdc) {
+            dc.cur_x = x;
+            dc.cur_y = y;
+        }
         1u64
     }
 
     pub fn line_to(&mut self, hdc: u32, x1: i32, y1: i32) -> u64 {
         let (hwnd, x0, y0, color) = match self.dcs.get_mut(&hdc) {
-            Some(dc) => { let r = (dc.hwnd, dc.cur_x, dc.cur_y, dc.text_color); dc.cur_x = x1; dc.cur_y = y1; r }
+            Some(dc) => {
+                let r = (dc.hwnd, dc.cur_x, dc.cur_y, dc.text_color);
+                dc.cur_x = x1;
+                dc.cur_y = y1;
+                r
+            }
             None => return 0,
         };
         if let Some(ws) = self.windows.get_mut(&hwnd) {
@@ -528,12 +587,24 @@ impl Win32kState {
     //      11=HWND_STYLE, 12=HWND_EXSTYLE, 13=HWND_ID, 14=HWND_ISARRANGED
     pub fn query_window(&self, hwnd: u32, cmd: u32) -> u64 {
         match cmd {
-            6  => if self.windows.contains_key(&hwnd) { 0 } else { 0 }, // IsIconic
+            6 => {
+                if self.windows.contains_key(&hwnd) {
+                    0
+                } else {
+                    0
+                }
+            } // IsIconic
             // Only report visible once a real host window exists.
-            7  => if self.windows.get(&hwnd).map(|w| w.visible).unwrap_or(false) { 1 } else { 0 },
+            7 => {
+                if self.windows.get(&hwnd).map(|w| w.visible).unwrap_or(false) {
+                    1
+                } else {
+                    0
+                }
+            }
             11 => 0x14CF_0000u64, // WS_OVERLAPPEDWINDOW | WS_VISIBLE
             12 => 0x0000_0100u64, // WS_EX_WINDOWEDGE
-            _  => 0,
+            _ => 0,
         }
     }
 
@@ -557,21 +628,39 @@ impl Win32kState {
     }
 
     // ── NtUserGetKeyState ────────────────────────────────────────────────────
-    pub fn get_key_state(&self, _vk: u32) -> u64 { 0 }
-    pub fn get_async_key_state(&self, _vk: u32) -> u64 { 0 }
-    pub fn get_keyboard_state(&self, _buf_gpa: u64) -> u64 { 1 }
+    pub fn get_key_state(&self, _vk: u32) -> u64 {
+        0
+    }
+    pub fn get_async_key_state(&self, _vk: u32) -> u64 {
+        0
+    }
+    pub fn get_keyboard_state(&self, _buf_gpa: u64) -> u64 {
+        1
+    }
 
     // ── NtUserGetQueueStatus ─────────────────────────────────────────────────
     pub fn get_queue_status(&self, tid: u32) -> u64 {
-        let has_msg = self.msg_queues.get(&tid).map(|q| !q.is_empty()).unwrap_or(false);
-        if has_msg { 0x0004_0004 } else { 0 } // QS_POSTMESSAGE
+        let has_msg = self
+            .msg_queues
+            .get(&tid)
+            .map(|q| !q.is_empty())
+            .unwrap_or(false);
+        if has_msg {
+            0x0004_0004
+        } else {
+            0
+        } // QS_POSTMESSAGE
     }
 
     // ── NtUserGetDoubleClickTime ─────────────────────────────────────────────
-    pub fn get_double_click_time(&self) -> u64 { 500 }
+    pub fn get_double_click_time(&self) -> u64 {
+        500
+    }
 
     // ── NtUserGetCaretBlinkTime ──────────────────────────────────────────────
-    pub fn get_caret_blink_time(&self) -> u64 { 530 }
+    pub fn get_caret_blink_time(&self) -> u64 {
+        530
+    }
 
     // ── NtUserSystemParametersInfo ───────────────────────────────────────────
     // uiAction values we care about:
@@ -583,8 +672,8 @@ impl Win32kState {
     pub fn system_parameters_info(&self, action: u32) -> (u64, Option<[i32; 4]>) {
         match action {
             0x0030 => (1, Some([0, 0, 1920, 1080])), // SPI_GETWORKAREA
-            0x004A => (1, None),                      // SPI_GETFONTSMOOTHING → true
-            _      => (1, None),
+            0x004A => (1, None),                     // SPI_GETFONTSMOOTHING → true
+            _ => (1, None),
         }
     }
 
@@ -605,7 +694,9 @@ impl Win32kState {
 
     // ── NtGdiExtGetObjectW ───────────────────────────────────────────────────
     // Returns object size; stub returns 0 (caller checks)
-    pub fn ext_get_object(&self, _h: u32) -> u64 { 0 }
+    pub fn ext_get_object(&self, _h: u32) -> u64 {
+        0
+    }
 
     // ── NtGdiEllipse ─────────────────────────────────────────────────────────
     pub fn gdi_ellipse(&mut self, hdc: u32, x0: i32, y0: i32, x1: i32, y1: i32) -> u64 {
@@ -614,13 +705,22 @@ impl Win32kState {
     }
 
     // ── NtGdiPolyPolyDraw ────────────────────────────────────────────────────
-    pub fn poly_poly_draw(&mut self, _hdc: u32) -> u64 { 1 }
+    pub fn poly_poly_draw(&mut self, _hdc: u32) -> u64 {
+        1
+    }
 
     // ── NtGdiFillRgn ─────────────────────────────────────────────────────────
     pub fn fill_rgn(&mut self, hdc: u32, _hrgn: u32, hbrush: u32) -> u64 {
         let (hwnd, color) = {
-            let dc = match self.dcs.get(&hdc) { Some(d) => d, None => return 0 };
-            let c = self.brush_colors.get(&hbrush).copied().unwrap_or(dc.bk_color);
+            let dc = match self.dcs.get(&hdc) {
+                Some(d) => d,
+                None => return 0,
+            };
+            let c = self
+                .brush_colors
+                .get(&hbrush)
+                .copied()
+                .unwrap_or(dc.bk_color);
             (dc.hwnd, c)
         };
         if let Some(ws) = self.windows.get_mut(&hwnd) {
@@ -638,7 +738,10 @@ impl Win32kState {
     // ── peek_message ─────────────────────────────────────────────────────────
     pub fn peek_message(&mut self, tid: u32, out: &mut GuestMsg) -> bool {
         if let Some(q) = self.msg_queues.get_mut(&tid) {
-            if let Some(msg) = q.pop_front() { *out = msg; return true; }
+            if let Some(msg) = q.pop_front() {
+                *out = msg;
+                return true;
+            }
         }
         false
     }
@@ -657,38 +760,78 @@ impl Win32kState {
                     ws.visible = false;
                     ws.window.set_visible(false);
                 }
-                q.push_back(GuestMsg { hwnd: hwnd as u64, message: WM_CLOSE, ..Default::default() });
+                q.push_back(GuestMsg {
+                    hwnd: hwnd as u64,
+                    message: WM_CLOSE,
+                    ..Default::default()
+                });
             }
             WindowEvent::RedrawRequested => {
-                q.push_back(GuestMsg { hwnd: hwnd as u64, message: WM_PAINT, ..Default::default() });
+                q.push_back(GuestMsg {
+                    hwnd: hwnd as u64,
+                    message: WM_PAINT,
+                    ..Default::default()
+                });
             }
             WindowEvent::Resized(sz) => {
                 if let Some(ws) = self.windows.get_mut(&hwnd) {
-                    ws.width  = sz.width.max(1);
+                    ws.width = sz.width.max(1);
                     ws.height = sz.height.max(1);
                     ws.ensure_fb();
                 }
                 let packed = ((sz.height as u64) << 16) | (sz.width as u64 & 0xFFFF);
-                q.push_back(GuestMsg { hwnd: hwnd as u64, message: WM_SIZE, l_param: packed, ..Default::default() });
+                q.push_back(GuestMsg {
+                    hwnd: hwnd as u64,
+                    message: WM_SIZE,
+                    l_param: packed,
+                    ..Default::default()
+                });
             }
             WindowEvent::KeyboardInput { event: ke, .. } => {
-                let msg = if ke.state == winit::event::ElementState::Pressed { WM_KEYDOWN } else { WM_KEYUP };
+                let msg = if ke.state == winit::event::ElementState::Pressed {
+                    WM_KEYDOWN
+                } else {
+                    WM_KEYUP
+                };
                 let vk = winit_key_to_vk(&ke.logical_key);
-                q.push_back(GuestMsg { hwnd: hwnd as u64, message: msg, w_param: vk, ..Default::default() });
+                q.push_back(GuestMsg {
+                    hwnd: hwnd as u64,
+                    message: msg,
+                    w_param: vk,
+                    ..Default::default()
+                });
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let packed = ((position.y as i32 as u64) << 32) | (position.x as i32 as u64 & 0xFFFF_FFFF);
-                q.push_back(GuestMsg { hwnd: hwnd as u64, message: WM_MOUSEMOVE, l_param: packed, ..Default::default() });
+                let packed =
+                    ((position.y as i32 as u64) << 32) | (position.x as i32 as u64 & 0xFFFF_FFFF);
+                q.push_back(GuestMsg {
+                    hwnd: hwnd as u64,
+                    message: WM_MOUSEMOVE,
+                    l_param: packed,
+                    ..Default::default()
+                });
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let msg = match (button, state) {
-                    (winit::event::MouseButton::Left,  winit::event::ElementState::Pressed)  => WM_LBUTTONDOWN,
-                    (winit::event::MouseButton::Left,  winit::event::ElementState::Released) => WM_LBUTTONUP,
-                    (winit::event::MouseButton::Right, winit::event::ElementState::Pressed)  => WM_RBUTTONDOWN,
-                    (winit::event::MouseButton::Right, winit::event::ElementState::Released) => WM_RBUTTONUP,
+                    (winit::event::MouseButton::Left, winit::event::ElementState::Pressed) => {
+                        WM_LBUTTONDOWN
+                    }
+                    (winit::event::MouseButton::Left, winit::event::ElementState::Released) => {
+                        WM_LBUTTONUP
+                    }
+                    (winit::event::MouseButton::Right, winit::event::ElementState::Pressed) => {
+                        WM_RBUTTONDOWN
+                    }
+                    (winit::event::MouseButton::Right, winit::event::ElementState::Released) => {
+                        WM_RBUTTONUP
+                    }
                     _ => return,
                 };
-                q.push_back(GuestMsg { hwnd: hwnd as u64, message: msg, ..Default::default() });
+                q.push_back(GuestMsg {
+                    hwnd: hwnd as u64,
+                    message: msg,
+                    ..Default::default()
+                });
             }
             _ => {}
         }
@@ -707,10 +850,18 @@ fn draw_line(fb: &mut Vec<u32>, w: u32, h: u32, x0: i32, y0: i32, x1: i32, y1: i
         if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
             fb[y as usize * w as usize + x as usize] = color;
         }
-        if x == x1 && y == y1 { break; }
+        if x == x1 && y == y1 {
+            break;
+        }
         let e2 = 2 * err;
-        if e2 > -dy { err -= dy; x += sx; }
-        if e2 <  dx { err += dx; y += sy; }
+        if e2 > -dy {
+            err -= dy;
+            x += sx;
+        }
+        if e2 < dx {
+            err += dx;
+            y += sy;
+        }
     }
 }
 
@@ -718,32 +869,32 @@ fn draw_line(fb: &mut Vec<u32>, w: u32, h: u32, x0: i32, y0: i32, x1: i32, y1: i
 fn winit_key_to_vk(key: &winit::keyboard::Key) -> u64 {
     use winit::keyboard::{Key, NamedKey};
     match key {
-        Key::Named(NamedKey::Enter)      => 0x0D,
-        Key::Named(NamedKey::Escape)     => 0x1B,
-        Key::Named(NamedKey::Space)      => 0x20,
-        Key::Named(NamedKey::Backspace)  => 0x08,
-        Key::Named(NamedKey::Tab)        => 0x09,
-        Key::Named(NamedKey::ArrowLeft)  => 0x25,
-        Key::Named(NamedKey::ArrowUp)    => 0x26,
+        Key::Named(NamedKey::Enter) => 0x0D,
+        Key::Named(NamedKey::Escape) => 0x1B,
+        Key::Named(NamedKey::Space) => 0x20,
+        Key::Named(NamedKey::Backspace) => 0x08,
+        Key::Named(NamedKey::Tab) => 0x09,
+        Key::Named(NamedKey::ArrowLeft) => 0x25,
+        Key::Named(NamedKey::ArrowUp) => 0x26,
         Key::Named(NamedKey::ArrowRight) => 0x27,
-        Key::Named(NamedKey::ArrowDown)  => 0x28,
-        Key::Named(NamedKey::Delete)     => 0x2E,
-        Key::Named(NamedKey::Home)       => 0x24,
-        Key::Named(NamedKey::End)        => 0x23,
-        Key::Named(NamedKey::PageUp)     => 0x21,
-        Key::Named(NamedKey::PageDown)   => 0x22,
-        Key::Named(NamedKey::F1)         => 0x70,
-        Key::Named(NamedKey::F2)         => 0x71,
-        Key::Named(NamedKey::F3)         => 0x72,
-        Key::Named(NamedKey::F4)         => 0x73,
-        Key::Named(NamedKey::F5)         => 0x74,
-        Key::Named(NamedKey::F6)         => 0x75,
-        Key::Named(NamedKey::F7)         => 0x76,
-        Key::Named(NamedKey::F8)         => 0x77,
-        Key::Named(NamedKey::F9)         => 0x78,
-        Key::Named(NamedKey::F10)        => 0x79,
-        Key::Named(NamedKey::F11)        => 0x7A,
-        Key::Named(NamedKey::F12)        => 0x7B,
+        Key::Named(NamedKey::ArrowDown) => 0x28,
+        Key::Named(NamedKey::Delete) => 0x2E,
+        Key::Named(NamedKey::Home) => 0x24,
+        Key::Named(NamedKey::End) => 0x23,
+        Key::Named(NamedKey::PageUp) => 0x21,
+        Key::Named(NamedKey::PageDown) => 0x22,
+        Key::Named(NamedKey::F1) => 0x70,
+        Key::Named(NamedKey::F2) => 0x71,
+        Key::Named(NamedKey::F3) => 0x72,
+        Key::Named(NamedKey::F4) => 0x73,
+        Key::Named(NamedKey::F5) => 0x74,
+        Key::Named(NamedKey::F6) => 0x75,
+        Key::Named(NamedKey::F7) => 0x76,
+        Key::Named(NamedKey::F8) => 0x77,
+        Key::Named(NamedKey::F9) => 0x78,
+        Key::Named(NamedKey::F10) => 0x79,
+        Key::Named(NamedKey::F11) => 0x7A,
+        Key::Named(NamedKey::F12) => 0x7B,
         Key::Character(s) => s.chars().next().unwrap_or('\0').to_ascii_uppercase() as u64,
         _ => 0,
     }
