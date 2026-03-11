@@ -3,6 +3,7 @@ use crate::mm::UserVa;
 use crate::mm::{KernelVa, PhysAddr};
 use crate::nt::constants::PAGE_SIZE_4K;
 
+const PAGE_TABLE_ENTRIES: usize = mmu::PAGE_TABLE_ENTRIES;
 const TABLE_U64S: usize = (PAGE_SIZE_4K as usize) / core::mem::size_of::<u64>();
 
 #[derive(Clone, Copy)]
@@ -18,6 +19,14 @@ pub(crate) struct OwnedTablePage {
 
 #[derive(Clone, Copy)]
 pub(crate) struct UserTableRoot(TablePageRef);
+
+pub(crate) struct ProcessUserTables {
+    ttbr0: PhysAddr,
+    l0: OwnedTablePage,
+    l1: OwnedTablePage,
+    l2: OwnedTablePage,
+    l3_tables: [OwnedTablePage; PAGE_TABLE_ENTRIES],
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct TableEntryRef {
@@ -157,6 +166,165 @@ impl UserTableRoot {
     #[inline(always)]
     pub(crate) const fn table_ref(self) -> TablePageRef {
         self.0
+    }
+}
+
+impl ProcessUserTables {
+    pub(crate) fn new_bootstrap_clone(user_va_base: u64, user_va_limit: u64) -> Option<Self> {
+        let (src_l0, src_l1, src_l2) = crate::mm::bootstrap_user_tables();
+        Self::clone_from_roots(
+            TablePageRef::kernel(src_l0),
+            TablePageRef::kernel(src_l1),
+            TablePageRef::kernel(src_l2),
+            user_va_base,
+            user_va_limit,
+        )
+    }
+
+    pub(crate) fn clone_from(parent: &Self, user_va_base: u64, user_va_limit: u64) -> Option<Self> {
+        Self::clone_from_roots(
+            parent.l0.table_ref(),
+            parent.l1.table_ref(),
+            parent.l2.table_ref(),
+            user_va_base,
+            user_va_limit,
+        )
+    }
+
+    fn clone_from_roots(
+        src_l0: TablePageRef,
+        src_l1: TablePageRef,
+        src_l2: TablePageRef,
+        user_va_base: u64,
+        user_va_limit: u64,
+    ) -> Option<Self> {
+        let l0 = OwnedTablePage::clone_from(src_l0)?;
+        let l1 = match OwnedTablePage::clone_from(src_l1) {
+            Some(table) => table,
+            None => {
+                l0.free();
+                return None;
+            }
+        };
+        let l2 = match OwnedTablePage::clone_from(src_l2) {
+            Some(table) => table,
+            None => {
+                l1.free();
+                l0.free();
+                return None;
+            }
+        };
+
+        let mut tables = Self {
+            ttbr0: l0.phys_addr(),
+            l0,
+            l1,
+            l2,
+            l3_tables: [OwnedTablePage::empty(); PAGE_TABLE_ENTRIES],
+        };
+
+        // SAFETY: l0/l1/l2 are freshly allocated process root page tables.
+        unsafe {
+            mmu::install_process_root_tables(
+                tables.l0.phys_addr(),
+                tables.l1.phys_addr(),
+                tables.l2.phys_addr(),
+            );
+        }
+
+        if !tables
+            .user_page_editor(user_va_base, user_va_limit)
+            .clone_l2_child_tables(&mut tables.l3_tables)
+        {
+            return None;
+        }
+
+        Some(tables)
+    }
+
+    #[inline(always)]
+    pub(crate) fn ttbr0(&self) -> u64 {
+        self.ttbr0.get()
+    }
+
+    #[inline(always)]
+    pub(crate) fn translate_user_va_for_access(&self, va: UserVa, access: u8) -> Option<PhysAddr> {
+        translate_user_va(UserTableRoot::phys(self.l0.phys_addr()), va, access)
+    }
+
+    pub(crate) fn map_page(
+        &mut self,
+        va: UserVa,
+        pa: PhysAddr,
+        prot: u32,
+        user_va_base: u64,
+        user_va_limit: u64,
+    ) -> bool {
+        let Some(edit) = self
+            .user_page_editor(user_va_base, user_va_limit)
+            .map_page(va, pa, prot)
+        else {
+            return false;
+        };
+        edit.record_owned_l3(&mut self.l3_tables);
+        true
+    }
+
+    pub(crate) fn clear_page(&mut self, va: UserVa, user_va_base: u64, user_va_limit: u64) -> bool {
+        let Some(edit) = self
+            .user_page_editor(user_va_base, user_va_limit)
+            .clear_page(va)
+        else {
+            return false;
+        };
+        edit.record_owned_l3(&mut self.l3_tables);
+        true
+    }
+
+    pub(crate) fn protect_page(
+        &mut self,
+        va: UserVa,
+        prot: u32,
+        user_va_base: u64,
+        user_va_limit: u64,
+    ) -> bool {
+        let Some(edit) = self
+            .user_page_editor(user_va_base, user_va_limit)
+            .protect_page(va, prot)
+        else {
+            return false;
+        };
+        edit.record_owned_l3(&mut self.l3_tables);
+        true
+    }
+
+    #[inline(always)]
+    fn user_page_editor(&self, user_va_base: u64, user_va_limit: u64) -> UserPageEditor {
+        UserPageEditor::new(self.l2.table_ref(), user_va_base, user_va_limit)
+    }
+}
+
+impl Drop for ProcessUserTables {
+    fn drop(&mut self) {
+        for entry in self.l3_tables.iter_mut() {
+            if entry.is_allocated() {
+                entry.free();
+                *entry = OwnedTablePage::empty();
+            }
+        }
+        if self.l2.is_allocated() {
+            self.l2.free();
+            self.l2 = OwnedTablePage::empty();
+        }
+        if self.l1.is_allocated() {
+            self.l1.free();
+            self.l1 = OwnedTablePage::empty();
+        }
+        if self.l0.is_allocated() {
+            self.l0.free();
+            self.l0 = OwnedTablePage::empty();
+        }
+        self.ttbr0 = PhysAddr::new(0);
     }
 }
 
