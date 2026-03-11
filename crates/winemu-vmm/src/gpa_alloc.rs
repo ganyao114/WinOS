@@ -203,7 +203,10 @@ impl GpaAllocator {
     /// Free a previously allocated region.
     /// `size` is the original requested size (must be 4KB-aligned).
     pub fn free(&mut self, gpa: u64, size: usize) -> Option<usize> {
-        if size == 0 || (size & (GUEST_PAGE_SIZE - 1)) != 0 || (gpa & (GUEST_PAGE_SIZE as u64 - 1)) != 0 {
+        if size == 0
+            || (size & (GUEST_PAGE_SIZE - 1)) != 0
+            || (gpa & (GUEST_PAGE_SIZE as u64 - 1)) != 0
+        {
             return None;
         }
         let alloc_size = align_up_host(size as u64) as usize;
@@ -211,7 +214,8 @@ impl GpaAllocator {
         if order >= MAX_ORDER {
             return None;
         }
-        let Some((chunk_base, chunk_size)) = self.find_chunk(gpa).map(|chunk| (chunk.gpa, chunk.size))
+        let Some((chunk_base, chunk_size)) =
+            self.find_chunk(gpa).map(|chunk| (chunk.gpa, chunk.size))
         else {
             return None;
         };
@@ -237,7 +241,9 @@ impl GpaAllocator {
             self.free_page_count -= 1usize << order;
             return Some(gpa);
         }
-        if order + 1 >= MAX_ORDER { return None; }
+        if order + 1 >= MAX_ORDER {
+            return None;
+        }
         let parent = self.alloc_order(order + 1)?;
         let buddy = parent + order_size(order) as u64;
         self.free_lists[order].insert(buddy);
@@ -261,7 +267,8 @@ impl GpaAllocator {
     fn free_order(&mut self, gpa: u64, order: usize) {
         self.free_page_count += 1usize << order;
         if order + 1 < MAX_ORDER {
-            if let Some((base, chunk_size)) = self.find_chunk(gpa).map(|chunk| (chunk.gpa, chunk.size))
+            if let Some((base, chunk_size)) =
+                self.find_chunk(gpa).map(|chunk| (chunk.gpa, chunk.size))
             {
                 let block_size = order_size(order) as u64;
                 let chunk_end = base + chunk_size as u64;
@@ -301,9 +308,7 @@ impl GpaAllocator {
             for order in 0..MAX_ORDER {
                 let blk_size = order_size(order) as u64;
                 let chunk_end = chunk_gpa + chunk_size as u64;
-                for &gpa in self.free_lists[order]
-                    .range(chunk_gpa..chunk_end)
-                {
+                for &gpa in self.free_lists[order].range(chunk_gpa..chunk_end) {
                     // Block must be fully within chunk
                     if gpa + blk_size <= chunk_end {
                         free_in_chunk += 1usize << order;
