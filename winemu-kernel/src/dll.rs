@@ -1,9 +1,15 @@
 use core::cell::UnsafeCell;
+use core::mem::size_of;
 
 use winemu_shared::pe;
 
 use crate::hypercall;
 use crate::ldr::{self, ImportRef};
+use crate::mm::usercopy::{
+    current_pid as current_user_pid, read_current_user_mapped_value,
+    with_current_process_user_slice, write_current_user_mapped_value,
+};
+use crate::mm::{UserVa, VM_ACCESS_READ};
 
 const MAX_DLLS: usize = 512;
 const MAX_DLL_NAME: usize = 96;
@@ -17,6 +23,7 @@ const ENTRY_READY: u8 = 1;
 struct DllEntry {
     state: u8,
     name_len: u8,
+    user_backed: u8,
     name: [u8; MAX_DLL_NAME],
     base: u64,
     size: u32,
@@ -28,6 +35,7 @@ impl DllEntry {
         Self {
             state: ENTRY_EMPTY,
             name_len: 0,
+            user_backed: 0,
             name: [0; MAX_DLL_NAME],
             base: 0,
             size: 0,
@@ -108,7 +116,7 @@ fn find_loaded_base(dll_name: &str) -> Option<u64> {
     None
 }
 
-fn remember_loaded(dll_name: &str, base: u64, size: u32, entry_va: u64) -> bool {
+fn remember_loaded(dll_name: &str, base: u64, size: u32, entry_va: u64, user_backed: bool) -> bool {
     let mut normalized = [0u8; MAX_DLL_NAME];
     let Some(name_len) = normalize_lower_ascii(dll_name, &mut normalized) else {
         return false;
@@ -120,6 +128,7 @@ fn remember_loaded(dll_name: &str, base: u64, size: u32, entry_va: u64) -> bool 
             slot.base = base;
             slot.size = size;
             slot.entry = entry_va;
+            slot.user_backed = u8::from(user_backed);
             slot.state = ENTRY_READY;
             return true;
         }
@@ -130,6 +139,7 @@ fn remember_loaded(dll_name: &str, base: u64, size: u32, entry_va: u64) -> bool 
             slot.base = base;
             slot.size = size;
             slot.entry = entry_va;
+            slot.user_backed = u8::from(user_backed);
             slot.name_len = name_len as u8;
             slot.name[..name_len].copy_from_slice(&normalized[..name_len]);
             return true;
@@ -204,7 +214,14 @@ fn load_mapped_dll(
     } else {
         loaded.base.saturating_add(loaded.entry_rva as u64)
     };
-    if !remember_loaded(dll_name, loaded.base, loaded.size as u32, entry) {
+    let user_backed = current_user_pid().is_some();
+    if !remember_loaded(
+        dll_name,
+        loaded.base,
+        loaded.size as u32,
+        entry,
+        user_backed,
+    ) {
         return Err(ldr::LdrError::BadImport);
     }
     let linked = unsafe {
@@ -235,7 +252,7 @@ fn apply_runtime_compat_bootstrap(dll_name: &str, base: u64, size: u64) {
 
         let export_target = |name: &str| {
             resolve_import("ntdll.dll", ImportRef::Name(name))
-                .map(|ptr| unsafe { (ptr as *const u64).read_volatile() })
+                .and_then(read_mapped_value::<u64>)
                 .unwrap_or(0)
         };
         let syscall_value = {
@@ -256,11 +273,9 @@ fn apply_runtime_compat_bootstrap(dll_name: &str, base: u64, size: u64) {
             if slot_va < base || slot_va.saturating_add(8) > base.saturating_add(size) {
                 return;
             }
-            unsafe {
-                let cur = (slot_va as *const u64).read_volatile();
-                if cur == 0 {
-                    (slot_va as *mut u64).write_volatile(value);
-                }
+            let cur = read_mapped_value::<u64>(slot_va).unwrap_or(0);
+            if cur == 0 {
+                let _ = write_mapped_value(slot_va, value);
             }
         };
 
@@ -284,9 +299,7 @@ fn apply_runtime_compat_bootstrap(dll_name: &str, base: u64, size: u64) {
                 "ntdll.dll",
                 ImportRef::Name("RtlOpenCrossProcessEmulatorWorkConnection"),
             ) {
-                unsafe {
-                    (slot_va as *mut u64).write_volatile(addr);
-                }
+                let _ = write_mapped_value(slot_va, addr);
             }
         }
 
@@ -302,29 +315,27 @@ fn apply_runtime_compat_bootstrap(dll_name: &str, base: u64, size: u64) {
             && table_va >= base
             && table_va.saturating_add(8) <= base.saturating_add(size)
         {
-            unsafe {
-                let fallback = (fallback_va as *const u64).read_volatile();
-                let runtime = (runtime_va as *const u64).read_volatile();
-                let table = (table_va as *const u64).read_volatile();
-                let mut patched = fallback;
-                if patched == 0 {
-                    patched = if runtime != 0 {
-                        runtime
-                    } else if table != 0 {
-                        table
-                    } else {
-                        kernelbase_locale_stub_ptr()
-                    };
-                    if patched != 0 {
-                        (fallback_va as *mut u64).write_volatile(patched);
-                    }
+            let fallback = read_mapped_value::<u64>(fallback_va).unwrap_or(0);
+            let runtime = read_mapped_value::<u64>(runtime_va).unwrap_or(0);
+            let table = read_mapped_value::<u64>(table_va).unwrap_or(0);
+            let mut patched = fallback;
+            if patched == 0 {
+                patched = if runtime != 0 {
+                    runtime
+                } else if table != 0 {
+                    table
+                } else {
+                    kernelbase_locale_stub_ptr()
+                };
+                if patched != 0 {
+                    let _ = write_mapped_value(fallback_va, patched);
                 }
-                if runtime == 0 && patched != 0 {
-                    (runtime_va as *mut u64).write_volatile(patched);
-                }
-                if table == 0 && patched != 0 {
-                    (table_va as *mut u64).write_volatile(patched);
-                }
+            }
+            if runtime == 0 && patched != 0 {
+                let _ = write_mapped_value(runtime_va, patched);
+            }
+            if table == 0 && patched != 0 {
+                let _ = write_mapped_value(table_va, patched);
             }
         }
     }
@@ -344,16 +355,12 @@ fn apply_runtime_compat_bootstrap(dll_name: &str, base: u64, size: u64) {
         .saturating_add(UCRT_LOCK_TABLE_RVA)
         .saturating_add(UCRT_LOCK_BOOTSTRAP_INDEX.saturating_mul(UCRT_LOCK_ENTRY_SIZE));
     if lock_flag_va >= base && lock_flag_va.saturating_add(4) <= base.saturating_add(size) {
-        unsafe {
-            (lock_flag_va as *mut u32).write_volatile(1);
-        }
+        let _ = write_mapped_value(lock_flag_va, 1u32);
     }
 
     let dbg_flags_va = base.saturating_add(UCRT_DBG_FLAGS_RVA);
     if dbg_flags_va >= base && dbg_flags_va < base.saturating_add(size) {
-        unsafe {
-            (dbg_flags_va as *mut u8).write_volatile(0);
-        }
+        let _ = write_mapped_value(dbg_flags_va, 0u8);
     }
 }
 
@@ -380,6 +387,78 @@ fn forget_loaded(dll_name: &str) {
             *entry = DllEntry::empty();
             return;
         }
+    }
+}
+
+fn loaded_image_info(base: u64) -> Option<(usize, bool)> {
+    let entries = unsafe { &*DLL_RUNTIME.entries.get() };
+    for entry in entries.iter() {
+        if entry.state == ENTRY_READY && entry.base == base && entry.size != 0 {
+            return Some((entry.size as usize, entry.user_backed != 0));
+        }
+    }
+    None
+}
+
+fn mapped_range_kind(addr: u64, size: usize) -> Option<bool> {
+    let Some(end) = addr.checked_add(size as u64) else {
+        return None;
+    };
+    let entries = unsafe { &*DLL_RUNTIME.entries.get() };
+    for entry in entries.iter() {
+        if entry.state != ENTRY_READY || entry.base == 0 || entry.size == 0 {
+            continue;
+        }
+        let start = entry.base;
+        let limit = start.saturating_add(entry.size as u64);
+        if addr >= start && end <= limit {
+            return Some(entry.user_backed != 0);
+        }
+    }
+    None
+}
+
+fn with_loaded_image_slice<R>(
+    base: u64,
+    size: usize,
+    user_backed: bool,
+    f: impl FnOnce(&[u8]) -> R,
+) -> Option<R> {
+    if user_backed {
+        let pid = current_user_pid()?;
+        return with_current_process_user_slice(pid, UserVa::new(base), size, VM_ACCESS_READ, f);
+    }
+    if size == 0 {
+        return Some(f(&[]));
+    }
+    // SAFETY: kernel-backed DLL images use stable kernel memory.
+    let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, size) };
+    Some(f(bytes))
+}
+
+fn read_mapped_value<T: Copy>(addr: u64) -> Option<T> {
+    match mapped_range_kind(addr, size_of::<T>())? {
+        true => read_current_user_mapped_value(addr as *const T),
+        false => {
+            // SAFETY: the address range was proven to lie inside a known
+            // kernel-backed loaded image.
+            Some(unsafe { (addr as *const T).read_volatile() })
+        }
+    }
+}
+
+fn write_mapped_value<T: Copy>(addr: u64, value: T) -> bool {
+    match mapped_range_kind(addr, size_of::<T>()) {
+        Some(true) => write_current_user_mapped_value(addr as *mut T, value),
+        Some(false) => {
+            // SAFETY: the address range was proven to lie inside a known
+            // kernel-backed loaded image.
+            unsafe {
+                (addr as *mut T).write_volatile(value);
+            }
+            true
+        }
+        None => false,
     }
 }
 
@@ -432,54 +511,72 @@ fn normalize_lower_ascii(name: &str, out: &mut [u8; MAX_DLL_NAME]) -> Option<usi
 }
 
 fn resolve_export_by_name(base: u64, name: &str, depth: u8) -> Option<u64> {
+    let (image_size, user_backed) = loaded_image_info(base)?;
     let (fn_rva_tbl, name_tbl, ord_tbl, num_names, num_funcs, _ord_base, exp_rva, exp_size) =
-        read_export_dir(base)?;
+        with_loaded_image_slice(base, image_size, user_backed, |image| {
+            read_export_dir(image)
+        })??;
     let target = name.as_bytes();
-    unsafe {
-        let image = base as *const u8;
+    with_loaded_image_slice(base, image_size, user_backed, |image| {
+        let image = image.as_ptr();
         for i in 0..num_names {
-            let name_rva = pe::ru32(image.add(name_tbl + i * 4)) as usize;
-            let export_name = cstr_bytes(image.add(name_rva));
-            if export_name == target {
-                let ord = pe::ru16(image.add(ord_tbl + i * 2)) as usize;
-                if ord >= num_funcs {
-                    return None;
+            // SAFETY: `image` points to the validated loaded image slice.
+            unsafe {
+                let name_rva = pe::ru32(image.add(name_tbl + i * 4)) as usize;
+                let export_name = cstr_bytes_in_image(image, image_size, name_rva);
+                if export_name == target {
+                    let ord = pe::ru16(image.add(ord_tbl + i * 2)) as usize;
+                    if ord >= num_funcs {
+                        return None;
+                    }
+                    let fn_rva = pe::ru32(image.add(fn_rva_tbl + ord * 4));
+                    if fn_rva == 0 {
+                        return None;
+                    }
+                    return resolve_export_target(
+                        image, image_size, base, fn_rva, exp_rva, exp_size, depth,
+                    );
                 }
-                let fn_rva = pe::ru32(image.add(fn_rva_tbl + ord * 4));
-                if fn_rva == 0 {
-                    return None;
-                }
-                return resolve_export_target(base, fn_rva, exp_rva, exp_size, depth);
             }
         }
-    }
-    None
+        None
+    })?
 }
 
 fn resolve_export_by_ordinal(base: u64, ordinal: u64, depth: u8) -> Option<u64> {
+    let (image_size, user_backed) = loaded_image_info(base)?;
     let (fn_rva_tbl, _name_tbl, _ord_tbl, _num_names, num_funcs, ord_base, exp_rva, exp_size) =
-        read_export_dir(base)?;
+        with_loaded_image_slice(base, image_size, user_backed, |image| {
+            read_export_dir(image)
+        })??;
     let idx = ordinal.wrapping_sub(ord_base) as usize;
     if idx >= num_funcs {
         return None;
     }
-    unsafe {
-        let image = base as *const u8;
-        let fn_rva = pe::ru32(image.add(fn_rva_tbl + idx * 4));
-        if fn_rva == 0 {
-            return None;
+    with_loaded_image_slice(base, image_size, user_backed, |image| {
+        let image = image.as_ptr();
+        // SAFETY: `image` points to the validated loaded image slice.
+        unsafe {
+            let fn_rva = pe::ru32(image.add(fn_rva_tbl + idx * 4));
+            if fn_rva == 0 {
+                return None;
+            }
+            resolve_export_target(image, image_size, base, fn_rva, exp_rva, exp_size, depth)
         }
-        resolve_export_target(base, fn_rva, exp_rva, exp_size, depth)
-    }
+    })?
 }
 
-fn read_export_dir(base: u64) -> Option<(usize, usize, usize, usize, usize, u64, u32, u32)> {
+fn read_export_dir(image: &[u8]) -> Option<(usize, usize, usize, usize, usize, u64, u32, u32)> {
+    let image_len = image.len();
     unsafe {
-        let image = base as *const u8;
-        if pe::ru16(image) != pe::MZ_MAGIC {
+        let image = image.as_ptr();
+        if image_len < 0x80 || pe::ru16(image) != pe::MZ_MAGIC {
             return None;
         }
         let lfanew = pe::ru32(image.add(60)) as usize;
+        if lfanew + 24 + 116 > image_len {
+            return None;
+        }
         if pe::ru32(image.add(lfanew)) != pe::PE_MAGIC {
             return None;
         }
@@ -487,7 +584,7 @@ fn read_export_dir(base: u64) -> Option<(usize, usize, usize, usize, usize, u64,
         let oh = image.add(lfanew + 24);
         let exp_rva = pe::ru32(oh.add(112)) as usize;
         let exp_size = pe::ru32(oh.add(116));
-        if exp_rva == 0 || exp_size == 0 {
+        if exp_rva == 0 || exp_size == 0 || exp_rva.checked_add(40)? > image_len {
             return None;
         }
 
@@ -512,6 +609,8 @@ fn read_export_dir(base: u64) -> Option<(usize, usize, usize, usize, usize, u64,
 }
 
 fn resolve_export_target(
+    image: *const u8,
+    image_len: usize,
     base: u64,
     fn_rva: u32,
     exp_rva: u32,
@@ -525,7 +624,7 @@ fn resolve_export_target(
         return Some(base + fn_rva_u64);
     }
 
-    let forward = unsafe { cstr_bytes((base + fn_rva_u64) as *const u8) };
+    let forward = unsafe { cstr_bytes_in_image(image, image_len, fn_rva_u64 as usize) };
     resolve_forwarder(forward, depth + 1)
 }
 
@@ -588,13 +687,16 @@ fn parse_decimal_u16(bytes: &[u8]) -> Option<u16> {
     Some(val as u16)
 }
 
-unsafe fn cstr_bytes<'a>(p: *const u8) -> &'a [u8] {
+unsafe fn cstr_bytes_in_image<'a>(image: *const u8, image_len: usize, offset: usize) -> &'a [u8] {
+    if offset >= image_len {
+        return &[];
+    }
     let mut len = 0usize;
-    while *p.add(len) != 0 {
+    while offset + len < image_len && *image.add(offset + len) != 0 {
         len += 1;
         if len >= 512 {
             break;
         }
     }
-    core::slice::from_raw_parts(p, len)
+    core::slice::from_raw_parts(image.add(offset), len)
 }

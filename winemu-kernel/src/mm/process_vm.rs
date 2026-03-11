@@ -1,5 +1,5 @@
 use crate::mm::vm_area::{VmKind, PAGE_SIZE};
-use crate::mm::{vm_kind_from_vma_type, vm_sanitize_nt_prot, UserVa, VmaType, VmQueryInfo};
+use crate::mm::{vm_kind_from_vma_type, vm_sanitize_nt_prot, UserVa, VmQueryInfo, VmaType};
 use winemu_shared::status;
 
 #[inline]
@@ -81,8 +81,7 @@ pub(crate) fn vm_set_section_backing(
     is_image: bool,
 ) -> bool {
     crate::process::with_process_mut(owner_pid, |p| {
-        p.vm
-            .set_section_backing(base, file_fd, file_offset, view_size, is_image)
+        p.vm.set_section_backing(base, file_fd, file_offset, view_size, is_image)
     })
     .unwrap_or(false)
 }

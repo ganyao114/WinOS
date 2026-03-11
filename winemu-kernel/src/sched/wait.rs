@@ -4,8 +4,8 @@
 // unblock_thread_locked — wake a waiting thread (set Ready)
 // check_wait_timeout    — called from scheduler round to expire deadlines
 
-use crate::sched::global::{with_thread, with_thread_mut, SCHED};
 use crate::sched::cpu::set_needs_reschedule;
+use crate::sched::global::{with_thread, with_thread_mut, SCHED};
 use crate::sched::topology::set_thread_state_locked;
 use crate::sched::types::{
     ThreadState, WaitDeadline, WAIT_KIND_DELAY, WAIT_KIND_MULTIPLE, WAIT_KIND_NONE,
@@ -14,11 +14,11 @@ use crate::sched::types::{
 
 // ── NTSTATUS codes ────────────────────────────────────────────────────────────
 
-pub const STATUS_SUCCESS:          u32 = 0x0000_0000;
-pub const STATUS_PENDING:          u32 = 0x0000_0103;
-pub const STATUS_TIMEOUT:          u32 = 0x0000_0102;
+pub const STATUS_SUCCESS: u32 = 0x0000_0000;
+pub const STATUS_PENDING: u32 = 0x0000_0103;
+pub const STATUS_TIMEOUT: u32 = 0x0000_0102;
 pub const STATUS_ABANDONED_WAIT_0: u32 = 0x0000_0080;
-pub const STATUS_USER_APC:         u32 = 0x0000_00C0;
+pub const STATUS_USER_APC: u32 = 0x0000_00C0;
 
 // ── block_thread_locked ───────────────────────────────────────────────────────
 
@@ -29,7 +29,7 @@ pub fn block_thread_locked(tid: u32, deadline: WaitDeadline) {
     let dl = deadline.to_ticks();
     with_thread_mut(tid, |t| {
         t.wait.deadline = dl;
-        t.wait.result   = STATUS_SUCCESS;
+        t.wait.result = STATUS_SUCCESS;
     });
     set_thread_state_locked(tid, ThreadState::Waiting);
 }
@@ -37,9 +37,9 @@ pub fn block_thread_locked(tid: u32, deadline: WaitDeadline) {
 /// Block the current thread for a pure delay (NtDelayExecution).
 pub fn block_thread_delay_locked(tid: u32, deadline: WaitDeadline) {
     with_thread_mut(tid, |t| {
-        t.wait.kind     = WAIT_KIND_DELAY;
+        t.wait.kind = WAIT_KIND_DELAY;
         t.wait.deadline = deadline.to_ticks();
-        t.wait.result   = STATUS_SUCCESS;
+        t.wait.result = STATUS_SUCCESS;
     });
     set_thread_state_locked(tid, ThreadState::Waiting);
 }
@@ -71,7 +71,7 @@ pub fn unblock_thread_locked(tid: u32, result: u32) {
     crate::sched::sync::detach_thread_sync_wait_links_locked(tid);
     with_thread_mut(tid, |t| {
         t.wait.result = result;
-        t.wait.kind   = WAIT_KIND_NONE;
+        t.wait.kind = WAIT_KIND_NONE;
         t.wait.handle_count = 0;
         t.wait.wait_all = false;
         t.wait.signaled_mask = 0;

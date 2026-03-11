@@ -8,6 +8,12 @@ pub const GUEST_PHYS_BASE: u64 = 0x4000_0000;
 pub const GUEST_PHYS_LIMIT: u64 = 0x8000_0000;
 pub const KERNEL_PHYSMAP_BASE: u64 = 0x8000_0000;
 pub const KERNEL_PHYSMAP_LIMIT: u64 = 0xc000_0000;
+pub const KERNEL_VM_BASE: u64 = 0xc000_0000;
+pub const KERNEL_VM_LIMIT: u64 = 0x1_0000_0000;
+pub const KERNEL_KMAP_BASE: u64 = KERNEL_VM_BASE;
+pub const KERNEL_KMAP_LIMIT: u64 = 0xc020_0000;
+pub const KERNEL_VMAP_BASE: u64 = KERNEL_KMAP_LIMIT;
+pub const KERNEL_VMAP_LIMIT: u64 = KERNEL_VM_LIMIT;
 
 #[inline(always)]
 pub fn memory_features_raw() -> u64 {
@@ -139,6 +145,16 @@ pub fn l2_index_in_user_window(_user_va_base: u64, _user_va_limit: u64, _idx: us
 }
 
 #[inline(always)]
-pub unsafe fn install_process_root_tables(_l0: *mut u64, _l1: *mut u64, _l2: *mut u64) {
+pub unsafe fn install_process_root_tables(_l0_pa: u64, _l1_pa: u64, _l2_pa: u64) {
+    unsupported()
+}
+
+#[inline(always)]
+pub fn map_kernel_pages(_va: u64, _pa: u64, _pages: usize) -> bool {
+    unsupported()
+}
+
+#[inline(always)]
+pub fn unmap_kernel_pages(_va: u64, _pages: usize) -> bool {
     unsupported()
 }

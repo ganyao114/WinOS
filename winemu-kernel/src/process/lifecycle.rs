@@ -103,9 +103,8 @@ pub(crate) fn update_current_thread_stack_limit(owner_pid: u32, new_limit: u64) 
     if tid == 0 || !crate::sched::thread_exists(tid) {
         return;
     }
-    let teb_va =
-        crate::sched::with_thread(tid, |t| if t.pid == owner_pid { t.teb_va } else { 0 })
-            .unwrap_or(0);
+    let teb_va = crate::sched::with_thread(tid, |t| if t.pid == owner_pid { t.teb_va } else { 0 })
+        .unwrap_or(0);
     if teb_va == 0 {
         return;
     }

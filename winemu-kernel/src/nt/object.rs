@@ -3,9 +3,9 @@ use core::mem::size_of;
 use crate::sched::wait::STATUS_SUCCESS;
 use winemu_shared::status;
 
-use super::common::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+use super::common::{GuestWriter, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
 use super::kobject;
-use crate::mm::usercopy::{copy_to_current_user, write_current_user_value};
+use super::user_args::UserOutPtr;
 use super::SvcFrame;
 
 const OBJECT_INFORMATION_CLASS_BASIC: u32 = 0;
@@ -50,7 +50,7 @@ pub(crate) fn handle_duplicate_object(frame: &mut SvcFrame) {
     let source_process = frame.x[0];
     let src = frame.x[1];
     let target_process = frame.x[2];
-    let out_ptr = frame.x[3] as *mut u64;
+    let out_ptr = UserOutPtr::from_raw(frame.x[3] as *mut u64);
     let desired_access = frame.x[4] as u32;
     let options = frame.x[6] as u32;
 
@@ -68,8 +68,7 @@ pub(crate) fn handle_duplicate_object(frame: &mut SvcFrame) {
         return;
     };
 
-    let Some((src_kind, _src_idx)) = kobject::resolve_handle_target_for_pid(source_pid, src)
-    else {
+    let Some((src_kind, _src_idx)) = kobject::resolve_handle_target_for_pid(source_pid, src) else {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     };
@@ -92,7 +91,7 @@ pub(crate) fn handle_duplicate_object(frame: &mut SvcFrame) {
         }
     };
 
-    if !out_ptr.is_null() && !write_current_user_value(out_ptr, dup) {
+    if !out_ptr.write_current_if_present(dup) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
@@ -128,13 +127,13 @@ fn query_object_basic(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) 
     }
 
     let refs = 1u32;
-    let mut obi = [0u8; OBJECT_BASIC_INFORMATION_SIZE];
-    obi[8..12].copy_from_slice(&refs.to_le_bytes());
-    obi[12..16].copy_from_slice(&refs.to_le_bytes());
-
-    if !copy_to_current_user(buf, obi.as_ptr(), OBJECT_BASIC_INFORMATION_SIZE) {
+    let Some(mut w) = GuestWriter::new(buf, len, OBJECT_BASIC_INFORMATION_SIZE) else {
         return status::INVALID_PARAMETER;
-    }
+    };
+    w.u64(0)
+        .u32(refs)
+        .u32(refs)
+        .zeros(OBJECT_BASIC_INFORMATION_SIZE - 16);
     write_ret_len(ret_len, OBJECT_BASIC_INFORMATION_SIZE as u32);
     status::SUCCESS
 }
@@ -157,31 +156,19 @@ fn query_object_name(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -
         return status::INFO_LENGTH_MISMATCH;
     }
 
-    let zero = [0u8; OBJECT_NAME_INFORMATION_SIZE];
-    if !copy_to_current_user(buf, zero.as_ptr(), zero.len()) {
+    let Some(mut w) = GuestWriter::new(buf, len, required) else {
         return status::INVALID_PARAMETER;
-    }
-
+    };
     let uni_len = core::cmp::min(name_len_bytes, u16::MAX as usize) as u16;
-    if !write_current_user_value(buf as *mut u16, uni_len)
-        || !write_current_user_value(unsafe { buf.add(2) } as *mut u16, uni_len)
-    {
-        return status::INVALID_PARAMETER;
-    }
-
-    if name_len_bytes != 0 {
-        let name_ptr = unsafe { buf.add(OBJECT_NAME_INFORMATION_SIZE) };
-        if !write_current_user_value(unsafe { buf.add(8) } as *mut u64, name_ptr as u64) {
-            return status::INVALID_PARAMETER;
-        }
-        if let Some(name) = name_utf16.as_ref() {
-            let mut i = 0usize;
-            while i < name.len() {
-                if !write_current_user_value(unsafe { name_ptr.add(i * 2) } as *mut u16, name[i]) {
-                    return status::INVALID_PARAMETER;
-                }
-                i += 1;
-            }
+    let name_addr = if name_len_bytes != 0 {
+        buf as u64 + OBJECT_NAME_INFORMATION_SIZE as u64
+    } else {
+        0
+    };
+    w.u16(uni_len).u16(uni_len).u32(0).u64(name_addr);
+    if let Some(name) = name_utf16.as_ref() {
+        for &ch in name {
+            w.u16(ch);
         }
     }
     write_ret_len(ret_len, required as u32);
@@ -201,40 +188,22 @@ fn query_object_type(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -
         return status::INFO_LENGTH_MISMATCH;
     }
 
-    let zero = [0u8; OBJECT_TYPE_INFORMATION_SIZE];
-    if !copy_to_current_user(buf, zero.as_ptr(), zero.len()) {
+    let Some(mut w) = GuestWriter::new(buf, len, required) else {
         return status::INVALID_PARAMETER;
-    }
-
+    };
     let type_meta = kobject::object_type_meta_for_kind(kind);
-    let name_ptr = unsafe { buf.add(OBJECT_TYPE_INFORMATION_SIZE) };
-    let name_addr = name_ptr as u64;
-
-    if !write_current_user_value(buf as *mut u16, type_name_bytes as u16)
-        || !write_current_user_value(unsafe { buf.add(2) } as *mut u16, type_name_bytes as u16)
-        || !write_current_user_value(unsafe { buf.add(8) } as *mut u64, name_addr)
-        || !write_current_user_value(
-            unsafe { buf.add(84) } as *mut u32,
-            type_meta.valid_access_mask,
-        )
-        || !write_current_user_value(
-            unsafe { buf.add(88) },
-            type_meta.security_required as u8,
-        )
-        || !write_current_user_value(
-            unsafe { buf.add(89) },
-            type_meta.maintain_handle_count as u8,
-        )
-    {
-        return status::INVALID_PARAMETER;
-    }
-
-    let mut i = 0usize;
-    while i < type_name_utf16.len() {
-        if !write_current_user_value(unsafe { name_ptr.add(i * 2) } as *mut u16, type_name_utf16[i]) {
-            return status::INVALID_PARAMETER;
-        }
-        i += 1;
+    let name_addr = buf as u64 + OBJECT_TYPE_INFORMATION_SIZE as u64;
+    w.u16(type_name_bytes as u16)
+        .u16(type_name_bytes as u16)
+        .u32(0)
+        .u64(name_addr)
+        .zeros(68)
+        .u32(type_meta.valid_access_mask)
+        .u8(type_meta.security_required as u8)
+        .u8(type_meta.maintain_handle_count as u8)
+        .zeros(14);
+    for &ch in type_name_utf16 {
+        w.u16(ch);
     }
 
     write_ret_len(ret_len, required as u32);
@@ -242,7 +211,5 @@ fn query_object_type(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) -
 }
 
 fn write_ret_len(ptr: *mut u32, value: u32) {
-    if !ptr.is_null() {
-        let _ = write_current_user_value(ptr, value);
-    }
+    let _ = UserOutPtr::from_raw(ptr).write_current_if_present(value);
 }

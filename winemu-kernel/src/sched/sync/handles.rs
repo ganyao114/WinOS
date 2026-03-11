@@ -4,20 +4,20 @@
 // set/wait  : KHandleTable.get → obj_idx → sync_get_mut_by_idx
 // close     : KHandleTable.remove → sync_free_idx  (via kobject drain)
 
+use crate::process::{current_pid, with_process_mut, KObjectRef};
+use crate::sched::cpu::current_tid;
+use crate::sched::global::{with_thread, with_thread_mut};
+use crate::sched::lock::SchedLockAndSleep;
 use crate::sched::sync::primitives_api::{KEvent, KMutex, KSemaphore};
 use crate::sched::sync::state::{sync_alloc, sync_get_by_idx, sync_get_mut_by_idx, SyncObject};
 use crate::sched::types::{
     ThreadState, WaitDeadline, MAX_WAIT_HANDLES, WAIT_KIND_MULTIPLE, WAIT_KIND_NONE,
     WAIT_KIND_SINGLE,
 };
-use crate::sched::wait::{STATUS_SUCCESS, STATUS_TIMEOUT, STATUS_PENDING};
-use crate::sched::cpu::current_tid;
-use crate::sched::lock::SchedLockAndSleep;
-use crate::sched::global::{with_thread, with_thread_mut};
-use crate::process::{KObjectRef, current_pid, with_process_mut};
+use crate::sched::wait::{STATUS_PENDING, STATUS_SUCCESS, STATUS_TIMEOUT};
 use winemu_shared::status;
 
-pub const STATUS_INVALID_HANDLE:       u32 = status::INVALID_HANDLE;
+pub const STATUS_INVALID_HANDLE: u32 = status::INVALID_HANDLE;
 pub const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
 const WAITABLE_POLL_REL_100NS: i64 = -10_000; // 1ms
 
@@ -26,14 +26,14 @@ const WAITABLE_POLL_REL_100NS: i64 = -10_000; // 1ms
 fn resolve_sync(handle: u64) -> Option<(u32, &'static SyncObject)> {
     let pid = current_pid();
     let obj = with_process_mut(pid, |p| p.handle_table.get(handle as u32)).flatten()?;
-    let so  = sync_get_by_idx(obj.obj_idx)?;
+    let so = sync_get_by_idx(obj.obj_idx)?;
     Some((obj.obj_idx, so))
 }
 
 fn resolve_sync_mut(handle: u64) -> Option<(u32, &'static mut SyncObject)> {
     let pid = current_pid();
     let obj = with_process_mut(pid, |p| p.handle_table.get(handle as u32)).flatten()?;
-    let so  = sync_get_mut_by_idx(obj.obj_idx)?;
+    let so = sync_get_mut_by_idx(obj.obj_idx)?;
     Some((obj.obj_idx, so))
 }
 
@@ -52,14 +52,14 @@ fn next_waitable_poll_deadline(deadline: WaitDeadline) -> WaitDeadline {
     match deadline {
         WaitDeadline::Immediate => WaitDeadline::Immediate,
         WaitDeadline::Infinite => crate::sched::wait::timeout_to_deadline(WAITABLE_POLL_REL_100NS),
-        WaitDeadline::DeadlineTicks(limit) => match crate::sched::wait::timeout_to_deadline(
-            WAITABLE_POLL_REL_100NS,
-        ) {
-            WaitDeadline::DeadlineTicks(poll) => WaitDeadline::DeadlineTicks(core::cmp::min(
-                limit, poll,
-            )),
-            _ => WaitDeadline::DeadlineTicks(limit),
-        },
+        WaitDeadline::DeadlineTicks(limit) => {
+            match crate::sched::wait::timeout_to_deadline(WAITABLE_POLL_REL_100NS) {
+                WaitDeadline::DeadlineTicks(poll) => {
+                    WaitDeadline::DeadlineTicks(core::cmp::min(limit, poll))
+                }
+                _ => WaitDeadline::DeadlineTicks(limit),
+            }
+        }
     }
 }
 
@@ -169,24 +169,31 @@ pub fn create_event(auto_reset: bool, initial_state: bool) -> Option<u64> {
     let obj_idx = sync_alloc(SyncObject::Event(KEvent::new(auto_reset, initial_state)))? as u32;
     let pid = current_pid();
     with_process_mut(pid, |p| p.handle_table.add(KObjectRef::event(obj_idx)))
-        .flatten().map(|h| h as u64)
+        .flatten()
+        .map(|h| h as u64)
 }
 
 pub fn set_event(handle: u64) -> u32 {
     let _lock = crate::sched::lock::KSchedulerLock::lock();
     match resolve_sync_mut(handle) {
-        Some((_, SyncObject::Event(e))) => { e.signal(); STATUS_SUCCESS }
+        Some((_, SyncObject::Event(e))) => {
+            e.signal();
+            STATUS_SUCCESS
+        }
         Some(_) => STATUS_OBJECT_TYPE_MISMATCH,
-        None    => STATUS_INVALID_HANDLE,
+        None => STATUS_INVALID_HANDLE,
     }
 }
 
 pub fn reset_event(handle: u64) -> u32 {
     let _lock = crate::sched::lock::KSchedulerLock::lock();
     match resolve_sync_mut(handle) {
-        Some((_, SyncObject::Event(e))) => { e.clear(); STATUS_SUCCESS }
+        Some((_, SyncObject::Event(e))) => {
+            e.clear();
+            STATUS_SUCCESS
+        }
         Some(_) => STATUS_OBJECT_TYPE_MISMATCH,
-        None    => STATUS_INVALID_HANDLE,
+        None => STATUS_INVALID_HANDLE,
     }
 }
 
@@ -194,7 +201,7 @@ pub fn query_event(handle: u64) -> (u32, bool) {
     match resolve_sync(handle) {
         Some((_, SyncObject::Event(e))) => (STATUS_SUCCESS, e.is_signaled()),
         Some(_) => (STATUS_OBJECT_TYPE_MISMATCH, false),
-        None    => (STATUS_INVALID_HANDLE, false),
+        None => (STATUS_INVALID_HANDLE, false),
     }
 }
 
@@ -211,7 +218,8 @@ pub fn create_mutex(initial_owner: bool) -> Option<u64> {
     let obj_idx = sync_alloc(SyncObject::Mutex(m))? as u32;
     let pid = current_pid();
     with_process_mut(pid, |p| p.handle_table.add(KObjectRef::mutex(obj_idx)))
-        .flatten().map(|h| h as u64)
+        .flatten()
+        .map(|h| h as u64)
 }
 
 pub fn release_mutex(handle: u64) -> u32 {
@@ -220,7 +228,7 @@ pub fn release_mutex(handle: u64) -> u32 {
     match resolve_sync_mut(handle) {
         Some((_, SyncObject::Mutex(m))) => m.release(tid),
         Some(_) => STATUS_OBJECT_TYPE_MISMATCH,
-        None    => STATUS_INVALID_HANDLE,
+        None => STATUS_INVALID_HANDLE,
     }
 }
 
@@ -231,7 +239,8 @@ pub fn create_semaphore(initial: i32, maximum: i32) -> Option<u64> {
     let obj_idx = sync_alloc(SyncObject::Semaphore(KSemaphore::new(initial, maximum)))? as u32;
     let pid = current_pid();
     with_process_mut(pid, |p| p.handle_table.add(KObjectRef::semaphore(obj_idx)))
-        .flatten().map(|h| h as u64)
+        .flatten()
+        .map(|h| h as u64)
 }
 
 pub fn release_semaphore(handle: u64, count: i32) -> (u32, i32) {
@@ -242,7 +251,7 @@ pub fn release_semaphore(handle: u64, count: i32) -> (u32, i32) {
             (s.release(count), prev)
         }
         Some(_) => (STATUS_OBJECT_TYPE_MISMATCH, 0),
-        None    => (STATUS_INVALID_HANDLE, 0),
+        None => (STATUS_INVALID_HANDLE, 0),
     }
 }
 
@@ -309,11 +318,7 @@ pub fn wait_for_single_object(handle: u64, deadline: WaitDeadline) -> u32 {
     }
 }
 
-pub fn wait_for_multiple_objects(
-    handles: &[u64],
-    wait_all: bool,
-    deadline: WaitDeadline,
-) -> u32 {
+pub fn wait_for_multiple_objects(handles: &[u64], wait_all: bool, deadline: WaitDeadline) -> u32 {
     const STATUS_WAIT_0: u32 = 0x0000_0000;
     let tid = current_tid();
 
@@ -325,22 +330,36 @@ pub fn wait_for_multiple_objects(
         if !wait_all {
             let mut found = None;
             for (i, &h) in handles.iter().enumerate() {
-                if resolve_sync(h).map(|(_, o)| o.is_signaled()).unwrap_or(false) {
-                    found = Some(i); break;
+                if resolve_sync(h)
+                    .map(|(_, o)| o.is_signaled())
+                    .unwrap_or(false)
+                {
+                    found = Some(i);
+                    break;
                 }
             }
             if let Some(i) = found {
                 if let Some((_, obj)) = resolve_sync_mut(handles[i]) {
                     match obj {
-                        SyncObject::Event(e)     => { if e.auto_reset { e.clear(); } }
-                        SyncObject::Mutex(m)     => { m.owner_tid = tid; m.recursion = 1; }
-                        SyncObject::Semaphore(s) => { s.count -= 1; }
+                        SyncObject::Event(e) => {
+                            if e.auto_reset {
+                                e.clear();
+                            }
+                        }
+                        SyncObject::Mutex(m) => {
+                            m.owner_tid = tid;
+                            m.recursion = 1;
+                        }
+                        SyncObject::Semaphore(s) => {
+                            s.count -= 1;
+                        }
                     }
                 }
                 slp.cancel();
                 STATUS_WAIT_0 + i as u32
             } else if deadline == WaitDeadline::Immediate {
-                slp.cancel(); STATUS_TIMEOUT
+                slp.cancel();
+                STATUS_TIMEOUT
             } else if let Some(&h) = handles.first() {
                 let r = match resolve_sync_mut(h) {
                     Some((obj_idx, SyncObject::Event(e))) => {
@@ -364,7 +383,10 @@ pub fn wait_for_multiple_objects(
                         }
                         r
                     }
-                    None => { slp.cancel(); STATUS_INVALID_HANDLE }
+                    None => {
+                        slp.cancel();
+                        STATUS_INVALID_HANDLE
+                    }
                 };
                 if r == STATUS_PENDING {
                     set_sync_wait_multiple_locked(tid, pending_idx, wait_all);
@@ -374,29 +396,46 @@ pub fn wait_for_multiple_objects(
                 }
                 r
             } else {
-                slp.cancel(); STATUS_TIMEOUT
+                slp.cancel();
+                STATUS_TIMEOUT
             }
         } else {
             let all = handles.iter().all(|&h| {
-                resolve_sync(h).map(|(_, o)| o.is_signaled()).unwrap_or(false)
+                resolve_sync(h)
+                    .map(|(_, o)| o.is_signaled())
+                    .unwrap_or(false)
             });
             if all {
                 for &h in handles {
                     if let Some((_, obj)) = resolve_sync_mut(h) {
                         match obj {
-                            SyncObject::Event(e)     => { if e.auto_reset { e.clear(); } }
-                            SyncObject::Mutex(m)     => { m.owner_tid = tid; m.recursion = 1; }
-                            SyncObject::Semaphore(s) => { s.count -= 1; }
+                            SyncObject::Event(e) => {
+                                if e.auto_reset {
+                                    e.clear();
+                                }
+                            }
+                            SyncObject::Mutex(m) => {
+                                m.owner_tid = tid;
+                                m.recursion = 1;
+                            }
+                            SyncObject::Semaphore(s) => {
+                                s.count -= 1;
+                            }
                         }
                     }
                 }
-                slp.cancel(); STATUS_WAIT_0
+                slp.cancel();
+                STATUS_WAIT_0
             } else if deadline == WaitDeadline::Immediate {
-                slp.cancel(); STATUS_TIMEOUT
+                slp.cancel();
+                STATUS_TIMEOUT
             } else {
                 let mut blocked = STATUS_TIMEOUT;
                 for &h in handles {
-                    if !resolve_sync(h).map(|(_, o)| o.is_signaled()).unwrap_or(false) {
+                    if !resolve_sync(h)
+                        .map(|(_, o)| o.is_signaled())
+                        .unwrap_or(false)
+                    {
                         blocked = match resolve_sync_mut(h) {
                             Some((obj_idx, SyncObject::Event(e))) => {
                                 let r = e.wait(tid, deadline);

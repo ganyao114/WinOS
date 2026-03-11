@@ -20,6 +20,12 @@ pub const GUEST_PHYS_BASE: u64 = super::backend::mmu::GUEST_PHYS_BASE;
 pub const GUEST_PHYS_LIMIT: u64 = super::backend::mmu::GUEST_PHYS_LIMIT;
 pub const KERNEL_PHYSMAP_BASE: u64 = super::backend::mmu::KERNEL_PHYSMAP_BASE;
 pub const KERNEL_PHYSMAP_LIMIT: u64 = super::backend::mmu::KERNEL_PHYSMAP_LIMIT;
+pub const KERNEL_VM_BASE: u64 = super::backend::mmu::KERNEL_VM_BASE;
+pub const KERNEL_VM_LIMIT: u64 = super::backend::mmu::KERNEL_VM_LIMIT;
+pub const KERNEL_KMAP_BASE: u64 = super::backend::mmu::KERNEL_KMAP_BASE;
+pub const KERNEL_KMAP_LIMIT: u64 = super::backend::mmu::KERNEL_KMAP_LIMIT;
+pub const KERNEL_VMAP_BASE: u64 = super::backend::mmu::KERNEL_VMAP_BASE;
+pub const KERNEL_VMAP_LIMIT: u64 = super::backend::mmu::KERNEL_VMAP_LIMIT;
 
 #[derive(Clone, Copy)]
 pub struct MemoryFeatures {
@@ -181,6 +187,16 @@ pub fn l2_index_in_user_window(user_va_base: u64, user_va_limit: u64, idx: usize
 }
 
 #[inline(always)]
-pub unsafe fn install_process_root_tables(l0: *mut u64, l1: *mut u64, l2: *mut u64) {
-    super::backend::mmu::install_process_root_tables(l0, l1, l2);
+pub unsafe fn install_process_root_tables(l0_pa: u64, l1_pa: u64, l2_pa: u64) {
+    super::backend::mmu::install_process_root_tables(l0_pa, l1_pa, l2_pa);
+}
+
+#[inline(always)]
+pub fn map_kernel_pages(va: u64, pa: u64, pages: usize) -> bool {
+    super::backend::mmu::map_kernel_pages(va, pa, pages)
+}
+
+#[inline(always)]
+pub fn unmap_kernel_pages(va: u64, pages: usize) -> bool {
+    super::backend::mmu::unmap_kernel_pages(va, pages)
 }

@@ -142,6 +142,10 @@ pub extern "C" fn el0_page_fault(far: u64, esr: u64, elr: u64, frame_ptr: u64) -
     // fallback slot is still zero but locale table pointer is already populated.
     // Patch slot from table and retry the faulting instruction once.
     if far == 0x8 && elr == 0x4042_a058 {
+        use crate::mm::usercopy::{
+            read_current_user_mapped_value, write_current_user_mapped_value,
+        };
+
         let kb_slot_va = 0x4053_f938u64;
         let kb_table_va = 0x4053_f950u64;
         let fault_x23 = if frame_ptr != 0 {
@@ -149,19 +153,19 @@ pub extern "C" fn el0_page_fault(far: u64, esr: u64, elr: u64, frame_ptr: u64) -
         } else {
             0
         };
-        unsafe {
-            let slot = (kb_slot_va as *const u64).read_volatile();
-            let table = (kb_table_va as *const u64).read_volatile();
-            let replacement = if slot != 0 { slot } else { table };
-            if fault_x23 == 0 && replacement != 0 {
+        let slot = read_current_user_mapped_value(kb_slot_va as *const u64).unwrap_or(0);
+        let table = read_current_user_mapped_value(kb_table_va as *const u64).unwrap_or(0);
+        let replacement = if slot != 0 { slot } else { table };
+        if fault_x23 == 0 && replacement != 0 {
+            unsafe {
                 if frame_ptr != 0 {
                     (frame_ptr as *mut u64).add(23).write_volatile(replacement);
                 }
-                if slot == 0 {
-                    (kb_slot_va as *mut u64).write_volatile(replacement);
-                }
-                return 1;
             }
+            if slot == 0 {
+                let _ = write_current_user_mapped_value(kb_slot_va as *mut u64, replacement);
+            }
+            return 1;
         }
     }
 
@@ -313,9 +317,12 @@ pub extern "C" fn kernel_main() -> ! {
     };
 
     let loaded = unsafe {
-        ldr::load_from_fd(exe_fd, exe_size, crate::mm::VmaType::ExeImage, |dll_name, imp| {
-            dll::resolve_import(dll_name, imp)
-        })
+        ldr::load_from_fd(
+            exe_fd,
+            exe_size,
+            crate::mm::VmaType::ExeImage,
+            |dll_name, imp| dll::resolve_import(dll_name, imp),
+        )
     };
 
     // 关闭 exe fd

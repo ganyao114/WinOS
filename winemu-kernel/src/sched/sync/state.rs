@@ -4,8 +4,8 @@
 // The public NT handles are managed by process::KHandleTable and carry obj_idx.
 // All access here requires the scheduler lock to be held.
 
-use crate::sched::sync::primitives_api::{KEvent, KMutex, KSemaphore};
 use crate::kobj::ObjectStore;
+use crate::sched::sync::primitives_api::{KEvent, KMutex, KSemaphore};
 use winemu_shared::status;
 
 // ── SyncObject enum ───────────────────────────────────────────────────────────
@@ -18,28 +18,52 @@ pub enum SyncObject {
 
 impl SyncObject {
     pub fn as_event(&self) -> Option<&KEvent> {
-        if let SyncObject::Event(e) = self { Some(e) } else { None }
+        if let SyncObject::Event(e) = self {
+            Some(e)
+        } else {
+            None
+        }
     }
     pub fn as_event_mut(&mut self) -> Option<&mut KEvent> {
-        if let SyncObject::Event(e) = self { Some(e) } else { None }
+        if let SyncObject::Event(e) = self {
+            Some(e)
+        } else {
+            None
+        }
     }
     pub fn as_mutex(&self) -> Option<&KMutex> {
-        if let SyncObject::Mutex(m) = self { Some(m) } else { None }
+        if let SyncObject::Mutex(m) = self {
+            Some(m)
+        } else {
+            None
+        }
     }
     pub fn as_mutex_mut(&mut self) -> Option<&mut KMutex> {
-        if let SyncObject::Mutex(m) = self { Some(m) } else { None }
+        if let SyncObject::Mutex(m) = self {
+            Some(m)
+        } else {
+            None
+        }
     }
     pub fn as_semaphore(&self) -> Option<&KSemaphore> {
-        if let SyncObject::Semaphore(s) = self { Some(s) } else { None }
+        if let SyncObject::Semaphore(s) = self {
+            Some(s)
+        } else {
+            None
+        }
     }
     pub fn as_semaphore_mut(&mut self) -> Option<&mut KSemaphore> {
-        if let SyncObject::Semaphore(s) = self { Some(s) } else { None }
+        if let SyncObject::Semaphore(s) = self {
+            Some(s)
+        } else {
+            None
+        }
     }
 
     pub fn is_signaled(&self) -> bool {
         match self {
-            SyncObject::Event(e)     => e.is_signaled(),
-            SyncObject::Mutex(m)     => m.owner_tid == 0,
+            SyncObject::Event(e) => e.is_signaled(),
+            SyncObject::Mutex(m) => m.owner_tid == 0,
             SyncObject::Semaphore(s) => s.count > 0,
         }
     }
@@ -55,7 +79,9 @@ pub struct SyncObjectStore {
 
 impl SyncObjectStore {
     pub fn new() -> Self {
-        Self { store: ObjectStore::new() }
+        Self {
+            store: ObjectStore::new(),
+        }
     }
 
     /// Allocate a new sync object. Returns object index (u32 cast to u64).
@@ -66,20 +92,27 @@ impl SyncObjectStore {
     /// Get an immutable reference to the object for `handle`.
     pub fn get(&self, handle: u64) -> Option<&SyncObject> {
         let ptr = self.store.get_ptr(handle as u32);
-        if ptr.is_null() { None } else { Some(unsafe { &*ptr }) }
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*ptr })
+        }
     }
 
     /// Get a mutable reference to the object for `handle`.
     pub fn get_mut(&mut self, handle: u64) -> Option<&mut SyncObject> {
         let ptr = self.store.get_ptr(handle as u32);
-        if ptr.is_null() { None } else { Some(unsafe { &mut *ptr }) }
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &mut *ptr })
+        }
     }
 
     /// Free a handle.
     pub fn free(&mut self, handle: u64) -> bool {
         self.store.free(handle as u32)
     }
-
 }
 
 unsafe impl Send for SyncObjectStore {}
@@ -98,7 +131,9 @@ unsafe impl Send for GlobalSyncState {}
 
 impl GlobalSyncState {
     const fn new() -> Self {
-        Self { store: UnsafeCell::new(None) }
+        Self {
+            store: UnsafeCell::new(None),
+        }
     }
 
     pub fn init(&self) {
@@ -107,12 +142,16 @@ impl GlobalSyncState {
 
     #[inline]
     pub unsafe fn store(&self) -> &SyncObjectStore {
-        (*self.store.get()).as_ref().expect("sync state not initialized")
+        (*self.store.get())
+            .as_ref()
+            .expect("sync state not initialized")
     }
 
     #[inline]
     pub unsafe fn store_mut(&self) -> &mut SyncObjectStore {
-        (*self.store.get()).as_mut().expect("sync state not initialized")
+        (*self.store.get())
+            .as_mut()
+            .expect("sync state not initialized")
     }
 }
 
@@ -131,13 +170,21 @@ pub fn sync_alloc(obj: SyncObject) -> Option<u64> {
 /// Get by raw obj_idx (not handle). Used after resolving via KHandleTable.
 pub fn sync_get_by_idx(idx: u32) -> Option<&'static SyncObject> {
     let ptr = unsafe { SYNC_STATE.store() }.store.get_ptr(idx);
-    if ptr.is_null() { None } else { Some(unsafe { &*ptr }) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &*ptr })
+    }
 }
 
 /// Get mutable by raw obj_idx.
 pub fn sync_get_mut_by_idx(idx: u32) -> Option<&'static mut SyncObject> {
     let ptr = unsafe { SYNC_STATE.store_mut() }.store.get_ptr(idx);
-    if ptr.is_null() { None } else { Some(unsafe { &mut *ptr }) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &mut *ptr })
+    }
 }
 
 /// Free by raw obj_idx. Called from kobject close_last_ref.

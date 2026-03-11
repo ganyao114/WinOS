@@ -2,23 +2,22 @@
 //
 // All functions require the scheduler lock to be held.
 
-use core::sync::atomic::Ordering;
-use crate::sched::cpu::{cpu_local, current_tid, vcpu_id};
 use crate::sched::cpu::set_needs_reschedule;
-use crate::sched::global::{SCHED, with_thread, with_thread_mut};
+use crate::sched::cpu::{cpu_local, current_tid, vcpu_id};
+use crate::sched::global::{with_thread, with_thread_mut, SCHED};
 use crate::sched::types::{ThreadState, MAX_VCPUS};
+use core::sync::atomic::Ordering;
 
 // ── set_thread_state_locked ───────────────────────────────────────────────────
 
 /// Transition a thread's state and update the ready queue accordingly.
 /// Must be called with the scheduler lock held.
 pub fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
-    let (old_state, old_priority, is_idle) = match with_thread(tid, |t| {
-        (t.state, t.priority, t.is_idle_thread)
-    }) {
-        Some(v) => v,
-        None => return,
-    };
+    let (old_state, old_priority, is_idle) =
+        match with_thread(tid, |t| (t.state, t.priority, t.is_idle_thread)) {
+            Some(v) => v,
+            None => return,
+        };
 
     if old_state == new_state {
         return;
@@ -91,9 +90,7 @@ pub fn hint_reschedule_any_idle() {
 
 /// Returns true if `tid` can run on `vid`.
 pub fn thread_can_run_on(tid: u32, vid: u32) -> bool {
-    with_thread(tid, |t| {
-        (t.affinity_mask & (1u32 << vid)) != 0
-    }).unwrap_or(false)
+    with_thread(tid, |t| (t.affinity_mask & (1u32 << vid)) != 0).unwrap_or(false)
 }
 
 #[inline]
@@ -104,7 +101,11 @@ fn active_vcpu_mask_locked() -> u32 {
             mask |= 1u32 << vid;
         }
     }
-    if mask == 0 { 1 } else { mask }
+    if mask == 0 {
+        1
+    } else {
+        mask
+    }
 }
 
 #[inline]
@@ -133,8 +134,7 @@ fn push_tid_to_ready_queue_locked(tid: u32, priority: u8) {
         return;
     }
     let queue = unsafe { SCHED.queue_raw_mut() };
-    let store =
-        unsafe { SCHED.threads_raw_mut() } as *mut crate::sched::thread_store::ThreadStore;
+    let store = unsafe { SCHED.threads_raw_mut() } as *mut crate::sched::thread_store::ThreadStore;
     queue.push_with_store(tid, priority, &mut |id| unsafe { (*store).get_mut(id) });
     with_thread_mut(tid, |t| {
         t.in_ready_queue = true;

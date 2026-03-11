@@ -84,14 +84,16 @@ extern "C" {
 #[no_mangle]
 extern "C" fn __winemu_syscall_dispatcher() {}
 
+use crate::mm::usercopy::write_current_user_value;
+
 /// 初始化 syscall 分发器
 /// teb_va: 当前线程的 TEB 虚拟地址
 pub fn init_dispatcher(teb_va: u64) {
     use winemu_shared::teb;
     let dispatcher_va = __winemu_syscall_dispatcher as u64;
     // 写入 TEB+0x2f8（SYSCALL_TABLE 字段）
-    unsafe {
-        let ptr = (teb_va + teb::SYSCALL_TABLE as u64) as *mut u64;
-        ptr.write_volatile(dispatcher_va);
-    }
+    let _ = write_current_user_value(
+        (teb_va + teb::SYSCALL_TABLE as u64) as *mut u64,
+        dispatcher_va,
+    );
 }

@@ -1,6 +1,9 @@
 use winemu_shared::status;
 
+use crate::mm::usercopy::write_current_user_value;
+
 use super::with_process;
+use crate::nt::common::GuestWriter;
 
 const PROCESS_BASIC_INFORMATION_SIZE: usize = 48;
 const PROCESS_IMAGE_FILE_NAME_SIZE: usize = 16;
@@ -38,9 +41,10 @@ fn query_wow64_information(buf: *mut u8, buf_len: usize, ret_len: *mut u32) -> u
         write_ret_len(ret_len, PROCESS_WOW64_INFORMATION_SIZE as u32);
         return status::INFO_LENGTH_MISMATCH;
     }
-    unsafe {
-        (buf as *mut u64).write_volatile(0);
-    }
+    let Some(mut w) = GuestWriter::new(buf, buf_len, PROCESS_WOW64_INFORMATION_SIZE) else {
+        return status::INVALID_PARAMETER;
+    };
+    w.u64(0);
     write_ret_len(ret_len, PROCESS_WOW64_INFORMATION_SIZE as u32);
     status::SUCCESS
 }
@@ -65,9 +69,10 @@ fn query_basic(pid: u32, buf: *mut u8, buf_len: usize, ret_len: *mut u32) -> u32
     pbi[32..40].copy_from_slice(&(pid as u64).to_le_bytes());
     pbi[40..48].copy_from_slice(&(parent_pid as u64).to_le_bytes());
 
-    unsafe {
-        core::ptr::copy_nonoverlapping(pbi.as_ptr(), buf, PROCESS_BASIC_INFORMATION_SIZE);
-    }
+    let Some(mut w) = GuestWriter::new(buf, buf_len, PROCESS_BASIC_INFORMATION_SIZE) else {
+        return status::INVALID_PARAMETER;
+    };
+    w.bytes(&pbi);
     write_ret_len(ret_len, PROCESS_BASIC_INFORMATION_SIZE as u32);
     status::SUCCESS
 }
@@ -78,17 +83,16 @@ fn query_image_file_name(buf: *mut u8, buf_len: usize, ret_len: *mut u32) -> u32
         return status::INFO_LENGTH_MISMATCH;
     }
 
-    unsafe {
-        core::ptr::write_bytes(buf, 0, PROCESS_IMAGE_FILE_NAME_SIZE);
-    }
+    let Some(mut w) = GuestWriter::new(buf, buf_len, PROCESS_IMAGE_FILE_NAME_SIZE) else {
+        return status::INVALID_PARAMETER;
+    };
+    w.zeros(PROCESS_IMAGE_FILE_NAME_SIZE);
     write_ret_len(ret_len, PROCESS_IMAGE_FILE_NAME_SIZE as u32);
     status::SUCCESS
 }
 
 fn write_ret_len(ptr: *mut u32, value: u32) {
     if !ptr.is_null() {
-        unsafe {
-            ptr.write_volatile(value);
-        }
+        let _ = write_current_user_value(ptr, value);
     }
 }

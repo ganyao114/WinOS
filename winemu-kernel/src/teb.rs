@@ -2,10 +2,12 @@
 // 参考: Wine dlls/ntdll/unix/signal_arm64.c call_init_thunk
 //       Wine dlls/ntdll/unix/virtual.c init_teb / init_peb
 
-use crate::mm::{vm_alloc_region_typed, vm_free_region, vm_make_guard_page};
+use crate::mm::usercopy::{with_current_process_user_slice_mut, write_user_value};
 use crate::mm::VmaType;
+use crate::mm::{
+    vm_alloc_region_typed, vm_free_region, vm_make_guard_page, UserVa, VM_ACCESS_WRITE,
+};
 use crate::nt::constants::PAGE_SIZE_4K;
-use crate::mm::usercopy::write_user_value;
 use winemu_shared::{peb, teb};
 
 /// 已初始化的 TEB/PEB 描述符
@@ -113,17 +115,20 @@ fn write_list_head(buf: &mut [u8], offset: usize, self_va: u64) {
 /// head_list_off: 链表头在 head_buf 中的偏移
 /// entry_list_off: 链表指针在 entry_buf 中的偏移
 fn list_insert_tail(
+    pid: u32,
     head_buf: &mut [u8],
     head_va: u64,
     head_list_off: usize,
     entry_buf: &mut [u8],
     entry_va: u64,
     entry_list_off: usize,
-) {
+) -> bool {
     // 读当前 Blink（尾节点）
     let blink_ptr = {
         let b = &head_buf[head_list_off + 8..head_list_off + 16];
-        u64::from_le_bytes(b.try_into().unwrap())
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(b);
+        u64::from_le_bytes(raw)
     };
     let entry_ptr = entry_va + entry_list_off as u64;
     let head_ptr = head_va + head_list_off as u64;
@@ -140,10 +145,20 @@ fn list_insert_tail(
     if blink_ptr == head_ptr {
         wu64(head_buf, head_list_off, entry_ptr);
     } else {
-        unsafe {
-            (blink_ptr as *mut u64).write_volatile(entry_ptr);
+        if !write_user_value(pid, blink_ptr as *mut u64, entry_ptr) {
+            return false;
         }
     }
+    true
+}
+
+fn with_process_user_buf_mut<R>(
+    pid: u32,
+    va: u64,
+    size: usize,
+    f: impl FnOnce(&mut [u8]) -> R,
+) -> Option<R> {
+    with_current_process_user_slice_mut(pid, UserVa::new(va), size, VM_ACCESS_WRITE, f)
 }
 
 fn init_ldr_entry(
@@ -272,55 +287,65 @@ pub fn init(
             return None;
         }
     };
-    let upp_buf = unsafe { core::slice::from_raw_parts_mut(upp_va as *mut u8, upp::SIZE) };
+    let upp_ok = with_process_user_buf_mut(pid, upp_va, upp::SIZE, |upp_buf| {
+        // 把 image_path 和 cmdline 编码为 UTF-16LE，写入字符串数据区
+        let mut str_off = upp::STR_DATA_OFF;
 
-    // 把 image_path 和 cmdline 编码为 UTF-16LE，写入字符串数据区
-    let mut str_off = upp::STR_DATA_OFF;
+        let img_va = write_utf16(upp_buf, &mut str_off, image_path, upp_va);
+        let img_len = (image_path.len() * 2) as u16;
 
-    let img_va = write_utf16(upp_buf, &mut str_off, image_path, upp_va);
-    let img_len = (image_path.len() * 2) as u16;
+        let cmd_va = write_utf16(upp_buf, &mut str_off, cmdline, upp_va);
+        let cmd_len = (cmdline.len() * 2) as u16;
 
-    let cmd_va = write_utf16(upp_buf, &mut str_off, cmdline, upp_va);
-    let cmd_len = (cmdline.len() * 2) as u16;
+        // Minimal environment block. Wine/kernelbase locale bootstrap expects
+        // WINEUSERLOCALE/WINEUNIXCP to be queryable at process start.
+        let env_va = upp_va + str_off as u64;
+        for key_value in ["WINEUSERLOCALE=en_US", "WINEUNIXCP=65001"] {
+            let _ = write_utf16(upp_buf, &mut str_off, key_value, upp_va);
+        }
+        // Multi-SZ terminator (extra trailing NUL).
+        if str_off + 2 <= upp_buf.len() {
+            upp_buf[str_off] = 0;
+            upp_buf[str_off + 1] = 0;
+        }
 
-    // Minimal environment block. Wine/kernelbase locale bootstrap expects
-    // WINEUSERLOCALE/WINEUNIXCP to be queryable at process start.
-    let env_va = upp_va + str_off as u64;
-    for key_value in ["WINEUSERLOCALE=en_US", "WINEUNIXCP=65001"] {
-        let _ = write_utf16(upp_buf, &mut str_off, key_value, upp_va);
+        // 固定字段
+        wu32(upp_buf, upp::MAXIMUM_LENGTH, upp::SIZE as u32);
+        wu32(upp_buf, upp::LENGTH, upp::SIZE as u32);
+        wu32(upp_buf, upp::FLAGS, 1); // normalized
+
+        // ImagePathName UNICODE_STRING
+        wu16(upp_buf, upp::IMAGE_PATH_NAME, img_len);
+        wu16(upp_buf, upp::IMAGE_PATH_NAME + 2, img_len + 2);
+        wu64(upp_buf, upp::IMAGE_PATH_NAME + 8, img_va);
+
+        // CommandLine UNICODE_STRING
+        wu16(upp_buf, upp::COMMAND_LINE, cmd_len);
+        wu16(upp_buf, upp::COMMAND_LINE + 2, cmd_len + 2);
+        wu64(upp_buf, upp::COMMAND_LINE + 8, cmd_va);
+        wu64(upp_buf, upp::ENVIRONMENT, env_va);
+    })
+    .is_some();
+    if !upp_ok {
+        free_user_regions(pid, &allocated, allocated_count);
+        return None;
     }
-    // Multi-SZ terminator (extra trailing NUL).
-    if str_off + 2 <= upp_buf.len() {
-        upp_buf[str_off] = 0;
-        upp_buf[str_off + 1] = 0;
-        str_off += 2;
-    }
-
-    // 固定字段
-    wu32(upp_buf, upp::MAXIMUM_LENGTH, upp::SIZE as u32);
-    wu32(upp_buf, upp::LENGTH, upp::SIZE as u32);
-    wu32(upp_buf, upp::FLAGS, 1); // normalized
-
-    // ImagePathName UNICODE_STRING
-    wu16(upp_buf, upp::IMAGE_PATH_NAME, img_len);
-    wu16(upp_buf, upp::IMAGE_PATH_NAME + 2, img_len + 2);
-    wu64(upp_buf, upp::IMAGE_PATH_NAME + 8, img_va);
-
-    // CommandLine UNICODE_STRING
-    wu16(upp_buf, upp::COMMAND_LINE, cmd_len);
-    wu16(upp_buf, upp::COMMAND_LINE + 2, cmd_len + 2);
-    wu64(upp_buf, upp::COMMAND_LINE + 8, cmd_va);
-    wu64(upp_buf, upp::ENVIRONMENT, env_va);
 
     // ── PEB ──────────────────────────────────────────────────
-    let peb_buf = unsafe { core::slice::from_raw_parts_mut(peb_va as *mut u8, peb::SIZE) };
-    wu64(peb_buf, peb::IMAGE_BASE_ADDRESS, image_base);
-    wu64(peb_buf, peb::PROCESS_PARAMETERS, upp_va);
-    wu64(peb_buf, peb::PROCESS_HEAP, process_heap_va);
-    wu32(peb_buf, peb::OS_MAJOR_VERSION, 10);
-    wu32(peb_buf, peb::OS_MINOR_VERSION, 0);
-    wu32(peb_buf, peb::OS_BUILD_NUMBER, 19045);
-    wu32(peb_buf, peb::OS_PLATFORM_ID, 2);
+    let peb_ok = with_process_user_buf_mut(pid, peb_va, peb::SIZE, |peb_buf| {
+        wu64(peb_buf, peb::IMAGE_BASE_ADDRESS, image_base);
+        wu64(peb_buf, peb::PROCESS_PARAMETERS, upp_va);
+        wu64(peb_buf, peb::PROCESS_HEAP, process_heap_va);
+        wu32(peb_buf, peb::OS_MAJOR_VERSION, 10);
+        wu32(peb_buf, peb::OS_MINOR_VERSION, 0);
+        wu32(peb_buf, peb::OS_BUILD_NUMBER, 19045);
+        wu32(peb_buf, peb::OS_PLATFORM_ID, 2);
+    })
+    .is_some();
+    if !peb_ok {
+        free_user_regions(pid, &allocated, allocated_count);
+        return None;
+    }
 
     // ── PEB_LDR_DATA ─────────────────────────────────────────
     let ldr_va = match alloc_user_region(
@@ -336,16 +361,6 @@ pub fn init(
             return None;
         }
     };
-    let ldr_buf = unsafe { core::slice::from_raw_parts_mut(ldr_va as *mut u8, ldr_data::SIZE) };
-
-    wu32(ldr_buf, ldr_data::LENGTH, ldr_data::SIZE as u32);
-    wu32(ldr_buf, ldr_data::INITIALIZED, 1);
-    // 初始化三个链表头为空循环链表
-    write_list_head(ldr_buf, ldr_data::IN_LOAD_ORDER, ldr_va);
-    write_list_head(ldr_buf, ldr_data::IN_MEMORY_ORDER, ldr_va);
-    write_list_head(ldr_buf, ldr_data::IN_INIT_ORDER, ldr_va);
-
-    // ── LDR_DATA_TABLE_ENTRY for main module ─────────────────
     let entry_va = match alloc_user_region(
         pid,
         ldr_entry::SIZE,
@@ -359,125 +374,151 @@ pub fn init(
             return None;
         }
     };
-    let entry_buf =
-        unsafe { core::slice::from_raw_parts_mut(entry_va as *mut u8, ldr_entry::SIZE) };
-
     let base_name = image_path
         .rfind('\\')
         .map(|i| &image_path[i + 1..])
         .unwrap_or(image_path);
-    init_ldr_entry(entry_buf, entry_va, image_base, 0, 0, image_path, base_name);
+    let ldr_ok = with_process_user_buf_mut(pid, ldr_va, ldr_data::SIZE, |ldr_buf| {
+        wu32(ldr_buf, ldr_data::LENGTH, ldr_data::SIZE as u32);
+        wu32(ldr_buf, ldr_data::INITIALIZED, 1);
+        write_list_head(ldr_buf, ldr_data::IN_LOAD_ORDER, ldr_va);
+        write_list_head(ldr_buf, ldr_data::IN_MEMORY_ORDER, ldr_va);
+        write_list_head(ldr_buf, ldr_data::IN_INIT_ORDER, ldr_va);
 
-    // 插入三个链表
-    list_insert_tail(
-        ldr_buf,
-        ldr_va,
-        ldr_data::IN_LOAD_ORDER,
-        entry_buf,
-        entry_va,
-        ldr_entry::IN_LOAD_ORDER,
-    );
-    list_insert_tail(
-        ldr_buf,
-        ldr_va,
-        ldr_data::IN_MEMORY_ORDER,
-        entry_buf,
-        entry_va,
-        ldr_entry::IN_MEMORY_ORDER,
-    );
-    list_insert_tail(
-        ldr_buf,
-        ldr_va,
-        ldr_data::IN_INIT_ORDER,
-        entry_buf,
-        entry_va,
-        ldr_entry::IN_INIT_ORDER,
-    );
-
-    // ── LDR_DATA_TABLE_ENTRY for preloaded DLLs ─────────────
-    crate::dll::for_each_loaded(|dll_name, dll_base, dll_size, dll_entry| {
-        if dll_base == 0 || dll_base == image_base {
-            return;
+        let mut ok = with_process_user_buf_mut(pid, entry_va, ldr_entry::SIZE, |entry_buf| {
+            init_ldr_entry(entry_buf, entry_va, image_base, 0, 0, image_path, base_name);
+            list_insert_tail(
+                pid,
+                ldr_buf,
+                ldr_va,
+                ldr_data::IN_LOAD_ORDER,
+                entry_buf,
+                entry_va,
+                ldr_entry::IN_LOAD_ORDER,
+            ) && list_insert_tail(
+                pid,
+                ldr_buf,
+                ldr_va,
+                ldr_data::IN_MEMORY_ORDER,
+                entry_buf,
+                entry_va,
+                ldr_entry::IN_MEMORY_ORDER,
+            ) && list_insert_tail(
+                pid,
+                ldr_buf,
+                ldr_va,
+                ldr_data::IN_INIT_ORDER,
+                entry_buf,
+                entry_va,
+                ldr_entry::IN_INIT_ORDER,
+            )
+        })
+        .unwrap_or(false);
+        if !ok {
+            return false;
         }
 
-        let Some(dll_entry_va) = alloc_user_region(
-            pid,
-            ldr_entry::SIZE,
-            VmaType::Private,
-            &mut allocated,
-            &mut allocated_count,
-        ) else {
-            return;
-        };
-        let dll_entry_buf =
-            unsafe { core::slice::from_raw_parts_mut(dll_entry_va as *mut u8, ldr_entry::SIZE) };
-        init_ldr_entry(
-            dll_entry_buf,
-            dll_entry_va,
-            dll_base,
-            dll_size,
-            dll_entry,
-            dll_name,
-            dll_name,
-        );
+        crate::dll::for_each_loaded(|dll_name, dll_base, dll_size, dll_entry| {
+            if !ok || dll_base == 0 || dll_base == image_base {
+                return;
+            }
 
-        list_insert_tail(
-            ldr_buf,
-            ldr_va,
-            ldr_data::IN_LOAD_ORDER,
-            dll_entry_buf,
-            dll_entry_va,
-            ldr_entry::IN_LOAD_ORDER,
-        );
-        list_insert_tail(
-            ldr_buf,
-            ldr_va,
-            ldr_data::IN_MEMORY_ORDER,
-            dll_entry_buf,
-            dll_entry_va,
-            ldr_entry::IN_MEMORY_ORDER,
-        );
-        list_insert_tail(
-            ldr_buf,
-            ldr_va,
-            ldr_data::IN_INIT_ORDER,
-            dll_entry_buf,
-            dll_entry_va,
-            ldr_entry::IN_INIT_ORDER,
-        );
-    });
+            let Some(dll_entry_va) = alloc_user_region(
+                pid,
+                ldr_entry::SIZE,
+                VmaType::Private,
+                &mut allocated,
+                &mut allocated_count,
+            ) else {
+                ok = false;
+                return;
+            };
 
-    // PEB.Ldr = ldr_va
-    wu64(peb_buf, peb::LDR, ldr_va);
+            let inserted =
+                with_process_user_buf_mut(pid, dll_entry_va, ldr_entry::SIZE, |dll_entry_buf| {
+                    init_ldr_entry(
+                        dll_entry_buf,
+                        dll_entry_va,
+                        dll_base,
+                        dll_size,
+                        dll_entry,
+                        dll_name,
+                        dll_name,
+                    );
+                    list_insert_tail(
+                        pid,
+                        ldr_buf,
+                        ldr_va,
+                        ldr_data::IN_LOAD_ORDER,
+                        dll_entry_buf,
+                        dll_entry_va,
+                        ldr_entry::IN_LOAD_ORDER,
+                    ) && list_insert_tail(
+                        pid,
+                        ldr_buf,
+                        ldr_va,
+                        ldr_data::IN_MEMORY_ORDER,
+                        dll_entry_buf,
+                        dll_entry_va,
+                        ldr_entry::IN_MEMORY_ORDER,
+                    ) && list_insert_tail(
+                        pid,
+                        ldr_buf,
+                        ldr_va,
+                        ldr_data::IN_INIT_ORDER,
+                        dll_entry_buf,
+                        dll_entry_va,
+                        ldr_entry::IN_INIT_ORDER,
+                    )
+                })
+                .unwrap_or(false);
+            if !inserted {
+                ok = false;
+            }
+        });
+        ok
+    })
+    .unwrap_or(false);
+    if !ldr_ok || !write_user_value(pid, (peb_va + peb::LDR as u64) as *mut u64, ldr_va) {
+        free_user_regions(pid, &allocated, allocated_count);
+        return None;
+    }
 
     // ── 标准句柄（stdin=0, stdout=1, stderr=2 作为伪句柄）────
     // Windows 用负数句柄表示伪句柄，但 guest 的 WriteFile 会通过
     // NtWriteFile hypercall 传给 VMM，VMM 侧 FileTable 已把 fd 1/2 注册为 stdout/stderr
-    wu64(
-        upp_buf,
-        upp_handles::STANDARD_INPUT,
+    if !write_user_value(
+        pid,
+        (upp_va + upp_handles::STANDARD_INPUT as u64) as *mut u64,
         0xFFFF_FFFF_FFFF_FFF6u64,
-    ); // -10
-    wu64(
-        upp_buf,
-        upp_handles::STANDARD_OUTPUT,
+    ) || !write_user_value(
+        pid,
+        (upp_va + upp_handles::STANDARD_OUTPUT as u64) as *mut u64,
         0xFFFF_FFFF_FFFF_FFF5u64,
-    ); // -11
-    wu64(
-        upp_buf,
-        upp_handles::STANDARD_ERROR,
+    ) || !write_user_value(
+        pid,
+        (upp_va + upp_handles::STANDARD_ERROR as u64) as *mut u64,
         0xFFFF_FFFF_FFFF_FFF4u64,
-    ); // -12
+    ) {
+        free_user_regions(pid, &allocated, allocated_count);
+        return None;
+    }
 
     // ── TEB ──────────────────────────────────────────────────
-    let teb_buf = unsafe { core::slice::from_raw_parts_mut(teb_va as *mut u8, teb::SIZE) };
-    wu64(teb_buf, teb::EXCEPTION_LIST, u64::MAX);
-    wu64(teb_buf, teb::STACK_BASE, stack_base);
-    wu64(teb_buf, teb::STACK_LIMIT, stack_limit);
-    wu64(teb_buf, teb::SELF, teb_va);
-    wu64(teb_buf, teb::PEB, peb_va);
-    wu64(teb_buf, teb::CLIENT_ID, pid as u64);
-    wu64(teb_buf, teb::CLIENT_ID + 8, tid as u64);
+    let teb_ok = with_process_user_buf_mut(pid, teb_va, teb::SIZE, |teb_buf| {
+        wu64(teb_buf, teb::EXCEPTION_LIST, u64::MAX);
+        wu64(teb_buf, teb::STACK_BASE, stack_base);
+        wu64(teb_buf, teb::STACK_LIMIT, stack_limit);
+        wu64(teb_buf, teb::SELF, teb_va);
+        wu64(teb_buf, teb::PEB, peb_va);
+        wu64(teb_buf, teb::CLIENT_ID, pid as u64);
+        wu64(teb_buf, teb::CLIENT_ID + 8, tid as u64);
+    })
+    .is_some();
+    if !teb_ok {
+        free_user_regions(pid, &allocated, allocated_count);
+        return None;
+    }
 
     Some(TebPeb {
         teb_va,
@@ -543,13 +584,8 @@ fn align_up(v: u64, align: u64) -> u64 {
 /// Returns the TEB VA on success, or None on OOM.
 pub fn alloc_teb(pid: u32) -> Option<u64> {
     use winemu_shared::teb as teb_off;
-    let teb_va = crate::mm::vm_alloc_region_typed(
-        pid,
-        0,
-        teb_off::SIZE as u64,
-        0x04,
-        VmaType::Private,
-    )?;
+    let teb_va =
+        crate::mm::vm_alloc_region_typed(pid, 0, teb_off::SIZE as u64, 0x04, VmaType::Private)?;
     if !write_user_value(pid, (teb_va + teb_off::SELF as u64) as *mut u64, teb_va) {
         let _ = vm_free_region(pid, teb_va);
         return None;

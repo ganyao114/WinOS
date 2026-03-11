@@ -3,9 +3,13 @@
 
 use crate::alloc;
 use crate::hypercall;
-use crate::mm::{UserVa, VM_ACCESS_READ, VM_ACCESS_WRITE, vm_alloc_region_typed, vm_protect_range};
-use crate::mm::usercopy::{current_pid as current_user_pid, current_process_user_ptr, translate_user_va};
+use crate::mm::usercopy::{
+    copy_to_process_user, current_pid as current_user_pid, translate_user_va,
+    with_current_process_user_slice, with_current_process_user_slice_mut,
+};
 use crate::mm::VmaType;
+use crate::mm::{vm_alloc_region_typed, vm_protect_range, UserVa, VM_ACCESS_READ, VM_ACCESS_WRITE};
+use crate::rust_alloc::vec::Vec;
 use winemu_shared::pe::{self, PeError, PeHeaders};
 
 // ── 错误类型 ─────────────────────────────────────────────────
@@ -42,18 +46,62 @@ struct ImageBuffer {
     owner_pid: Option<u32>,
 }
 
+impl ImageBuffer {
+    fn copy_from_bytes(&self, image_off: usize, src: &[u8]) -> bool {
+        let Some(end) = image_off.checked_add(src.len()) else {
+            return false;
+        };
+        if end > self.size {
+            return false;
+        }
+        if src.is_empty() {
+            return true;
+        }
+
+        if let Some(pid) = self.owner_pid {
+            let Some(dst_va) = UserVa::new(self.base).checked_add(image_off as u64) else {
+                return false;
+            };
+            return copy_to_process_user(pid, dst_va, src.as_ptr(), src.len());
+        }
+
+        // SAFETY: bounds were checked above and `ptr` owns the backing buffer.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(image_off), src.len());
+        }
+        true
+    }
+
+    fn with_slice_mut<R>(&self, access: u8, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        if let Some(pid) = self.owner_pid {
+            return with_current_process_user_slice_mut(
+                pid,
+                UserVa::new(self.base),
+                self.size,
+                access,
+                f,
+            );
+        }
+
+        if self.size == 0 {
+            let mut empty = [];
+            return Some(f(&mut empty));
+        }
+
+        // SAFETY: `ptr` owns a writable buffer of `size` bytes for kernel-backed images.
+        let slice = unsafe { core::slice::from_raw_parts_mut(self.ptr, self.size) };
+        Some(f(slice))
+    }
+}
+
 fn alloc_image_buffer(size: usize, vma_type: VmaType) -> LdrResult<ImageBuffer> {
     if let Some(pid) = current_user_pid() {
         let Some(base) = vm_alloc_region_typed(pid, 0, size as u64, 0x04, vma_type) else {
             return Err(LdrError::AllocFailed);
         };
-        let Some(ptr) = current_process_user_ptr(pid, UserVa::new(base), size, VM_ACCESS_WRITE)
-        else {
-            return Err(LdrError::AllocFailed);
-        };
         return Ok(ImageBuffer {
             base,
-            ptr,
+            ptr: core::ptr::null_mut(),
             size,
             owner_pid: Some(pid),
         });
@@ -128,27 +176,39 @@ pub fn finalize_loaded_image(image_base: u64) -> LdrResult<()> {
     let Some(pid) = current_user_pid() else {
         return Ok(());
     };
-    let Some(ptr) =
-        current_process_user_ptr(pid, UserVa::new(image_base), HEADER_VIEW_SIZE, VM_ACCESS_READ)
-    else {
-        return Err(LdrError::ProtectFailed);
-    };
-    // SAFETY: the current process mapping was validated above for header access.
-    let hdrs = unsafe {
-        PeHeaders::from_slice(core::slice::from_raw_parts(ptr as *const u8, HEADER_VIEW_SIZE))?
-    };
+    let (headers_size, sections) = with_current_process_user_slice(
+        pid,
+        UserVa::new(image_base),
+        HEADER_VIEW_SIZE,
+        VM_ACCESS_READ,
+        |bytes| -> Result<(u64, Vec<(u64, u64, u32)>), LdrError> {
+            let hdrs = PeHeaders::from_slice(bytes)?;
+            let mut sections = Vec::new();
+            if sections.try_reserve(hdrs.num_sections as usize).is_err() {
+                return Err(LdrError::AllocFailed);
+            }
+            for sec in hdrs.sections() {
+                let sec_size = u64::from(sec.vsize.max(sec.raw_size));
+                if sec_size == 0 {
+                    continue;
+                }
+                sections.push((
+                    image_base.saturating_add(sec.vaddr as u64),
+                    sec_size,
+                    section_nt_prot(sec.chars),
+                ));
+            }
+            Ok((hdrs.size_of_headers as u64, sections))
+        },
+    )
+    .ok_or(LdrError::ProtectFailed)??;
 
-    if vm_protect_range(pid, image_base, hdrs.size_of_headers as u64, 0x02).is_err() {
+    if vm_protect_range(pid, image_base, headers_size, 0x02).is_err() {
         return Err(LdrError::ProtectFailed);
     }
 
-    for sec in hdrs.sections() {
-        let sec_size = u64::from(sec.vsize.max(sec.raw_size));
-        if sec_size == 0 {
-            continue;
-        }
-        let sec_base = image_base.saturating_add(sec.vaddr as u64);
-        if vm_protect_range(pid, sec_base, sec_size, section_nt_prot(sec.chars)).is_err() {
+    for (sec_base, sec_size, sec_prot) in sections {
+        if vm_protect_range(pid, sec_base, sec_size, sec_prot).is_err() {
             return Err(LdrError::ProtectFailed);
         }
     }
@@ -202,20 +262,19 @@ pub unsafe fn load_from_fd(
 
     // 3. 分配镜像内存
     let image = alloc_image_buffer(hdrs.size_of_image as usize, vma_type)?;
-    let buf = image.ptr;
     let load_base = image.base;
 
     // 4. 复制头部到镜像基址
     let hdr_copy = (hdrs.size_of_headers as usize).min(got);
-    // SAFETY: `buf` points to a writable image buffer of at least `hdr_copy` bytes.
-    core::ptr::copy_nonoverlapping(hdr_buf as *const u8, buf, hdr_copy);
+    if !image.copy_from_bytes(0, &hdr_slice[..hdr_copy]) {
+        return Err(LdrError::AllocFailed);
+    }
 
     // 5. 逐 section 从 fd 读取
     for sec in hdrs.sections() {
         if sec.raw_size > 0 && sec.raw_off > 0 {
             let read_size = (sec.raw_size as usize).min(sec.vsize as usize);
-            if !read_file_into_image(fd, &image, sec.vaddr as u64, read_size, sec.raw_off as u64)
-            {
+            if !read_file_into_image(fd, &image, sec.vaddr as u64, read_size, sec.raw_off as u64) {
                 crate::kerror!("ldr: section read failed");
                 return Err(LdrError::IoError);
             }
@@ -227,7 +286,16 @@ pub unsafe fn load_from_fd(
     if delta != 0 {
         if let Some(dir) = hdrs.data_dir(pe::DIR_BASERELOC) {
             if dir.is_present() {
-                apply_relocations(buf, dir.rva as usize, dir.size as usize, delta)?;
+                image
+                    .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
+                        apply_relocations(
+                            buf.as_mut_ptr(),
+                            dir.rva as usize,
+                            dir.size as usize,
+                            delta,
+                        )
+                    })
+                    .ok_or(LdrError::AllocFailed)??;
             }
         }
     }
@@ -235,7 +303,11 @@ pub unsafe fn load_from_fd(
     // 7. 导入表
     if let Some(dir) = hdrs.data_dir(pe::DIR_IMPORT) {
         if dir.is_present() {
-            apply_imports(buf, dir.rva as usize, &resolve_import)?;
+            image
+                .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
+                    apply_imports(buf.as_mut_ptr(), dir.rva as usize, &resolve_import)
+                })
+                .ok_or(LdrError::AllocFailed)??;
         }
     }
 
@@ -263,15 +335,13 @@ pub unsafe fn load(
     }
 
     let image_buf = alloc_image_buffer(hdrs.size_of_image as usize, vma_type)?;
-    let buf = image_buf.ptr;
     crate::kdebug!("ldr: alloc ok");
     let load_base = image_buf.base;
 
     // 先复制 PE headers（导出解析依赖 DOS/NT 头）
     let hdr_copy = (hdrs.size_of_headers as usize).min(image.len());
-    if hdr_copy > 0 {
-        // SAFETY: `buf` points to a writable image buffer of at least `hdr_copy` bytes.
-        core::ptr::copy_nonoverlapping(image.as_ptr(), buf, hdr_copy);
+    if !image_buf.copy_from_bytes(0, &image[..hdr_copy]) {
+        return Err(LdrError::AllocFailed);
     }
 
     // 复制各 section
@@ -281,12 +351,9 @@ pub unsafe fn load(
             let dst_off = sec.vaddr as usize;
             let copy_len = (sec.raw_size as usize).min(sec.vsize as usize);
             if src_off + copy_len <= image.len() {
-                // SAFETY: source/destination bounds are checked above and both buffers are valid.
-                core::ptr::copy_nonoverlapping(
-                    image.as_ptr().add(src_off),
-                    buf.add(dst_off),
-                    copy_len,
-                );
+                if !image_buf.copy_from_bytes(dst_off, &image[src_off..src_off + copy_len]) {
+                    return Err(LdrError::AllocFailed);
+                }
             }
         }
     }
@@ -296,7 +363,16 @@ pub unsafe fn load(
     if delta != 0 {
         if let Some(dir) = hdrs.data_dir(pe::DIR_BASERELOC) {
             if dir.is_present() {
-                apply_relocations(buf, dir.rva as usize, dir.size as usize, delta)?;
+                image_buf
+                    .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
+                        apply_relocations(
+                            buf.as_mut_ptr(),
+                            dir.rva as usize,
+                            dir.size as usize,
+                            delta,
+                        )
+                    })
+                    .ok_or(LdrError::AllocFailed)??;
             }
         }
     }
@@ -304,7 +380,11 @@ pub unsafe fn load(
     // 导入表
     if let Some(dir) = hdrs.data_dir(pe::DIR_IMPORT) {
         if dir.is_present() {
-            apply_imports(buf, dir.rva as usize, &resolve_import)?;
+            image_buf
+                .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
+                    apply_imports(buf.as_mut_ptr(), dir.rva as usize, &resolve_import)
+                })
+                .ok_or(LdrError::AllocFailed)??;
         }
     }
 
@@ -339,19 +419,18 @@ pub unsafe fn load_from_fd_unlinked(
     }
 
     let image = alloc_image_buffer(hdrs.size_of_image as usize, vma_type)?;
-    let buf = image.ptr;
     crate::kdebug!("ldr: alloc ok");
     let load_base = image.base;
 
     let hdr_copy = (hdrs.size_of_headers as usize).min(got);
-    // SAFETY: `buf` points to a writable image buffer of at least `hdr_copy` bytes.
-    core::ptr::copy_nonoverlapping(hdr_buf as *const u8, buf, hdr_copy);
+    if !image.copy_from_bytes(0, &hdr_slice[..hdr_copy]) {
+        return Err(LdrError::AllocFailed);
+    }
 
     for sec in hdrs.sections() {
         if sec.raw_size > 0 && sec.raw_off > 0 {
             let read_size = (sec.raw_size as usize).min(sec.vsize as usize);
-            if !read_file_into_image(fd, &image, sec.vaddr as u64, read_size, sec.raw_off as u64)
-            {
+            if !read_file_into_image(fd, &image, sec.vaddr as u64, read_size, sec.raw_off as u64) {
                 crate::kerror!("ldr: section read failed");
                 return Err(LdrError::IoError);
             }
@@ -362,7 +441,16 @@ pub unsafe fn load_from_fd_unlinked(
     if delta != 0 {
         if let Some(dir) = hdrs.data_dir(pe::DIR_BASERELOC) {
             if dir.is_present() {
-                apply_relocations(buf, dir.rva as usize, dir.size as usize, delta)?;
+                image
+                    .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
+                        apply_relocations(
+                            buf.as_mut_ptr(),
+                            dir.rva as usize,
+                            dir.size as usize,
+                            delta,
+                        )
+                    })
+                    .ok_or(LdrError::AllocFailed)??;
             }
         }
     }
@@ -384,14 +472,12 @@ pub unsafe fn load_unlinked(image: &[u8], vma_type: VmaType) -> LdrResult<Loaded
     }
 
     let image_buf = alloc_image_buffer(hdrs.size_of_image as usize, vma_type)?;
-    let buf = image_buf.ptr;
     crate::kdebug!("ldr: alloc ok");
     let load_base = image_buf.base;
 
     let hdr_copy = (hdrs.size_of_headers as usize).min(image.len());
-    if hdr_copy > 0 {
-        // SAFETY: `buf` points to a writable image buffer of at least `hdr_copy` bytes.
-        core::ptr::copy_nonoverlapping(image.as_ptr(), buf, hdr_copy);
+    if !image_buf.copy_from_bytes(0, &image[..hdr_copy]) {
+        return Err(LdrError::AllocFailed);
     }
 
     for sec in hdrs.sections() {
@@ -400,12 +486,9 @@ pub unsafe fn load_unlinked(image: &[u8], vma_type: VmaType) -> LdrResult<Loaded
             let dst_off = sec.vaddr as usize;
             let copy_len = (sec.raw_size as usize).min(sec.vsize as usize);
             if src_off + copy_len <= image.len() {
-                // SAFETY: source/destination bounds are checked above and both buffers are valid.
-                core::ptr::copy_nonoverlapping(
-                    image.as_ptr().add(src_off),
-                    buf.add(dst_off),
-                    copy_len,
-                );
+                if !image_buf.copy_from_bytes(dst_off, &image[src_off..src_off + copy_len]) {
+                    return Err(LdrError::AllocFailed);
+                }
             }
         }
     }
@@ -414,7 +497,16 @@ pub unsafe fn load_unlinked(image: &[u8], vma_type: VmaType) -> LdrResult<Loaded
     if delta != 0 {
         if let Some(dir) = hdrs.data_dir(pe::DIR_BASERELOC) {
             if dir.is_present() {
-                apply_relocations(buf, dir.rva as usize, dir.size as usize, delta)?;
+                image_buf
+                    .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
+                        apply_relocations(
+                            buf.as_mut_ptr(),
+                            dir.rva as usize,
+                            dir.size as usize,
+                            delta,
+                        )
+                    })
+                    .ok_or(LdrError::AllocFailed)??;
             }
         }
     }
@@ -431,6 +523,39 @@ pub unsafe fn link_imports(
     image_base: u64,
     resolve_import: impl Fn(&str, ImportRef) -> Option<u64>,
 ) -> LdrResult<()> {
+    if let Some(pid) = current_user_pid() {
+        let (image_size, import_rva, import_size) = with_current_process_user_slice(
+            pid,
+            UserVa::new(image_base),
+            HEADER_VIEW_SIZE,
+            VM_ACCESS_READ,
+            |bytes| -> Result<(usize, usize, usize), LdrError> {
+                let hdrs = PeHeaders::from_slice(bytes)?;
+                let dir = hdrs
+                    .data_dir(pe::DIR_IMPORT)
+                    .unwrap_or(pe::DataDir { rva: 0, size: 0 });
+                Ok((
+                    hdrs.size_of_image as usize,
+                    dir.rva as usize,
+                    dir.size as usize,
+                ))
+            },
+        )
+        .ok_or(LdrError::ProtectFailed)??;
+        if import_rva == 0 || import_size == 0 {
+            return Ok(());
+        }
+        with_current_process_user_slice_mut(
+            pid,
+            UserVa::new(image_base),
+            image_size,
+            VM_ACCESS_WRITE,
+            |image| unsafe { apply_imports(image.as_mut_ptr(), import_rva, &resolve_import) },
+        )
+        .ok_or(LdrError::ProtectFailed)??;
+        return Ok(());
+    }
+
     let Some((import_rva, import_size)) = read_import_dir(image_base as *const u8) else {
         return Ok(());
     };

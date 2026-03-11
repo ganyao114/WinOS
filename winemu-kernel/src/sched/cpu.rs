@@ -10,13 +10,13 @@ use crate::sched::types::MAX_VCPUS;
 
 #[repr(C)]
 pub struct KCpuLocal {
-    pub vcpu_id:     u32,
+    pub vcpu_id: u32,
     pub current_tid: u32,
-    pub idle_tid:    u32,
+    pub idle_tid: u32,
     /// Set when this vCPU should call schedule() at next safe point.
     pub needs_reschedule: bool,
     /// True while executing the idle loop.
-    pub in_idle:     bool,
+    pub in_idle: bool,
     _pad: [u8; 2],
     /// Number of EL1 WFI/WFE traps safely skipped in idle wait path.
     pub wfx_skip_count: u32,
@@ -44,10 +44,14 @@ impl KCpuLocal {
 static mut CPU_LOCALS: [KCpuLocal; MAX_VCPUS] = {
     // Can't use array repeat for non-Copy, so init manually.
     [
-        KCpuLocal::new(0), KCpuLocal::new(1),
-        KCpuLocal::new(2), KCpuLocal::new(3),
-        KCpuLocal::new(4), KCpuLocal::new(5),
-        KCpuLocal::new(6), KCpuLocal::new(7),
+        KCpuLocal::new(0),
+        KCpuLocal::new(1),
+        KCpuLocal::new(2),
+        KCpuLocal::new(3),
+        KCpuLocal::new(4),
+        KCpuLocal::new(5),
+        KCpuLocal::new(6),
+        KCpuLocal::new(7),
     ]
 };
 

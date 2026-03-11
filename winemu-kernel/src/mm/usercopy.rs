@@ -287,8 +287,11 @@ pub(crate) fn copy_from_phys_to_process_user(
         if can_use_current_process_fastpath(pid) {
             // SAFETY: destination user range is validated in the current
             // address space for this chunk.
-            if !crate::mm::linear_map::copy_from_phys(cur_dst_va.as_mut_ptr::<u8>(), cur_src_pa, chunk)
-            {
+            if !crate::mm::linear_map::copy_from_phys(
+                cur_dst_va.as_mut_ptr::<u8>(),
+                cur_src_pa,
+                chunk,
+            ) {
                 return false;
             }
         } else {
@@ -313,18 +316,170 @@ pub(crate) fn current_pid() -> Option<u32> {
     }
 }
 
-pub(crate) fn current_process_user_ptr(
+fn current_user_range_mapped(addr: UserVa, size: usize, access: u8) -> bool {
+    let Some(pid) = current_pid() else {
+        return false;
+    };
+    if !can_use_current_process_fastpath(pid) {
+        return false;
+    }
+    if size == 0 {
+        return true;
+    }
+    let Some(end_addr) = addr.get().checked_add((size as u64).saturating_sub(1)) else {
+        return false;
+    };
+    let mut page = addr.get() & PAGE_MASK_4K;
+    let end_page = end_addr & PAGE_MASK_4K;
+    loop {
+        if page < USER_ACCESS_BASE || page >= USER_VA_LIMIT {
+            return false;
+        }
+        if crate::mm::address_space::translate_current_user_va_for_access(UserVa::new(page), access)
+            .is_none()
+        {
+            return false;
+        }
+        if page == end_page {
+            break;
+        }
+        let Some(next) = page.checked_add(PAGE_SIZE_4K) else {
+            return false;
+        };
+        page = next;
+    }
+    true
+}
+
+pub(crate) fn with_current_user_mapped_slice<R>(
+    va: UserVa,
+    size: usize,
+    access: u8,
+    f: impl FnOnce(&[u8]) -> R,
+) -> Option<R> {
+    if !current_user_range_mapped(va, size, access) {
+        return None;
+    }
+    if size == 0 {
+        return Some(f(&[]));
+    }
+    // SAFETY: the current user range was verified as already mapped in the
+    // active address space, and this helper intentionally does not fault pages in.
+    let slice = unsafe { core::slice::from_raw_parts(va.as_ptr::<u8>(), size) };
+    Some(f(slice))
+}
+
+pub(crate) fn with_current_user_mapped_slice_mut<R>(
+    va: UserVa,
+    size: usize,
+    access: u8,
+    f: impl FnOnce(&mut [u8]) -> R,
+) -> Option<R> {
+    if !current_user_range_mapped(va, size, access) {
+        return None;
+    }
+    if size == 0 {
+        let mut empty = [];
+        return Some(f(&mut empty));
+    }
+    // SAFETY: the current user range was verified as already mapped in the
+    // active address space, and this helper intentionally does not fault pages in.
+    let slice = unsafe { core::slice::from_raw_parts_mut(va.as_mut_ptr::<u8>(), size) };
+    Some(f(slice))
+}
+
+pub(crate) fn read_current_user_mapped_value<T: Copy>(user_ptr: *const T) -> Option<T> {
+    if user_ptr.is_null() {
+        return None;
+    }
+    with_current_user_mapped_slice(
+        UserVa::new(user_ptr as u64),
+        core::mem::size_of::<T>(),
+        VM_ACCESS_READ,
+        |bytes| {
+            let mut value = core::mem::MaybeUninit::<T>::uninit();
+            // SAFETY: `bytes` is exactly `size_of::<T>()` long and points to a
+            // currently mapped range in the active user address space.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    value.as_mut_ptr().cast::<u8>(),
+                    core::mem::size_of::<T>(),
+                );
+                value.assume_init()
+            }
+        },
+    )
+}
+
+pub(crate) fn write_current_user_mapped_value<T: Copy>(user_ptr: *mut T, value: T) -> bool {
+    if user_ptr.is_null() {
+        return false;
+    }
+    with_current_user_mapped_slice_mut(
+        UserVa::new(user_ptr as u64),
+        core::mem::size_of::<T>(),
+        VM_ACCESS_WRITE,
+        |bytes| {
+            // SAFETY: `bytes` is exactly `size_of::<T>()` long and points to a
+            // currently mapped writable range in the active user address space.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (&value as *const T).cast::<u8>(),
+                    bytes.as_mut_ptr(),
+                    core::mem::size_of::<T>(),
+                );
+            }
+        },
+    )
+    .is_some()
+}
+
+pub(crate) fn with_current_process_user_slice<R>(
     pid: u32,
     va: UserVa,
     size: usize,
     access: u8,
-) -> Option<*mut u8> {
+    f: impl FnOnce(&[u8]) -> R,
+) -> Option<R> {
     if !crate::process::current_process_context_matches(pid)
         || !ensure_user_range_access(pid, va, size, access)
     {
         return None;
     }
-    Some(va.as_mut_ptr::<u8>())
+
+    if size == 0 {
+        return Some(f(&[]));
+    }
+
+    // SAFETY: the current process context matches `pid` and the full range was
+    // validated above, including faulting in any lazy pages.
+    let slice = unsafe { core::slice::from_raw_parts(va.as_ptr::<u8>(), size) };
+    Some(f(slice))
+}
+
+pub(crate) fn with_current_process_user_slice_mut<R>(
+    pid: u32,
+    va: UserVa,
+    size: usize,
+    access: u8,
+    f: impl FnOnce(&mut [u8]) -> R,
+) -> Option<R> {
+    if !crate::process::current_process_context_matches(pid)
+        || !ensure_user_range_access(pid, va, size, access)
+    {
+        return None;
+    }
+
+    if size == 0 {
+        let mut empty = [];
+        return Some(f(&mut empty));
+    }
+
+    // SAFETY: the current process context matches `pid` and the full range was
+    // validated above, including faulting in any lazy pages.
+    let slice = unsafe { core::slice::from_raw_parts_mut(va.as_mut_ptr::<u8>(), size) };
+    Some(f(slice))
 }
 
 pub(crate) fn copy_from_current_user(src: *const u8, dst: *mut u8, size: usize) -> bool {

@@ -6,7 +6,11 @@ fn unsupported() -> ! {
 }
 
 #[inline(always)]
-pub fn schedule_running_slice_100ns(_now_100ns: u64, _next_deadline_100ns: u64, _quantum_100ns: u64) {
+pub fn schedule_running_slice_100ns(
+    _now_100ns: u64,
+    _next_deadline_100ns: u64,
+    _quantum_100ns: u64,
+) {
     unsupported()
 }
 

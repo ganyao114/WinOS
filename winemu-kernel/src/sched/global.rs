@@ -10,10 +10,10 @@ use crate::sched::types::{KThread, MAX_VCPUS};
 // ── Per-vCPU state ────────────────────────────────────────────────────────────
 
 pub struct KVcpuState {
-    pub current_tid:          u32,
-    pub idle_tid:             u32,
-    pub needs_scheduling:     bool,
-    pub is_idle:              bool,
+    pub current_tid: u32,
+    pub idle_tid: u32,
+    pub needs_scheduling: bool,
+    pub is_idle: bool,
     /// Next thread selected by flush_unlock_edge (0 = none/idle).
     pub highest_priority_tid: u32,
 }
@@ -21,10 +21,10 @@ pub struct KVcpuState {
 impl KVcpuState {
     const fn new() -> Self {
         Self {
-            current_tid:          0,
-            idle_tid:             0,
-            needs_scheduling:     false,
-            is_idle:              false,
+            current_tid: 0,
+            idle_tid: 0,
+            needs_scheduling: false,
+            is_idle: false,
             highest_priority_tid: 0,
         }
     }
@@ -72,9 +72,9 @@ impl DeferredKstacks {
 
 pub struct KGlobalScheduler {
     /// Option<ThreadStore> — None until init() is called.
-    threads:          UnsafeCell<Option<ThreadStore>>,
-    pub ready_queue:  UnsafeCell<KReadyQueue>,
-    pub vcpus:        UnsafeCell<[KVcpuState; MAX_VCPUS]>,
+    threads: UnsafeCell<Option<ThreadStore>>,
+    pub ready_queue: UnsafeCell<KReadyQueue>,
+    pub vcpus: UnsafeCell<[KVcpuState; MAX_VCPUS]>,
     pub deferred_kstacks: UnsafeCell<DeferredKstacks>,
     /// bitmask of vCPUs that need a reschedule IPI
     pub reschedule_mask: AtomicU32,
@@ -92,19 +92,23 @@ unsafe impl Send for KGlobalScheduler {}
 impl KGlobalScheduler {
     const fn new_uninit() -> Self {
         Self {
-            threads:          UnsafeCell::new(None),
-            ready_queue:      UnsafeCell::new(KReadyQueue::new()),
-            vcpus:            UnsafeCell::new([
-                KVcpuState::new(), KVcpuState::new(),
-                KVcpuState::new(), KVcpuState::new(),
-                KVcpuState::new(), KVcpuState::new(),
-                KVcpuState::new(), KVcpuState::new(),
+            threads: UnsafeCell::new(None),
+            ready_queue: UnsafeCell::new(KReadyQueue::new()),
+            vcpus: UnsafeCell::new([
+                KVcpuState::new(),
+                KVcpuState::new(),
+                KVcpuState::new(),
+                KVcpuState::new(),
+                KVcpuState::new(),
+                KVcpuState::new(),
+                KVcpuState::new(),
+                KVcpuState::new(),
             ]),
             deferred_kstacks: UnsafeCell::new(DeferredKstacks::new()),
-            reschedule_mask:          AtomicU32::new(0),
-            schedule_events:          AtomicU32::new(0),
-            scheduler_update_needed:  AtomicBool::new(false),
-            initialized:              AtomicU32::new(0),
+            reschedule_mask: AtomicU32::new(0),
+            schedule_events: AtomicU32::new(0),
+            scheduler_update_needed: AtomicBool::new(false),
+            initialized: AtomicU32::new(0),
         }
     }
 
@@ -118,12 +122,16 @@ impl KGlobalScheduler {
 
     #[inline]
     pub unsafe fn threads_raw(&self) -> &ThreadStore {
-        (*self.threads.get()).as_ref().expect("scheduler not initialized")
+        (*self.threads.get())
+            .as_ref()
+            .expect("scheduler not initialized")
     }
 
     #[inline]
     pub unsafe fn threads_raw_mut(&self) -> &mut ThreadStore {
-        (*self.threads.get()).as_mut().expect("scheduler not initialized")
+        (*self.threads.get())
+            .as_mut()
+            .expect("scheduler not initialized")
     }
 
     #[inline]

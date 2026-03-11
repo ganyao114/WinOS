@@ -1,3 +1,4 @@
+use crate::kobj::ObjectStore;
 /// ProcessVmManager — 每进程虚拟地址空间管理器
 ///
 /// 基于 AreaSet<VmArea> 提供：
@@ -14,7 +15,6 @@ use crate::mm::{
 use crate::process::ProcessAddressSpace;
 use crate::rust_alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use crate::kobj::ObjectStore;
 use winemu_shared::status;
 
 // ─── NT 常量 ─────────────────────────────────────────────────────────────────
@@ -456,8 +456,7 @@ impl ProcessVmManager {
                     }
                 }
                 let pa = iso.value().phys_page(i);
-                if !pa.is_null()
-                    && !aspace.protect_user_range(UserVa::new(va), PAGE_SIZE, new_prot)
+                if !pa.is_null() && !aspace.protect_user_range(UserVa::new(va), PAGE_SIZE, new_prot)
                 {
                     self.rollback_prot(aspace, &iso, 0, i, &old_prots);
                     return Err(status::INVALID_PARAMETER);

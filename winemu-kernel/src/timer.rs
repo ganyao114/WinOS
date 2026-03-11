@@ -286,7 +286,10 @@ fn register_task_locked(
         deadline_100ns,
         generation,
     })?;
-    let handle = TimerTaskHandle { id: task_id, generation };
+    let handle = TimerTaskHandle {
+        id: task_id,
+        generation,
+    };
     let ok = state.heap.push(TimerHeapEntry {
         deadline_100ns,
         task_id,

@@ -1,6 +1,23 @@
 use crate::rust_alloc::string::String;
 
-use crate::mm::usercopy::read_current_user_value;
+use super::user_args::UserInPtr;
+use crate::mm::usercopy::read_current_user_bytes;
+
+const OA_ROOT_DIRECTORY_OFFSET: u64 = 0x08;
+const OA_OBJECT_NAME_OFFSET: u64 = 0x10;
+const OA_ATTRIBUTES_OFFSET: u64 = 0x18;
+const US_LENGTH_OFFSET: u64 = 0x00;
+const US_BUFFER_OFFSET: u64 = 0x08;
+
+#[derive(Clone, Copy)]
+pub(crate) struct UnicodeStringView {
+    ptr: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ObjectAttributesView {
+    ptr: u64,
+}
 
 #[inline(always)]
 fn shift_left(path: &mut [u8], len: usize, count: usize) -> usize {
@@ -59,18 +76,26 @@ fn normalize_separators(path: &mut [u8], len: usize) -> usize {
     out
 }
 
-fn read_unicode_ascii_internal(us_ptr: u64, out: &mut [u8], normalize_path: bool) -> usize {
-    if us_ptr == 0 || out.is_empty() {
+fn read_unicode_ascii_internal(
+    us: UnicodeStringView,
+    out: &mut [u8],
+    normalize_path: bool,
+) -> usize {
+    if out.is_empty() {
         return 0;
     }
-    let byte_len = read_current_user_value(us_ptr as *const u16).unwrap_or(0) as usize;
-    let buf_ptr = read_current_user_value((us_ptr + 8) as *const u64).unwrap_or(0);
+    let byte_len = us.byte_len();
+    let buf_ptr = us.buffer_ptr();
     if byte_len == 0 || buf_ptr == 0 {
         return 0;
     }
-    let count = core::cmp::min(byte_len / 2, out.len());
+    let copy_len = core::cmp::min(byte_len, out.len().saturating_mul(2));
+    let Some(bytes) = read_current_user_bytes(buf_ptr as *const u8, copy_len) else {
+        return 0;
+    };
+    let count = bytes.len() / 2;
     for i in 0..count {
-        let wc = read_current_user_value((buf_ptr + (i as u64 * 2)) as *const u16).unwrap_or(0);
+        let wc = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
         out[i] = if wc < 0x80 { wc as u8 } else { b'?' };
     }
     if normalize_path {
@@ -80,8 +105,87 @@ fn read_unicode_ascii_internal(us_ptr: u64, out: &mut [u8], normalize_path: bool
     }
 }
 
-pub(crate) fn read_unicode_direct(us_ptr: u64, out: &mut [u8]) -> usize {
-    read_unicode_ascii_internal(us_ptr, out, false)
+impl UnicodeStringView {
+    #[inline]
+    pub(crate) fn from_ptr(ptr: u64) -> Option<Self> {
+        if ptr == 0 {
+            None
+        } else {
+            Some(Self { ptr })
+        }
+    }
+
+    #[inline]
+    pub(crate) fn byte_len(self) -> usize {
+        UserInPtr::from_raw((self.ptr + US_LENGTH_OFFSET) as *const u16)
+            .read_current()
+            .unwrap_or(0) as usize
+    }
+
+    #[inline]
+    pub(crate) fn buffer_ptr(self) -> u64 {
+        UserInPtr::from_raw((self.ptr + US_BUFFER_OFFSET) as *const u64)
+            .read_current()
+            .unwrap_or(0)
+    }
+
+    #[inline]
+    pub(crate) fn read_ascii(self, out: &mut [u8]) -> usize {
+        read_unicode_ascii_internal(self, out, false)
+    }
+
+    #[inline]
+    pub(crate) fn read_path(self, out: &mut [u8]) -> usize {
+        let len = read_unicode_ascii_internal(self, out, true);
+        normalize_nt_path(out, len)
+    }
+}
+
+impl ObjectAttributesView {
+    #[inline]
+    pub(crate) fn from_ptr(ptr: u64) -> Option<Self> {
+        if ptr == 0 {
+            None
+        } else {
+            Some(Self { ptr })
+        }
+    }
+
+    #[inline]
+    pub(crate) fn root_directory(self) -> u64 {
+        UserInPtr::from_raw((self.ptr + OA_ROOT_DIRECTORY_OFFSET) as *const u64)
+            .read_current()
+            .unwrap_or(0)
+    }
+
+    #[inline]
+    pub(crate) fn name_ptr(self) -> u64 {
+        UserInPtr::from_raw((self.ptr + OA_OBJECT_NAME_OFFSET) as *const u64)
+            .read_current()
+            .unwrap_or(0)
+    }
+
+    #[inline]
+    pub(crate) fn attributes(self) -> u32 {
+        UserInPtr::from_raw((self.ptr + OA_ATTRIBUTES_OFFSET) as *const u32)
+            .read_current()
+            .unwrap_or(0)
+    }
+
+    #[inline]
+    pub(crate) fn name(self) -> Option<UnicodeStringView> {
+        UnicodeStringView::from_ptr(self.name_ptr())
+    }
+
+    #[inline]
+    pub(crate) fn read_name_ascii(self, out: &mut [u8]) -> usize {
+        self.name().map_or(0, |us| us.read_ascii(out))
+    }
+
+    #[inline]
+    pub(crate) fn read_path(self, out: &mut [u8]) -> usize {
+        self.name().map_or(0, |us| us.read_path(out))
+    }
 }
 
 pub(crate) fn normalize_nt_path(path: &mut [u8], len: usize) -> usize {
@@ -115,15 +219,6 @@ pub(crate) fn normalize_nt_path(path: &mut [u8], len: usize) -> usize {
         len -= 1;
     }
     len
-}
-
-pub(crate) fn read_oa_path(oa_ptr: u64, out: &mut [u8]) -> usize {
-    if oa_ptr == 0 || out.is_empty() {
-        return 0;
-    }
-    let us_ptr = read_current_user_value((oa_ptr + 0x10) as *const u64).unwrap_or(0);
-    let len = read_unicode_ascii_internal(us_ptr, out, true);
-    normalize_nt_path(out, len)
 }
 
 pub(crate) fn normalize_registry_path(path: &mut [u8], len: usize) -> (usize, bool) {

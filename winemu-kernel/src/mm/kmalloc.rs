@@ -557,7 +557,8 @@ impl AllocState {
             return null_mut();
         }
 
-        let obj_ptr = (self.page_addr(pidx).get() as usize + obj_idx as usize * obj_size) as *mut u8;
+        let obj_ptr =
+            (self.page_addr(pidx).get() as usize + obj_idx as usize * obj_size) as *mut u8;
         let next = unsafe { (obj_ptr as *const u16).read_unaligned() };
         if next != NONE_U16 && next >= total {
             // Corrupted next pointer; stop using this slab page for allocation.
@@ -1412,8 +1413,7 @@ impl KmallocManager {
         let mut i = 0usize;
         while i < MAX_DIRECT_ALLOCS {
             let meta = self.direct_allocs[i];
-            if meta.active && ptr.get() >= meta.base_kva.get() && ptr.get() < meta.end_kva().get()
-            {
+            if meta.active && ptr.get() >= meta.base_kva.get() && ptr.get() < meta.end_kva().get() {
                 return true;
             }
             i += 1;

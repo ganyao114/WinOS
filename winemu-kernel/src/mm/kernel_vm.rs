@@ -72,7 +72,11 @@ pub fn kvunmap(base: KernelVa, pages: usize) -> bool {
     let Some(start) = kva_to_page_index(base) else {
         return false;
     };
-    if pages == 0 || start.checked_add(pages).is_none_or(|end| end > VMAP_PAGE_COUNT) {
+    if pages == 0
+        || start
+            .checked_add(pages)
+            .is_none_or(|end| end > VMAP_PAGE_COUNT)
+    {
         return false;
     }
 
@@ -121,7 +125,10 @@ fn find_free_range(state: &KernelVmState, pages: usize, align: usize) -> Option<
     }
 
     let mut start = 0usize;
-    while start.checked_add(pages).is_some_and(|end| end <= VMAP_PAGE_COUNT) {
+    while start
+        .checked_add(pages)
+        .is_some_and(|end| end <= VMAP_PAGE_COUNT)
+    {
         let Some(base) = page_index_to_kva(start) else {
             return None;
         };

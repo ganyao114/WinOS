@@ -159,21 +159,9 @@ impl ProcessAddressSpace {
         };
 
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                src_l0,
-                l0.kva.as_mut_ptr::<u64>(),
-                PAGE_TABLE_ENTRIES,
-            );
-            core::ptr::copy_nonoverlapping(
-                src_l1,
-                l1.kva.as_mut_ptr::<u64>(),
-                PAGE_TABLE_ENTRIES,
-            );
-            core::ptr::copy_nonoverlapping(
-                src_l2,
-                l2.kva.as_mut_ptr::<u64>(),
-                PAGE_TABLE_ENTRIES,
-            );
+            core::ptr::copy_nonoverlapping(src_l0, l0.kva.as_mut_ptr::<u64>(), PAGE_TABLE_ENTRIES);
+            core::ptr::copy_nonoverlapping(src_l1, l1.kva.as_mut_ptr::<u64>(), PAGE_TABLE_ENTRIES);
+            core::ptr::copy_nonoverlapping(src_l2, l2.kva.as_mut_ptr::<u64>(), PAGE_TABLE_ENTRIES);
         }
 
         let mut aspace = Self {
@@ -334,7 +322,11 @@ impl ProcessAddressSpace {
         for i in 0..PAGE_TABLE_ENTRIES {
             let page_pa = block_base + (i as u64) * PAGE_SIZE_4K;
             // SAFETY: l3 is a freshly allocated page table and i is loop-bounded.
-            write_table_entry(l3.kva, i, mmu::split_l2_block_entry_to_l3_page(l2e, page_pa));
+            write_table_entry(
+                l3.kva,
+                i,
+                mmu::split_l2_block_entry_to_l3_page(l2e, page_pa),
+            );
         }
 
         // SAFETY: l2 points to a live table and l2_idx is bounded by caller.

@@ -1,7 +1,7 @@
 use crate::mm::range::Range;
+use crate::mm::vaspace::ProcessVmManager;
 use crate::mm::vm_area::{VmArea, PAGE_SIZE};
 use crate::mm::{vm_clone_shared_nt_prot, UserVa};
-use crate::mm::vaspace::ProcessVmManager;
 use crate::process::{with_process, with_process_mut, ProcessAddressSpace};
 use crate::rust_alloc::vec::Vec;
 
@@ -78,8 +78,8 @@ pub(crate) fn clone_process_vm_for_fork(parent_pid: u32, child_pid: u32) -> bool
         return false;
     };
 
-    let child_installed = with_process_mut(child_pid, |p| p.vm.install_clone_plan(&plan))
-        .unwrap_or(false);
+    let child_installed =
+        with_process_mut(child_pid, |p| p.vm.install_clone_plan(&plan)).unwrap_or(false);
     if !child_installed {
         return false;
     }

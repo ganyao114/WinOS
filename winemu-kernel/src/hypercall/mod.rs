@@ -1,13 +1,13 @@
 mod hostcall;
 
+use crate::mm::PhysAddr;
 use winemu_shared::hostcall as hc;
 use winemu_shared::nr;
 
 pub use crate::log::{logf, LogLevel};
 pub use hostcall::{
     hostcall_cancel, hostcall_poll_batch, hostcall_query_sched_wake_stats, hostcall_setup,
-    hostcall_submit_tagged,
-    HostCallCompletion,
+    hostcall_submit_tagged, HostCallCompletion,
 };
 
 /// 6 引数 hypercall（HVC #0）
@@ -115,7 +115,11 @@ pub fn kick_vcpu_mask(mask: u32) {
 pub fn query_windows_build() -> u32 {
     let v = hypercall6(nr::QUERY_WINDOWS_BUILD, 0, 0, 0, 0, 0, 0);
     let build = v as u32;
-    if build == 0 { 22631 } else { build }
+    if build == 0 {
+        22631
+    } else {
+        build
+    }
 }
 
 /// NtCreateSection — file_handle=0 表示 pagefile-backed
@@ -184,9 +188,29 @@ pub fn host_read(fd: u64, dst: *mut u8, len: usize, offset: u64) -> usize {
     }
 }
 
+/// HOST_READ — 将文件数据读入 guest physical page.
+pub fn host_read_phys(fd: u64, dst_pa: PhysAddr, len: usize, offset: u64) -> usize {
+    let (ret, aux) = hostcall_sync(hc::OP_READ, fd, dst_pa.get(), len as u64, offset);
+    if ret == hc::HC_OK {
+        aux as usize
+    } else {
+        0
+    }
+}
+
 /// HOST_WRITE — 写入 src 指针到文件，返回实际写入字节数
 pub fn host_write(fd: u64, src: *const u8, len: usize, offset: u64) -> usize {
     let (ret, aux) = hostcall_sync(hc::OP_WRITE, fd, src as u64, len as u64, offset);
+    if ret == hc::HC_OK {
+        aux as usize
+    } else {
+        0
+    }
+}
+
+/// HOST_WRITE — 将 guest physical page 中的数据写入文件.
+pub fn host_write_phys(fd: u64, src_pa: PhysAddr, len: usize, offset: u64) -> usize {
+    let (ret, aux) = hostcall_sync(hc::OP_WRITE, fd, src_pa.get(), len as u64, offset);
     if ret == hc::HC_OK {
         aux as usize
     } else {
@@ -250,29 +274,13 @@ pub fn host_notify_dir(
 /// HOST_MEMSET — fill guest physical memory range.
 /// Returns true on success.
 pub fn host_memset(dst_gpa: u64, len: usize, value: u8) -> bool {
-    hypercall6(
-        nr::HOST_MEMSET,
-        dst_gpa,
-        len as u64,
-        value as u64,
-        0,
-        0,
-        0,
-    ) == 0
+    hypercall6(nr::HOST_MEMSET, dst_gpa, len as u64, value as u64, 0, 0, 0) == 0
 }
 
 /// HOST_MEMCPY — copy guest physical memory range.
 /// Returns true on success.
 pub fn host_memcpy(dst_gpa: u64, src_gpa: u64, len: usize) -> bool {
-    hypercall6(
-        nr::HOST_MEMCPY,
-        dst_gpa,
-        src_gpa,
-        len as u64,
-        0,
-        0,
-        0,
-    ) == 0
+    hypercall6(nr::HOST_MEMCPY, dst_gpa, src_gpa, len as u64, 0, 0, 0) == 0
 }
 
 /// Raw HOST_MMAP primitive. Keep internal so callers must choose explicit
@@ -307,7 +315,7 @@ pub fn host_mmap_tracked(fd: u64, offset: u64, size: u64, map_prot: u32, vm_prot
         let _ = host_munmap(base, size);
         return 0;
     }
-    if crate::nt::state::vm_track_existing_file_mapping(owner_pid, base, size, vm_prot) {
+    if crate::mm::vm_track_existing_file_mapping(owner_pid, base, size, vm_prot) {
         base
     } else {
         let _ = host_munmap(base, size);

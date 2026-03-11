@@ -5,12 +5,10 @@ use winemu_shared::status;
 
 use crate::sched::types::WaitDeadline;
 
+use super::common::GuestWriter;
 use super::constants::PAGE_SIZE_4K;
-use crate::mm::usercopy::{
-    copy_to_current_user, read_current_user_value, write_current_user_value,
-};
+use super::user_args::{UserInPtr, UserOutPtr};
 use super::SvcFrame;
-
 const SYSTEM_INFO_CLASS_BASIC: u32 = 0;
 const SYSTEM_INFO_CLASS_TIME_OF_DAY: u32 = 3;
 // Test-only class: force async hostcall through call_sync pending path.
@@ -68,9 +66,7 @@ struct VmmSchedWakeStatsInformation {
 
 #[inline(always)]
 fn write_ret_len(ret_len: *mut u32, value: u32) {
-    if !ret_len.is_null() {
-        let _ = write_current_user_value(ret_len, value);
-    }
+    let _ = UserOutPtr::from_raw(ret_len).write_current_if_present(value);
 }
 
 fn write_info_struct<T: Copy>(buf: *mut u8, buf_len: usize, ret_len: *mut u32, info: &T) -> u32 {
@@ -80,10 +76,11 @@ fn write_info_struct<T: Copy>(buf: *mut u8, buf_len: usize, ret_len: *mut u32, i
         return status::INFO_LENGTH_MISMATCH;
     }
 
-    if !copy_to_current_user(buf, (info as *const T).cast::<u8>(), need) {
+    let Some(mut w) = GuestWriter::new(buf, buf_len, need) else {
         write_ret_len(ret_len, need as u32);
         return status::INVALID_PARAMETER;
-    }
+    };
+    w.write_struct(*info);
     write_ret_len(ret_len, need as u32);
     status::SUCCESS
 }
@@ -240,14 +237,14 @@ pub(crate) fn handle_query_system_information(frame: &mut SvcFrame) {
 }
 
 pub(crate) fn handle_query_system_time(frame: &mut SvcFrame) {
-    let out = frame.x[0] as *mut i64;
+    let out = UserOutPtr::from_raw(frame.x[0] as *mut i64);
     if out.is_null() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
 
     let now = crate::hypercall::query_system_time_100ns() as i64;
-    if !write_current_user_value(out, now) {
+    if !out.write_current(now) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
@@ -255,21 +252,19 @@ pub(crate) fn handle_query_system_time(frame: &mut SvcFrame) {
 }
 
 pub(crate) fn handle_query_performance_counter(frame: &mut SvcFrame) {
-    let counter_ptr = frame.x[0] as *mut i64;
-    let freq_ptr = frame.x[1] as *mut i64;
+    let counter_ptr = UserOutPtr::from_raw(frame.x[0] as *mut i64);
+    let freq_ptr = UserOutPtr::from_raw(frame.x[1] as *mut i64);
     if counter_ptr.is_null() && freq_ptr.is_null() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
 
     let counter = crate::hypercall::query_mono_time_100ns() as i64;
-    if !counter_ptr.is_null() && !write_current_user_value(counter_ptr, counter) {
+    if !counter_ptr.write_current_if_present(counter) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
-    if !freq_ptr.is_null()
-        && !write_current_user_value(freq_ptr, PERF_COUNTER_FREQUENCY_100NS as i64)
-    {
+    if !freq_ptr.write_current_if_present(PERF_COUNTER_FREQUENCY_100NS as i64) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
@@ -284,15 +279,15 @@ pub(crate) fn should_dispatch_delay_execution(frame: &SvcFrame) -> bool {
 
 pub(crate) fn handle_delay_execution(frame: &mut SvcFrame) {
     let _alertable = frame.x[0] != 0;
-    let timeout_ptr = frame.x[1] as *const i64;
+    let timeout_ptr = UserInPtr::from_raw(frame.x[1] as *const i64);
     crate::log::debug_u64(0xD100_0001);
-    crate::log::debug_u64(timeout_ptr as u64);
+    crate::log::debug_u64(timeout_ptr.as_raw() as u64);
     if timeout_ptr.is_null() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
 
-    let Some(raw) = read_current_user_value(timeout_ptr) else {
+    let Some(raw) = timeout_ptr.read_current() else {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     };

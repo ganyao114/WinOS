@@ -1,7 +1,8 @@
 use core::mem::size_of;
 use winemu_shared::status;
 
-use crate::mm::usercopy::write_current_user_value;
+use super::common::GuestWriter;
+use super::user_args::UserOutPtr;
 use super::SvcFrame;
 
 // ── Guest-memory layout structs ───────────────────────────────────────────────
@@ -9,25 +10,25 @@ use super::SvcFrame;
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct TokenUser {
-    sid_ptr:    u64,  // pointer to SID (follows immediately in same buffer)
+    sid_ptr: u64, // pointer to SID (follows immediately in same buffer)
     attributes: u32,
-    _pad:       u32,
+    _pad: u32,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct Sid1 {
-    revision:           u8,
+    revision: u8,
     sub_authority_count: u8,
-    authority:          [u8; 6],
-    sub_authority_0:    u32,
+    authority: [u8; 6],
+    sub_authority_0: u32,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct TokenUserBuffer {
     user: TokenUser,
-    sid:  Sid1,
+    sid: Sid1,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -67,7 +68,7 @@ pub fn is_valid_token_handle(token_handle: u64) -> bool {
 pub(crate) fn handle_open_process_token(frame: &mut SvcFrame) {
     let process_handle = frame.x[0];
     let desired_access = frame.x[1] as u32;
-    let out_ptr = frame.x[2] as *mut u64;
+    let out_ptr = UserOutPtr::from_raw(frame.x[2] as *mut u64);
 
     if out_ptr.is_null() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
@@ -86,15 +87,14 @@ pub(crate) fn handle_open_process_token(frame: &mut SvcFrame) {
     }
 
     let cur_pid = crate::process::current_pid();
-    let Some(token_handle) = super::kobject::add_handle_for_pid(
-        cur_pid,
-        crate::process::KObjectRef::token(pid),
-    ) else {
+    let Some(token_handle) =
+        super::kobject::add_handle_for_pid(cur_pid, crate::process::KObjectRef::token(pid))
+    else {
         frame.x[0] = status::NO_MEMORY as u64;
         return;
     };
 
-    if !write_current_user_value(out_ptr, token_handle) {
+    if !out_ptr.write_current(token_handle) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
@@ -106,7 +106,7 @@ pub(crate) fn handle_open_process_token_ex(frame: &mut SvcFrame) {
     // HandleAttributes (x2) ignored — delegate to base OpenProcessToken logic
     let process_handle = frame.x[0];
     let desired_access = frame.x[1] as u32;
-    let out_ptr = frame.x[3] as *mut u64;
+    let out_ptr = UserOutPtr::from_raw(frame.x[3] as *mut u64);
 
     if out_ptr.is_null() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
@@ -122,14 +122,13 @@ pub(crate) fn handle_open_process_token_ex(frame: &mut SvcFrame) {
         return;
     }
     let cur_pid = crate::process::current_pid();
-    let Some(token_handle) = super::kobject::add_handle_for_pid(
-        cur_pid,
-        crate::process::KObjectRef::token(pid),
-    ) else {
+    let Some(token_handle) =
+        super::kobject::add_handle_for_pid(cur_pid, crate::process::KObjectRef::token(pid))
+    else {
         frame.x[0] = status::NO_MEMORY as u64;
         return;
     };
-    if !write_current_user_value(out_ptr, token_handle) {
+    if !out_ptr.write_current(token_handle) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
@@ -141,17 +140,17 @@ pub(crate) fn handle_open_process_token_ex(frame: &mut SvcFrame) {
 // We use the process token for the thread's owning process (no impersonation support).
 pub(crate) fn handle_open_thread_token(frame: &mut SvcFrame) {
     let thread_handle = frame.x[0];
-    let out_ptr = frame.x[3] as *mut u64;
+    let out_ptr = UserOutPtr::from_raw(frame.x[3] as *mut u64);
     open_thread_token_inner(thread_handle, out_ptr, frame);
 }
 
 pub(crate) fn handle_open_thread_token_ex(frame: &mut SvcFrame) {
     let thread_handle = frame.x[0];
-    let out_ptr = frame.x[4] as *mut u64;
+    let out_ptr = UserOutPtr::from_raw(frame.x[4] as *mut u64);
     open_thread_token_inner(thread_handle, out_ptr, frame);
 }
 
-fn open_thread_token_inner(thread_handle: u64, out_ptr: *mut u64, frame: &mut SvcFrame) {
+fn open_thread_token_inner(thread_handle: u64, out_ptr: UserOutPtr<u64>, frame: &mut SvcFrame) {
     if out_ptr.is_null() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
@@ -163,14 +162,13 @@ fn open_thread_token_inner(thread_handle: u64, out_ptr: *mut u64, frame: &mut Sv
         return;
     }
     let cur_pid = crate::process::current_pid();
-    let Some(token_handle) = super::kobject::add_handle_for_pid(
-        cur_pid,
-        crate::process::KObjectRef::token(pid),
-    ) else {
+    let Some(token_handle) =
+        super::kobject::add_handle_for_pid(cur_pid, crate::process::KObjectRef::token(pid))
+    else {
         frame.x[0] = status::NO_MEMORY as u64;
         return;
     };
-    if !write_current_user_value(out_ptr, token_handle) {
+    if !out_ptr.write_current(token_handle) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
@@ -225,9 +223,9 @@ fn resolve_token_owner_pid(token_handle: u64) -> Option<u32> {
     }
 
     let cur_pid = crate::process::current_pid();
-    let obj = crate::process::with_process_mut(cur_pid, |p| {
-        p.handle_table.get(token_handle as u32)
-    }).flatten()?;
+    let obj =
+        crate::process::with_process_mut(cur_pid, |p| p.handle_table.get(token_handle as u32))
+            .flatten()?;
     if obj.kind != crate::process::KObjectKind::Token {
         return None;
     }
@@ -247,12 +245,16 @@ fn query_token_user(buf: *mut u8, len: usize, ret_len: *mut u32) -> u32 {
     };
     let sid_addr = buf as u64 + size_of::<TokenUser>() as u64;
     w.write_struct(TokenUserBuffer {
-        user: TokenUser { sid_ptr: sid_addr, attributes: TOKEN_USER_ATTRIBUTES, _pad: 0 },
-        sid:  Sid1 {
-            revision:            SID_REVISION,
+        user: TokenUser {
+            sid_ptr: sid_addr,
+            attributes: TOKEN_USER_ATTRIBUTES,
+            _pad: 0,
+        },
+        sid: Sid1 {
+            revision: SID_REVISION,
             sub_authority_count: 1,
-            authority:           SECURITY_NT_AUTHORITY,
-            sub_authority_0:     SECURITY_LOCAL_SYSTEM_RID,
+            authority: SECURITY_NT_AUTHORITY,
+            sub_authority_0: SECURITY_LOCAL_SYSTEM_RID,
         },
     });
     write_ret_len(ret_len, required as u32);
@@ -266,15 +268,15 @@ fn query_token_linked_token(pid: u32, buf: *mut u8, len: usize, ret_len: *mut u3
     }
 
     let cur_pid = crate::process::current_pid();
-    let Some(linked) = super::kobject::add_handle_for_pid(
-        cur_pid,
-        crate::process::KObjectRef::token(pid),
-    ) else {
+    let Some(linked) =
+        super::kobject::add_handle_for_pid(cur_pid, crate::process::KObjectRef::token(pid))
+    else {
         return status::NO_MEMORY;
     };
-    if !write_current_user_value(buf as *mut u64, linked) {
+    let Some(mut w) = GuestWriter::new(buf, len, size_of::<u64>()) else {
         return status::INVALID_PARAMETER;
-    }
+    };
+    w.u64(linked);
     write_ret_len(ret_len, size_of::<u64>() as u32);
     status::SUCCESS
 }
@@ -285,15 +287,14 @@ fn write_u32(buf: *mut u8, len: usize, ret_len: *mut u32, value: u32) -> u32 {
         return status::BUFFER_TOO_SMALL;
     }
 
-    if !write_current_user_value(buf as *mut u32, value) {
+    let Some(mut w) = GuestWriter::new(buf, len, size_of::<u32>()) else {
         return status::INVALID_PARAMETER;
-    }
+    };
+    w.u32(value);
     write_ret_len(ret_len, size_of::<u32>() as u32);
     status::SUCCESS
 }
 
 fn write_ret_len(ptr: *mut u32, value: u32) {
-    if !ptr.is_null() {
-        let _ = write_current_user_value(ptr, value);
-    }
+    let _ = UserOutPtr::from_raw(ptr).write_current_if_present(value);
 }

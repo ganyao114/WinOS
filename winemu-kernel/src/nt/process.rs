@@ -1,10 +1,10 @@
 use winemu_shared::status;
 
+use super::user_args::{UserInPtr, UserOutPtr};
 use super::SvcFrame;
-use crate::mm::usercopy::{read_current_user_value, write_current_user_value};
+use crate::mm::usercopy::read_user_at;
+use crate::mm::UserVa;
 
-const PAGE_SIZE_4K: u64 = 0x1000;
-const PAGE_MASK_4K: u64 = !(PAGE_SIZE_4K - 1);
 const CPP_EH_EXCEPTION_CODE: u32 = 0xE06D_7363;
 const EXCEPTION_NAME_MAX: usize = 128;
 
@@ -16,32 +16,7 @@ struct ClientId {
 }
 
 fn read_user_u8(pid: u32, va: u64) -> Option<u8> {
-    if va >= crate::process::USER_VA_LIMIT {
-        return None;
-    }
-    if let Some(pa) = crate::process::with_process(pid, |p| {
-        p.address_space
-            .translate_user_va_for_access(va, super::state::VM_ACCESS_READ)
-    })
-    .flatten()
-    {
-        let ptr = crate::mm::physmap::gpa_to_kva(pa)?;
-        // SAFETY: the translated GPA is mapped through the shared kernel physmap.
-        return Some(unsafe { ptr.cast::<u8>().read_volatile() });
-    }
-
-    let page = va & PAGE_MASK_4K;
-    if !super::state::vm_handle_page_fault(pid, page, super::state::VM_ACCESS_READ) {
-        return None;
-    }
-    let pa = crate::process::with_process(pid, |p| {
-        p.address_space
-            .translate_user_va_for_access(va, super::state::VM_ACCESS_READ)
-    })
-    .flatten()?;
-    let ptr = crate::mm::physmap::gpa_to_kva(pa)?;
-    // SAFETY: the translated GPA is mapped through the shared kernel physmap.
-    Some(unsafe { ptr.cast::<u8>().read_volatile() })
+    read_user_at(pid, UserVa::new(va))
 }
 
 fn read_user_u32(pid: u32, va: u64) -> Option<u32> {
@@ -215,17 +190,17 @@ pub(crate) fn handle_set_information_process(frame: &mut SvcFrame) {
 // NtOpenProcess:
 // x0=*ProcessHandle, x1=DesiredAccess, x2=ObjectAttributes, x3=ClientId
 pub(crate) fn handle_open_process(frame: &mut SvcFrame) {
-    let out_ptr = frame.x[0] as *mut u64;
+    let out_ptr = UserOutPtr::from_raw(frame.x[0] as *mut u64);
     let desired_access = frame.x[1] as u32;
     let _obj_attr = frame.x[2];
-    let client_id_ptr = frame.x[3] as *const ClientId;
+    let client_id_ptr = UserInPtr::from_raw(frame.x[3] as *const ClientId);
 
     if out_ptr.is_null() || client_id_ptr.is_null() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
 
-    let Some(cid) = read_current_user_value(client_id_ptr) else {
+    let Some(cid) = client_id_ptr.read_current() else {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     };
@@ -243,7 +218,7 @@ pub(crate) fn handle_open_process(frame: &mut SvcFrame) {
 
     match crate::process::open_process(target_pid, desired_access) {
         Ok(handle) => {
-            if !write_current_user_value(out_ptr, handle) {
+            if !out_ptr.write_current(handle) {
                 frame.x[0] = status::INVALID_PARAMETER as u64;
                 return;
             }
@@ -258,8 +233,7 @@ pub(crate) fn handle_open_process(frame: &mut SvcFrame) {
 // NtCreateProcessEx:
 // x0=*ProcessHandle, x1=DesiredAccess, x3=ParentProcess, x4=Flags, x5=SectionHandle
 pub(crate) fn handle_create_process(frame: &mut SvcFrame) {
-    crate::log::debug_u64(0xC501_0001);
-    let out_ptr = frame.x[0] as *mut u64;
+    let out_ptr = UserOutPtr::from_raw(frame.x[0] as *mut u64);
     let desired_access = frame.x[1] as u32;
     let parent_handle = frame.x[3];
     let flags = frame.x[4] as u32;
@@ -273,15 +247,13 @@ pub(crate) fn handle_create_process(frame: &mut SvcFrame) {
 
     match crate::process::create_process(parent_handle, section_handle, flags) {
         Ok(handle) => {
-            crate::log::debug_u64(0xC501_0002);
-            if !out_ptr.is_null() && !write_current_user_value(out_ptr, handle) {
+            if !out_ptr.write_current_if_present(handle) {
                 frame.x[0] = status::INVALID_PARAMETER as u64;
                 return;
             }
             frame.x[0] = status::SUCCESS as u64;
         }
         Err(st) => {
-            crate::log::debug_u64(0xC501_1000 | st as u64);
             frame.x[0] = st as u64;
         }
     }

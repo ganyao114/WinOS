@@ -5,8 +5,8 @@
 //   - Lock count is per-vCPU (reentrant on same vCPU).
 //   - On final unlock, runs deferred topology updates then checks reschedule.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use crate::sched::cpu::vcpu_id;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 // ── Raw spinlock ──────────────────────────────────────────────────────────────
 
@@ -16,13 +16,16 @@ pub struct SchedSpinlock {
 
 impl SchedSpinlock {
     pub const fn new() -> Self {
-        Self { locked: AtomicBool::new(false) }
+        Self {
+            locked: AtomicBool::new(false),
+        }
     }
 
     #[inline]
     pub fn acquire(&self) {
         loop {
-            if self.locked
+            if self
+                .locked
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
@@ -51,10 +54,14 @@ pub static SCHED_LOCK: SchedSpinlock = SchedSpinlock::new();
 
 // Per-vCPU lock depth (not in KCpuLocal to avoid circular dep at static init).
 static LOCK_DEPTH: [AtomicU32; 8] = [
-    AtomicU32::new(0), AtomicU32::new(0),
-    AtomicU32::new(0), AtomicU32::new(0),
-    AtomicU32::new(0), AtomicU32::new(0),
-    AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
 ];
 
 // ── KSchedulerLock RAII guard ─────────────────────────────────────────────────
@@ -177,14 +184,17 @@ pub fn with_sched_lock_vid0<R>(f: impl FnOnce() -> R) -> R {
 /// } else { result }
 /// ```
 pub struct SchedLockAndSleep {
-    _guard:    KSchedulerLock,
+    _guard: KSchedulerLock,
     cancelled: bool,
 }
 
 impl SchedLockAndSleep {
     #[inline]
     pub fn new() -> Self {
-        Self { _guard: KSchedulerLock::lock(), cancelled: false }
+        Self {
+            _guard: KSchedulerLock::lock(),
+            cancelled: false,
+        }
     }
 
     /// Cancel the sleep — the lock will still be released on drop, but

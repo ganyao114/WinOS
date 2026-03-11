@@ -1,5 +1,7 @@
 use winemu_shared::status;
 
+use crate::mm::usercopy::{read_current_user_bytes, read_current_user_value};
+
 use super::resolve_process_handle;
 
 const PROCESS_INFO_CLASS_ACCESS_TOKEN: u32 = 9;
@@ -50,7 +52,9 @@ fn set_u32_field(pid: u32, info: *const u8, info_len: usize) -> u32 {
     if info.is_null() || info_len != core::mem::size_of::<u32>() {
         return status::INVALID_PARAMETER;
     }
-    let _ = unsafe { (info as *const u32).read_volatile() };
+    let Some(_) = read_current_user_value(info.cast::<u32>()) else {
+        return status::INVALID_PARAMETER;
+    };
     status::SUCCESS
 }
 
@@ -60,7 +64,9 @@ fn set_priority_class(pid: u32, info: *const u8, info_len: usize) -> u32 {
         return status::INVALID_PARAMETER;
     }
 
-    let _ = unsafe { info.add(1).read_volatile() };
+    let Some(_) = read_current_user_bytes(info, PROCESS_PRIORITY_CLASS_SIZE) else {
+        return status::INVALID_PARAMETER;
+    };
     status::SUCCESS
 }
 
@@ -68,7 +74,9 @@ fn set_affinity_mask(pid: u32, info: *const u8, info_len: usize) -> u32 {
     if info.is_null() || info_len != core::mem::size_of::<u64>() {
         return status::INVALID_PARAMETER;
     }
-    let requested_mask = unsafe { (info as *const u64).read_volatile() };
+    let Some(requested_mask) = read_current_user_value(info.cast::<u64>()) else {
+        return status::INVALID_PARAMETER;
+    };
     if requested_mask == 0 {
         return status::INVALID_PARAMETER;
     }
@@ -97,8 +105,15 @@ fn set_access_token(_pid: u32, info: *const u8, info_len: usize) -> u32 {
         return status::INFO_LENGTH_MISMATCH;
     }
 
-    let token_handle = unsafe { (info as *const u64).read_volatile() };
-    let thread_handle = unsafe { (info as *const u64).add(1).read_volatile() };
+    let Some(raw) = read_current_user_bytes(info, PROCESS_ACCESS_TOKEN_SIZE) else {
+        return status::INVALID_PARAMETER;
+    };
+    let mut token_bytes = [0u8; 8];
+    token_bytes.copy_from_slice(&raw[0..8]);
+    let token_handle = u64::from_le_bytes(token_bytes);
+    let mut thread_bytes = [0u8; 8];
+    thread_bytes.copy_from_slice(&raw[8..16]);
+    let thread_handle = u64::from_le_bytes(thread_bytes);
     if thread_handle != 0 {
         return status::NOT_IMPLEMENTED;
     }

@@ -32,11 +32,11 @@ fn host_page_size() -> usize {
 const GUEST_PAGE_SIZE: usize = 4096;
 
 /// Maximum buddy order
-const MAX_ORDER: usize = 11;
+const MAX_ORDER: usize = 21;
 /// Pool low watermark (in host pages)
 const POOL_LOW_PAGES: usize = 16;
-/// Pool grow batch (in host pages)
-const POOL_GROW_PAGES: usize = 64;
+/// Pool grow batch order (64 host pages; must stay power-of-two)
+const POOL_GROW_ORDER: usize = 6;
 /// Pool high watermark — shrink when exceeded (in host pages)
 const POOL_HIGH_PAGES: usize = 256;
 
@@ -78,6 +78,13 @@ fn align_down_host(v: u64) -> u64 {
     v & !mask
 }
 
+/// Align `v` up to a power-of-two boundary.
+#[inline]
+fn align_up_pow2(v: u64, align: u64) -> u64 {
+    debug_assert!(align.is_power_of_two());
+    (v + align - 1) & !(align - 1)
+}
+
 struct HostChunk {
     hva: *mut u8,
     gpa: u64,
@@ -115,14 +122,22 @@ impl GpaAllocator {
         self.free_page_count * host_page_size()
     }
 
-    fn grow_pool(&mut self) -> bool {
-        let hps = host_page_size();
-        let size = POOL_GROW_PAGES * hps;
-        let gpa = self.next_gpa;
-        if gpa + size as u64 > self.limit {
+    fn grow_pool(&mut self, min_order: usize) -> bool {
+        let chunk_order = min_order.max(POOL_GROW_ORDER);
+        if chunk_order >= MAX_ORDER {
             return false;
         }
 
+        let size = order_size(chunk_order);
+        let gpa = align_up_pow2(self.next_gpa, size as u64);
+        let Some(chunk_end) = gpa.checked_add(size as u64) else {
+            return false;
+        };
+        if chunk_end > self.limit {
+            return false;
+        }
+
+        // SAFETY: We request an anonymous private mapping owned by this allocator.
         let hva = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -139,27 +154,9 @@ impl GpaAllocator {
         let hva = hva as *mut u8;
 
         self.chunks.push(HostChunk { hva, gpa, size });
-        self.next_gpa = gpa + size as u64;
-
-        // Insert into buddy free lists at largest aligned orders
-        let mut offset = 0u64;
-        let mut remaining = POOL_GROW_PAGES;
-        while remaining > 0 {
-            let mut order = MAX_ORDER - 1;
-            loop {
-                let pages = 1usize << order;
-                let block_gpa = gpa + offset;
-                let aligned = (block_gpa & (order_size(order) as u64 - 1)) == 0;
-                if pages <= remaining && aligned { break; }
-                if order == 0 { break; }
-                order -= 1;
-            }
-            let pages = 1usize << order;
-            self.free_lists[order].insert(gpa + offset);
-            self.free_page_count += pages;
-            offset += order_size(order) as u64;
-            remaining -= pages;
-        }
+        self.next_gpa = chunk_end;
+        self.free_lists[chunk_order].insert(gpa);
+        self.free_page_count += 1usize << chunk_order;
 
         true
     }
@@ -174,15 +171,27 @@ impl GpaAllocator {
         }
         let alloc_size = align_up_host(size as u64) as usize;
         let order = size_to_order(alloc_size);
-        if order >= MAX_ORDER { return None; }
-
-        while self.free_page_count < (1usize << order) + POOL_LOW_PAGES {
-            if !self.grow_pool() { break; }
+        if order >= MAX_ORDER {
+            return None;
         }
 
-        let gpa = self.alloc_order(order)?;
+        while self.free_page_count < (1usize << order).saturating_add(POOL_LOW_PAGES) {
+            if !self.grow_pool(order) {
+                break;
+            }
+        }
+
+        let gpa = loop {
+            if let Some(gpa) = self.alloc_order(order) {
+                break gpa;
+            }
+            if !self.grow_pool(order) {
+                return None;
+            }
+        };
         let hva = self.resolve_hva(gpa, alloc_size)?;
-        unsafe { std::ptr::write_bytes(hva, 0, alloc_size); }
+        // SAFETY: `resolve_hva` returned a valid writable mapping spanning `alloc_size`.
+        unsafe { std::ptr::write_bytes(hva, 0, alloc_size) };
         Some((Gpa(gpa), hva))
     }
 
@@ -199,12 +208,18 @@ impl GpaAllocator {
         }
         let alloc_size = align_up_host(size as u64) as usize;
         let order = size_to_order(alloc_size);
-        if order >= MAX_ORDER { return None; }
-        let Some(chunk_base) = self.find_chunk_base(gpa) else {
+        if order >= MAX_ORDER {
+            return None;
+        }
+        let Some((chunk_base, chunk_size)) = self.find_chunk(gpa).map(|chunk| (chunk.gpa, chunk.size))
+        else {
             return None;
         };
         let block_size = order_size(order) as u64;
         if ((gpa - chunk_base) & (block_size - 1)) != 0 {
+            return None;
+        }
+        if gpa + block_size > chunk_base + chunk_size as u64 {
             return None;
         }
         if self.resolve_hva(gpa, alloc_size).is_none() {
@@ -235,6 +250,8 @@ impl GpaAllocator {
             let end = chunk.gpa + chunk.size as u64;
             if gpa >= chunk.gpa && gpa + size as u64 <= end {
                 let offset = (gpa - chunk.gpa) as usize;
+                // SAFETY: `offset` is within the chunk because the bounds check above
+                // guarantees `[gpa, gpa + size)` lies inside this host mapping.
                 return Some(unsafe { chunk.hva.add(offset) });
             }
         }
@@ -244,9 +261,15 @@ impl GpaAllocator {
     fn free_order(&mut self, gpa: u64, order: usize) {
         self.free_page_count += 1usize << order;
         if order + 1 < MAX_ORDER {
-            if let Some(base) = self.find_chunk_base(gpa) {
+            if let Some((base, chunk_size)) = self.find_chunk(gpa).map(|chunk| (chunk.gpa, chunk.size))
+            {
+                let block_size = order_size(order) as u64;
+                let chunk_end = base + chunk_size as u64;
                 let bud = buddy_gpa(gpa, order, base);
-                if self.free_lists[order].remove(&bud) {
+                if bud >= base
+                    && bud + block_size <= chunk_end
+                    && self.free_lists[order].remove(&bud)
+                {
                     self.free_page_count -= 1usize << order;
                     self.free_page_count -= 1usize << order;
                     self.free_order(gpa.min(bud), order + 1);
@@ -310,6 +333,8 @@ impl GpaAllocator {
 
             // munmap host memory
             let chunk = self.chunks.remove(i);
+            // SAFETY: `chunk.hva`/`chunk.size` originate from a successful `mmap`
+            // owned by this allocator and are no longer referenced after removal.
             unsafe {
                 libc::munmap(chunk.hva as *mut libc::c_void, chunk.size);
             }
@@ -317,13 +342,10 @@ impl GpaAllocator {
         }
     }
 
-    fn find_chunk_base(&self, gpa: u64) -> Option<u64> {
-        for chunk in &self.chunks {
-            if gpa >= chunk.gpa && gpa < chunk.gpa + chunk.size as u64 {
-                return Some(chunk.gpa);
-            }
-        }
-        None
+    fn find_chunk(&self, gpa: u64) -> Option<&HostChunk> {
+        self.chunks
+            .iter()
+            .find(|chunk| gpa >= chunk.gpa && gpa < chunk.gpa + chunk.size as u64)
     }
 
     /// Resolve HVA for a GPA (public, for hv_vm_map by caller).

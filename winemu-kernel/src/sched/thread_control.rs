@@ -4,17 +4,15 @@
 
 use core::sync::atomic::Ordering;
 
-use crate::sched::global::{with_thread, with_thread_mut};
 use crate::sched::global::SCHED;
+use crate::sched::global::{with_thread, with_thread_mut};
 use crate::sched::topology::set_thread_state_locked;
 use crate::sched::types::ThreadState;
 use crate::sched::wait::{unblock_thread_locked, STATUS_SUCCESS};
 
 #[inline]
 fn notify_priority_changed_locked() {
-    SCHED
-        .scheduler_update_needed
-        .store(true, Ordering::Relaxed);
+    SCHED.scheduler_update_needed.store(true, Ordering::Relaxed);
 }
 
 fn purge_tid_from_ready_queue_locked(tid: u32, priority: u8) {
@@ -67,7 +65,7 @@ pub fn set_thread_priority_locked(tid: u32, priority: u8) {
         purge_tid_from_ready_queue_locked(tid, old_prio);
     }
     with_thread_mut(tid, |t| {
-        t.priority      = priority;
+        t.priority = priority;
         t.base_priority = priority;
     });
     if old_state == ThreadState::Ready {
@@ -231,5 +229,6 @@ pub fn consume_quantum_locked(tid: u32, elapsed_100ns: u64) -> bool {
             t.slice_remaining_100ns -= elapsed_100ns;
             false
         }
-    }).unwrap_or(false)
+    })
+    .unwrap_or(false)
 }

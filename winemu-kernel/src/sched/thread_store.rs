@@ -49,7 +49,11 @@ impl ThreadStore {
     /// Return a raw mutable pointer to the thread, or null if not found.
     pub fn get_ptr(&self, tid: u32) -> Option<*mut KThread> {
         let ptr = self.0.get_ptr(tid);
-        if ptr.is_null() { None } else { Some(ptr) }
+        if ptr.is_null() {
+            None
+        } else {
+            Some(ptr)
+        }
     }
 
     /// Iterate over all live thread IDs.

@@ -88,9 +88,7 @@ pub(crate) fn vm_promote_cow_prot(prot: u32) -> u32 {
 pub(crate) fn vm_clone_shared_nt_prot(prot: u32) -> u32 {
     match vm_sanitize_nt_prot(prot) & 0xFF {
         0x04 => (prot & !0xFF) | PAGE_WRITECOPY,
-        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY => {
-            (prot & !0xFF) | PAGE_EXECUTE_WRITECOPY
-        }
+        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY => (prot & !0xFF) | PAGE_EXECUTE_WRITECOPY,
         _ => prot,
     }
 }

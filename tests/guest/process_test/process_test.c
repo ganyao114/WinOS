@@ -236,11 +236,7 @@ static inline NTSTATUS nt_close(HANDLE handle) {
     return (NTSTATUS)svc8(NR_CLOSE, (uint64_t)handle, 0, 0, 0, 0, 0, 0, 0);
 }
 
-static inline void nt_yield(void) {
-    (void)svc8(NR_YIELD_EXECUTION, 0, 0, 0, 0, 0, 0, 0, 0);
-}
-
-static volatile uint64_t g_child_thread_pid = 0;
+static volatile uint64_t g_clone_cow_word = 0;
 static uint32_t g_pass = 0;
 static uint32_t g_fail = 0;
 
@@ -295,6 +291,7 @@ static __attribute__((noreturn)) void fail_fast(const char* name, NTSTATUS st) {
 
 static __attribute__((noreturn)) void child_thread_entry(void* arg) {
     (void)arg;
+    g_clone_cow_word = 0x8877665544332211ULL;
     PROCESS_BASIC_INFORMATION pbi;
     ULONG ret_len = 0;
     NTSTATUS st = nt_query_information_process(
@@ -304,15 +301,13 @@ static __attribute__((noreturn)) void child_thread_entry(void* arg) {
         sizeof(pbi),
         &ret_len
     );
-    if (st == STATUS_SUCCESS) {
-        g_child_thread_pid = pbi.UniqueProcessId;
-    }
     (void)nt_terminate_thread(NT_CURRENT_THREAD, st);
     spin_forever();
 }
 
 void mainCRTStartup(void) {
     write_str("== process_test ==\r\n");
+    g_clone_cow_word = 0x1122334455667788ULL;
 
     PROCESS_BASIC_INFORMATION self_pbi;
     ULONG self_ret_len = 0;
@@ -417,13 +412,9 @@ void mainCRTStartup(void) {
     st = nt_wait_single(child_thread);
     check("Wait child thread success", st == STATUS_SUCCESS);
     (void)nt_close(child_thread);
-
-    for (int i = 0; i < 256 && g_child_thread_pid == 0; i++) {
-        nt_yield();
-    }
     check(
-        "Child thread observed child PID",
-        g_child_thread_pid == child_pbi.UniqueProcessId
+        "Child writable image data does not corrupt parent",
+        g_clone_cow_word == 0x1122334455667788ULL
     );
 
     st = nt_terminate_process(child, 0x55667788U);

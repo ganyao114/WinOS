@@ -10,7 +10,7 @@ use crate::sched::wait::STATUS_SUCCESS;
 pub struct WaitQueue {
     /// Head TID of the priority-sorted list (0 = empty).
     head: u32,
-    len:  usize,
+    len: usize,
 }
 
 impl WaitQueue {
@@ -32,14 +32,14 @@ impl WaitQueue {
 
         // Find insertion point.
         let mut prev = 0u32;
-        let mut cur  = self.head;
+        let mut cur = self.head;
         while cur != 0 {
             let cur_prio = with_thread(cur, |t| t.priority).unwrap_or(31);
             if prio < cur_prio {
                 break; // insert before cur
             }
             prev = cur;
-            cur  = with_thread(cur, |t| t.wait.wait_next).unwrap_or(0);
+            cur = with_thread(cur, |t| t.wait.wait_next).unwrap_or(0);
         }
 
         // Link tid → cur.
@@ -58,18 +58,18 @@ impl WaitQueue {
         if self.head == 0 {
             return None;
         }
-        let tid  = self.head;
+        let tid = self.head;
         let next = with_thread(tid, |t| t.wait.wait_next).unwrap_or(0);
         with_thread_mut(tid, |t| t.wait.wait_next = 0);
         self.head = next;
-        self.len  = self.len.saturating_sub(1);
+        self.len = self.len.saturating_sub(1);
         Some(tid)
     }
 
     /// Remove a specific TID from the queue. Returns true if found.
     pub fn remove(&mut self, tid: u32) -> bool {
         let mut prev = 0u32;
-        let mut cur  = self.head;
+        let mut cur = self.head;
         while cur != 0 {
             let next = with_thread(cur, |t| t.wait.wait_next).unwrap_or(0);
             if cur == tid {
@@ -83,7 +83,7 @@ impl WaitQueue {
                 return true;
             }
             prev = cur;
-            cur  = next;
+            cur = next;
         }
         false
     }

@@ -19,24 +19,24 @@ use crate::sched::wait::check_wait_timeouts_locked;
 
 pub enum SchedulerRoundAction {
     ContinueCurrent {
-        now_100ns:             u64,
-        next_deadline_100ns:   u64,
+        now_100ns: u64,
+        next_deadline_100ns: u64,
         slice_remaining_100ns: u64,
     },
     RunThread {
-        now_100ns:             u64,
-        next_deadline_100ns:   u64,
+        now_100ns: u64,
+        next_deadline_100ns: u64,
         slice_remaining_100ns: u64,
-        from_tid:              u32,
-        to_tid:                u32,
-        pending_resched:       bool,
-        timeout_woke:          bool,
-        cur_not_running:       bool,
+        from_tid: u32,
+        to_tid: u32,
+        pending_resched: bool,
+        timeout_woke: bool,
+        cur_not_running: bool,
     },
     IdleWait {
-        now_100ns:           u64,
+        now_100ns: u64,
         next_deadline_100ns: u64,
-        from_tid:            u32,
+        from_tid: u32,
     },
 }
 
@@ -55,15 +55,12 @@ pub enum ScheduleReason {
 fn pick_next_thread_locked(vid: u32) -> u32 {
     let queue = unsafe { SCHED.queue_raw_mut() };
     let store = unsafe { SCHED.threads_raw() };
-    let tid = queue.pop_highest_matching(
-        &|id| store.get_ptr(id),
-        &|t| {
-            !t.is_idle_thread
-                && t.state == ThreadState::Ready
-                && (t.affinity_mask & (1u32 << vid)) != 0
-                && (!t.in_kernel || t.last_vcpu_hint as u32 == vid)
-        },
-    );
+    let tid = queue.pop_highest_matching(&|id| store.get_ptr(id), &|t| {
+        !t.is_idle_thread
+            && t.state == ThreadState::Ready
+            && (t.affinity_mask & (1u32 << vid)) != 0
+            && (!t.in_kernel || t.last_vcpu_hint as u32 == vid)
+    });
     if tid != 0 {
         with_thread_mut(tid, |t| {
             t.in_ready_queue = false;
@@ -76,15 +73,12 @@ fn pick_next_thread_locked(vid: u32) -> u32 {
 fn peek_next_thread_locked(vid: u32) -> u32 {
     let queue = unsafe { SCHED.queue_raw_mut() };
     let store = unsafe { SCHED.threads_raw() };
-    queue.peek_highest_matching(
-        &|id| store.get_ptr(id).map(|p| p as *const _),
-        &|t| {
-            !t.is_idle_thread
-                && t.state == ThreadState::Ready
-                && (t.affinity_mask & (1u32 << vid)) != 0
-                && (!t.in_kernel || t.last_vcpu_hint as u32 == vid)
-        },
-    )
+    queue.peek_highest_matching(&|id| store.get_ptr(id).map(|p| p as *const _), &|t| {
+        !t.is_idle_thread
+            && t.state == ThreadState::Ready
+            && (t.affinity_mask & (1u32 << vid)) != 0
+            && (!t.in_kernel || t.last_vcpu_hint as u32 == vid)
+    })
 }
 
 fn dequeue_ready_tid_locked(tid: u32) -> bool {
@@ -132,7 +126,8 @@ pub fn scheduler_round_locked(
     };
 
     let cur_not_running = from_tid == 0 || {
-        with_thread(from_tid, |t| t.state).unwrap_or(ThreadState::Terminated) != ThreadState::Running
+        with_thread(from_tid, |t| t.state).unwrap_or(ThreadState::Terminated)
+            != ThreadState::Running
     };
 
     let mut to_tid = peek_next_thread_locked(vid);
@@ -305,8 +300,8 @@ pub fn execute_kernel_continuation_switch(
     _slice_remaining_100ns: u64,
     _label: &str,
 ) {
-    use crate::sched::topology::set_vcpu_current_thread;
     use crate::sched::context::__sched_switch_kernel_context;
+    use crate::sched::topology::set_vcpu_current_thread;
 
     let vid = vcpu_id() as usize;
     set_vcpu_current_thread(vid, to_tid);
@@ -316,11 +311,12 @@ pub fn execute_kernel_continuation_switch(
         t.last_vcpu_hint = vid as u8;
     });
 
-    let to_kctx = with_thread(to_tid, |t| &t.kctx as *const KernelContext as usize)
-        .unwrap_or(0) as *const u8;
+    let to_kctx =
+        with_thread(to_tid, |t| &t.kctx as *const KernelContext as usize).unwrap_or(0) as *const u8;
     let from_kctx = with_thread_mut(from_tid, |t| &mut t.kctx as *mut KernelContext as usize)
         .unwrap_or(0) as *mut u8;
 
+    crate::process::switch_to_thread_process(to_tid);
     arm_target_running_slice_locked(to_tid);
     crate::sched::lock::unlock_after_raw_or_scoped(vid);
 
@@ -355,6 +351,7 @@ pub unsafe fn enter_kernel_continuation_noreturn(to_tid: u32) -> ! {
     });
 
     let kctx = with_thread(to_tid, |t| t.kctx).unwrap_or_else(KernelContext::new);
+    crate::process::switch_to_thread_process(to_tid);
     crate::sched::lock::unlock_after_raw_or_scoped(vid);
 
     unsafe {
@@ -375,15 +372,12 @@ pub unsafe fn enter_kernel_continuation_noreturn(to_tid: u32) -> ! {
 fn peek_next_thread_for_vcpu(vid: u32) -> u32 {
     let queue = unsafe { SCHED.queue_raw_mut() };
     let store = unsafe { SCHED.threads_raw() };
-    queue.peek_highest_matching(
-        &|id| store.get_ptr(id).map(|p| p as *const _),
-        &|t| {
-            !t.is_idle_thread
-                && t.state == ThreadState::Ready
-                && (t.affinity_mask & (1u32 << vid)) != 0
-                && (!t.in_kernel || t.last_vcpu_hint as u32 == vid)
-        },
-    )
+    queue.peek_highest_matching(&|id| store.get_ptr(id).map(|p| p as *const _), &|t| {
+        !t.is_idle_thread
+            && t.state == ThreadState::Ready
+            && (t.affinity_mask & (1u32 << vid)) != 0
+            && (!t.in_kernel || t.last_vcpu_hint as u32 == vid)
+    })
 }
 
 fn needs_cross_core_reschedule_locked(vid: usize, candidate_tid: u32) -> bool {
@@ -425,7 +419,10 @@ pub fn update_highest_priority_threads() -> u32 {
     }
 
     // Fast path: no scheduler topology update is pending; keep explicit flags.
-    if !SCHED.scheduler_update_needed.swap(false, core::sync::atomic::Ordering::AcqRel) {
+    if !SCHED
+        .scheduler_update_needed
+        .swap(false, core::sync::atomic::Ordering::AcqRel)
+    {
         return cores_needing_scheduling;
     }
 
@@ -491,7 +488,8 @@ pub fn flush_unlock_edge(vid: usize) -> u32 {
     match action {
         SchedulerRoundAction::RunThread { .. } => {
             // Mark update needed so other vCPUs are also re-evaluated.
-            SCHED.scheduler_update_needed
+            SCHED
+                .scheduler_update_needed
                 .store(true, core::sync::atomic::Ordering::Relaxed);
         }
         SchedulerRoundAction::IdleWait { .. } | SchedulerRoundAction::ContinueCurrent { .. } => {}
@@ -584,7 +582,11 @@ pub fn schedule_noreturn_locked(from_tid: u32) -> ! {
 
     let to_tid = pick_next_thread_locked(vid as u32);
     let idle_tid = unsafe { SCHED.vcpu_raw(vid) }.idle_tid;
-    let target = if to_tid != 0 { to_tid } else if idle_tid != 0 { idle_tid } else {
+    let target = if to_tid != 0 {
+        to_tid
+    } else if idle_tid != 0 {
+        idle_tid
+    } else {
         panic!("schedule_noreturn_locked: no thread to run");
     };
 
@@ -596,10 +598,11 @@ pub fn schedule_noreturn_locked(from_tid: u32) -> ! {
     });
 
     if from_tid != 0 && from_tid != target {
-        let to_kctx = with_thread(target, |t| &t.kctx as *const KernelContext as usize)
-            .unwrap_or(0) as *const u8;
+        let to_kctx = with_thread(target, |t| &t.kctx as *const KernelContext as usize).unwrap_or(0)
+            as *const u8;
         let from_kctx = with_thread_mut(from_tid, |t| &mut t.kctx as *mut KernelContext as usize)
             .unwrap_or(0) as *mut u8;
+        crate::process::switch_to_thread_process(target);
         arm_target_running_slice_locked(target);
         crate::sched::lock::unlock_after_raw_or_scoped(vid);
         unsafe { crate::sched::context::__sched_switch_kernel_context(from_kctx, to_kctx) }
@@ -617,8 +620,8 @@ pub fn schedule_noreturn_locked(from_tid: u32) -> ! {
 /// Main scheduler entry point for a vCPU.
 /// Called once per vCPU after boot setup. Does not return.
 pub fn enter_core_scheduler_entry(vid: usize) -> ! {
-    use crate::sched::topology::set_vcpu_current_thread;
     use crate::sched::lock::SCHED_LOCK;
+    use crate::sched::topology::set_vcpu_current_thread;
 
     loop {
         SCHED_LOCK.acquire();
@@ -628,7 +631,11 @@ pub fn enter_core_scheduler_entry(vid: usize) -> ! {
 
         let to_tid = pick_next_thread_locked(vid as u32);
         let idle_tid = unsafe { SCHED.vcpu_raw(vid) }.idle_tid;
-        let target = if to_tid != 0 { to_tid } else if idle_tid != 0 { idle_tid } else {
+        let target = if to_tid != 0 {
+            to_tid
+        } else if idle_tid != 0 {
+            idle_tid
+        } else {
             crate::sched::lock::unlock_after_raw_or_scoped(vid);
             idle_wait_or_exit(vid, crate::sched::wait::current_ticks(), u64::MAX);
             continue;

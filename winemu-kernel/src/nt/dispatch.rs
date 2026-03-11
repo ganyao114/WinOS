@@ -4,14 +4,13 @@
 
 use crate::hypercall;
 use crate::sched::{
-    current_tid, drain_deferred_kstacks, set_thread_in_kernel_locked,
-    set_needs_reschedule,
-    vcpu_id, with_thread, with_thread_mut, set_current_tid, set_vcpu_current_thread, ThreadState,
-    SCHED_LOCK, ScheduleReason, SchedulerRoundAction, scheduler_round_locked,
-    execute_kernel_continuation_switch, enter_kernel_continuation_noreturn,
+    current_tid, drain_deferred_kstacks, enter_kernel_continuation_noreturn,
+    execute_kernel_continuation_switch, scheduler_round_locked, set_current_tid,
+    set_needs_reschedule, set_thread_in_kernel_locked, set_vcpu_current_thread, vcpu_id,
+    with_thread, with_thread_mut, ScheduleReason, SchedulerRoundAction, ThreadState, SCHED_LOCK,
 };
 use crate::timer;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::constants::{
     EL0_FAULT_ELR_TAG, EL0_FAULT_ESR_TAG, EL0_FAULT_FAR_TAG, EL0_FAULT_SPSR_TAG, EL1_FAULT_ELR_TAG,
@@ -27,11 +26,71 @@ use super::{
 static SYSCALL_ERR_TRACE_BUDGET: AtomicU32 = AtomicU32::new(512);
 const DEFERRED_RESCHED_RETRY_100NS: u64 = 10_000; // 1ms
 static TRAP_SCHED_ACTIVE: [AtomicU32; 8] = [
-    AtomicU32::new(0), AtomicU32::new(0),
-    AtomicU32::new(0), AtomicU32::new(0),
-    AtomicU32::new(0), AtomicU32::new(0),
-    AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
 ];
+static TIMER_EL0_LAST_ELR: [AtomicU64; 8] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static TIMER_EL0_REPEAT_COUNT: [AtomicU32; 8] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+#[inline]
+fn trace_repeated_timer_el0_pc(vid: usize, tid: u32, frame: &SvcFrame) {
+    if tid == 0 || vid >= TRAP_SCHED_ACTIVE.len() {
+        return;
+    }
+    if with_thread(tid, |t| t.is_idle_thread).unwrap_or(true) {
+        return;
+    }
+
+    let last_elr = TIMER_EL0_LAST_ELR[vid].load(Ordering::Acquire);
+    let repeat = if last_elr == frame.elr {
+        TIMER_EL0_REPEAT_COUNT[vid].fetch_add(1, Ordering::AcqRel) + 1
+    } else {
+        TIMER_EL0_LAST_ELR[vid].store(frame.elr, Ordering::Release);
+        TIMER_EL0_REPEAT_COUNT[vid].store(1, Ordering::Release);
+        1
+    };
+
+    if repeat < 64 || (repeat & (repeat - 1)) != 0 {
+        return;
+    }
+
+    crate::kwarn!(
+        "timer_el0_repeat: vid={} repeat={} tid={} pid={} elr={:#x} sp={:#x} x0={:#x} x1={:#x} ttbr0={:#x}",
+        vid,
+        repeat,
+        tid,
+        crate::sched::thread_pid(tid),
+        frame.elr,
+        frame.sp_el0,
+        frame.x[0],
+        frame.x[1],
+        crate::arch::mmu::current_user_table_root(),
+    );
+}
 
 struct TrapSchedGuard {
     vid: usize,
@@ -118,92 +177,99 @@ pub extern "C" fn svc_dispatch(frame: &mut SvcFrame) {
 fn dispatch_nt_handler(frame: &mut SvcFrame, handler_id: u8) {
     use NtHandlerId::*;
     match handler_id {
-        x if x == CreateFile as u8            => file::handle_create_file(frame),
-        x if x == OpenFile as u8              => file::handle_open_file(frame),
-        x if x == ReadFile as u8              => file::handle_read_file(frame),
-        x if x == DeviceIoControlFile as u8   => file::handle_device_io_control_file(frame),
-        x if x == WriteFile as u8             => file::handle_write_file(frame),
-        x if x == QueryInformationFile as u8  => file::handle_query_information_file(frame),
-        x if x == QueryAttributesFile as u8   => file::handle_query_attributes_file(frame),
+        x if x == CreateFile as u8 => file::handle_create_file(frame),
+        x if x == OpenFile as u8 => file::handle_open_file(frame),
+        x if x == ReadFile as u8 => file::handle_read_file(frame),
+        x if x == DeviceIoControlFile as u8 => file::handle_device_io_control_file(frame),
+        x if x == WriteFile as u8 => file::handle_write_file(frame),
+        x if x == QueryInformationFile as u8 => file::handle_query_information_file(frame),
+        x if x == QueryAttributesFile as u8 => file::handle_query_attributes_file(frame),
         x if x == QueryFullAttributesFile as u8 => file::handle_query_full_attributes_file(frame),
-        x if x == QueryVolumeInformationFile as u8 => file::handle_query_volume_information_file(frame),
-        x if x == SetInformationFile as u8    => file::handle_set_information_file(frame),
-        x if x == FsControlFile as u8         => file::handle_fs_control_file(frame),
-        x if x == QueryDirectoryFile as u8    => file::handle_query_directory_file(frame),
-        x if x == NotifyChangeDirectoryFile as u8 => file::handle_notify_change_directory_file(frame),
-        x if x == FlushBuffersFile as u8      => file::handle_flush_buffers_file(frame),
-        x if x == CancelIoFile as u8          => file::handle_cancel_io_file(frame),
-        x if x == LockFile as u8              => file::handle_lock_file(frame),
-        x if x == UnlockFile as u8            => file::handle_unlock_file(frame),
+        x if x == QueryVolumeInformationFile as u8 => {
+            file::handle_query_volume_information_file(frame)
+        }
+        x if x == SetInformationFile as u8 => file::handle_set_information_file(frame),
+        x if x == FsControlFile as u8 => file::handle_fs_control_file(frame),
+        x if x == QueryDirectoryFile as u8 => file::handle_query_directory_file(frame),
+        x if x == NotifyChangeDirectoryFile as u8 => {
+            file::handle_notify_change_directory_file(frame)
+        }
+        x if x == FlushBuffersFile as u8 => file::handle_flush_buffers_file(frame),
+        x if x == CancelIoFile as u8 => file::handle_cancel_io_file(frame),
+        x if x == LockFile as u8 => file::handle_lock_file(frame),
+        x if x == UnlockFile as u8 => file::handle_unlock_file(frame),
         x if x == QuerySystemInformation as u8 => system::handle_query_system_information(frame),
-        x if x == QuerySystemTime as u8       => system::handle_query_system_time(frame),
+        x if x == QuerySystemTime as u8 => system::handle_query_system_time(frame),
         x if x == QueryPerformanceCounter as u8 => system::handle_query_performance_counter(frame),
-        x if x == CreateEvent as u8           => sync::handle_create_event(frame),
-        x if x == SetEvent as u8              => sync::handle_set_event(frame),
-        x if x == ResetEvent as u8            => sync::handle_reset_event_or_delay(frame),
-        x if x == ClearEvent as u8            => sync::handle_clear_event(frame),
-        x if x == OpenEvent as u8             => sync::handle_open_event(frame),
-        x if x == WaitForSingleObject as u8   => sync::handle_wait_single(frame),
+        x if x == CreateEvent as u8 => sync::handle_create_event(frame),
+        x if x == SetEvent as u8 => sync::handle_set_event(frame),
+        x if x == ResetEvent as u8 => sync::handle_reset_event_or_delay(frame),
+        x if x == ClearEvent as u8 => sync::handle_clear_event(frame),
+        x if x == OpenEvent as u8 => sync::handle_open_event(frame),
+        x if x == WaitForSingleObject as u8 => sync::handle_wait_single(frame),
         x if x == WaitForMultipleObjects as u8 => sync::handle_wait_multiple(frame),
-        x if x == CreateMutant as u8          => sync::handle_create_mutex(frame),
+        x if x == CreateMutant as u8 => sync::handle_create_mutex(frame),
         x if x == ReleaseMutant as u8 || x == SetInformationProcess as u8 => {
             sync::handle_release_mutant_or_set_information_process(frame)
         }
-        x if x == OpenMutant as u8            => sync::handle_open_mutex(frame),
-        x if x == CreateSemaphore as u8       => sync::handle_create_semaphore(frame),
-        x if x == ReleaseSemaphore as u8      => sync::handle_release_semaphore(frame),
-        x if x == OpenSemaphore as u8         => sync::handle_open_semaphore(frame),
-        x if x == OpenKey as u8               => registry::handle_open_key(frame),
-        x if x == OpenKeyEx as u8             => registry::handle_open_key_ex(frame),
-        x if x == CreateKey as u8             => registry::handle_create_key(frame),
-        x if x == QueryKey as u8              => registry::handle_query_key(frame),
-        x if x == QueryValueKey as u8         => registry::handle_query_value_key(frame),
-        x if x == SetValueKey as u8           => registry::handle_set_value_key(frame),
-        x if x == DeleteKey as u8             => registry::handle_delete_key(frame),
-        x if x == DeleteValueKey as u8        => registry::handle_delete_value_key(frame),
-        x if x == EnumerateKey as u8          => registry::handle_enumerate_key(frame),
-        x if x == EnumerateValueKey as u8     => registry::handle_enumerate_value_key(frame),
+        x if x == OpenMutant as u8 => sync::handle_open_mutex(frame),
+        x if x == CreateSemaphore as u8 => sync::handle_create_semaphore(frame),
+        x if x == ReleaseSemaphore as u8 => sync::handle_release_semaphore(frame),
+        x if x == OpenSemaphore as u8 => sync::handle_open_semaphore(frame),
+        x if x == OpenKey as u8 => registry::handle_open_key(frame),
+        x if x == OpenKeyEx as u8 => registry::handle_open_key_ex(frame),
+        x if x == CreateKey as u8 => registry::handle_create_key(frame),
+        x if x == QueryKey as u8 => registry::handle_query_key(frame),
+        x if x == QueryValueKey as u8 => registry::handle_query_value_key(frame),
+        x if x == SetValueKey as u8 => registry::handle_set_value_key(frame),
+        x if x == DeleteKey as u8 => registry::handle_delete_key(frame),
+        x if x == DeleteValueKey as u8 => registry::handle_delete_value_key(frame),
+        x if x == EnumerateKey as u8 => registry::handle_enumerate_key(frame),
+        x if x == EnumerateValueKey as u8 => registry::handle_enumerate_value_key(frame),
         x if x == AllocateVirtualMemory as u8 => memory::handle_allocate_virtual_memory(frame),
-        x if x == FreeVirtualMemory as u8     => memory::handle_free_virtual_memory(frame),
-        x if x == QueryVirtualMemory as u8    => memory::handle_query_virtual_memory(frame),
-        x if x == ProtectVirtualMemory as u8  => memory::handle_protect_virtual_memory(frame),
-        x if x == ReadVirtualMemory as u8     => memory::handle_read_virtual_memory(frame),
-        x if x == WriteVirtualMemory as u8    => memory::handle_write_virtual_memory(frame),
-        x if x == CreateSection as u8         => section::handle_create_section(frame),
-        x if x == OpenSection as u8           => section::handle_open_section(frame),
-        x if x == MapViewOfSection as u8      => section::handle_map_view_of_section(frame),
-        x if x == UnmapViewOfSection as u8    => section::handle_unmap_view_of_section(frame),
-        x if x == QuerySection as u8          => section::handle_query_section(frame),
+        x if x == FreeVirtualMemory as u8 => memory::handle_free_virtual_memory(frame),
+        x if x == QueryVirtualMemory as u8 => memory::handle_query_virtual_memory(frame),
+        x if x == ProtectVirtualMemory as u8 => memory::handle_protect_virtual_memory(frame),
+        x if x == ReadVirtualMemory as u8 => memory::handle_read_virtual_memory(frame),
+        x if x == WriteVirtualMemory as u8 => memory::handle_write_virtual_memory(frame),
+        x if x == CreateSection as u8 => section::handle_create_section(frame),
+        x if x == OpenSection as u8 => section::handle_open_section(frame),
+        x if x == MapViewOfSection as u8 => section::handle_map_view_of_section(frame),
+        x if x == UnmapViewOfSection as u8 => section::handle_unmap_view_of_section(frame),
+        x if x == QuerySection as u8 => section::handle_query_section(frame),
         x if x == QueryInformationProcess as u8 => process::handle_query_information_process(frame),
-        x if x == OpenProcess as u8           => process::handle_open_process(frame),
-        x if x == CreateProcessEx as u8       => process::handle_create_process(frame),
-        x if x == TerminateProcess as u8      => process::handle_terminate_process(frame),
-        x if x == OpenProcessToken as u8      => token::handle_open_process_token(frame),
-        x if x == OpenProcessTokenEx as u8    => token::handle_open_process_token_ex(frame),
-        x if x == OpenThreadToken as u8       => token::handle_open_thread_token(frame),
-        x if x == OpenThreadTokenEx as u8     => token::handle_open_thread_token_ex(frame),
+        x if x == OpenProcess as u8 => process::handle_open_process(frame),
+        x if x == CreateProcessEx as u8 => process::handle_create_process(frame),
+        x if x == TerminateProcess as u8 => process::handle_terminate_process(frame),
+        x if x == OpenProcessToken as u8 => token::handle_open_process_token(frame),
+        x if x == OpenProcessTokenEx as u8 => token::handle_open_process_token_ex(frame),
+        x if x == OpenThreadToken as u8 => token::handle_open_thread_token(frame),
+        x if x == OpenThreadTokenEx as u8 => token::handle_open_thread_token_ex(frame),
         x if x == AdjustPrivilegesToken as u8 => token::handle_adjust_privileges_token(frame),
         x if x == QueryInformationToken as u8 => token::handle_query_information_token(frame),
         x if x == QueryInformationThread as u8 => thread::handle_query_information_thread(frame),
-        x if x == SetInformationThread as u8  => thread::handle_set_information_thread(frame),
-        x if x == CreateThreadEx as u8        => thread::handle_create_thread(frame),
-        x if x == SuspendThread as u8         => thread::handle_suspend_thread(frame),
-        x if x == ResumeThread as u8          => thread::handle_resume_thread(frame),
-        x if x == YieldExecution as u8        => thread::handle_yield(frame),
-        x if x == TerminateThread as u8       => thread::handle_terminate_thread(frame),
+        x if x == SetInformationThread as u8 => thread::handle_set_information_thread(frame),
+        x if x == CreateThreadEx as u8 => thread::handle_create_thread(frame),
+        x if x == SuspendThread as u8 => thread::handle_suspend_thread(frame),
+        x if x == ResumeThread as u8 => thread::handle_resume_thread(frame),
+        x if x == YieldExecution as u8 => thread::handle_yield(frame),
+        x if x == TerminateThread as u8 => thread::handle_terminate_thread(frame),
         x if x == AlertThreadByThreadId as u8 => thread::handle_alert_thread_by_thread_id(frame),
         x if x == WaitForAlertByThreadId as u8 => thread::handle_wait_for_alert_by_thread_id(frame),
-        x if x == Continue as u8              => thread::handle_continue(frame),
-        x if x == RaiseException as u8        => thread::handle_raise_exception(frame),
-        x if x == DuplicateObject as u8       => object::handle_duplicate_object(frame),
-        x if x == QueryObject as u8           => object::handle_query_object(frame),
+        x if x == Continue as u8 => thread::handle_continue(frame),
+        x if x == RaiseException as u8 => thread::handle_raise_exception(frame),
+        x if x == DuplicateObject as u8 => object::handle_duplicate_object(frame),
+        x if x == QueryObject as u8 => object::handle_query_object(frame),
         x if x == Close as u8 => {
             if !object::handle_close(frame) {
                 forward_to_vmm(frame, sysno::CLOSE, 0);
             }
         }
-        x if x == DelayExecution as u8        => sync::handle_reset_event_or_delay(frame),
-        x if x == SetInformationObject as u8  => { let nr = frame.x8_orig as u16; forward_to_vmm(frame, nr, 0); }
+        x if x == DelayExecution as u8 => sync::handle_reset_event_or_delay(frame),
+        x if x == SetInformationObject as u8 => {
+            let nr = frame.x8_orig as u16;
+            forward_to_vmm(frame, nr, 0);
+        }
         _ => {
             // handler_id is valid but has no dispatch arm — forward to VMM
             let nr = frame.x8_orig as u16;
@@ -211,7 +277,6 @@ fn dispatch_nt_handler(frame: &mut SvcFrame, handler_id: u8) {
         }
     }
 }
-
 
 fn schedule_reason_for_handler(
     handler_id: u8,
@@ -335,15 +400,16 @@ fn schedule_from_trap(
                 next_deadline_100ns,
                 slice_remaining_100ns,
             } => {
-                crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
                 let cur = current_tid();
                 if cur != 0 {
+                    crate::process::switch_to_thread_process(cur);
                     with_thread_mut(cur, |t| {
                         t.state = ThreadState::Running;
                         t.last_vcpu_hint = vid_u8;
                     });
                     set_thread_in_kernel_locked(cur, false);
                 }
+                crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
                 timer::schedule_running_slice_100ns(
                     now_100ns,
                     next_deadline_100ns,
@@ -362,14 +428,16 @@ fn schedule_from_trap(
                 cur_not_running,
             } => {
                 if from_sched != 0 && from_sched != to {
-                    let to_has_kctx = with_thread(to, |t| t.kctx.has_continuation()).unwrap_or(false);
+                    let to_has_kctx =
+                        with_thread(to, |t| t.kctx.has_continuation()).unwrap_or(false);
                     let mut to_in_kernel = with_thread(to, |t| t.in_kernel).unwrap_or(false);
                     if cur_not_running && to_in_kernel && !to_has_kctx {
                         set_thread_in_kernel_locked(to, false);
                         to_in_kernel = false;
                     }
                     if cur_not_running
-                        && with_thread(from_sched, |t| t.state == ThreadState::Terminated).unwrap_or(false)
+                        && with_thread(from_sched, |t| t.state == ThreadState::Terminated)
+                            .unwrap_or(false)
                     {
                         set_thread_in_kernel_locked(from_sched, false);
                     }
@@ -453,8 +521,8 @@ fn schedule_from_trap(
                     });
                     restore_ctx_to_frame(to, frame);
                 }
-                crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
                 set_thread_in_kernel_locked(to, false);
+                crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
                 timer::schedule_running_slice_100ns(
                     now_100ns,
                     next_deadline_100ns,
@@ -500,6 +568,9 @@ pub extern "C" fn timer_irq_dispatch(frame: &mut SvcFrame) {
     // SPSR.M[3:0] == 0b0000 means interrupted from EL0t (user mode).
     // If we interrupted EL1, defer preemption to avoid nested kernel re-entry.
     let interrupted_from_el0 = (frame.spsr & 0xF) == 0;
+    if interrupted_from_el0 {
+        trace_repeated_timer_el0_pc(vid, cur, frame);
+    }
     if in_nested_trap_sched || !interrupted_from_el0 {
         set_needs_reschedule();
         let now = crate::sched::wait::current_ticks();
@@ -518,13 +589,7 @@ pub extern "C" fn timer_irq_dispatch(frame: &mut SvcFrame) {
     } else {
         ScheduleReason::TimerPreempt
     };
-    schedule_from_trap(
-        frame,
-        false,
-        true,
-        timer::DEFAULT_TIMESLICE_100NS,
-        reason,
-    );
+    schedule_from_trap(frame, false, true, timer::DEFAULT_TIMESLICE_100NS, reason);
 }
 
 #[no_mangle]
