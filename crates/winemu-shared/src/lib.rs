@@ -1,8 +1,8 @@
 #![no_std]
 
+pub mod nt_sysno;
 pub mod pe;
 pub mod win32k_sysno;
-pub mod nt_sysno;
 
 /// Hypercall ABI — 所有编号和参数约定的唯一来源
 /// 同时被 winemu-kernel (bare-metal) 和 winemu-core (host) 使用

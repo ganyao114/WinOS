@@ -3,11 +3,11 @@
 mod handler_id;
 pub use handler_id::NtHandlerId;
 
-mod nr_26100;
 mod nr_22631;
+mod nr_26100;
 
-pub use nr_26100::NT_SYSNO_TABLE_26100;
 pub use nr_22631::NT_SYSNO_TABLE_22631;
+pub use nr_26100::NT_SYSNO_TABLE_26100;
 
 /// Look up the NT syscall table for the given Windows build number.
 /// Returns `None` if the build is not supported.
@@ -18,4 +18,3 @@ pub fn nt_sysno_table_for_build(build: u32) -> Option<&'static [(u16, u8)]> {
         _ => None,
     }
 }
-
