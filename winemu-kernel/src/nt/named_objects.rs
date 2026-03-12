@@ -80,7 +80,7 @@ pub(crate) fn normalize_name(raw: &[u8], out: &mut [u8; MAX_NAME_BYTES]) -> usiz
     }
 
     // \BaseNamedObjects\<name>
-    if let Some(off) = skip_prefix(src, b"basednamedobjects\\") {
+    if let Some(off) = skip_prefix(src, b"basenamedobjects\\") {
         src = &src[off..];
     }
     // \Sessions\N\BaseNamedObjects\<name>  — skip "sessions\N\"
@@ -94,7 +94,7 @@ pub(crate) fn normalize_name(raw: &[u8], out: &mut [u8; MAX_NAME_BYTES]) -> usiz
             i += 1;
         }
         let rest = &src[i..];
-        if let Some(off2) = skip_prefix(rest, b"basednamedobjects\\") {
+        if let Some(off2) = skip_prefix(rest, b"basenamedobjects\\") {
             src = &rest[off2..];
         } else {
             src = rest;

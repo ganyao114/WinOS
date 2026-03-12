@@ -24,6 +24,7 @@ typedef struct {
 
 #define STATUS_SUCCESS 0x00000000U
 #define STATUS_TIMEOUT 0x00000102U
+#define STATUS_INVALID_PARAMETER 0xC000000DU
 #define STATUS_INVALID_HANDLE 0xC0000008U
 #define STATUS_ACCESS_DENIED 0xC0000022U
 
@@ -308,6 +309,10 @@ static __attribute__((noreturn)) void child_thread_entry(void* arg) {
 void mainCRTStartup(void) {
     write_str("== process_test ==\r\n");
     g_clone_cow_word = 0x1122334455667788ULL;
+
+    check("NtCreateProcessEx(NULL out handle) returns STATUS_INVALID_PARAMETER",
+          nt_create_process_ex(NULL, 0x001FFFFF, NT_CURRENT_PROCESS, 0, NULL)
+              == STATUS_INVALID_PARAMETER);
 
     PROCESS_BASIC_INFORMATION self_pbi;
     ULONG self_ret_len = 0;

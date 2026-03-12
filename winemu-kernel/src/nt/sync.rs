@@ -1,4 +1,4 @@
-use crate::process::{current_pid, with_process_mut, KObjectKind, KObjectRef};
+use crate::process::{current_pid, KObjectKind, KObjectRef};
 use crate::sched::sync::primitives_api::{KEvent, KMutex, KSemaphore};
 use crate::sched::sync::{
     create_event, create_mutex, create_semaphore, release_mutex, release_semaphore, reset_event,
@@ -42,27 +42,85 @@ fn read_oa_name(oa: Option<ObjectAttributesView>) -> ([u8; 128], usize, u32) {
     (name, len, attrs)
 }
 
-/// Open-by-name: look up named object, add a handle for current process.
-fn open_named(kind: KObjectKind, name: &[u8; 128], name_len: usize) -> Option<u64> {
+fn sync_kref(kind: KObjectKind, obj_idx: u32) -> Option<KObjectRef> {
+    match kind {
+        KObjectKind::Event => Some(KObjectRef::event(obj_idx)),
+        KObjectKind::Mutex => Some(KObjectRef::mutex(obj_idx)),
+        KObjectKind::Semaphore => Some(KObjectRef::semaphore(obj_idx)),
+        _ => None,
+    }
+}
+
+fn lookup_named_live(kind: KObjectKind, name: &[u8; 128], name_len: usize) -> Option<u32> {
+    let _lock = crate::sched::lock::KSchedulerLock::lock();
     let obj_idx = nobj::lookup(kind, name, name_len)?;
+    if crate::sched::sync::state::sync_get_by_idx(obj_idx).is_some() {
+        Some(obj_idx)
+    } else {
+        nobj::remove(kind, obj_idx);
+        None
+    }
+}
+
+fn open_named_handle(
+    kind: KObjectKind,
+    name: &[u8; 128],
+    name_len: usize,
+    out_ptr: UserOutPtr<u64>,
+) -> Result<u64, u32> {
+    let obj_idx = lookup_named_live(kind, name, name_len).ok_or(status::OBJECT_NAME_NOT_FOUND)?;
     let pid = current_pid();
-    let kref = match kind {
-        KObjectKind::Event => KObjectRef::event(obj_idx),
-        KObjectKind::Mutex => KObjectRef::mutex(obj_idx),
-        KObjectKind::Semaphore => KObjectRef::semaphore(obj_idx),
-        _ => return None,
+    let kref = sync_kref(kind, obj_idx).ok_or(status::INVALID_PARAMETER)?;
+    super::kobject::install_handle_for_pid(pid, kref, out_ptr)
+}
+
+fn alloc_named_sync_object(
+    kind: KObjectKind,
+    object: SyncObject,
+    name: &[u8; 128],
+    name_len: usize,
+) -> Result<u32, u32> {
+    let _lock = crate::sched::lock::KSchedulerLock::lock();
+    let Some(obj_idx) = sync_alloc(object).map(|idx| idx as u32) else {
+        return Err(status::NO_MEMORY);
     };
-    with_process_mut(pid, |p| p.handle_table.add(kref))
-        .flatten()
-        .map(|h| h as u64)
+    if nobj::insert(kind, obj_idx, name, name_len) {
+        Ok(obj_idx)
+    } else {
+        let _ = crate::sched::sync::sync_free_idx(obj_idx);
+        Err(status::NO_MEMORY)
+    }
+}
+
+fn rollback_named_sync_create(kind: KObjectKind, obj_idx: u32, install_status: u32) {
+    if install_status != status::NO_MEMORY {
+        return;
+    }
+    let _lock = crate::sched::lock::KSchedulerLock::lock();
+    nobj::remove(kind, obj_idx);
+    let _ = crate::sched::sync::sync_free_idx(obj_idx);
+}
+
+fn publish_created_handle(out_ptr: UserOutPtr<u64>, handle: u64) -> Result<(), u32> {
+    if out_ptr.write_current(handle) {
+        Ok(())
+    } else {
+        let _ = super::kobject::close_handle_for_current(handle);
+        Err(status::INVALID_PARAMETER)
+    }
 }
 
 // x0 = EventHandle* (out), x1 = DesiredAccess, x2 = ObjectAttributes*
 // x3 = EventType (0=Notification, 1=Sync), x4 = InitialState
 pub(crate) fn handle_create_event(frame: &mut SvcFrame) {
+    let out_ptr = UserOutPtr::from_raw(frame.x[0] as *mut u64);
     let desired_access = frame.x[1] as u32;
     if (desired_access & !ACCESS_MASK_EVENT) != 0 {
         frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
+    if out_ptr.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
     let oa_ptr = frame.x[2];
@@ -73,41 +131,51 @@ pub(crate) fn handle_create_event(frame: &mut SvcFrame) {
 
     if name_len > 0 {
         // Named object: check if already exists
-        if let Some(h) = open_named(KObjectKind::Event, &name, name_len) {
-            write_out_handle(frame, h);
-            // STATUS_OBJECT_NAME_EXISTS when OBJ_OPENIF and object already existed
-            frame.x[0] = if (attrs & OBJ_OPENIF) != 0 {
-                status::OBJECT_NAME_EXISTS as u64
-            } else {
-                status::OBJECT_NAME_COLLISION as u64
+        if let Some(_obj_idx) = lookup_named_live(KObjectKind::Event, &name, name_len) {
+            let st = match open_named_handle(KObjectKind::Event, &name, name_len, out_ptr) {
+                Ok(_) => {
+                    if (attrs & OBJ_OPENIF) != 0 {
+                        status::OBJECT_NAME_EXISTS
+                    } else {
+                        status::OBJECT_NAME_COLLISION
+                    }
+                }
+                Err(st) => st,
             };
+            // STATUS_OBJECT_NAME_EXISTS when OBJ_OPENIF and object already existed
+            frame.x[0] = st as u64;
             return;
         }
         // Create new named event
-        let _lock = crate::sched::lock::KSchedulerLock::lock();
-        let obj_idx = match sync_alloc(SyncObject::Event(KEvent::new(auto_reset, initial))) {
-            Some(idx) => idx as u32,
-            None => {
-                frame.x[0] = status::NO_MEMORY as u64;
+        let obj_idx = match alloc_named_sync_object(
+            KObjectKind::Event,
+            SyncObject::Event(KEvent::new(auto_reset, initial)),
+            &name,
+            name_len,
+        ) {
+            Ok(idx) => idx,
+            Err(st) => {
+                frame.x[0] = st as u64;
                 return;
             }
         };
-        nobj::insert(KObjectKind::Event, obj_idx, &name, name_len);
         let pid = current_pid();
-        match with_process_mut(pid, |p| p.handle_table.add(KObjectRef::event(obj_idx))).flatten() {
-            Some(h) => {
-                write_out_handle(frame, h as u64);
+        match super::kobject::install_handle_for_pid(pid, KObjectRef::event(obj_idx), out_ptr) {
+            Ok(_) => {
                 frame.x[0] = STATUS_SUCCESS as u64;
             }
-            None => {
-                frame.x[0] = status::NO_MEMORY as u64;
+            Err(st) => {
+                rollback_named_sync_create(KObjectKind::Event, obj_idx, st);
+                frame.x[0] = st as u64;
             }
         }
     } else {
         match create_event(auto_reset, initial) {
             Some(h) => {
-                write_out_handle(frame, h);
-                frame.x[0] = STATUS_SUCCESS as u64;
+                frame.x[0] = match publish_created_handle(out_ptr, h) {
+                    Ok(()) => STATUS_SUCCESS,
+                    Err(st) => st,
+                } as u64;
             }
             None => {
                 frame.x[0] = status::NO_MEMORY as u64;
@@ -166,9 +234,14 @@ pub(crate) fn handle_wait_multiple(frame: &mut SvcFrame) {
 
 // x0 = MutantHandle* (out), x1 = DesiredAccess, x2 = ObjAttr*, x3 = InitialOwner
 pub(crate) fn handle_create_mutex(frame: &mut SvcFrame) {
+    let out_ptr = UserOutPtr::from_raw(frame.x[0] as *mut u64);
     let desired_access = frame.x[1] as u32;
     if (desired_access & !ACCESS_MASK_MUTEX) != 0 {
         frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
+    if out_ptr.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
     let oa_ptr = frame.x[2];
@@ -176,44 +249,50 @@ pub(crate) fn handle_create_mutex(frame: &mut SvcFrame) {
     let (name, name_len, attrs) = read_oa_name(ObjectAttributesView::from_ptr(oa_ptr));
 
     if name_len > 0 {
-        if let Some(h) = open_named(KObjectKind::Mutex, &name, name_len) {
-            write_out_handle(frame, h);
-            frame.x[0] = if (attrs & OBJ_OPENIF) != 0 {
-                status::OBJECT_NAME_EXISTS as u64
-            } else {
-                status::OBJECT_NAME_COLLISION as u64
-            };
+        if let Some(_obj_idx) = lookup_named_live(KObjectKind::Mutex, &name, name_len) {
+            frame.x[0] = match open_named_handle(KObjectKind::Mutex, &name, name_len, out_ptr) {
+                Ok(_) => {
+                    if (attrs & OBJ_OPENIF) != 0 {
+                        status::OBJECT_NAME_EXISTS
+                    } else {
+                        status::OBJECT_NAME_COLLISION
+                    }
+                }
+                Err(st) => st,
+            } as u64;
             return;
         }
-        let _lock = crate::sched::lock::KSchedulerLock::lock();
         let mut m = KMutex::new();
         if initial_owner {
             m.owner_tid = crate::sched::current_tid();
             m.recursion = 1;
         }
-        let obj_idx = match sync_alloc(SyncObject::Mutex(m)) {
-            Some(idx) => idx as u32,
-            None => {
-                frame.x[0] = status::NO_MEMORY as u64;
-                return;
-            }
-        };
-        nobj::insert(KObjectKind::Mutex, obj_idx, &name, name_len);
+        let obj_idx =
+            match alloc_named_sync_object(KObjectKind::Mutex, SyncObject::Mutex(m), &name, name_len)
+            {
+                Ok(idx) => idx,
+                Err(st) => {
+                    frame.x[0] = st as u64;
+                    return;
+                }
+            };
         let pid = current_pid();
-        match with_process_mut(pid, |p| p.handle_table.add(KObjectRef::mutex(obj_idx))).flatten() {
-            Some(h) => {
-                write_out_handle(frame, h as u64);
+        match super::kobject::install_handle_for_pid(pid, KObjectRef::mutex(obj_idx), out_ptr) {
+            Ok(_) => {
                 frame.x[0] = STATUS_SUCCESS as u64;
             }
-            None => {
-                frame.x[0] = status::NO_MEMORY as u64;
+            Err(st) => {
+                rollback_named_sync_create(KObjectKind::Mutex, obj_idx, st);
+                frame.x[0] = st as u64;
             }
         }
     } else {
         match create_mutex(initial_owner) {
             Some(h) => {
-                write_out_handle(frame, h);
-                frame.x[0] = STATUS_SUCCESS as u64;
+                frame.x[0] = match publish_created_handle(out_ptr, h) {
+                    Ok(()) => STATUS_SUCCESS,
+                    Err(st) => st,
+                } as u64;
             }
             None => {
                 frame.x[0] = status::NO_MEMORY as u64;
@@ -234,9 +313,14 @@ pub(crate) fn handle_release_mutant_or_set_information_process(frame: &mut SvcFr
 // x0 = SemaphoreHandle* (out), x1 = DesiredAccess, x2 = ObjAttr*
 // x3 = InitialCount, x4 = MaximumCount
 pub(crate) fn handle_create_semaphore(frame: &mut SvcFrame) {
+    let out_ptr = UserOutPtr::from_raw(frame.x[0] as *mut u64);
     let desired_access = frame.x[1] as u32;
     if (desired_access & !ACCESS_MASK_SEMAPHORE) != 0 {
         frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
+    if out_ptr.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
     let oa_ptr = frame.x[2];
@@ -245,41 +329,49 @@ pub(crate) fn handle_create_semaphore(frame: &mut SvcFrame) {
     let (name, name_len, attrs) = read_oa_name(ObjectAttributesView::from_ptr(oa_ptr));
 
     if name_len > 0 {
-        if let Some(h) = open_named(KObjectKind::Semaphore, &name, name_len) {
-            write_out_handle(frame, h);
-            frame.x[0] = if (attrs & OBJ_OPENIF) != 0 {
-                status::OBJECT_NAME_EXISTS as u64
-            } else {
-                status::OBJECT_NAME_COLLISION as u64
-            };
+        if let Some(_obj_idx) = lookup_named_live(KObjectKind::Semaphore, &name, name_len) {
+            frame.x[0] = match open_named_handle(KObjectKind::Semaphore, &name, name_len, out_ptr) {
+                Ok(_) => {
+                    if (attrs & OBJ_OPENIF) != 0 {
+                        status::OBJECT_NAME_EXISTS
+                    } else {
+                        status::OBJECT_NAME_COLLISION
+                    }
+                }
+                Err(st) => st,
+            } as u64;
             return;
         }
-        let _lock = crate::sched::lock::KSchedulerLock::lock();
-        let obj_idx = match sync_alloc(SyncObject::Semaphore(KSemaphore::new(initial, maximum))) {
-            Some(idx) => idx as u32,
-            None => {
-                frame.x[0] = status::NO_MEMORY as u64;
+        let obj_idx = match alloc_named_sync_object(
+            KObjectKind::Semaphore,
+            SyncObject::Semaphore(KSemaphore::new(initial, maximum)),
+            &name,
+            name_len,
+        ) {
+            Ok(idx) => idx,
+            Err(st) => {
+                frame.x[0] = st as u64;
                 return;
             }
         };
-        nobj::insert(KObjectKind::Semaphore, obj_idx, &name, name_len);
         let pid = current_pid();
-        match with_process_mut(pid, |p| p.handle_table.add(KObjectRef::semaphore(obj_idx)))
-            .flatten()
+        match super::kobject::install_handle_for_pid(pid, KObjectRef::semaphore(obj_idx), out_ptr)
         {
-            Some(h) => {
-                write_out_handle(frame, h as u64);
+            Ok(_) => {
                 frame.x[0] = STATUS_SUCCESS as u64;
             }
-            None => {
-                frame.x[0] = status::NO_MEMORY as u64;
+            Err(st) => {
+                rollback_named_sync_create(KObjectKind::Semaphore, obj_idx, st);
+                frame.x[0] = st as u64;
             }
         }
     } else {
         match create_semaphore(initial, maximum) {
             Some(h) => {
-                write_out_handle(frame, h);
-                frame.x[0] = STATUS_SUCCESS as u64;
+                frame.x[0] = match publish_created_handle(out_ptr, h) {
+                    Ok(()) => STATUS_SUCCESS,
+                    Err(st) => st,
+                } as u64;
             }
             None => {
                 frame.x[0] = status::NO_MEMORY as u64;
@@ -311,56 +403,71 @@ pub(crate) fn handle_clear_event(frame: &mut SvcFrame) {
 
 // x0 = EventHandle* (out), x1 = DesiredAccess, x2 = ObjectAttributes*
 pub(crate) fn handle_open_event(frame: &mut SvcFrame) {
+    let out_ptr = UserOutPtr::from_raw(frame.x[0] as *mut u64);
+    let desired_access = frame.x[1] as u32;
+    if (desired_access & !ACCESS_MASK_EVENT) != 0 {
+        frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
+    if out_ptr.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
     let (name, name_len, _) = read_oa_name(ObjectAttributesView::from_ptr(frame.x[2]));
     if name_len == 0 {
         frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
         return;
     }
-    match open_named(KObjectKind::Event, &name, name_len) {
-        Some(h) => {
-            write_out_handle(frame, h);
-            frame.x[0] = STATUS_SUCCESS as u64;
-        }
-        None => {
-            frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
-        }
-    }
+    frame.x[0] = match open_named_handle(KObjectKind::Event, &name, name_len, out_ptr) {
+        Ok(_) => STATUS_SUCCESS,
+        Err(st) => st,
+    } as u64;
 }
 
 // x0 = MutantHandle* (out), x1 = DesiredAccess, x2 = ObjectAttributes*
 pub(crate) fn handle_open_mutex(frame: &mut SvcFrame) {
+    let out_ptr = UserOutPtr::from_raw(frame.x[0] as *mut u64);
+    let desired_access = frame.x[1] as u32;
+    if (desired_access & !ACCESS_MASK_MUTEX) != 0 {
+        frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
+    if out_ptr.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
     let (name, name_len, _) = read_oa_name(ObjectAttributesView::from_ptr(frame.x[2]));
     if name_len == 0 {
         frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
         return;
     }
-    match open_named(KObjectKind::Mutex, &name, name_len) {
-        Some(h) => {
-            write_out_handle(frame, h);
-            frame.x[0] = STATUS_SUCCESS as u64;
-        }
-        None => {
-            frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
-        }
-    }
+    frame.x[0] = match open_named_handle(KObjectKind::Mutex, &name, name_len, out_ptr) {
+        Ok(_) => STATUS_SUCCESS,
+        Err(st) => st,
+    } as u64;
 }
 
 // x0 = SemaphoreHandle* (out), x1 = DesiredAccess, x2 = ObjectAttributes*
 pub(crate) fn handle_open_semaphore(frame: &mut SvcFrame) {
+    let out_ptr = UserOutPtr::from_raw(frame.x[0] as *mut u64);
+    let desired_access = frame.x[1] as u32;
+    if (desired_access & !ACCESS_MASK_SEMAPHORE) != 0 {
+        frame.x[0] = status::ACCESS_DENIED as u64;
+        return;
+    }
+    if out_ptr.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
     let (name, name_len, _) = read_oa_name(ObjectAttributesView::from_ptr(frame.x[2]));
     if name_len == 0 {
         frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
         return;
     }
-    match open_named(KObjectKind::Semaphore, &name, name_len) {
-        Some(h) => {
-            write_out_handle(frame, h);
-            frame.x[0] = STATUS_SUCCESS as u64;
-        }
-        None => {
-            frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
-        }
-    }
+    frame.x[0] = match open_named_handle(KObjectKind::Semaphore, &name, name_len, out_ptr) {
+        Ok(_) => STATUS_SUCCESS,
+        Err(st) => st,
+    } as u64;
 }
 
 // x0 = EventHandle, x1 = EventInformationClass, x2 = buf, x3 = len, x4 = *ReturnLength
@@ -395,11 +502,6 @@ pub(crate) fn handle_query_event(frame: &mut SvcFrame) {
     w.u32(0).u32(signaled as u32);
     let _ = ret_len.write_current_if_present(8u32);
     frame.x[0] = winemu_shared::status::SUCCESS as u64;
-}
-
-fn write_out_handle(frame: &SvcFrame, handle: u64) {
-    let out_ptr = UserOutPtr::from_raw(frame.x[0] as *mut u64);
-    let _ = out_ptr.write_current_if_present(handle);
 }
 
 fn parse_timeout(timeout_ptr: UserInPtr<i64>) -> WaitDeadline {

@@ -12,10 +12,10 @@ pub use handle::{current_pid, resolve_process_handle};
 pub use handle_table::{KHandleTable, KObjectKind, KObjectRef};
 pub(crate) use lifecycle::update_current_thread_stack_limit;
 pub use lifecycle::{
-    create_process, current_process_context_matches, init_boot_process, last_handle_closed,
-    on_thread_created, on_thread_terminated, open_process, process_accepts_new_threads,
-    process_exists, process_signaled, switch_to_thread_process, take_kernel_shutdown_exit_code,
-    terminate_process,
+    create_process, current_process_context_matches, destroy_unpublished_process,
+    init_boot_process, last_handle_closed, on_thread_created, on_thread_terminated, open_process,
+    process_accepts_new_threads, process_exists, process_signaled, switch_to_thread_process,
+    take_kernel_shutdown_exit_code, terminate_process,
 };
 pub use query::query_information_process;
 pub use set::set_information_process;

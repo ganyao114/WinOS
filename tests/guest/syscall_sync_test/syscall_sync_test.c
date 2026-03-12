@@ -30,29 +30,24 @@ typedef struct {
     void* SecurityQualityOfService;
 } OBJECT_ATTRIBUTES;
 
-typedef struct {
-    uint32_t EventType;
-    uint32_t EventState;
-} EVENT_BASIC_INFORMATION;
-
 #define STDOUT_HANDLE ((HANDLE)(uint64_t)0xFFFFFFFFFFFFFFF5ULL)
 #define NT_CURRENT_PROCESS ((HANDLE)(uint64_t)-1)
 
 #define STATUS_SUCCESS 0x00000000U
+#define STATUS_TIMEOUT 0x00000102U
 #define STATUS_ACCESS_DENIED 0xC0000022U
+#define STATUS_INVALID_PARAMETER 0xC000000DU
 #define STATUS_OBJECT_NAME_NOT_FOUND 0xC0000034U
 #define STATUS_OBJECT_NAME_COLLISION 0xC0000035U
 #define STATUS_OBJECT_NAME_EXISTS 0x40000000U
-#define STATUS_BUFFER_TOO_SMALL 0xC0000023U
 
 #define OBJ_CASE_INSENSITIVE 0x40U
 #define OBJ_OPENIF 0x80U
 
 #define NR_CLEAR_EVENT 0x003EU
-#define NR_OPEN_EVENT 0x0200U
-#define NR_OPEN_MUTANT 0x0020U
-#define NR_OPEN_SEMAPHORE 0x0035U
-#define NR_QUERY_EVENT 0x0056U
+#define NR_OPEN_EVENT 0x0040U
+#define NR_OPEN_MUTANT 0x012DU
+#define NR_OPEN_SEMAPHORE 0x0134U
 
 __declspec(dllimport) NTSTATUS NtWriteFile(
     HANDLE file, HANDLE event, void* apc_routine, void* apc_ctx,
@@ -60,6 +55,7 @@ __declspec(dllimport) NTSTATUS NtWriteFile(
 __declspec(dllimport) NTSTATUS NtCreateEvent(
     HANDLE* event_handle, ULONG desired_access, void* object_attributes, ULONG event_type, uint8_t initial_state);
 __declspec(dllimport) NTSTATUS NtSetEvent(HANDLE event_handle, ULONG* previous_state);
+__declspec(dllimport) NTSTATUS NtWaitForSingleObject(HANDLE handle, uint8_t alertable, int64_t* timeout);
 __declspec(dllimport) NTSTATUS NtCreateMutant(
     HANDLE* mutant_handle, ULONG desired_access, void* object_attributes, uint8_t initial_owner);
 __declspec(dllimport) NTSTATUS NtCreateSemaphore(
@@ -107,28 +103,6 @@ static NTSTATUS raw_nt_clear_event(HANDLE event_handle) {
         : "+r"(x0)
         : "r"(x8)
         : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "memory"
-    );
-    return (NTSTATUS)x0;
-}
-
-static NTSTATUS raw_nt_query_event(
-    HANDLE event_handle,
-    ULONG event_info_class,
-    void* event_info,
-    ULONG event_info_len,
-    ULONG* ret_len
-) {
-    register uint64_t x0 __asm__("x0") = (uint64_t)(uintptr_t)event_handle;
-    register uint64_t x1 __asm__("x1") = (uint64_t)event_info_class;
-    register uint64_t x2 __asm__("x2") = (uint64_t)(uintptr_t)event_info;
-    register uint64_t x3 __asm__("x3") = (uint64_t)event_info_len;
-    register uint64_t x4 __asm__("x4") = (uint64_t)(uintptr_t)ret_len;
-    register uint64_t x8 __asm__("x8") = NR_QUERY_EVENT;
-    __asm__ volatile(
-        "svc #0"
-        : "+r"(x0)
-        : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x8)
-        : "x5", "x6", "x7", "memory"
     );
     return (NTSTATUS)x0;
 }
@@ -214,14 +188,17 @@ void mainCRTStartup(void) {
     NTSTATUS st;
     HANDLE h = 0;
     HANDLE h2 = 0;
-    ULONG ret_len = 0;
-    EVENT_BASIC_INFORMATION ebi = {0};
     OBJECT_ATTRIBUTES oa;
     UNICODE_STRING us;
     WCHAR name_buf[96];
     WCHAR missing_buf[96];
+    int64_t timeout_immediate = 0;
 
     write_str("== syscall_sync_test ==\r\n");
+
+    h = 0;
+    st = NtCreateEvent(0, 0, 0, 1, 0);
+    check("NtCreateEvent(NULL out handle) returns STATUS_INVALID_PARAMETER", st == STATUS_INVALID_PARAMETER);
 
     h = 0;
     st = NtCreateEvent(&h, 0, 0, 1, 0);
@@ -282,37 +259,28 @@ void mainCRTStartup(void) {
 
     init_oa(&oa, &us, OBJ_CASE_INSENSITIVE);
     HANDLE h_open = 0;
+    st = raw_nt_open_event(0, 0, &oa);
+    check("NtOpenEvent(NULL out handle) returns STATUS_INVALID_PARAMETER", st == STATUS_INVALID_PARAMETER);
+
     st = raw_nt_open_event(&h_open, 0, &oa);
     check("NtOpenEvent(existing named) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     check("NtOpenEvent(existing named) returns handle", h_open != 0);
 
-    ret_len = 0;
-    ebi.EventState = 0xFFFFFFFFU;
-    st = raw_nt_query_event(h_open, 0, &ebi, (ULONG)sizeof(ebi), &ret_len);
-    check("NtQueryEvent(EventBasicInformation) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
-    check("NtQueryEvent(EventBasicInformation) reports 8 bytes", ret_len == 8);
-    check("NtQueryEvent(EventBasicInformation) initial state is non-signaled", ebi.EventState == 0);
+    st = NtWaitForSingleObject(h_open, 0, &timeout_immediate);
+    check("NtWaitForSingleObject(named initial state) returns STATUS_TIMEOUT", st == STATUS_TIMEOUT);
+
+    check("NtClose(named primary handle) returns STATUS_SUCCESS", NtClose(h) == STATUS_SUCCESS);
+    h = 0;
 
     st = NtSetEvent(h_open, 0);
     check("NtSetEvent(named) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
-    ebi.EventState = 0;
-    ret_len = 0;
-    st = raw_nt_query_event(h_open, 0, &ebi, (ULONG)sizeof(ebi), &ret_len);
-    check("NtQueryEvent after NtSetEvent returns STATUS_SUCCESS", st == STATUS_SUCCESS);
-    check("NtQueryEvent after NtSetEvent state is signaled", ebi.EventState == 1);
+    st = NtWaitForSingleObject(h_open, 0, &timeout_immediate);
+    check("NtWaitForSingleObject after NtSetEvent returns STATUS_SUCCESS", st == STATUS_SUCCESS);
 
     st = raw_nt_clear_event(h_open);
     check("NtClearEvent(named) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
-    ebi.EventState = 0xFFFFFFFFU;
-    ret_len = 0;
-    st = raw_nt_query_event(h_open, 0, &ebi, (ULONG)sizeof(ebi), &ret_len);
-    check("NtQueryEvent after NtClearEvent returns STATUS_SUCCESS", st == STATUS_SUCCESS);
-    check("NtQueryEvent after NtClearEvent state is non-signaled", ebi.EventState == 0);
-
-    ret_len = 0;
-    st = raw_nt_query_event(h_open, 0, &ebi, 4, &ret_len);
-    check("NtQueryEvent(short buffer) returns STATUS_BUFFER_TOO_SMALL", st == STATUS_BUFFER_TOO_SMALL);
-    check("NtQueryEvent(short buffer) reports 8 bytes", ret_len == 8);
+    st = NtWaitForSingleObject(h_open, 0, &timeout_immediate);
+    check("NtWaitForSingleObject after NtClearEvent returns STATUS_TIMEOUT", st == STATUS_TIMEOUT);
 
     init_unicode(&us, missing_buf, "\\BaseNamedObjects\\WinEmuSyncMissingEvent");
     init_oa(&oa, &us, OBJ_CASE_INSENSITIVE);

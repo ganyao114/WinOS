@@ -142,15 +142,15 @@ pub fn init_boot_process(image_base: u64, peb_va: u64) -> bool {
     true
 }
 
-pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> Result<u64, u32> {
+pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> Result<u32, u32> {
     let Some(parent_pid) = super::resolve_process_handle(parent_handle) else {
         return Err(status::INVALID_HANDLE);
     };
 
     if section_handle != 0 {
         use crate::process::{with_process_mut, KObjectKind};
-        let ppid = super::resolve_process_handle(parent_handle).unwrap_or(0);
-        let ok = with_process_mut(ppid, |p| {
+        let owner_pid = super::handle::current_pid();
+        let ok = with_process_mut(owner_pid, |p| {
             p.handle_table
                 .get(section_handle as u32)
                 .map(|o| o.kind == KObjectKind::Section)
@@ -187,15 +187,7 @@ pub fn create_process(parent_handle: u64, section_handle: u64, _flags: u32) -> R
         return Err(status::NO_MEMORY);
     }
 
-    let Some(handle) = crate::nt::kobject::add_handle_for_pid(
-        parent_pid,
-        crate::process::KObjectRef::process(pid),
-    ) else {
-        let _ = free_process(pid);
-        return Err(status::NO_MEMORY);
-    };
-
-    Ok(handle)
+    Ok(pid)
 }
 
 pub fn open_process(pid: u32, _desired_access: u32) -> Result<u64, u32> {
@@ -205,6 +197,19 @@ pub fn open_process(pid: u32, _desired_access: u32) -> Result<u64, u32> {
     let cur_pid = super::handle::current_pid();
     crate::nt::kobject::add_handle_for_pid(cur_pid, crate::process::KObjectRef::process(pid))
         .ok_or(status::NO_MEMORY)
+}
+
+pub fn destroy_unpublished_process(pid: u32) {
+    if pid == 0 || pid == boot_pid() {
+        return;
+    }
+    let Some(thread_count) = with_process(pid, |p| p.thread_count) else {
+        return;
+    };
+    if thread_count != 0 {
+        return;
+    }
+    let _ = free_process(pid);
 }
 
 pub fn on_thread_created(pid: u32, tid: u32) {

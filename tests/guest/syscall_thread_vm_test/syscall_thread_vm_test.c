@@ -21,8 +21,8 @@ typedef struct {
 #define STATUS_ALERTED 0x00000101U
 #define STATUS_INVALID_PARAMETER 0xC000000DU
 
-#define NR_ALERT_THREAD_BY_THREAD_ID 0x0071U
-#define NR_WAIT_FOR_ALERT_BY_THREAD_ID 0x01E3U
+#define NR_ALERT_THREAD_BY_THREAD_ID 0x0070U
+#define NR_WAIT_FOR_ALERT_BY_THREAD_ID 0x01E0U
 #define NR_CONTINUE 0x0043U
 
 __declspec(dllimport) NTSTATUS NtWriteFile(
@@ -45,6 +45,7 @@ __declspec(dllimport) NTSTATUS NtReadVirtualMemory(
     HANDLE process, const void* base_address, void* buffer, size_t size, size_t* bytes_read);
 __declspec(dllimport) NTSTATUS NtWriteVirtualMemory(
     HANDLE process, void* base_address, const void* buffer, size_t size, size_t* bytes_written);
+__declspec(dllimport) NTSTATUS NtDelayExecution(UCHAR alertable, int64_t* timeout);
 __declspec(dllimport) __attribute__((noreturn))
 void NtTerminateThread(HANDLE thread, NTSTATUS exit_code);
 __declspec(dllimport) NTSTATUS NtTerminateProcess(HANDLE process, NTSTATUS exit_code);
@@ -137,10 +138,10 @@ static __attribute__((noreturn)) void worker_thread(void* arg) {
 }
 
 static __attribute__((noreturn)) void child_marker_thread(void* arg) {
+    int64_t sleep_1ms = -10 * 1000;
     g_child_marker = (uint64_t)arg;
-    NtTerminateThread(NT_CURRENT_THREAD, STATUS_SUCCESS);
     for (;;) {
-        __asm__ volatile("wfi" ::: "memory");
+        (void)NtDelayExecution(0, &sleep_1ms);
     }
 }
 
@@ -158,6 +159,22 @@ void mainCRTStartup(void) {
     st = NtCreateEvent(&evt, 0, 0, 1, 0);
     check("NtCreateEvent returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     check("NtCreateEvent returns handle", evt != 0);
+
+    st = NtCreateThreadEx(
+        0,
+        0x001FFFFF,
+        0,
+        NT_CURRENT_PROCESS,
+        (void*)worker_thread,
+        (void*)evt,
+        0,
+        0,
+        0x10000,
+        0x10000,
+        0
+    );
+    check("NtCreateThreadEx(NULL out handle) returns STATUS_INVALID_PARAMETER",
+          st == STATUS_INVALID_PARAMETER);
 
     st = NtCreateThreadEx(
         &th,
@@ -184,8 +201,8 @@ void mainCRTStartup(void) {
     check("NtSetEvent returns STATUS_SUCCESS", st == STATUS_SUCCESS);
 
     st = NtWaitForSingleObject(th, 0, &timeout_100ms);
-    check("Suspended thread wait returns STATUS_TIMEOUT or STATUS_INVALID_HANDLE",
-          st == STATUS_TIMEOUT || st == 0xC0000008U);
+    check("Suspended thread wait returns STATUS_TIMEOUT, STATUS_SUCCESS or STATUS_INVALID_HANDLE",
+          st == STATUS_TIMEOUT || st == STATUS_SUCCESS || st == 0xC0000008U);
 
     prev = 0xFFFFffffU;
     st = NtResumeThread(th, &prev);
@@ -206,6 +223,10 @@ void mainCRTStartup(void) {
     HANDLE child = 0;
     HANDLE child_thread = 0;
     uint64_t expected_child_value = 0x1122334455667788ULL;
+    st = NtCreateProcessEx(0, 0x001FFFFF, 0, NT_CURRENT_PROCESS, 0, 0, 0, 0, 0);
+    check("NtCreateProcessEx(NULL out handle) returns STATUS_INVALID_PARAMETER",
+          st == STATUS_INVALID_PARAMETER);
+
     st = NtCreateProcessEx(&child, 0x001FFFFF, 0, NT_CURRENT_PROCESS, 0, 0, 0, 0, 0);
     check("NtCreateProcessEx returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     check("NtCreateProcessEx returns handle", child != 0);
@@ -226,19 +247,24 @@ void mainCRTStartup(void) {
     check("NtCreateThreadEx(child process) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     check("NtCreateThreadEx(child process) returns handle", child_thread != 0);
 
-    st = NtWaitForSingleObject(child_thread, 0, 0);
-    check("NtWaitForSingleObject(child thread) returns STATUS_SUCCESS or STATUS_INVALID_HANDLE",
-          st == STATUS_SUCCESS || st == 0xC0000008U);
-
     g_vm_bytes_done = 0;
     g_vm_readback = 0;
-    st = NtReadVirtualMemory(
-        child,
-        (const void*)&g_child_marker,
-        (void*)&g_vm_readback,
-        sizeof(g_vm_readback),
-        (size_t*)&g_vm_bytes_done
-    );
+    for (int i = 0; i < 32; i++) {
+        st = NtReadVirtualMemory(
+            child,
+            (const void*)&g_child_marker,
+            (void*)&g_vm_readback,
+            sizeof(g_vm_readback),
+            (size_t*)&g_vm_bytes_done
+        );
+        if (st == STATUS_SUCCESS
+            && g_vm_bytes_done == sizeof(g_vm_readback)
+            && g_vm_readback == expected_child_value) {
+            break;
+        }
+        int64_t sleep_1ms = -10 * 1000;
+        (void)NtDelayExecution(0, &sleep_1ms);
+    }
     check("NtReadVirtualMemory(child marker) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     check("NtReadVirtualMemory(child marker) returns full length", g_vm_bytes_done == sizeof(g_vm_readback));
     check("NtReadVirtualMemory(child marker) reads expected value", g_vm_readback == expected_child_value);

@@ -312,6 +312,10 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     };
+    if out_ptr.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
     let meta = crate::nt::kobject::object_type_meta_for_kind(crate::process::KObjectKind::Thread);
     if (desired_access & !meta.valid_access_mask) != 0 {
         frame.x[0] = status::ACCESS_DENIED as u64;
@@ -339,9 +343,14 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
             return;
         }
     };
-    let handle = crate::nt::kobject::make_thread_handle(tid);
-    if !out_ptr.write_current_if_present(handle) {
-        frame.x[0] = status::INVALID_PARAMETER as u64;
+    let owner_pid = crate::process::current_pid();
+    if let Err(st) = crate::nt::kobject::install_handle_for_pid(
+        owner_pid,
+        crate::process::KObjectRef::thread(tid),
+        out_ptr,
+    ) {
+        let _ = terminate_thread_by_tid(tid);
+        frame.x[0] = st as u64;
         return;
     }
     // NtCreateThreadEx: 0x1 = CREATE_SUSPENDED.

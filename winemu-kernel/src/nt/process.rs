@@ -219,6 +219,7 @@ pub(crate) fn handle_open_process(frame: &mut SvcFrame) {
     match crate::process::open_process(target_pid, desired_access) {
         Ok(handle) => {
             if !out_ptr.write_current(handle) {
+                let _ = super::kobject::close_handle_for_current(handle);
                 frame.x[0] = status::INVALID_PARAMETER as u64;
                 return;
             }
@@ -244,14 +245,29 @@ pub(crate) fn handle_create_process(frame: &mut SvcFrame) {
         frame.x[0] = status::ACCESS_DENIED as u64;
         return;
     }
+    if out_ptr.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
 
     match crate::process::create_process(parent_handle, section_handle, flags) {
-        Ok(handle) => {
-            if !out_ptr.write_current_if_present(handle) {
-                frame.x[0] = status::INVALID_PARAMETER as u64;
-                return;
+        Ok(pid) => {
+            let owner_pid = crate::process::current_pid();
+            match super::kobject::install_handle_for_pid(
+                owner_pid,
+                crate::process::KObjectRef::process(pid),
+                out_ptr,
+            ) {
+                Ok(_) => {
+                    frame.x[0] = status::SUCCESS as u64;
+                }
+                Err(st) => {
+                    if st == status::NO_MEMORY {
+                        crate::process::destroy_unpublished_process(pid);
+                    }
+                    frame.x[0] = st as u64;
+                }
             }
-            frame.x[0] = status::SUCCESS as u64;
         }
         Err(st) => {
             frame.x[0] = st as u64;

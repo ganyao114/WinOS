@@ -2,14 +2,18 @@ use crate::process::{with_process_mut, KObjectKind, KObjectRef};
 use crate::rust_alloc::vec::Vec;
 use winemu_shared::status;
 
-use super::{file, registry, section};
+use super::{file, named_objects, registry, section};
+use super::user_args::UserOutPtr;
 
 // ── Object type metadata ──────────────────────────────────────────────────────
 
 pub(crate) struct KObjectOps {
     pub(crate) type_name_utf16: &'static [u16],
-    pub(crate) close_last_ref: fn(u32) -> u32,
+    pub(crate) close_last_ref: fn(u32, u32) -> u32,
+    pub(crate) retain_for_duplicate: fn(u32) -> bool,
+    pub(crate) release_duplicated: fn(u32, u32),
     pub(crate) query_name_utf16: fn(u32) -> Option<Vec<u16>>,
+    pub(crate) ref_count: fn(u32) -> u32,
     pub(crate) valid_access_mask: u32,
     pub(crate) security_required: bool,
     pub(crate) maintain_handle_count: bool,
@@ -58,40 +62,83 @@ fn query_name_section(idx: u32) -> Option<Vec<u16>> {
     section::section_name_utf16(idx)
 }
 fn query_name_file(idx: u32) -> Option<Vec<u16>> {
-    file::file_name_utf16(idx)
+    crate::fs::file_name_utf16(crate::fs::FsFileHandle::from_raw(idx))
+}
+fn retain_duplicate_none(_: u32) -> bool {
+    true
+}
+fn release_duplicate_none(_: u32, _: u32) {}
+fn ref_count_none(_: u32) -> u32 {
+    1
+}
+fn ref_count_event(idx: u32) -> u32 {
+    object_handle_count_for_kind(KObjectKind::Event, idx)
+}
+fn ref_count_mutex(idx: u32) -> u32 {
+    object_handle_count_for_kind(KObjectKind::Mutex, idx)
+}
+fn ref_count_semaphore(idx: u32) -> u32 {
+    object_handle_count_for_kind(KObjectKind::Semaphore, idx)
+}
+fn retain_duplicate_file(idx: u32) -> bool {
+    crate::fs::retain_file(crate::fs::FsFileHandle::from_raw(idx))
+}
+fn release_duplicate_file(owner_pid: u32, idx: u32) {
+    let _ = close_file(owner_pid, idx);
+}
+fn ref_count_file(idx: u32) -> u32 {
+    crate::fs::file_ref_count(crate::fs::FsFileHandle::from_raw(idx))
+}
+fn retain_duplicate_section(idx: u32) -> bool {
+    section::retain_section_idx(idx)
+}
+fn release_duplicate_section(owner_pid: u32, idx: u32) {
+    let _ = close_section(owner_pid, idx);
+}
+fn ref_count_section(idx: u32) -> u32 {
+    super::state::section_ref_count(idx)
 }
 
-fn close_event(idx: u32) -> u32 {
-    crate::sched::sync::sync_free_idx(idx);
+fn close_sync_object(kind: KObjectKind, idx: u32) -> u32 {
+    if object_handle_count_for_kind(kind, idx) != 0 {
+        return status::SUCCESS;
+    }
+    named_objects::remove(kind, idx);
+    if crate::sched::sync::sync_free_idx(idx) {
+        status::SUCCESS
+    } else {
+        status::INVALID_HANDLE
+    }
+}
+
+fn close_event(_owner_pid: u32, idx: u32) -> u32 {
+    close_sync_object(KObjectKind::Event, idx)
+}
+fn close_mutant(_owner_pid: u32, idx: u32) -> u32 {
+    close_sync_object(KObjectKind::Mutex, idx)
+}
+fn close_semaphore(_owner_pid: u32, idx: u32) -> u32 {
+    close_sync_object(KObjectKind::Semaphore, idx)
+}
+fn close_thread(_owner_pid: u32, _tid: u32) -> u32 {
     status::SUCCESS
 }
-fn close_mutant(idx: u32) -> u32 {
-    crate::sched::sync::sync_free_idx(idx);
-    status::SUCCESS
-}
-fn close_semaphore(idx: u32) -> u32 {
-    crate::sched::sync::sync_free_idx(idx);
-    status::SUCCESS
-}
-fn close_thread(_tid: u32) -> u32 {
-    status::SUCCESS
-}
-fn close_process(pid: u32) -> u32 {
+fn close_process(_owner_pid: u32, pid: u32) -> u32 {
     crate::process::last_handle_closed(pid);
     status::SUCCESS
 }
-fn close_token(_idx: u32) -> u32 {
+fn close_token(_owner_pid: u32, _idx: u32) -> u32 {
     status::SUCCESS
 }
-fn close_file(idx: u32) -> u32 {
-    file::close_file_idx(idx);
+fn close_file(owner_pid: u32, idx: u32) -> u32 {
+    file::close_file_handle_for_pid(owner_pid, idx);
     status::SUCCESS
 }
-fn close_section(idx: u32) -> u32 {
+fn close_section(_owner_pid: u32, idx: u32) -> u32 {
     section::close_section_idx(idx);
     status::SUCCESS
 }
-fn close_key(idx: u32) -> u32 {
+fn close_key(_owner_pid: u32, idx: u32) -> u32 {
     if registry::close_key_idx(idx) {
         status::SUCCESS
     } else {
@@ -108,7 +155,10 @@ fn ops_for(kind: KObjectKind) -> &'static KObjectOps {
         KObjectKind::Event => &KObjectOps {
             type_name_utf16: EVENT_NAME,
             close_last_ref: close_event,
+            retain_for_duplicate: retain_duplicate_none,
+            release_duplicated: release_duplicate_none,
             query_name_utf16: query_name_none,
+            ref_count: ref_count_event,
             valid_access_mask: ACCESS_MASK_EVENT,
             security_required: false,
             maintain_handle_count: false,
@@ -116,7 +166,10 @@ fn ops_for(kind: KObjectKind) -> &'static KObjectOps {
         KObjectKind::Mutex => &KObjectOps {
             type_name_utf16: MUTANT_NAME,
             close_last_ref: close_mutant,
+            retain_for_duplicate: retain_duplicate_none,
+            release_duplicated: release_duplicate_none,
             query_name_utf16: query_name_none,
+            ref_count: ref_count_mutex,
             valid_access_mask: ACCESS_MASK_MUTEX,
             security_required: false,
             maintain_handle_count: false,
@@ -124,7 +177,10 @@ fn ops_for(kind: KObjectKind) -> &'static KObjectOps {
         KObjectKind::Semaphore => &KObjectOps {
             type_name_utf16: SEMAPHORE_NAME,
             close_last_ref: close_semaphore,
+            retain_for_duplicate: retain_duplicate_none,
+            release_duplicated: release_duplicate_none,
             query_name_utf16: query_name_none,
+            ref_count: ref_count_semaphore,
             valid_access_mask: ACCESS_MASK_SEMAPHORE,
             security_required: false,
             maintain_handle_count: false,
@@ -132,7 +188,10 @@ fn ops_for(kind: KObjectKind) -> &'static KObjectOps {
         KObjectKind::Thread => &KObjectOps {
             type_name_utf16: THREAD_NAME,
             close_last_ref: close_thread,
+            retain_for_duplicate: retain_duplicate_none,
+            release_duplicated: release_duplicate_none,
             query_name_utf16: query_name_none,
+            ref_count: ref_count_none,
             valid_access_mask: ACCESS_MASK_THREAD,
             security_required: false,
             maintain_handle_count: true,
@@ -140,7 +199,10 @@ fn ops_for(kind: KObjectKind) -> &'static KObjectOps {
         KObjectKind::Process => &KObjectOps {
             type_name_utf16: PROCESS_NAME,
             close_last_ref: close_process,
+            retain_for_duplicate: retain_duplicate_none,
+            release_duplicated: release_duplicate_none,
             query_name_utf16: query_name_none,
+            ref_count: ref_count_none,
             valid_access_mask: ACCESS_MASK_PROCESS,
             security_required: false,
             maintain_handle_count: true,
@@ -148,7 +210,10 @@ fn ops_for(kind: KObjectKind) -> &'static KObjectOps {
         KObjectKind::File => &KObjectOps {
             type_name_utf16: FILE_NAME,
             close_last_ref: close_file,
+            retain_for_duplicate: retain_duplicate_file,
+            release_duplicated: release_duplicate_file,
             query_name_utf16: query_name_file,
+            ref_count: ref_count_file,
             valid_access_mask: ACCESS_MASK_FILE,
             security_required: false,
             maintain_handle_count: false,
@@ -156,7 +221,10 @@ fn ops_for(kind: KObjectKind) -> &'static KObjectOps {
         KObjectKind::Section => &KObjectOps {
             type_name_utf16: SECTION_NAME,
             close_last_ref: close_section,
+            retain_for_duplicate: retain_duplicate_section,
+            release_duplicated: release_duplicate_section,
             query_name_utf16: query_name_section,
+            ref_count: ref_count_section,
             valid_access_mask: ACCESS_MASK_SECTION,
             security_required: false,
             maintain_handle_count: false,
@@ -164,7 +232,10 @@ fn ops_for(kind: KObjectKind) -> &'static KObjectOps {
         KObjectKind::Key => &KObjectOps {
             type_name_utf16: KEY_NAME,
             close_last_ref: close_key,
+            retain_for_duplicate: retain_duplicate_none,
+            release_duplicated: release_duplicate_none,
             query_name_utf16: query_name_key,
+            ref_count: ref_count_none,
             valid_access_mask: ACCESS_MASK_KEY,
             security_required: false,
             maintain_handle_count: false,
@@ -172,7 +243,10 @@ fn ops_for(kind: KObjectKind) -> &'static KObjectOps {
         KObjectKind::Token => &KObjectOps {
             type_name_utf16: TOKEN_NAME,
             close_last_ref: close_token,
+            retain_for_duplicate: retain_duplicate_none,
+            release_duplicated: release_duplicate_none,
             query_name_utf16: query_name_none,
+            ref_count: ref_count_none,
             valid_access_mask: ACCESS_MASK_TOKEN,
             security_required: false,
             maintain_handle_count: false,
@@ -188,6 +262,24 @@ pub(crate) fn add_handle_for_pid(pid: u32, obj: KObjectRef) -> Option<u64> {
     with_process_mut(pid, |p| p.handle_table.add(obj))
         .flatten()
         .map(|h| h as u64)
+}
+
+pub(crate) fn install_handle_for_pid(
+    pid: u32,
+    obj: KObjectRef,
+    out_ptr: UserOutPtr<u64>,
+) -> Result<u64, u32> {
+    if out_ptr.is_null() {
+        return Err(status::INVALID_PARAMETER);
+    }
+    let Some(handle) = add_handle_for_pid(pid, obj) else {
+        return Err(status::NO_MEMORY);
+    };
+    if !out_ptr.write_current(handle) {
+        let _ = close_handle_for_pid(pid, handle);
+        return Err(status::INVALID_PARAMETER);
+    }
+    Ok(handle)
 }
 
 /// Resolve a handle to (KObjectKind, obj_idx) for the current process.
@@ -213,7 +305,7 @@ pub(crate) fn close_handle_for_current(handle: u64) -> u32 {
 pub(crate) fn close_handle_for_pid(pid: u32, handle: u64) -> u32 {
     let obj = with_process_mut(pid, |p| p.handle_table.remove(handle as u32)).flatten();
     match obj {
-        Some(o) => (ops_for(o.kind).close_last_ref)(o.obj_idx),
+        Some(o) => (ops_for(o.kind).close_last_ref)(pid, o.obj_idx),
         None => status::INVALID_HANDLE,
     }
 }
@@ -222,7 +314,7 @@ pub(crate) fn close_handle_for_pid(pid: u32, handle: u64) -> u32 {
 pub(crate) fn drain_handles_for_pid(pid: u32) {
     with_process_mut(pid, |p| {
         p.handle_table.drain(|obj| {
-            (ops_for(obj.kind).close_last_ref)(obj.obj_idx);
+            (ops_for(obj.kind).close_last_ref)(pid, obj.obj_idx);
         });
     });
 }
@@ -235,7 +327,17 @@ pub(crate) fn duplicate_handle(
 ) -> Option<u64> {
     let obj =
         with_process_mut(source_pid, |p| p.handle_table.get(source_handle as u32)).flatten()?;
-    add_handle_for_pid(target_pid, obj)
+    let ops = ops_for(obj.kind);
+    if !(ops.retain_for_duplicate)(obj.obj_idx) {
+        return None;
+    }
+    match add_handle_for_pid(target_pid, obj) {
+        Some(handle) => Some(handle),
+        None => {
+            (ops.release_duplicated)(target_pid, obj.obj_idx);
+            None
+        }
+    }
 }
 
 /// Get the thread ID from a thread handle in the current process.
@@ -284,13 +386,32 @@ pub(crate) fn object_name_utf16(htype: u64, obj_idx: u32) -> Option<Vec<u16>> {
 
 pub(crate) fn close_last_ref(htype: u64, obj_idx: u32) -> u32 {
     match htype_to_kind(htype) {
-        Some(k) => (ops_for(k).close_last_ref)(obj_idx),
+        Some(k) => (ops_for(k).close_last_ref)(crate::process::current_pid(), obj_idx),
         None => status::INVALID_HANDLE,
     }
 }
 
-pub(crate) fn object_ref_count(_htype: u64, _obj_idx: u32) -> u32 {
-    1
+pub(crate) fn object_ref_count_for_kind(kind: KObjectKind, obj_idx: u32) -> u32 {
+    (ops_for(kind).ref_count)(obj_idx)
+}
+
+pub(crate) fn object_handle_count_for_kind(kind: KObjectKind, obj_idx: u32) -> u32 {
+    let mut count = 0u32;
+    crate::process::for_each_process(|_, proc_ref| {
+        proc_ref.handle_table.for_each(|_, obj| {
+            if obj.kind == kind && obj.obj_idx == obj_idx {
+                count = count.saturating_add(1);
+            }
+        });
+    });
+    count
+}
+
+pub(crate) fn object_ref_count(htype: u64, obj_idx: u32) -> u32 {
+    let Some(kind) = htype_to_kind(htype) else {
+        return 0;
+    };
+    object_ref_count_for_kind(kind, obj_idx)
 }
 
 pub(crate) fn object_type_stats(_htype: u64) -> KObjectTypeStats {
