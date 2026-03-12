@@ -37,6 +37,13 @@ typedef struct {
     uint64_t MaximumSize;
 } SECTION_BASIC_INFORMATION;
 
+typedef struct {
+    uint64_t Attributes;
+    uint32_t HandleCount;
+    uint32_t PointerCount;
+    uint8_t Reserved[40];
+} OBJECT_BASIC_INFORMATION;
+
 #define STDOUT_HANDLE ((HANDLE)(uint64_t)0xFFFFFFFFFFFFFFF5ULL)
 #define NT_CURRENT_PROCESS ((HANDLE)(uint64_t)-1)
 
@@ -52,8 +59,10 @@ typedef struct {
 #define PAGE_READWRITE 0x04U
 #define SEC_COMMIT 0x08000000U
 #define OBJ_CASE_INSENSITIVE 0x40U
+#define OBJECT_BASIC_INFORMATION_CLASS 0U
 #define OBJECT_NAME_INFORMATION_CLASS 1U
 #define NR_QUERY_SECTION 0x0051U
+#define DUPLICATE_SAME_ACCESS 0x00000002U
 
 __declspec(dllimport) NTSTATUS NtWriteFile(
     HANDLE file, HANDLE event, void* apc_routine, void* apc_ctx,
@@ -67,6 +76,9 @@ __declspec(dllimport) NTSTATUS NtOpenSection(
     HANDLE* section_handle, ULONG desired_access, OBJECT_ATTRIBUTES* object_attributes);
 __declspec(dllimport) NTSTATUS NtQueryObject(
     HANDLE handle, ULONG object_info_class, void* object_info, ULONG object_info_len, ULONG* ret_len);
+__declspec(dllimport) NTSTATUS NtDuplicateObject(
+    HANDLE source_process, HANDLE source_handle, HANDLE target_process, HANDLE* target_handle,
+    ULONG desired_access, ULONG handle_attributes, ULONG options);
 __declspec(dllimport) NTSTATUS NtClose(HANDLE handle);
 
 static uint32_t g_pass = 0;
@@ -194,8 +206,10 @@ void mainCRTStartup(void) {
     HANDLE section_a = 0;
     HANDLE section_b = 0;
     HANDLE section_c = 0;
+    HANDLE section_dup = 0;
     ULONG ret_len = 0;
     SECTION_BASIC_INFORMATION sbi = {0};
+    OBJECT_BASIC_INFORMATION obi = {0};
     uint8_t section_image_info[40];
     uint64_t section_size = 0x2000;
     uint8_t obj_name_info[256];
@@ -212,6 +226,9 @@ void mainCRTStartup(void) {
     init_unicode(&named_name, named_buf, "\\BaseNamedObjects\\WinEmuOpenSectionTest");
     init_oa(&named_oa, &named_name, 0);
 
+    st = NtCreateSection((HANDLE*)0, 0, &named_oa, &section_size, PAGE_READWRITE, SEC_COMMIT, 0);
+    check("NtCreateSection(NULL out handle) returns STATUS_INVALID_PARAMETER", st == STATUS_INVALID_PARAMETER);
+
     st = NtCreateSection(&section_a, 0, &named_oa, &section_size, PAGE_READWRITE, SEC_COMMIT, 0);
     check("NtCreateSection(named) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     check("NtCreateSection(named) returns non-zero handle", section_a != 0);
@@ -224,6 +241,9 @@ void mainCRTStartup(void) {
     st = NtOpenSection(&section_b, 0, &named_oa);
     check("NtOpenSection(existing name) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     check("NtOpenSection(existing name) returns non-zero handle", section_b != 0);
+
+    st = NtOpenSection((HANDLE*)0, 0, &named_oa);
+    check("NtOpenSection(NULL out handle) returns STATUS_INVALID_PARAMETER", st == STATUS_INVALID_PARAMETER);
 
     ret_len = 0;
     sbi.AllocationAttributes = 0;
@@ -262,8 +282,64 @@ void mainCRTStartup(void) {
     check("NtOpenSection(invalid desired access) returns STATUS_ACCESS_DENIED", st == STATUS_ACCESS_DENIED);
     check("NtOpenSection(invalid desired access) returns no handle", section_c == 0);
 
+    st = NtClose(section_b);
+    check("NtClose(opened section) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    section_b = 0;
+
     ret_len = 0;
-    st = NtQueryObject(section_a, OBJECT_NAME_INFORMATION_CLASS, obj_name_info, (ULONG)sizeof(obj_name_info), &ret_len);
+    sbi.AllocationAttributes = 0;
+    sbi.MaximumSize = 0;
+    st = raw_nt_query_section(section_a, 0, &sbi, (ULONG)sizeof(sbi), &ret_len);
+    check(
+        "NtQuerySection(created handle remains valid after closing sibling handle)",
+        st == STATUS_SUCCESS
+    );
+
+    st = NtOpenSection(&section_b, 0, &named_oa);
+    check("NtOpenSection(reopen after sibling close) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtOpenSection(reopen after sibling close) returns non-zero handle", section_b != 0);
+
+    st = NtDuplicateObject(
+        NT_CURRENT_PROCESS,
+        section_a,
+        NT_CURRENT_PROCESS,
+        &section_dup,
+        0,
+        0,
+        DUPLICATE_SAME_ACCESS
+    );
+    check("NtDuplicateObject(section) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("NtDuplicateObject(section) returns non-zero handle", section_dup != 0);
+
+    st = NtClose(section_a);
+    check("NtClose(created section) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    section_a = 0;
+
+    ret_len = 0;
+    sbi.AllocationAttributes = 0;
+    sbi.MaximumSize = 0;
+    st = raw_nt_query_section(section_dup, 0, &sbi, (ULONG)sizeof(sbi), &ret_len);
+    check(
+        "NtQuerySection(duplicate handle remains valid after closing source handle)",
+        st == STATUS_SUCCESS
+    );
+
+    ret_len = 0;
+    obi.HandleCount = 0;
+    obi.PointerCount = 0;
+    st = NtQueryObject(
+        section_dup,
+        OBJECT_BASIC_INFORMATION_CLASS,
+        &obi,
+        (ULONG)sizeof(obi),
+        &ret_len
+    );
+    check("NtQueryObject(section, ObjectBasicInformation) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    check("ObjectBasicInformation(section) handle count is 2 after closing source handle", obi.HandleCount == 2);
+    check("ObjectBasicInformation(section) pointer count is 2 after closing source handle", obi.PointerCount == 2);
+
+    ret_len = 0;
+    st = NtQueryObject(section_dup, OBJECT_NAME_INFORMATION_CLASS, obj_name_info, (ULONG)sizeof(obj_name_info), &ret_len);
     check("NtQueryObject(section, ObjectNameInformation) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     if (st == STATUS_SUCCESS && ret_len >= 16) {
         USHORT name_len = *(USHORT*)(obj_name_info + 0);
@@ -275,7 +351,7 @@ void mainCRTStartup(void) {
     }
 
     ret_len = 0;
-    st = NtQueryObject(section_a, OBJECT_NAME_INFORMATION_CLASS, short_obj_name_info, (ULONG)sizeof(short_obj_name_info), &ret_len);
+    st = NtQueryObject(section_dup, OBJECT_NAME_INFORMATION_CLASS, short_obj_name_info, (ULONG)sizeof(short_obj_name_info), &ret_len);
     check("NtQueryObject(ObjectNameInformation, short) returns STATUS_INFO_LENGTH_MISMATCH",
           st == STATUS_INFO_LENGTH_MISMATCH);
     check("NtQueryObject(ObjectNameInformation, short) reports required length > 16", ret_len > 16);
@@ -294,10 +370,16 @@ void mainCRTStartup(void) {
     st = NtOpenSection(&section_c, 0, 0);
     check("NtOpenSection(NULL oa) returns STATUS_INVALID_PARAMETER", st == STATUS_INVALID_PARAMETER);
 
-    st = NtClose(section_b);
-    check("NtClose(opened section) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
-    st = NtClose(section_a);
-    check("NtClose(created section) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+    if (section_b != 0) {
+        st = NtClose(section_b);
+        check("NtClose(reopened section) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+        section_b = 0;
+    }
+    if (section_dup != 0) {
+        st = NtClose(section_dup);
+        check("NtClose(duplicate section) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+        section_dup = 0;
+    }
 
     write_str("syscall_section_open_test summary: pass=");
     write_u64_hex(g_pass);

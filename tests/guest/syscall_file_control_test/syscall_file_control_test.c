@@ -51,6 +51,13 @@ typedef struct {
     uint32_t _pad;
 } FILE_NETWORK_OPEN_INFORMATION;
 
+typedef struct {
+    uint64_t Attributes;
+    uint32_t HandleCount;
+    uint32_t PointerCount;
+    uint8_t Reserved[40];
+} OBJECT_BASIC_INFORMATION;
+
 #define STDOUT_HANDLE ((HANDLE)(uint64_t)0xFFFFFFFFFFFFFFF5ULL)
 #define NT_CURRENT_PROCESS ((HANDLE)(uint64_t)-1)
 
@@ -64,6 +71,8 @@ typedef struct {
 #define FILE_ATTRIBUTE_NORMAL 0x00000080U
 #define OBJ_CASE_INSENSITIVE 0x40U
 #define EVENT_ALL_ACCESS 0x001F0003U
+#define OBJECT_BASIC_INFORMATION_CLASS 0U
+#define DUPLICATE_SAME_ACCESS 0x00000002U
 
 #define FILE_SHARE_READ 0x00000001U
 #define FILE_SHARE_WRITE 0x00000002U
@@ -74,8 +83,8 @@ typedef struct {
 #define IOCTL_WINEMU_HOSTCALL_SYNC 0x0022A004U
 #define WINEMU_PING_MAGIC 0x57454D55U
 
-#define NR_QUERY_FULL_ATTRIBUTES_FILE 0x0151U
-#define NR_FLUSH_BUFFERS_FILE 0x0202U
+#define NR_QUERY_FULL_ATTRIBUTES_FILE 0x014FU
+#define NR_FLUSH_BUFFERS_FILE 0x004BU
 #define NR_CANCEL_IO_FILE 0x005DU
 
 #define HOSTCALL_FLAG_FORCE_ASYNC (1ull << 1)
@@ -117,12 +126,17 @@ __declspec(dllimport) NTSTATUS NtDeviceIoControlFile(
     HANDLE file_handle, HANDLE event, void* apc_routine, void* apc_context,
     IO_STATUS_BLOCK* io_status_block, ULONG io_control_code, void* input_buffer, ULONG input_buffer_length,
     void* output_buffer, ULONG output_buffer_length);
+__declspec(dllimport) NTSTATUS NtDuplicateObject(
+    HANDLE source_process, HANDLE source_handle, HANDLE target_process, HANDLE* target_handle,
+    ULONG desired_access, ULONG handle_attributes, ULONG options);
 __declspec(dllimport) NTSTATUS NtFsControlFile(
     HANDLE file_handle, HANDLE event, void* apc_routine, void* apc_context,
     IO_STATUS_BLOCK* io_status_block, ULONG fs_control_code, void* input_buffer, ULONG input_buffer_length,
     void* output_buffer, ULONG output_buffer_length);
 __declspec(dllimport) NTSTATUS NtCreateEvent(
     HANDLE* event_handle, ULONG desired_access, OBJECT_ATTRIBUTES* object_attributes, ULONG event_type, UCHAR initial_state);
+__declspec(dllimport) NTSTATUS NtQueryObject(
+    HANDLE handle, ULONG object_info_class, void* object_info, ULONG object_info_len, ULONG* ret_len);
 __declspec(dllimport) NTSTATUS NtWaitForSingleObject(HANDLE handle, UCHAR alertable, int64_t* timeout);
 __declspec(dllimport) NTSTATUS NtClose(HANDLE handle);
 
@@ -240,13 +254,16 @@ void mainCRTStartup(void) {
     IO_STATUS_BLOCK iosb;
     FILE_BASIC_INFORMATION fbi;
     FILE_NETWORK_OPEN_INFORMATION fnoi;
+    OBJECT_BASIC_INFORMATION obi;
     OBJECT_ATTRIBUTES oa;
     UNICODE_STRING us;
     WCHAR path_buf[128];
     HANDLE dev = 0;
     HANDLE file_handle = 0;
+    HANDLE dup_file = 0;
     HANDLE io_event = 0;
     ULONG ping = 0;
+    ULONG ret_len = 0;
     uint64_t host_fd = 0;
     char host_open_path[] = "guest/sysroot/hello_win.exe";
     ULONG host_open_path_len = 0;
@@ -292,6 +309,25 @@ void mainCRTStartup(void) {
     iosb.Status = 0;
     iosb.Information = 0;
     st = NtCreateFile(
+        (HANDLE*)0,
+        0x0001U,
+        &oa,
+        &iosb,
+        0,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        0,
+        0,
+        0
+    );
+    check("NtCreateFile(NULL out handle) returns STATUS_INVALID_PARAMETER", st == STATUS_INVALID_PARAMETER);
+    check("NtCreateFile(NULL out handle) IOSB status is STATUS_INVALID_PARAMETER",
+          (NTSTATUS)iosb.Status == STATUS_INVALID_PARAMETER);
+
+    iosb.Status = 0;
+    iosb.Information = 0;
+    st = NtCreateFile(
         &file_handle,
         0x0001U,
         &oa,
@@ -307,6 +343,35 @@ void mainCRTStartup(void) {
     check("NtCreateFile(hello_win for flush/cancel) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
     check("NtCreateFile(hello_win for flush/cancel) returns handle", file_handle != 0);
     if (file_handle) {
+        dup_file = 0;
+        st = NtDuplicateObject(
+            NT_CURRENT_PROCESS,
+            file_handle,
+            NT_CURRENT_PROCESS,
+            &dup_file,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS
+        );
+        check("NtDuplicateObject(file) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+        check("NtDuplicateObject(file) returns non-zero handle", dup_file != 0);
+
+        if (dup_file) {
+            ret_len = 0;
+            obi.HandleCount = 0;
+            obi.PointerCount = 0;
+            st = NtQueryObject(
+                dup_file,
+                OBJECT_BASIC_INFORMATION_CLASS,
+                &obi,
+                (ULONG)sizeof(obi),
+                &ret_len
+            );
+            check("NtQueryObject(file, ObjectBasicInformation) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+            check("ObjectBasicInformation(file) handle count is 2 after duplicate", obi.HandleCount == 2);
+            check("ObjectBasicInformation(file) pointer count is 2 after duplicate", obi.PointerCount == 2);
+        }
+
         iosb.Status = 0;
         iosb.Information = 0;
         st = raw_nt_flush_buffers_file(file_handle, &iosb);
@@ -324,6 +389,33 @@ void mainCRTStartup(void) {
         st = NtClose(file_handle);
         check("NtClose(file handle) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
         file_handle = 0;
+
+        if (dup_file) {
+            iosb.Status = 0;
+            iosb.Information = 0;
+            st = raw_nt_flush_buffers_file(dup_file, &iosb);
+            check("NtFlushBuffersFile(duplicate file) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+            check("NtFlushBuffersFile(duplicate file) IOSB status is STATUS_SUCCESS",
+                  (NTSTATUS)iosb.Status == STATUS_SUCCESS);
+
+            ret_len = 0;
+            obi.HandleCount = 0;
+            obi.PointerCount = 0;
+            st = NtQueryObject(
+                dup_file,
+                OBJECT_BASIC_INFORMATION_CLASS,
+                &obi,
+                (ULONG)sizeof(obi),
+                &ret_len
+            );
+            check("NtQueryObject(duplicate file, ObjectBasicInformation) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+            check("ObjectBasicInformation(file) handle count is 1 after closing source", obi.HandleCount == 1);
+            check("ObjectBasicInformation(file) pointer count is 1 after closing source", obi.PointerCount == 1);
+
+            st = NtClose(dup_file);
+            check("NtClose(duplicate file handle) returns STATUS_SUCCESS", st == STATUS_SUCCESS);
+            dup_file = 0;
+        }
     }
 
     iosb.Status = 0;

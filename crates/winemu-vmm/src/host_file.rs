@@ -8,6 +8,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 
 /// Host file open flags (matches winemu-shared nr module docs)
 const FLAG_READ: u64 = 0;
@@ -15,12 +16,20 @@ const FLAG_WRITE: u64 = 1;
 const FLAG_RW: u64 = 2;
 const FLAG_CREATE: u64 = 3;
 
+#[derive(Clone, Eq, PartialEq)]
+struct DirSnapshotEntry {
+    path: String,
+    is_dir: bool,
+    size: u64,
+    modified_ns: u128,
+}
+
 struct HostFile {
     file: File,
     #[allow(dead_code)]
     path: PathBuf,
     dir_cursor: usize,
-    dir_notify_snapshot: Vec<String>,
+    dir_notify_snapshot: Vec<DirSnapshotEntry>,
     dir_notify_init: bool,
 }
 
@@ -274,7 +283,25 @@ impl HostFileTable {
         ret
     }
 
-    fn read_dir_snapshot(path: &std::path::Path, watch_tree: bool) -> Option<Vec<String>> {
+    fn snapshot_entry(
+        rel_path: String,
+        is_dir: bool,
+        meta: &std::fs::Metadata,
+    ) -> DirSnapshotEntry {
+        let modified_ns = meta
+            .modified()
+            .ok()
+            .and_then(|ts| ts.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |dur| dur.as_nanos());
+        DirSnapshotEntry {
+            path: rel_path,
+            is_dir,
+            size: meta.len(),
+            modified_ns,
+        }
+    }
+
+    fn read_dir_snapshot(path: &std::path::Path, watch_tree: bool) -> Option<Vec<DirSnapshotEntry>> {
         let mut out = Vec::new();
         let iter = std::fs::read_dir(path).ok()?;
         for item in iter {
@@ -285,17 +312,26 @@ impl HostFileTable {
             if name.is_empty() {
                 continue;
             }
-            out.push(name.clone());
-            if watch_tree && entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let is_dir = meta.is_dir();
+            out.push(Self::snapshot_entry(name.clone(), is_dir, &meta));
+            if watch_tree && is_dir {
                 let sub = path.join(&name);
                 if let Some(children) = Self::read_dir_snapshot(&sub, true) {
                     for child in children {
-                        out.push(format!("{}/{}", name, child));
+                        out.push(DirSnapshotEntry {
+                            path: format!("{}/{}", name, child.path),
+                            is_dir: child.is_dir,
+                            size: child.size,
+                            modified_ns: child.modified_ns,
+                        });
                     }
                 }
             }
         }
-        out.sort_unstable();
+        out.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         Some(out)
     }
 
@@ -348,26 +384,30 @@ impl HostFileTable {
         let mut oi = 0usize;
         let mut ci = 0usize;
         while oi < old.len() && ci < current.len() {
-            if old[oi] == current[ci] {
-                oi += 1;
-                ci += 1;
-                continue;
+            if old[oi].path == current[ci].path {
+                if old[oi] == current[ci] {
+                    oi += 1;
+                    ci += 1;
+                    continue;
+                }
+                changed_name = current[ci].path.clone();
+                break;
             }
-            if old[oi] > current[ci] {
+            if old[oi].path > current[ci].path {
                 action = 1; // FILE_ACTION_ADDED
-                changed_name = current[ci].clone();
+                changed_name = current[ci].path.clone();
                 break;
             }
             action = 2; // FILE_ACTION_REMOVED
-            changed_name = old[oi].clone();
+            changed_name = old[oi].path.clone();
             break;
         }
         if oi >= old.len() && ci < current.len() {
             action = 1;
-            changed_name = current[ci].clone();
+            changed_name = current[ci].path.clone();
         } else if ci >= current.len() && oi < old.len() {
             action = 2;
-            changed_name = old[oi].clone();
+            changed_name = old[oi].path.clone();
         }
 
         hf.dir_notify_snapshot = current;

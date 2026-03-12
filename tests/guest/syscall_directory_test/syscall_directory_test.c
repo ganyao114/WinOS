@@ -295,7 +295,7 @@ void mainCRTStartup(void) {
     );
     check("NtQueryDirectoryFile(invalid class) returns STATUS_INVALID_PARAMETER", st == STATUS_INVALID_PARAMETER);
 
-    for (i = 0; i < 256; i++) {
+    for (i = 0; i < 2048; i++) {
         FILE_NAMES_INFORMATION* fni;
         iosb.Status = 0;
         iosb.Information = 0;

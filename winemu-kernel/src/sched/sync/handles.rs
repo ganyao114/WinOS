@@ -25,14 +25,22 @@ const WAITABLE_POLL_REL_100NS: i64 = -10_000; // 1ms
 
 fn resolve_sync(handle: u64) -> Option<(u32, &'static SyncObject)> {
     let pid = current_pid();
-    let obj = with_process_mut(pid, |p| p.handle_table.get(handle as u32)).flatten()?;
-    let so = sync_get_by_idx(obj.obj_idx)?;
-    Some((obj.obj_idx, so))
+    resolve_sync_for_pid(pid, handle)
 }
 
 fn resolve_sync_mut(handle: u64) -> Option<(u32, &'static mut SyncObject)> {
     let pid = current_pid();
-    let obj = with_process_mut(pid, |p| p.handle_table.get(handle as u32)).flatten()?;
+    resolve_sync_mut_for_pid(pid, handle)
+}
+
+fn resolve_sync_for_pid(owner_pid: u32, handle: u64) -> Option<(u32, &'static SyncObject)> {
+    let obj = with_process_mut(owner_pid, |p| p.handle_table.get(handle as u32)).flatten()?;
+    let so = sync_get_by_idx(obj.obj_idx)?;
+    Some((obj.obj_idx, so))
+}
+
+fn resolve_sync_mut_for_pid(owner_pid: u32, handle: u64) -> Option<(u32, &'static mut SyncObject)> {
+    let obj = with_process_mut(owner_pid, |p| p.handle_table.get(handle as u32)).flatten()?;
     let so = sync_get_mut_by_idx(obj.obj_idx)?;
     Some((obj.obj_idx, so))
 }
@@ -85,6 +93,25 @@ fn wait_for_process_or_thread(handle: u64, deadline: WaitDeadline) -> u32 {
             let _slp = SchedLockAndSleep::new();
             crate::sched::wait::block_thread_delay_locked(tid, poll_deadline);
         }
+    }
+}
+
+fn retry_single_wait_immediate_on_timeout(handle: u64) -> u32 {
+    if let Some(signaled) = waitable_handle_signaled(handle) {
+        return if signaled {
+            STATUS_SUCCESS
+        } else {
+            STATUS_TIMEOUT
+        };
+    }
+
+    let tid = current_tid();
+    let _lock = crate::sched::lock::KSchedulerLock::lock();
+    match resolve_sync_mut(handle) {
+        Some((_, SyncObject::Event(e))) => e.wait(tid, WaitDeadline::Immediate),
+        Some((_, SyncObject::Mutex(m))) => m.acquire(tid, WaitDeadline::Immediate),
+        Some((_, SyncObject::Semaphore(s))) => s.wait(tid, WaitDeadline::Immediate),
+        None => STATUS_INVALID_HANDLE,
     }
 }
 
@@ -307,7 +334,11 @@ pub fn wait_for_single_object(handle: u64, deadline: WaitDeadline) -> u32 {
             let (state, r) = with_thread(tid, |t| (t.state, t.wait.result))
                 .unwrap_or((ThreadState::Terminated, STATUS_TIMEOUT));
             if state != ThreadState::Waiting {
-                break r;
+                break if r == STATUS_TIMEOUT {
+                    retry_single_wait_immediate_on_timeout(handle)
+                } else {
+                    r
+                };
             }
             // Defensive: if we resumed before the wait state was cleared,
             // immediately sleep again until a real wake/timeout transition.
@@ -505,6 +536,14 @@ pub fn delay_current_thread_sync(deadline: WaitDeadline) -> u32 {
     with_thread(tid, |t| t.wait.result).unwrap_or(STATUS_SUCCESS)
 }
 
-pub fn event_set_by_handle_for_pid(_owner_pid: u32, handle: u64) -> u32 {
-    set_event(handle)
+pub fn event_set_by_handle_for_pid(owner_pid: u32, handle: u64) -> u32 {
+    let _lock = crate::sched::lock::KSchedulerLock::lock();
+    match resolve_sync_mut_for_pid(owner_pid, handle) {
+        Some((_, SyncObject::Event(e))) => {
+            e.signal();
+            STATUS_SUCCESS
+        }
+        Some(_) => STATUS_OBJECT_TYPE_MISMATCH,
+        None => STATUS_INVALID_HANDLE,
+    }
 }
