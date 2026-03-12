@@ -2,7 +2,7 @@
 // 头部解析委托给 winemu_shared::pe，本模块只负责内存分配和加载
 
 use crate::alloc;
-use crate::hypercall;
+use crate::fs::{self, FsFileHandle};
 use crate::mm::usercopy::{
     copy_to_process_user, current_pid as current_user_pid, translate_user_va,
     with_current_process_user_slice, with_current_process_user_slice_mut,
@@ -117,7 +117,7 @@ fn alloc_image_buffer(size: usize, vma_type: VmaType) -> LdrResult<ImageBuffer> 
 }
 
 fn read_file_into_image(
-    fd: u64,
+    file: FsFileHandle,
     image: &ImageBuffer,
     image_off: u64,
     len: usize,
@@ -144,8 +144,7 @@ fn read_file_into_image(
             };
             let page_off = (cur_va.get() as usize) & ((PAGE_SIZE as usize) - 1);
             let chunk = core::cmp::min(len - done, (PAGE_SIZE as usize) - page_off);
-            let got = hypercall::host_read_phys(fd, dst_pa, chunk, file_off + done as u64);
-            if got != chunk {
+            if fs::read_exact_at_phys(file, dst_pa, chunk, file_off + done as u64).is_err() {
                 return false;
             }
             done += chunk;
@@ -154,7 +153,7 @@ fn read_file_into_image(
     } else {
         // SAFETY: bounds were checked above and the buffer belongs to this loader.
         let dst = unsafe { image.ptr.add(image_off as usize) };
-        hypercall::host_read(fd, dst, len, file_off) == len
+        fs::read_exact_at(file, dst, len, file_off).is_ok()
     }
 }
 
@@ -232,12 +231,12 @@ pub enum ImportRef<'a> {
     Ordinal(u16),
 }
 
-// ── 从 host fd 加载（零拷贝路径）─────────────────────────────
+// ── 从 kernel fs file 加载（顺序读取路径）────────────────────
 
-/// 从 host file descriptor 加载 PE。
+/// 从 kernel fs file 加载 PE。
 /// 读取头部 → 解析 → 分配镜像 → 逐 section 读取 → 重定位 → 导入
-pub unsafe fn load_from_fd(
-    fd: u64,
+pub unsafe fn load_from_file(
+    file: FsFileHandle,
     file_size: u64,
     vma_type: VmaType,
     resolve_import: impl Fn(&str, ImportRef) -> Option<u64>,
@@ -245,7 +244,13 @@ pub unsafe fn load_from_fd(
     // 1. 读取 PE 头部（4KB 足够覆盖 DOS + PE + section table）
     let hdr_buf = alloc::alloc_zeroed(HEADER_VIEW_SIZE, 16).ok_or(LdrError::AllocFailed)?;
     let read_len = HEADER_VIEW_SIZE.min(file_size as usize);
-    let got = hypercall::host_read(fd, hdr_buf, read_len, 0);
+    let got = fs::read_at(fs::FsReadRequest {
+        file,
+        dst: hdr_buf,
+        len: read_len,
+        offset: 0,
+    })
+    .map_err(|_| LdrError::IoError)?;
     if got == 0 {
         crate::kerror!("ldr: failed to read PE headers");
         return Err(LdrError::IoError);
@@ -274,7 +279,13 @@ pub unsafe fn load_from_fd(
     for sec in hdrs.sections() {
         if sec.raw_size > 0 && sec.raw_off > 0 {
             let read_size = (sec.raw_size as usize).min(sec.vsize as usize);
-            if !read_file_into_image(fd, &image, sec.vaddr as u64, read_size, sec.raw_off as u64) {
+            if !read_file_into_image(
+                file,
+                &image,
+                sec.vaddr as u64,
+                read_size,
+                sec.raw_off as u64,
+            ) {
                 crate::kerror!("ldr: section read failed");
                 return Err(LdrError::IoError);
             }
@@ -398,14 +409,20 @@ pub unsafe fn load(
 }
 
 /// Load PE image into memory (with relocations) but do not resolve IAT yet.
-pub unsafe fn load_from_fd_unlinked(
-    fd: u64,
+pub unsafe fn load_from_file_unlinked(
+    file: FsFileHandle,
     file_size: u64,
     vma_type: VmaType,
 ) -> LdrResult<LoadedImage> {
     let hdr_buf = alloc::alloc_zeroed(HEADER_VIEW_SIZE, 16).ok_or(LdrError::AllocFailed)?;
     let read_len = HEADER_VIEW_SIZE.min(file_size as usize);
-    let got = hypercall::host_read(fd, hdr_buf, read_len, 0);
+    let got = fs::read_at(fs::FsReadRequest {
+        file,
+        dst: hdr_buf,
+        len: read_len,
+        offset: 0,
+    })
+    .map_err(|_| LdrError::IoError)?;
     if got == 0 {
         crate::kerror!("ldr: failed to read PE headers");
         return Err(LdrError::IoError);
@@ -430,7 +447,13 @@ pub unsafe fn load_from_fd_unlinked(
     for sec in hdrs.sections() {
         if sec.raw_size > 0 && sec.raw_off > 0 {
             let read_size = (sec.raw_size as usize).min(sec.vsize as usize);
-            if !read_file_into_image(fd, &image, sec.vaddr as u64, read_size, sec.raw_off as u64) {
+            if !read_file_into_image(
+                file,
+                &image,
+                sec.vaddr as u64,
+                read_size,
+                sec.raw_off as u64,
+            ) {
                 crate::kerror!("ldr: section read failed");
                 return Err(LdrError::IoError);
             }

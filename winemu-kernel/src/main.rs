@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 mod alloc;
 mod arch;
 mod dll;
+mod fs;
 mod hostcall;
 mod hypercall;
 mod kobj;
@@ -104,9 +105,17 @@ pub extern "C" fn kernel_main() -> ! {
         nt::sysno_table::load_for_build(build);
     }
 
-    // ── 1. 通过 host fd 加载 EXE ─────────────────────────────
-    let (exe_fd, exe_size) = hypercall::query_exe_info();
-    if exe_fd == u64::MAX || exe_size == 0 {
+    // ── 1. 通过 kernel fs bootstrap 打开初始 EXE ──────────────
+    let exe = match fs::bootstrap::open_initial_exe() {
+        Ok(v) => v,
+        Err(_) => {
+            crate::kerror!("kernel: query_exe_info failed");
+            hypercall::process_exit(1);
+        }
+    };
+    let exe_file = exe.file;
+    let exe_size = exe.size;
+    if exe_size == 0 {
         crate::kerror!("kernel: query_exe_info failed");
         hypercall::process_exit(1);
     }
@@ -114,7 +123,13 @@ pub extern "C" fn kernel_main() -> ! {
     // 读取 PE 可选头栈参数：reserve/commit
     let (stack_reserve, stack_commit) = {
         let mut hdr = [0u8; 512];
-        let got = hypercall::host_read(exe_fd, hdr.as_mut_ptr(), 512, 0);
+        let got = fs::read_at(fs::FsReadRequest {
+            file: exe_file,
+            dst: hdr.as_mut_ptr(),
+            len: 512,
+            offset: 0,
+        })
+        .unwrap_or(0);
         if got >= 80 {
             let lfanew = u32::from_le_bytes([hdr[60], hdr[61], hdr[62], hdr[63]]) as usize;
             let oh = lfanew + 24;
@@ -132,16 +147,15 @@ pub extern "C" fn kernel_main() -> ! {
     };
 
     let loaded = unsafe {
-        ldr::load_from_fd(
-            exe_fd,
+        ldr::load_from_file(
+            exe_file,
             exe_size,
             crate::mm::VmaType::ExeImage,
             |dll_name, imp| dll::resolve_import(dll_name, imp),
         )
     };
 
-    // 关闭 exe fd
-    hypercall::host_close(exe_fd);
+    fs::close(exe_file);
 
     let loaded = match loaded {
         Ok(img) => img,

@@ -1,30 +1,48 @@
-use crate::hypercall;
 use crate::kobj::ObjectStore;
 use crate::mm::vm_sanitize_nt_prot;
 use crate::rust_alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
-use super::common::HOST_PSEUDO_FD_WINEMU_HOST;
+use crate::fs::FsBackingHandle;
 
 pub(crate) const VM_FILE_MAPPING_DEFAULT_PROT: u32 = 0x20; // PAGE_EXECUTE_READ
 
-#[derive(Clone, Copy)]
 pub(crate) struct GuestSection {
-    pub(crate) owner_pid: u32,
     pub(crate) size: u64,
     pub(crate) prot: u32,
-    pub(crate) file_fd: u64,
-    pub(crate) file_backed: bool,
+    pub(crate) backing: Option<FsBackingHandle>,
     pub(crate) alloc_attrs: u32,
     pub(crate) is_image: bool,
+    refs: u32,
 }
 
-#[derive(Clone, Copy)]
-struct GuestFile {
-    owner_pid: u32,
-    host_fd: u64,
-    path_len: u16,
-    path: [u8; MAX_FILE_PATH_BYTES],
+impl Clone for GuestSection {
+    fn clone(&self) -> Self {
+        let backing = self.backing.and_then(|handle| {
+            if crate::fs::retain_backing(handle) {
+                Some(handle)
+            } else {
+                debug_assert!(false, "section backing retain failed");
+                None
+            }
+        });
+        Self {
+            size: self.size,
+            prot: self.prot,
+            backing,
+            alloc_attrs: self.alloc_attrs,
+            is_image: self.is_image,
+            refs: self.refs,
+        }
+    }
+}
+
+impl Drop for GuestSection {
+    fn drop(&mut self) {
+        if let Some(backing) = self.backing.take() {
+            crate::fs::release_backing(backing);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -35,7 +53,6 @@ struct GuestView {
 }
 
 struct NtState {
-    files: UnsafeCell<Option<ObjectStore<GuestFile>>>,
     sections: UnsafeCell<Option<ObjectStore<GuestSection>>>,
     views: UnsafeCell<Option<ObjectStore<GuestView>>>,
 }
@@ -43,22 +60,9 @@ struct NtState {
 unsafe impl Sync for NtState {}
 
 static NT_STATE: NtState = NtState {
-    files: UnsafeCell::new(None),
     sections: UnsafeCell::new(None),
     views: UnsafeCell::new(None),
 };
-
-const MAX_FILE_PATH_BYTES: usize = 512;
-
-fn files_store_mut() -> &'static mut ObjectStore<GuestFile> {
-    unsafe {
-        let slot = &mut *NT_STATE.files.get();
-        if slot.is_none() {
-            *slot = Some(ObjectStore::new());
-        }
-        slot.as_mut().unwrap()
-    }
-}
 
 fn sections_store_mut() -> &'static mut ObjectStore<GuestSection> {
     unsafe {
@@ -80,95 +84,29 @@ fn views_store_mut() -> &'static mut ObjectStore<GuestView> {
     }
 }
 
-// ─── 文件管理 ─────────────────────────────────────────────────────────────────
-
-pub(crate) fn file_alloc(owner_pid: u32, host_fd: u64, path: &[u8]) -> Option<u32> {
-    let path_len = core::cmp::min(path.len(), MAX_FILE_PATH_BYTES);
-    let mut name = [0u8; MAX_FILE_PATH_BYTES];
-    if path_len != 0 {
-        name[..path_len].copy_from_slice(&path[..path_len]);
-    }
-    files_store_mut().alloc_with(|_| GuestFile {
-        owner_pid,
-        host_fd,
-        path_len: path_len as u16,
-        path: name,
-    })
-}
-
-pub(crate) fn file_host_fd(idx: u32) -> Option<u64> {
-    let ptr = files_store_mut().get_ptr(idx);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { (*ptr).host_fd })
-    }
-}
-
-pub(crate) fn file_owner_pid(idx: u32) -> Option<u32> {
-    let ptr = files_store_mut().get_ptr(idx);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { (*ptr).owner_pid })
-    }
-}
-
-pub(crate) fn file_name_utf16(idx: u32) -> Option<Vec<u16>> {
-    let ptr = files_store_mut().get_ptr(idx);
-    if ptr.is_null() {
-        return None;
-    }
-    let file = unsafe { &*ptr };
-    let len = file.path_len as usize;
-    if len == 0 || len > MAX_FILE_PATH_BYTES {
-        return None;
-    }
-    let mut out = Vec::<u16>::new();
-    if out.try_reserve(len).is_err() {
-        return None;
-    }
-    let mut i = 0usize;
-    while i < len {
-        out.push(file.path[i] as u16);
-        i += 1;
-    }
-    Some(out)
-}
-
-pub(crate) fn file_free(idx: u32) {
-    let store = files_store_mut();
-    let ptr = store.get_ptr(idx);
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        if (*ptr).host_fd != HOST_PSEUDO_FD_WINEMU_HOST {
-            hypercall::host_close((*ptr).host_fd);
-        }
-    }
-    let _ = store.free(idx);
-}
-
 // ─── Section 管理 ────────────────────────────────────────────────────────────
 
 pub(crate) fn section_alloc(
-    owner_pid: u32,
     size: u64,
     prot: u32,
-    file_fd: Option<u64>,
+    backing: Option<FsBackingHandle>,
     alloc_attrs: u32,
 ) -> Option<u32> {
     let is_image = (alloc_attrs & 0x0100_0000) != 0;
-    sections_store_mut().alloc_with(|_| GuestSection {
-        owner_pid,
+    let id = sections_store_mut().alloc_with(|_| GuestSection {
         size,
         prot: vm_sanitize_nt_prot(prot),
-        file_fd: file_fd.unwrap_or(0),
-        file_backed: file_fd.is_some(),
+        backing,
         alloc_attrs,
         is_image,
-    })
+        refs: 1,
+    });
+    if id.is_none() {
+        if let Some(backing) = backing {
+            crate::fs::release_backing(backing);
+        }
+    }
+    id
 }
 
 pub(crate) fn section_get(idx: u32) -> Option<GuestSection> {
@@ -176,12 +114,50 @@ pub(crate) fn section_get(idx: u32) -> Option<GuestSection> {
     if ptr.is_null() {
         None
     } else {
-        Some(unsafe { *ptr })
+        // SAFETY: object store returns a stable live pointer for this id.
+        Some(unsafe { (&*ptr).clone() })
     }
 }
 
-pub(crate) fn section_free(idx: u32) {
-    let _ = sections_store_mut().free(idx);
+pub(crate) fn section_exists(idx: u32) -> bool {
+    !sections_store_mut().get_ptr(idx).is_null()
+}
+
+pub(crate) fn section_retain(idx: u32) -> bool {
+    let ptr = sections_store_mut().get_ptr(idx);
+    if ptr.is_null() {
+        return false;
+    }
+    // SAFETY: pointer comes from the live section store entry.
+    unsafe {
+        (*ptr).refs = (*ptr).refs.saturating_add(1);
+    }
+    true
+}
+
+pub(crate) fn section_ref_count(idx: u32) -> u32 {
+    let ptr = sections_store_mut().get_ptr(idx);
+    if ptr.is_null() {
+        0
+    } else {
+        // SAFETY: pointer comes from the live section store entry.
+        unsafe { (*ptr).refs }
+    }
+}
+
+pub(crate) fn section_free(idx: u32) -> bool {
+    let store = sections_store_mut();
+    let ptr = store.get_ptr(idx);
+    if ptr.is_null() {
+        return false;
+    }
+    // SAFETY: pointer comes from the live section store entry.
+    let entry = unsafe { &mut *ptr };
+    if entry.refs > 1 {
+        entry.refs -= 1;
+        return false;
+    }
+    store.free(idx)
 }
 
 // ─── View 管理 ───────────────────────────────────────────────────────────────
@@ -215,28 +191,6 @@ pub(crate) fn view_free(owner_pid: u32, base: u64) -> bool {
 pub(crate) fn cleanup_process_owned_resources(owner_pid: u32) {
     if owner_pid == 0 {
         return;
-    }
-
-    let mut file_ids = Vec::new();
-    files_store_mut().for_each_live_ptr(|id, ptr| unsafe {
-        if (*ptr).owner_pid == owner_pid {
-            let _ = file_ids.try_reserve(1);
-            file_ids.push(id);
-        }
-    });
-    for id in file_ids {
-        file_free(id);
-    }
-
-    let mut section_ids = Vec::new();
-    sections_store_mut().for_each_live_ptr(|id, ptr| unsafe {
-        if (*ptr).owner_pid == owner_pid {
-            let _ = section_ids.try_reserve(1);
-            section_ids.push(id);
-        }
-    });
-    for id in section_ids {
-        section_free(id);
     }
 
     let mut view_ids = Vec::new();

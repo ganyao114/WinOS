@@ -122,17 +122,18 @@ fn query_object_basic(handle: u64, buf: *mut u8, len: usize, ret_len: *mut u32) 
         return status::INFO_LENGTH_MISMATCH;
     }
 
-    if kobject::resolve_handle_target(handle).is_none() {
+    let Some((kind, obj_idx)) = kobject::resolve_handle_target(handle) else {
         return status::INVALID_HANDLE;
-    }
+    };
 
-    let refs = 1u32;
+    let handle_count = kobject::object_handle_count_for_kind(kind, obj_idx);
+    let pointer_count = kobject::object_ref_count_for_kind(kind, obj_idx);
     let Some(mut w) = GuestWriter::new(buf, len, OBJECT_BASIC_INFORMATION_SIZE) else {
         return status::INVALID_PARAMETER;
     };
     w.u64(0)
-        .u32(refs)
-        .u32(refs)
+        .u32(handle_count)
+        .u32(pointer_count)
         .zeros(OBJECT_BASIC_INFORMATION_SIZE - 16);
     write_ret_len(ret_len, OBJECT_BASIC_INFORMATION_SIZE as u32);
     status::SUCCESS

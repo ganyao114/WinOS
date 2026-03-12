@@ -1,15 +1,19 @@
 use core::cell::UnsafeCell;
 
+use crate::fs::FsError;
 use crate::kobj::ObjectStore;
 use crate::mm::{vm_alloc_region_typed, vm_free_region, vm_set_section_backing, VmaType};
 use crate::process::{with_process_mut, KObjectKind, KObjectRef};
 use crate::rust_alloc::vec::Vec;
 use winemu_shared::status;
 
-use super::common::{align_up_4k, GuestWriter};
+use super::common::{align_up_4k, file_handle_target, GuestWriter, NtFileHandleTarget};
 use super::constants::PAGE_SIZE_4K;
 use super::path::ObjectAttributesView;
-use super::state::{file_host_fd, section_alloc, section_free, section_get, view_alloc, view_free};
+use super::state::{
+    section_alloc, section_exists, section_free, section_get, section_retain, view_alloc,
+    view_free,
+};
 use super::user_args::{SyscallArgs, UserInPtr, UserOutPtr};
 use super::SvcFrame;
 // ── Guest-memory layout structs ───────────────────────────────────────────────
@@ -102,7 +106,7 @@ fn named_section_gc_stale() {
     let store = named_sections_mut();
     let mut stale = Vec::<u32>::new();
     store.for_each_live_ptr(|id, ptr| unsafe {
-        if section_get((*ptr).section_idx).is_none() {
+        if !section_exists((*ptr).section_idx) {
             let _ = stale.try_reserve(1);
             stale.push(id);
         }
@@ -172,6 +176,10 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
         frame.x[0] = status::ACCESS_DENIED as u64;
         return;
     }
+    if out_ptr.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
 
     let mut section_name = [0u8; MAX_SECTION_NAME];
     let section_name_len = section_name_from_oa(oa, &mut section_name);
@@ -181,8 +189,32 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
         return;
     }
 
+    let file = if file_handle == 0 {
+        None
+    } else {
+        match file_handle_target(file_handle) {
+            Some(NtFileHandleTarget::Fs(file)) => Some(file),
+            _ => {
+                frame.x[0] = status::INVALID_HANDLE as u64;
+                return;
+            }
+        }
+    };
+    if file_handle != 0 && file.is_none() {
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    }
     let size = if max_size_ptr.is_null() {
-        PAGE_SIZE_4K
+        match file {
+            Some(file) => match crate::fs::file_size(file) {
+                Ok(size) => align_up_4k(size.max(PAGE_SIZE_4K)),
+                Err(_) => {
+                    frame.x[0] = status::INVALID_HANDLE as u64;
+                    return;
+                }
+            },
+            None => PAGE_SIZE_4K,
+        }
     } else {
         let Some(max_size) = max_size_ptr.read_current() else {
             frame.x[0] = status::INVALID_PARAMETER as u64;
@@ -190,31 +222,32 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
         };
         align_up_4k(max_size.max(PAGE_SIZE_4K))
     };
-    let owner_pid = crate::process::current_pid();
     let is_image = (alloc_attrs & SEC_IMAGE) != 0;
-    let file_fd = if file_handle == 0 {
-        None
-    } else {
-        let pid = crate::process::current_pid();
-        let obj = with_process_mut(pid, |p| p.handle_table.get(file_handle as u32)).flatten();
-        match obj {
-            Some(o) if o.kind == KObjectKind::File => file_host_fd(o.obj_idx),
-            _ => {
-                frame.x[0] = status::INVALID_HANDLE as u64;
-                return;
-            }
-        }
-    };
-    if file_handle != 0 && file_fd.is_none() {
-        frame.x[0] = status::INVALID_HANDLE as u64;
-        return;
-    }
-    if is_image && file_fd.is_none() {
+    if is_image && file.is_none() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
 
-    let idx = match section_alloc(owner_pid, size, prot, file_fd, alloc_attrs) {
+    let backing = match file {
+        Some(file) => match crate::fs::create_backing_from_file(file, 0, size, is_image) {
+            Ok(backing) => Some(backing),
+            Err(FsError::NoMemory) => {
+                frame.x[0] = status::NO_MEMORY as u64;
+                return;
+            }
+            Err(FsError::Unsupported | FsError::InvalidHandle) => {
+                frame.x[0] = status::INVALID_HANDLE as u64;
+                return;
+            }
+            Err(FsError::NotFound | FsError::IoError) => {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            }
+        },
+        None => None,
+    };
+
+    let idx = match section_alloc(size, prot, backing, alloc_attrs) {
         Some(i) => i,
         None => {
             frame.x[0] = status::NO_MEMORY as u64;
@@ -227,21 +260,11 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
         return;
     }
     let pid = crate::process::current_pid();
-    let Some(handle) = with_process_mut(pid, |p| {
-        p.handle_table
-            .add(KObjectRef::section(idx))
-            .map(|v| v as u64)
-    })
-    .flatten() else {
+    if let Err(st) = super::kobject::install_handle_for_pid(pid, KObjectRef::section(idx), out_ptr)
+    {
         named_section_remove_by_section(idx);
-        section_free(idx);
-        frame.x[0] = status::NO_MEMORY as u64;
-        return;
-    };
-    if !out_ptr.write_current_if_present(handle) {
-        named_section_remove_by_section(idx);
-        section_free(idx);
-        frame.x[0] = status::INVALID_PARAMETER as u64;
+        let _ = section_free(idx);
+        frame.x[0] = st as u64;
         return;
     }
     frame.x[0] = status::SUCCESS as u64;
@@ -258,6 +281,10 @@ pub(crate) fn handle_open_section(frame: &mut SvcFrame) {
         frame.x[0] = status::ACCESS_DENIED as u64;
         return;
     }
+    if out_ptr.is_null() {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
 
     let mut section_name = [0u8; MAX_SECTION_NAME];
     let section_name_len = section_name_from_oa(oa, &mut section_name);
@@ -271,24 +298,18 @@ pub(crate) fn handle_open_section(frame: &mut SvcFrame) {
         frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
         return;
     };
-    if section_get(section_idx).is_none() {
+    if !section_retain(section_idx) {
         named_section_remove_by_section(section_idx);
         frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
         return;
     }
 
     let pid = crate::process::current_pid();
-    let Some(handle) = with_process_mut(pid, |p| {
-        p.handle_table
-            .add(KObjectRef::section(section_idx))
-            .map(|v| v as u64)
-    })
-    .flatten() else {
-        frame.x[0] = status::NO_MEMORY as u64;
-        return;
-    };
-    if !out_ptr.write_current_if_present(handle) {
-        frame.x[0] = status::INVALID_PARAMETER as u64;
+    if let Err(st) =
+        super::kobject::install_handle_for_pid(pid, KObjectRef::section(section_idx), out_ptr)
+    {
+        let _ = section_free(section_idx);
+        frame.x[0] = st as u64;
         return;
     }
     frame.x[0] = status::SUCCESS as u64;
@@ -386,15 +407,10 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
             return;
         }
     };
-    let backing_fd = if sec.file_backed {
-        Some(sec.file_fd)
-    } else {
-        None
-    };
     if !vm_set_section_backing(
         owner_pid,
         base,
-        backing_fd,
+        sec.backing,
         section_offset,
         map_size,
         sec.is_image,
@@ -431,8 +447,13 @@ pub(crate) fn handle_unmap_view_of_section(frame: &mut SvcFrame) {
 }
 
 pub(crate) fn close_section_idx(idx: u32) {
-    named_section_remove_by_section(idx);
-    section_free(idx);
+    if section_free(idx) {
+        named_section_remove_by_section(idx);
+    }
+}
+
+pub(crate) fn retain_section_idx(idx: u32) -> bool {
+    section_retain(idx)
 }
 
 pub(crate) fn section_name_utf16(section_idx: u32) -> Option<Vec<u16>> {

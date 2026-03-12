@@ -189,36 +189,7 @@ impl ObjectAttributesView {
 }
 
 pub(crate) fn normalize_nt_path(path: &mut [u8], len: usize) -> usize {
-    let mut len = normalize_separators(path, len);
-    if len == 0 {
-        return 0;
-    }
-
-    let mut start = 0usize;
-    if len >= 4
-        && ((path[0] == b'/' && path[1] == b'?' && path[2] == b'?' && path[3] == b'/')
-            || (path[0] == b'/' && path[1] == b'/' && path[2] == b'?' && path[3] == b'/')
-            || (path[0] == b'/' && path[1] == b'/' && path[2] == b'.' && path[3] == b'/'))
-    {
-        start = 4;
-    }
-
-    while start < len && path[start] == b'/' {
-        start += 1;
-    }
-
-    if start + 1 < len && path[start + 1] == b':' {
-        start += 2;
-        while start < len && path[start] == b'/' {
-            start += 1;
-        }
-    }
-
-    len = shift_left(path, len, start);
-    while len > 0 && path[len - 1] == b'/' {
-        len -= 1;
-    }
-    len
+    crate::fs::path::normalize_nt_path(path, len)
 }
 
 pub(crate) fn normalize_registry_path(path: &mut [u8], len: usize) -> (usize, bool) {

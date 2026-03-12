@@ -3,7 +3,7 @@ use core::mem::size_of;
 
 use winemu_shared::pe;
 
-use crate::hypercall;
+use crate::fs::{self, FsFileHandle};
 use crate::ldr::{self, ImportRef};
 use crate::mm::usercopy::{
     current_pid as current_user_pid, read_current_user_mapped_value,
@@ -14,8 +14,6 @@ use crate::mm::{UserVa, VM_ACCESS_READ};
 const MAX_DLLS: usize = 512;
 const MAX_DLL_NAME: usize = 96;
 const MAX_DLL_PATH: usize = 192;
-const HOST_OPEN_READ: u64 = 0;
-const GUEST_RAM_BASE: u64 = 0x4000_0000;
 const ENTRY_EMPTY: u8 = 0;
 const ENTRY_READY: u8 = 1;
 
@@ -90,18 +88,15 @@ fn ensure_loaded(dll_name: &str) -> Option<u64> {
         return Some(base);
     }
 
-    let fd = open_dll_file(dll_name);
-    if fd == u64::MAX {
-        return None;
-    }
-    let file_size = hypercall::host_stat(fd);
+    let file = open_dll_file(dll_name)?;
+    let file_size = fs::file_size(file).ok()?;
     if file_size == 0 {
-        hypercall::host_close(fd);
+        fs::close(file);
         return None;
     }
 
-    let loaded = load_mapped_dll(fd, file_size, dll_name);
-    hypercall::host_close(fd);
+    let loaded = load_dll_file(file, file_size, dll_name);
+    fs::close(file);
 
     loaded.ok().map(|img| img.base)
 }
@@ -148,7 +143,7 @@ fn remember_loaded(dll_name: &str, base: u64, size: u32, entry_va: u64, user_bac
     false
 }
 
-fn open_dll_file(dll_name: &str) -> u64 {
+fn open_dll_file(dll_name: &str) -> Option<FsFileHandle> {
     let mut lower_name = [0u8; MAX_DLL_NAME];
     let lower_len = normalize_lower_ascii(dll_name, &mut lower_name);
 
@@ -156,7 +151,7 @@ fn open_dll_file(dll_name: &str) -> u64 {
     if let Some(path_len) = build_sysroot_path(dll_name, &mut path) {
         let p = unsafe { core::str::from_utf8_unchecked(&path[..path_len]) };
         if let Some(fd) = try_open_path(p) {
-            return fd;
+            return Some(fd);
         }
     }
     if let Some(lower_len) = lower_len {
@@ -164,7 +159,7 @@ fn open_dll_file(dll_name: &str) -> u64 {
         if let Some(path_len) = build_sysroot_path(lower, &mut path) {
             let p = unsafe { core::str::from_utf8_unchecked(&path[..path_len]) };
             if let Some(fd) = try_open_path(p) {
-                return fd;
+                return Some(fd);
             }
         }
     }
@@ -175,37 +170,26 @@ fn open_dll_file(dll_name: &str) -> u64 {
         .any(|b| *b == b'/' || *b == b'\\' || *b == b':');
     if has_path {
         if let Some(fd) = try_open_path(dll_name) {
-            return fd;
+            return Some(fd);
         }
         if let Some(len) = lower_len {
             let lower = unsafe { core::str::from_utf8_unchecked(&lower_name[..len]) };
             if let Some(fd) = try_open_path(lower) {
-                return fd;
+                return Some(fd);
             }
         }
     }
 
-    u64::MAX
+    None
 }
 
-fn load_mapped_dll(
-    fd: u64,
+fn load_dll_file(
+    file: FsFileHandle,
     file_size: u64,
     dll_name: &str,
 ) -> Result<ldr::LoadedImage, ldr::LdrError> {
-    let map_base = hypercall::host_mmap_untracked(fd, 0, file_size, 0x02);
-    let loaded = if map_base == 0 || map_base < GUEST_RAM_BASE {
-        if map_base != 0 {
-            let _ = hypercall::host_munmap(map_base, file_size);
-        }
-        unsafe { ldr::load_from_fd_unlinked(fd, file_size, crate::mm::VmaType::DllImage) }
-    } else {
-        let image =
-            unsafe { core::slice::from_raw_parts(map_base as *const u8, file_size as usize) };
-        let out = unsafe { ldr::load_unlinked(image, crate::mm::VmaType::DllImage) };
-        let _ = hypercall::host_munmap(map_base, file_size);
-        out
-    }?;
+    let loaded =
+        unsafe { ldr::load_from_file_unlinked(file, file_size, crate::mm::VmaType::DllImage) }?;
 
     // Register before linking imports to break recursive DLL cycles
     // (e.g. user32 <-> gdi32) during resolve_import().
@@ -478,13 +462,8 @@ pub fn for_each_loaded(mut f: impl FnMut(&str, u64, u32, u64)) {
     }
 }
 
-fn try_open_path(path: &str) -> Option<u64> {
-    let fd = hypercall::host_open(path, HOST_OPEN_READ);
-    if fd == u64::MAX {
-        None
-    } else {
-        Some(fd)
-    }
+fn try_open_path(path: &str) -> Option<FsFileHandle> {
+    fs::open_readonly(path).ok()
 }
 
 fn build_sysroot_path(name: &str, out: &mut [u8; MAX_DLL_PATH]) -> Option<usize> {

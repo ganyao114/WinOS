@@ -1,3 +1,4 @@
+use crate::fs::FsBackingHandle;
 use crate::kobj::ObjectStore;
 /// ProcessVmManager — 每进程虚拟地址空间管理器
 ///
@@ -138,9 +139,9 @@ fn vm_region_mem_type(area: &VmArea) -> u32 {
 // ─── 按页填充 section 数据 ────────────────────────────────────────────────────
 
 fn vm_fill_section_page(area: &VmArea, idx: usize, pa: PhysAddr) -> bool {
-    if !area.section_file_backed {
+    let Some(backing) = area.section_backing else {
         return true;
-    }
+    };
     let page_off = (idx as u64) * PAGE_SIZE;
     if page_off >= area.section_view_size {
         return true;
@@ -148,7 +149,10 @@ fn vm_fill_section_page(area: &VmArea, idx: usize, pa: PhysAddr) -> bool {
     let remain = area.section_view_size - page_off;
     let read_len = PAGE_SIZE.min(remain) as usize;
     let file_off = area.section_file_offset.saturating_add(page_off);
-    let read = crate::hypercall::host_read_phys(area.section_file_fd, pa, read_len, file_off);
+    let read = match crate::fs::pager_read_into_phys(backing, file_off, pa, read_len) {
+        Ok(read) => read,
+        Err(_) => return false,
+    };
     if read < read_len {
         let Some(zero_pa) = pa.checked_add(read as u64) else {
             return false;
@@ -767,7 +771,7 @@ impl ProcessVmManager {
     pub fn set_section_backing(
         &mut self,
         base: u64,
-        file_fd: Option<u64>,
+        backing: Option<FsBackingHandle>,
         file_offset: u64,
         view_size: u64,
         is_image: bool,
@@ -780,8 +784,17 @@ impl ProcessVmManager {
             return false;
         }
         let area = seg.value_mut();
-        area.section_file_backed = file_fd.is_some();
-        area.section_file_fd = file_fd.unwrap_or(0);
+        if let Some(old_backing) = area.section_backing.take() {
+            crate::fs::release_backing(old_backing);
+        }
+        area.section_backing = backing.and_then(|handle| {
+            if crate::fs::retain_backing(handle) {
+                Some(handle)
+            } else {
+                debug_assert!(false, "vm section backing retain failed");
+                None
+            }
+        });
         area.section_file_offset = file_offset;
         area.section_view_size = view_size.min(area.page_count() as u64 * PAGE_SIZE);
         area.section_is_image = is_image;

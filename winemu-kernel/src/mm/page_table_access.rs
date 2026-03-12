@@ -223,6 +223,10 @@ impl ProcessUserTables {
             l3_tables: [OwnedTablePage::empty(); PAGE_TABLE_ENTRIES],
         };
 
+        if !tables.clear_user_window_l2_entries(user_va_base, user_va_limit) {
+            return None;
+        }
+
         // SAFETY: l0/l1/l2 are freshly allocated process root page tables.
         unsafe {
             mmu::install_process_root_tables(
@@ -301,6 +305,20 @@ impl ProcessUserTables {
     #[inline(always)]
     fn user_page_editor(&self, user_va_base: u64, user_va_limit: u64) -> UserPageEditor {
         UserPageEditor::new(self.l2.table_ref(), user_va_base, user_va_limit)
+    }
+
+    fn clear_user_window_l2_entries(&mut self, user_va_base: u64, user_va_limit: u64) -> bool {
+        if user_va_limit <= user_va_base {
+            return false;
+        }
+        let start = mmu::l2_index(user_va_base);
+        let end = mmu::l2_index(user_va_limit - 1);
+        for idx in start..=end {
+            if !table_entry(self.l2.table_ref(), idx).clear() {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -439,7 +457,7 @@ impl UserPageEditor {
     }
 
     pub(crate) fn clear_page(self, va: UserVa) -> Option<UserPageEdit> {
-        let Some(slot) = self.existing_page_slot(va)? else {
+        let Some(slot) = self.present_page_slot(va)? else {
             return Some(UserPageEdit::unchanged());
         };
         if !slot.pte.clear() {
@@ -449,7 +467,7 @@ impl UserPageEditor {
     }
 
     pub(crate) fn protect_page(self, va: UserVa, prot: u32) -> Option<UserPageEdit> {
-        let Some(slot) = self.existing_page_slot(va)? else {
+        let Some(slot) = self.present_page_slot(va)? else {
             return Some(UserPageEdit::unchanged());
         };
         if slot.pte.kind()? != PageTableEntryKind::TableOrPage {
@@ -507,12 +525,21 @@ impl UserPageEditor {
         })
     }
 
-    fn existing_page_slot(self, va: UserVa) -> Option<Option<UserPageSlot>> {
+    fn present_page_slot(self, va: UserVa) -> Option<Option<UserPageSlot>> {
         let l2_entry = self.l2_entry(va)?;
         match l2_entry.kind()? {
-            PageTableEntryKind::Invalid
-            | PageTableEntryKind::Block
-            | PageTableEntryKind::Reserved => return Some(None),
+            PageTableEntryKind::Invalid | PageTableEntryKind::Reserved => return Some(None),
+            PageTableEntryKind::Block => {
+                let ensured = ensure_user_l3_table(l2_entry)?;
+                let edit = match ensured.owned_table() {
+                    Some(l3) => UserPageEdit::with_owned_l3(l2_entry.index(), l3),
+                    None => UserPageEdit::unchanged(),
+                };
+                return Some(Some(UserPageSlot {
+                    pte: UserPteRef::new(ensured.table_ref(), va),
+                    edit,
+                }));
+            }
             PageTableEntryKind::TableOrPage => {}
         }
         let Some(l3) = l2_entry.child_table() else {

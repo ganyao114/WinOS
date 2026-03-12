@@ -1,3 +1,4 @@
+use crate::fs::FsBackingHandle;
 use crate::mm::vm_area::{VmKind, PAGE_SIZE};
 use crate::mm::{vm_kind_from_vma_type, vm_sanitize_nt_prot, UserVa, VmQueryInfo, VmaType};
 use winemu_shared::status;
@@ -75,13 +76,13 @@ pub(crate) fn vm_make_guard_page(owner_pid: u32, page_va: u64) -> bool {
 pub(crate) fn vm_set_section_backing(
     owner_pid: u32,
     base: u64,
-    file_fd: Option<u64>,
+    backing: Option<FsBackingHandle>,
     file_offset: u64,
     view_size: u64,
     is_image: bool,
 ) -> bool {
     crate::process::with_process_mut(owner_pid, |p| {
-        p.vm.set_section_backing(base, file_fd, file_offset, view_size, is_image)
+        p.vm.set_section_backing(base, backing, file_offset, view_size, is_image)
     })
     .unwrap_or(false)
 }

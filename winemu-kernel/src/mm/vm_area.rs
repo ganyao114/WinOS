@@ -1,3 +1,4 @@
+use crate::fs::FsBackingHandle;
 /// VmArea — 虚拟内存区域，作为 AreaSet 的值类型
 ///
 /// 每个 VmArea 对应一段连续的虚拟地址区间，包含：
@@ -26,7 +27,6 @@ pub enum VmKind {
 
 // ─── VmArea ──────────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
 pub struct VmArea {
     /// 本次 VirtualAlloc 的原始基地址（用于 MEM_RELEASE 整块释放）
     pub alloc_base: u64,
@@ -44,11 +44,47 @@ pub struct VmArea {
     pub commit_bits: Vec<u64>,
 
     // Section / 文件映射元信息（仅 kind == Section 时有意义）
-    pub section_file_fd: u64,
+    pub section_backing: Option<FsBackingHandle>,
     pub section_file_offset: u64,
     pub section_view_size: u64,
-    pub section_file_backed: bool,
     pub section_is_image: bool,
+}
+
+fn retained_backing(backing: Option<FsBackingHandle>) -> Option<FsBackingHandle> {
+    backing.and_then(|handle| {
+        if crate::fs::retain_backing(handle) {
+            Some(handle)
+        } else {
+            debug_assert!(false, "vm area backing retain failed");
+            None
+        }
+    })
+}
+
+impl Clone for VmArea {
+    fn clone(&self) -> Self {
+        Self {
+            alloc_base: self.alloc_base,
+            kind: self.kind,
+            default_prot: self.default_prot,
+            owns_phys_pages: self.owns_phys_pages,
+            phys_pages: self.phys_pages.clone(),
+            prot_pages: self.prot_pages.clone(),
+            commit_bits: self.commit_bits.clone(),
+            section_backing: retained_backing(self.section_backing),
+            section_file_offset: self.section_file_offset,
+            section_view_size: self.section_view_size,
+            section_is_image: self.section_is_image,
+        }
+    }
+}
+
+impl Drop for VmArea {
+    fn drop(&mut self) {
+        if let Some(backing) = self.section_backing.take() {
+            crate::fs::release_backing(backing);
+        }
+    }
 }
 
 impl VmArea {
@@ -77,10 +113,9 @@ impl VmArea {
             phys_pages,
             prot_pages,
             commit_bits,
-            section_file_fd: 0,
+            section_backing: None,
             section_file_offset: 0,
             section_view_size: 0,
-            section_file_backed: false,
             section_is_image: false,
         })
     }
@@ -110,10 +145,9 @@ impl VmArea {
             phys_pages,
             prot_pages,
             commit_bits,
-            section_file_fd: 0,
+            section_backing: None,
             section_file_offset: 0,
             section_view_size: view_size,
-            section_file_backed: false,
             section_is_image: false,
         })
     }
@@ -242,10 +276,9 @@ impl AreaValue for VmArea {
             phys_pages,
             prot_pages,
             commit_bits,
-            section_file_fd: 0,
+            section_backing: None,
             section_file_offset: 0,
             section_view_size: 0,
-            section_file_backed: false,
             section_is_image: false,
         })
     }
@@ -274,10 +307,9 @@ impl AreaValue for VmArea {
             phys_pages: left_phys,
             prot_pages: left_prot,
             commit_bits: left_bits,
-            section_file_fd: self.section_file_fd,
+            section_backing: retained_backing(self.section_backing),
             section_file_offset: self.section_file_offset,
             section_view_size: left_view_size,
-            section_file_backed: self.section_file_backed,
             section_is_image: self.section_is_image,
         };
         let right = Self {
@@ -288,10 +320,9 @@ impl AreaValue for VmArea {
             phys_pages: right_phys,
             prot_pages: right_prot,
             commit_bits: right_bits,
-            section_file_fd: self.section_file_fd,
+            section_backing: retained_backing(self.section_backing),
             section_file_offset: right_file_offset,
             section_view_size: right_view_size,
-            section_file_backed: self.section_file_backed,
             section_is_image: self.section_is_image,
         };
         (left, right)
