@@ -197,7 +197,7 @@ impl HypercallManager {
         use winemu_hypervisor::hvf::ffi;
 
         let count = self.sched.vcpu_count as usize;
-        if count == 0 {
+        if count <= 1 {
             return;
         }
         let mut ids = Vec::with_capacity(count);
@@ -205,7 +205,7 @@ impl HypercallManager {
             ids.push(id as ffi::hv_vcpuid_t);
         }
         let ret = unsafe { ffi::hv_vcpus_exit(ids.as_mut_ptr(), ids.len() as u32) };
-        if ret != ffi::HV_SUCCESS {
+        if ret != ffi::HV_SUCCESS && ret != ffi::HV_NO_DEVICE {
             log::warn!("PROCESS_EXIT: hv_vcpus_exit failed ret={:#x}", ret);
         }
     }
@@ -658,7 +658,7 @@ impl HypercallManager {
                         gpa.0
                     );
                 }
-                log::debug!(
+                log::trace!(
                     "ALLOC_PHYS_PAGES: pages={} size={} gpa={:#x} used={} budget={}",
                     pages,
                     size,
@@ -697,7 +697,7 @@ impl HypercallManager {
                     state.allocs.remove(&gpa);
                     state.used_bytes = state.used_bytes.saturating_sub(size);
                 }
-                log::debug!(
+                log::trace!(
                     "FREE_PHYS_PAGES: gpa={:#x} pages={} size={} ok={} used={} budget={}",
                     gpa,
                     pages,
@@ -1068,6 +1068,10 @@ impl HypercallManager {
         event: &winit::event::WindowEvent,
     ) {
         self.hostcall.handle_window_event(window_id, event);
+    }
+
+    pub fn set_host_ui_main_thread_waker(&self, waker: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.hostcall.set_main_thread_waker(waker);
     }
 
     pub fn force_exit_vcpus_if_shutdown(&self) {

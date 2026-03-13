@@ -156,8 +156,8 @@ impl HvfVcpu {
 
     fn parse_exit(&mut self) -> Result<VmExit> {
         let exit = unsafe { &*self.exit };
-        // Log raw exit struct for debugging
-        log::debug!(
+        // Raw exit dumps are too noisy at debug level during normal guest execution.
+        log::trace!(
             "parse_exit: reason={} syndrome={:#x} va={:#x} pa={:#x}",
             exit.reason,
             exit.exception.syndrome,

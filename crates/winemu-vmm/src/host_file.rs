@@ -3,6 +3,7 @@
 // These are used by the kernel's PE loader, DLL loader, etc.
 
 use std::collections::HashMap;
+use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
@@ -139,6 +140,42 @@ impl HostFileTable {
                 u64::MAX
             }
         }
+    }
+
+    pub fn create_dir(&self, path: &str) -> std::io::Result<()> {
+        let host_path = self.resolve(path);
+        fs::create_dir(&host_path)
+    }
+
+    pub fn seek(&self, fd: u64, offset: i64, whence: u32) -> Option<u64> {
+        if fd <= 2 {
+            return None;
+        }
+        let mut files = self.files.lock().unwrap();
+        let hf = files.get_mut(&fd)?;
+        let target = match whence {
+            0 => {
+                if offset < 0 {
+                    return None;
+                }
+                SeekFrom::Start(offset as u64)
+            }
+            1 => SeekFrom::Current(offset),
+            2 => SeekFrom::End(offset),
+            _ => return None,
+        };
+        hf.file.seek(target).ok()
+    }
+
+    pub fn set_len(&self, fd: u64, len: u64) -> bool {
+        if fd <= 2 {
+            return false;
+        }
+        let mut files = self.files.lock().unwrap();
+        let Some(hf) = files.get_mut(&fd) else {
+            return false;
+        };
+        hf.file.set_len(len).is_ok()
     }
 
     /// Read from file into a buffer. Returns bytes read.
@@ -301,7 +338,10 @@ impl HostFileTable {
         }
     }
 
-    fn read_dir_snapshot(path: &std::path::Path, watch_tree: bool) -> Option<Vec<DirSnapshotEntry>> {
+    fn read_dir_snapshot(
+        path: &std::path::Path,
+        watch_tree: bool,
+    ) -> Option<Vec<DirSnapshotEntry>> {
         let mut out = Vec::new();
         let iter = std::fs::read_dir(path).ok()?;
         for item in iter {

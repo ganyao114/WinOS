@@ -241,6 +241,9 @@ pub mod hostcall {
     pub const OP_MMAP: u64 = 8;
     pub const OP_MUNMAP: u64 = 9;
     pub const OP_WIN32K_CALL: u64 = 10;
+    pub const OP_MKDIR: u64 = 11;
+    pub const OP_SEEK: u64 = 12;
+    pub const OP_SET_LEN: u64 = 13;
 
     pub const WIN32K_CALL_PACKET_VERSION: u32 = 1;
     pub const WIN32K_CALL_MAX_ARGS: usize = 16;
@@ -345,7 +348,7 @@ pub mod teb {
     pub const PEB: usize = 0x0060;
     pub const SYSCALL_FRAME: usize = 0x02f0; // Wine ARM64 private
     pub const SYSCALL_TABLE: usize = 0x02f8;
-    pub const SIZE: usize = 0x1000;
+    pub const SIZE: usize = 0x1838;
 }
 
 /// NT PEB 字段偏移（64-bit）

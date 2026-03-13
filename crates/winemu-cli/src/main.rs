@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 use winit::window::WindowId;
 
@@ -57,6 +57,17 @@ impl HostUiApp {
             started_at: Instant::now(),
         }
     }
+
+    fn pump_hostcalls_and_check_shutdown(&mut self, event_loop: &ActiveEventLoop) {
+        let elapsed_ms = self.started_at.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        self.hypercall_mgr
+            .pump_hostcall_main_thread_with_event_loop(event_loop, elapsed_ms);
+        self.hypercall_mgr.force_exit_vcpus_if_shutdown();
+        if self.hypercall_mgr.sched.shutdown.load(Ordering::Acquire) {
+            let code = self.hypercall_mgr.guest_exit_code();
+            std::process::exit(code as i32);
+        }
+    }
 }
 
 impl ApplicationHandler<()> for HostUiApp {
@@ -74,15 +85,13 @@ impl ApplicationHandler<()> for HostUiApp {
             .handle_host_window_event(window_id, &event);
     }
 
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: ()) {
+        self.pump_hostcalls_and_check_shutdown(event_loop);
+        event_loop.set_control_flow(ControlFlow::Poll);
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let elapsed_ms = self.started_at.elapsed().as_millis().min(u32::MAX as u128) as u32;
-        self.hypercall_mgr
-            .pump_hostcall_main_thread_with_event_loop(event_loop, elapsed_ms);
-        self.hypercall_mgr.force_exit_vcpus_if_shutdown();
-        if self.hypercall_mgr.sched.shutdown.load(Ordering::Acquire) {
-            let code = self.hypercall_mgr.guest_exit_code();
-            std::process::exit(code as i32);
-        }
+        self.pump_hostcalls_and_check_shutdown(event_loop);
         event_loop.set_control_flow(ControlFlow::Poll);
     }
 }
@@ -123,6 +132,7 @@ fn run_vmm_with_host_ui(mut vmm: winemu_vmm::Vmm) -> Result<()> {
     };
 
     let hypercall_mgr = vmm.hypercall_manager();
+    install_host_ui_waker(&hypercall_mgr, event_loop.create_proxy());
     let (done_tx, done_rx) = mpsc::sync_channel::<std::result::Result<(), String>>(1);
     let _vmm_thread = thread::Builder::new()
         .name("winemu-vmm".to_string())
@@ -157,6 +167,75 @@ fn run_vmm_with_host_ui(mut vmm: winemu_vmm::Vmm) -> Result<()> {
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+fn install_host_ui_waker(
+    hypercall_mgr: &Arc<winemu_vmm::hypercall::HypercallManager>,
+    proxy: EventLoopProxy<()>,
+) {
+    let pending = Arc::new(AtomicBool::new(false));
+    let hypercall_mgr_for_wake = Arc::clone(hypercall_mgr);
+    let wake = Arc::new(move || {
+        if pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let pending = Arc::clone(&pending);
+        let hypercall_mgr = Arc::clone(&hypercall_mgr_for_wake);
+        let proxy = proxy.clone();
+        dispatch2::DispatchQueue::main().exec_async(move || {
+            pending.store(false, Ordering::Release);
+            hypercall_mgr.pump_hostcall_main_thread(usize::MAX);
+            let _ = proxy.send_event(());
+            stop_host_ui_pump_once();
+        });
+    });
+    hypercall_mgr.set_host_ui_main_thread_waker(wake);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_host_ui_waker(
+    hypercall_mgr: &Arc<winemu_vmm::hypercall::HypercallManager>,
+    proxy: EventLoopProxy<()>,
+) {
+    let wake = Arc::new(move || {
+        let _ = proxy.send_event(());
+    });
+    hypercall_mgr.set_host_ui_main_thread_waker(wake);
+}
+
+#[cfg(target_os = "macos")]
+fn stop_host_ui_pump_once() {
+    use objc2_app_kit::{
+        NSApplication, NSEvent, NSEventModifierFlags, NSEventSubtype, NSEventType,
+    };
+    use objc2_foundation::{MainThreadMarker, NSPoint};
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        log::debug!("host-ui: stop_host_ui_pump_once skipped (not on main thread)");
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    app.stop(None);
+    let dummy = unsafe {
+        NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+            NSEventType::ApplicationDefined,
+            NSPoint::new(0.0, 0.0),
+            NSEventModifierFlags(0),
+            0.0,
+            0,
+            None,
+            NSEventSubtype::WindowExposed.0,
+            0,
+            0,
+        )
+    };
+    if let Some(dummy) = dummy {
+        app.postEvent_atStart(&dummy, true);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stop_host_ui_pump_once() {}
 
 fn parse_args(args: &[String]) -> Result<(PathBuf, PathBuf, PathBuf, Vec<PathBuf>)> {
     let default_table = PathBuf::from("config/syscall-tables/win11-arm64.toml");

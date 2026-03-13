@@ -38,12 +38,14 @@ struct BrokerInner {
     main_submit_tx: SyncSender<WorkerJob>,
     main_submit_rx: Mutex<Receiver<WorkerJob>>,
     main_executor_thread: Mutex<Option<std::thread::ThreadId>>,
+    main_thread_waker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     inflight: Mutex<HashMap<u64, InflightReq>>,
     completions: Mutex<VecDeque<HostCallCompletion>>,
     next_request_id: AtomicU64,
     stats: BrokerStats,
     completion_queue_hwm: AtomicU64,
     win32k: Mutex<Win32kState>,
+    pending_window_events: Mutex<VecDeque<(WindowId, WindowEvent)>>,
     registry: HandlerRegistry,
 }
 
@@ -213,12 +215,14 @@ impl HostCallBroker {
             main_submit_tx: main_tx,
             main_submit_rx: Mutex::new(main_rx),
             main_executor_thread: Mutex::new(None),
+            main_thread_waker: Mutex::new(None),
             inflight: Mutex::new(HashMap::new()),
             completions: Mutex::new(VecDeque::new()),
             next_request_id: AtomicU64::new(1),
             stats: BrokerStats::new(32),
             completion_queue_hwm: AtomicU64::new(0),
             win32k: Mutex::new(Win32kState::new()),
+            pending_window_events: Mutex::new(VecDeque::new()),
             registry,
         });
 
@@ -256,6 +260,10 @@ impl HostCallBroker {
 // ── submit / execute_sync ─────────────────────────────────────────────────────
 
 impl HostCallBroker {
+    pub fn set_main_thread_waker(&self, waker: Arc<dyn Fn() + Send + Sync>) {
+        *self.inner.main_thread_waker.lock().unwrap() = Some(waker);
+    }
+
     pub fn submit(&self, opcode: u64, flags: u64, args: [u64; 4], user_tag: u64) -> SubmitResult {
         let inner = &*self.inner;
 
@@ -281,13 +289,23 @@ impl HostCallBroker {
 
         if !do_async {
             inner.stats.on_submit_sync(opcode);
+            let payload = match inner.registry.prepare_payload(opcode, &inner.memory, args) {
+                Ok(p) => p,
+                Err((r0, r1)) => {
+                    inner.stats.on_complete_sync(opcode);
+                    return SubmitResult::Completed {
+                        host_result: r0,
+                        aux: r1,
+                    };
+                }
+            };
             let (r0, r1) = if exec_class == ExecClass::MainThread {
-                self.execute_sync_main_thread(opcode, args)
+                self.execute_sync_main_thread(opcode, args, payload)
             } else {
                 let ctx = self.make_ctx();
                 inner
                     .registry
-                    .dispatch(&ctx, opcode, args, None)
+                    .dispatch(&ctx, opcode, args, Some(&payload))
                     .unwrap_or((hc::HC_INVALID, 0))
             };
             inner.stats.on_complete_sync(opcode);
@@ -343,6 +361,9 @@ impl HostCallBroker {
 
         match send_result {
             Ok(()) => {
+                if exec_class == ExecClass::MainThread {
+                    self.wake_main_thread();
+                }
                 inner.stats.on_submit_async(opcode);
                 SubmitResult::Pending { request_id }
             }
@@ -364,7 +385,12 @@ impl HostCallBroker {
         }
     }
 
-    fn execute_sync_main_thread(&self, opcode: u64, args: [u64; 4]) -> (u64, u64) {
+    fn execute_sync_main_thread(
+        &self,
+        opcode: u64,
+        args: [u64; 4],
+        payload: WorkerPayload,
+    ) -> (u64, u64) {
         let inner = &*self.inner;
 
         // Headless mode keeps historical behavior: execute inline.
@@ -372,7 +398,7 @@ impl HostCallBroker {
             let ctx = self.make_ctx();
             return inner
                 .registry
-                .dispatch(&ctx, opcode, args, None)
+                .dispatch(&ctx, opcode, args, Some(&payload))
                 .unwrap_or((hc::HC_INVALID, 0));
         }
 
@@ -381,7 +407,7 @@ impl HostCallBroker {
             let ctx = self.make_ctx();
             return inner
                 .registry
-                .dispatch(&ctx, opcode, args, None)
+                .dispatch(&ctx, opcode, args, Some(&payload))
                 .unwrap_or((hc::HC_INVALID, 0));
         }
 
@@ -390,7 +416,7 @@ impl HostCallBroker {
             request_id: 0,
             opcode,
             args,
-            payload: WorkerPayload::None,
+            payload,
             user_tag: 0,
             cancel: Arc::new(AtomicBool::new(false)),
             exec_class: ExecClass::MainThread,
@@ -401,6 +427,7 @@ impl HostCallBroker {
             Err(TrySendError::Full(_)) => return (hc::HC_BUSY, 0),
             Err(TrySendError::Disconnected(_)) => return (hc::HC_IO_ERROR, 0),
         }
+        self.wake_main_thread();
         rx.recv().unwrap_or((hc::HC_IO_ERROR, 0))
     }
 }
@@ -408,6 +435,23 @@ impl HostCallBroker {
 // ── cancel / poll / pump / stats ──────────────────────────────────────────────
 
 impl HostCallBroker {
+    fn flush_deferred_window_events(&self) {
+        loop {
+            let deferred = {
+                let mut queue = self.inner.pending_window_events.lock().unwrap();
+                queue.pop_front()
+            };
+            let Some((window_id, event)) = deferred else {
+                break;
+            };
+            self.inner
+                .win32k
+                .lock()
+                .unwrap()
+                .on_window_event(window_id, &event);
+        }
+    }
+
     pub fn cancel(&self, request_id: u64) -> (u64, u64) {
         let inner = &*self.inner;
         let mut inflight = inner.inflight.lock().unwrap();
@@ -460,6 +504,7 @@ impl HostCallBroker {
     /// Drive a host UI event-loop tick.
     /// This must run on the UI thread that owns `ActiveEventLoop`.
     pub fn pump_main_thread_with_event_loop(&self, el: &ActiveEventLoop, elapsed_ms: u32) {
+        self.flush_deferred_window_events();
         // Bound per-tick queue drain to avoid starving window lifecycle work.
         self.pump_main_thread_budget(64);
         self.inner
@@ -467,15 +512,21 @@ impl HostCallBroker {
             .lock()
             .unwrap()
             .on_event_loop_tick(el, elapsed_ms);
+        self.flush_deferred_window_events();
     }
 
     /// Forward host window events into the win32k message bridge.
     pub fn handle_window_event(&self, window_id: WindowId, event: &WindowEvent) {
+        if let Ok(mut win32k) = self.inner.win32k.try_lock() {
+            win32k.on_window_event(window_id, event);
+            return;
+        }
+
         self.inner
-            .win32k
+            .pending_window_events
             .lock()
             .unwrap()
-            .on_window_event(window_id, event);
+            .push_back((window_id, event.clone()));
     }
 
     fn register_main_executor_thread(&self) {
@@ -503,6 +554,13 @@ impl HostCallBroker {
             .as_ref()
             .map(|id| *id == thread::current().id())
             .unwrap_or(false)
+    }
+
+    fn wake_main_thread(&self) {
+        let waker = self.inner.main_thread_waker.lock().unwrap().clone();
+        if let Some(waker) = waker {
+            waker();
+        }
     }
 
     pub fn stats_snapshot(&self, reset: bool) -> HostCallStatsSnapshot {

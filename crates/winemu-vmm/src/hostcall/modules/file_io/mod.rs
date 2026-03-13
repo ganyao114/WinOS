@@ -40,6 +40,17 @@ fn h_open(ctx: &HandlerCtx<'_>, args: [u64; 4], payload: Option<&WorkerPayload>)
     handlers::execute_open(ctx, args, path)
 }
 
+fn h_mkdir(ctx: &HandlerCtx<'_>, args: [u64; 4], payload: Option<&WorkerPayload>) -> (u64, u64) {
+    let path = payload.and_then(|p| {
+        if let WorkerPayload::Path(s) = p {
+            Some(s.as_ref())
+        } else {
+            None
+        }
+    });
+    handlers::execute_mkdir(ctx, args, path)
+}
+
 fn h_read(ctx: &HandlerCtx<'_>, args: [u64; 4], _: Option<&WorkerPayload>) -> (u64, u64) {
     handlers::execute_read(ctx, args)
 }
@@ -61,6 +72,14 @@ fn h_close(ctx: &HandlerCtx<'_>, args: [u64; 4], _: Option<&WorkerPayload>) -> (
 
 fn h_stat(ctx: &HandlerCtx<'_>, args: [u64; 4], _: Option<&WorkerPayload>) -> (u64, u64) {
     handlers::execute_stat(ctx, args)
+}
+
+fn h_seek(ctx: &HandlerCtx<'_>, args: [u64; 4], _: Option<&WorkerPayload>) -> (u64, u64) {
+    handlers::execute_seek(ctx, args)
+}
+
+fn h_set_len(ctx: &HandlerCtx<'_>, args: [u64; 4], _: Option<&WorkerPayload>) -> (u64, u64) {
+    handlers::execute_set_len(ctx, args)
 }
 
 fn h_readdir(ctx: &HandlerCtx<'_>, args: [u64; 4], _: Option<&WorkerPayload>) -> (u64, u64) {
@@ -122,6 +141,13 @@ static ENTRIES: &[OpcodeEntry] = &[
         requires_main_thread: false,
     },
     OpcodeEntry {
+        opcode: hc::OP_MKDIR,
+        handler: h_mkdir,
+        async_eligible: no_async,
+        prepare_payload: Some(prep_open),
+        requires_main_thread: false,
+    },
+    OpcodeEntry {
         opcode: hc::OP_READ,
         handler: h_read,
         async_eligible: large_io_async,
@@ -153,6 +179,20 @@ static ENTRIES: &[OpcodeEntry] = &[
         opcode: hc::OP_READDIR,
         handler: h_readdir,
         async_eligible: always_async,
+        prepare_payload: None,
+        requires_main_thread: false,
+    },
+    OpcodeEntry {
+        opcode: hc::OP_SEEK,
+        handler: h_seek,
+        async_eligible: no_async,
+        prepare_payload: None,
+        requires_main_thread: false,
+    },
+    OpcodeEntry {
+        opcode: hc::OP_SET_LEN,
+        handler: h_set_len,
+        async_eligible: no_async,
         prepare_payload: None,
         requires_main_thread: false,
     },

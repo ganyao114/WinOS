@@ -10,6 +10,7 @@ pub type hv_sys_reg_t = u16;
 pub type hv_vm_config_t = *mut c_void;
 
 pub const HV_SUCCESS: hv_return_t = 0;
+pub const HV_NO_DEVICE: hv_return_t = 0xfae9_4006u32 as i32;
 pub const HV_EXIT_REASON_CANCELED: u32 = 0;
 pub const HV_EXIT_REASON_EXCEPTION: u32 = 1;
 pub const HV_EXIT_REASON_VTIMER_ACTIVATED: u32 = 2;
