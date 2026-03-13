@@ -62,18 +62,7 @@ pub extern "C" fn kernel_main() -> ! {
     sched::init_sync_state();
     crate::kinfo!("kernel_main: mmu ok");
 
-    // Bootstrap process/thread context first so sync hostcall path runs under
-    // kernel-thread semantics from the beginning of image loading.
-    if !process::init_boot_process(0, 0) {
-        crate::kerror!("kernel: bootstrap process init failed");
-        hypercall::process_exit(1);
-    }
-    // Register thread0 (the boot thread) with the scheduler.
-    {
-        let _lock = sched::KSchedulerLock::lock();
-        sched::create_boot_thread_for_current_vcpu_locked(23)
-            .expect("kernel: thread0 alloc failed");
-    }
+    let thread0_tid = bootstrap_initial_kernel_thread_or_exit();
 
     hostcall::init();
     if hypercall::hostcall_setup() != winemu_shared::hostcall::HC_OK {
@@ -86,57 +75,147 @@ pub extern "C" fn kernel_main() -> ! {
         nt::sysno_table::load_for_build(build);
     }
 
-    // ── 1. 通过 kernel fs bootstrap 打开初始 EXE ──────────────
-    let exe = match fs::bootstrap::open_initial_exe() {
-        Ok(v) => v,
-        Err(_) => {
-            crate::kerror!("kernel: query_exe_info failed");
-            hypercall::process_exit(1);
-        }
-    };
-    let exe_file = exe.file;
-    let exe_size = exe.size;
-    if exe_size == 0 {
-        crate::kerror!("kernel: query_exe_info failed");
-        hypercall::process_exit(1);
+    let initial_image = load_initial_user_image_or_exit();
+    let boot_task = create_boot_user_task_or_exit(thread0_tid, &initial_image);
+    boot_task.notify_kernel_ready();
+    boot_task.prepare_initial_thread_launch();
+
+    // Release secondary CPUs from early boot hold loop only after thread0
+    // bootstrap context is fully committed.
+    set_primary_boot_ready();
+
+    crate::kinfo!(
+        "kernel: boot task pid={} tid={} enter bootstrap dispatch",
+        boot_task.pid,
+        boot_task.tid
+    );
+    sched::enter_current_core_scheduler()
+}
+
+const BOOT_THREAD_PRIORITY: u8 = 23;
+const DEFAULT_STACK_RESERVE: u64 = 0x10_0000;
+const DEFAULT_STACK_COMMIT: u64 = 0x1000;
+const COMPAT_SECONDARY_STACK_SIZE: u64 = 0x10000;
+
+struct InitialUserImage {
+    loaded: ldr::LoadedImage,
+    stack_reserve: u64,
+    stack_commit: u64,
+}
+
+struct BootUserTask {
+    pid: u32,
+    tid: u32,
+    teb_peb: teb::TebPeb,
+    app_entry_va: u64,
+    start_thunk_va: u64,
+}
+
+impl BootUserTask {
+    fn notify_kernel_ready(&self) {
+        hypercall::kernel_ready(
+            self.start_thunk_va,
+            self.teb_peb.stack_base,
+            self.teb_peb.teb_va,
+            crate::alloc::heap_end(),
+            0,
+            0,
+        );
     }
 
-    // 读取 PE 可选头栈参数：reserve/commit
-    let (stack_reserve, stack_commit) = {
-        let mut hdr = [0u8; 512];
-        let got = fs::read_at(fs::FsReadRequest {
-            file: exe_file,
-            dst: hdr.as_mut_ptr(),
-            len: 512,
-            offset: 0,
-        })
-        .unwrap_or(0);
-        if got >= 80 {
-            let lfanew = u32::from_le_bytes([hdr[60], hdr[61], hdr[62], hdr[63]]) as usize;
-            let oh = lfanew + 24;
-            if oh + 88 <= got {
-                let reserve =
-                    u64::from_le_bytes(hdr[oh + 72..oh + 80].try_into().unwrap_or([0; 8]));
-                let commit = u64::from_le_bytes(hdr[oh + 80..oh + 88].try_into().unwrap_or([0; 8]));
-                (reserve, commit)
-            } else {
-                (0x10_0000, 0x1000)
-            }
-        } else {
-            (0x10_0000, 0x1000)
-        }
-    };
+    fn prepare_initial_thread_launch(&self) {
+        let now = sched::current_ticks();
+        // Bootstrap path: avoid unlock-edge scheduling before we enter the
+        // unified scheduler entry below.
+        sched::lock::with_sched_raw_lock(|| {
+            sched::prepare_boot_thread_user_entry_locked(
+                self.tid,
+                crate::arch::context::UserThreadStart {
+                    program_counter: self.start_thunk_va,
+                    stack_pointer: self.teb_peb.stack_base,
+                    thread_pointer: self.teb_peb.teb_va,
+                    arg0: self.app_entry_va,
+                    arg1: self.teb_peb.peb_va,
+                },
+                now,
+            );
+        });
+        process::switch_to_thread_process(self.tid);
+    }
+}
 
+fn kernel_boot_exit(message: &str) -> ! {
+    crate::kerror!("{}", message);
+    hypercall::process_exit(1);
+}
+
+fn bootstrap_initial_kernel_thread_or_exit() -> u32 {
+    if !process::init_boot_process(0, 0) {
+        kernel_boot_exit("kernel: bootstrap process init failed");
+    }
+    let Some(thread0_tid) = ({
+        let _lock = sched::KSchedulerLock::lock();
+        sched::create_boot_thread_for_current_vcpu_locked(BOOT_THREAD_PRIORITY)
+    }) else {
+        kernel_boot_exit("kernel: thread0 alloc failed");
+    };
+    thread0_tid
+}
+
+fn open_initial_exe_or_exit() -> fs::bootstrap::InitialExe {
+    let Ok(exe) = fs::bootstrap::open_initial_exe() else {
+        kernel_boot_exit("kernel: query_exe_info failed");
+    };
+    if exe.size == 0 {
+        kernel_boot_exit("kernel: query_exe_info failed");
+    }
+    exe
+}
+
+fn read_initial_exe_stack_params(exe_file: fs::FsFileHandle) -> (u64, u64) {
+    let mut hdr = [0u8; 512];
+    let got = fs::read_at(fs::FsReadRequest {
+        file: exe_file,
+        dst: hdr.as_mut_ptr(),
+        len: hdr.len(),
+        offset: 0,
+    })
+    .unwrap_or(0);
+    if got < 80 {
+        return (DEFAULT_STACK_RESERVE, DEFAULT_STACK_COMMIT);
+    }
+
+    let lfanew = u32::from_le_bytes([hdr[60], hdr[61], hdr[62], hdr[63]]) as usize;
+    let optional_header = lfanew + 24;
+    if optional_header + 88 > got {
+        return (DEFAULT_STACK_RESERVE, DEFAULT_STACK_COMMIT);
+    }
+
+    let reserve = u64::from_le_bytes(
+        hdr[optional_header + 72..optional_header + 80]
+            .try_into()
+            .unwrap_or([0; 8]),
+    );
+    let commit = u64::from_le_bytes(
+        hdr[optional_header + 80..optional_header + 88]
+            .try_into()
+            .unwrap_or([0; 8]),
+    );
+    (reserve, commit)
+}
+
+fn load_initial_user_image_or_exit() -> InitialUserImage {
+    let exe = open_initial_exe_or_exit();
+    let stack = read_initial_exe_stack_params(exe.file);
     let loaded = unsafe {
         ldr::load_from_file(
-            exe_file,
-            exe_size,
+            exe.file,
+            exe.size,
             crate::mm::VmaType::ExeImage,
             |dll_name, imp| dll::resolve_import(dll_name, imp),
         )
     };
-
-    fs::close(exe_file);
+    fs::close(exe.file);
 
     let loaded = match loaded {
         Ok(img) => img,
@@ -146,58 +225,14 @@ pub extern "C" fn kernel_main() -> ! {
         }
     };
 
-    // ── 3. 先建立 boot process，再在其地址空间初始化 TEB / PEB / 栈 ──
-    if !process::init_boot_process(loaded.base, 0) {
-        crate::kerror!("kernel: boot process init failed");
-        hypercall::process_exit(1);
+    InitialUserImage {
+        loaded,
+        stack_reserve: stack.0,
+        stack_commit: stack.1,
     }
-    let boot_pid = process::boot_pid();
-    if boot_pid == 0 {
-        crate::kerror!("kernel: boot pid invalid");
-        hypercall::process_exit(1);
-    }
+}
 
-    let teb_peb = match teb::init(
-        loaded.base,
-        boot_pid,
-        1,
-        stack_reserve,
-        stack_commit,
-        "C:\\app.exe",
-        "app.exe",
-    ) {
-        Some(t) => t,
-        None => {
-            crate::kerror!("kernel: teb init failed");
-            hypercall::process_exit(1);
-        }
-    };
-
-    if !process::init_boot_process(loaded.base, teb_peb.peb_va) {
-        crate::kerror!("kernel: boot process update failed");
-        hypercall::process_exit(1);
-    }
-    // Update thread0 metadata now that the boot process PID is known.
-    // thread0 was created during early bootstrap with pid=0; bind it to the
-    // boot process and account it once in process lifecycle tracking.
-    let mut account_thread0 = false;
-    {
-        let tid = sched::current_tid();
-        let _lock = sched::KSchedulerLock::lock();
-        sched::with_thread_mut(tid, |t| {
-            t.teb_va = teb_peb.teb_va;
-            if t.pid == 0 {
-                t.pid = boot_pid;
-                account_thread0 = true;
-            }
-        });
-    }
-    if account_thread0 {
-        process::on_thread_created(boot_pid, sched::current_tid());
-    }
-
-    // ── 4. 通知 VMM 内核已就绪 + 内核侧直入首用户线程 ───────────
-    let app_entry_va = loaded.base + loaded.entry_rva as u64;
+fn resolve_boot_start_thunk(app_entry_va: u64) -> u64 {
     let start_thunk_va =
         dll::resolve_import("ntdll.dll", ldr::ImportRef::Name("WinEmuProcessStart"))
             .or_else(|| {
@@ -207,61 +242,74 @@ pub extern "C" fn kernel_main() -> ! {
     if start_thunk_va == app_entry_va {
         crate::kwarn!("kernel: start thunk missing, fallback to app entry");
     }
+    start_thunk_va
+}
 
-    // Compatibility reservation: keep prior user VA layout stable.
-    const SECONDARY_STACK_SIZE: u64 = 0x10000;
+fn bind_boot_thread_to_process_or_exit(thread0_tid: u32, boot_pid: u32, teb_va: u64) {
+    if thread0_tid == 0 || !sched::thread_exists(thread0_tid) {
+        kernel_boot_exit("kernel: thread0 missing");
+    }
+
+    let mut account_thread0 = false;
+    {
+        let _lock = sched::KSchedulerLock::lock();
+        sched::with_thread_mut(thread0_tid, |t| {
+            t.teb_va = teb_va;
+            if t.pid == 0 {
+                t.pid = boot_pid;
+                account_thread0 = true;
+            }
+        });
+    }
+    if account_thread0 {
+        process::on_thread_created(boot_pid, thread0_tid);
+    }
+}
+
+fn create_boot_user_task_or_exit(thread0_tid: u32, image: &InitialUserImage) -> BootUserTask {
+    if !process::init_boot_process(image.loaded.base, 0) {
+        kernel_boot_exit("kernel: boot process init failed");
+    }
+
+    let boot_pid = process::boot_pid();
+    if boot_pid == 0 {
+        kernel_boot_exit("kernel: boot pid invalid");
+    }
+
+    let Some(teb_peb) = teb::init(
+        image.loaded.base,
+        boot_pid,
+        1,
+        image.stack_reserve,
+        image.stack_commit,
+        "C:\\app.exe",
+        "app.exe",
+    ) else {
+        kernel_boot_exit("kernel: teb init failed");
+    };
+
+    if !process::init_boot_process(image.loaded.base, teb_peb.peb_va) {
+        kernel_boot_exit("kernel: boot process update failed");
+    }
+
+    bind_boot_thread_to_process_or_exit(thread0_tid, boot_pid, teb_peb.teb_va);
+
     let _ = crate::mm::vm_alloc_region_typed(
         boot_pid,
         0,
-        SECONDARY_STACK_SIZE,
+        COMPAT_SECONDARY_STACK_SIZE,
         0x04,
         crate::mm::VmaType::ThreadStack,
     );
 
-    // KERNEL_READY is notify-only: it should not own thread0 launch semantics.
-    hypercall::kernel_ready(
-        start_thunk_va,
-        teb_peb.stack_base,
-        teb_peb.teb_va,
-        crate::alloc::heap_end(),
-        0,
-        0,
-    );
-
-    let thread0_tid = sched::current_tid();
-    if thread0_tid == 0 || !sched::thread_exists(thread0_tid) {
-        crate::kerror!("kernel: thread0 missing");
-        hypercall::process_exit(1);
+    let app_entry_va = image.loaded.base + image.loaded.entry_rva as u64;
+    BootUserTask {
+        pid: boot_pid,
+        tid: thread0_tid,
+        teb_peb,
+        app_entry_va,
+        start_thunk_va: resolve_boot_start_thunk(app_entry_va),
     }
-    let now = sched::current_ticks();
-    {
-        // Bootstrap path: avoid unlock-edge scheduling before we enter the
-        // unified scheduler entry below.
-        sched::lock::with_sched_raw_lock(|| {
-            sched::prepare_boot_thread_user_entry_locked(
-                thread0_tid,
-                crate::arch::context::UserThreadStart {
-                    program_counter: start_thunk_va,
-                    stack_pointer: teb_peb.stack_base,
-                    thread_pointer: teb_peb.teb_va,
-                    arg0: app_entry_va,
-                    arg1: teb_peb.peb_va,
-                },
-                now,
-            );
-        });
-    }
-    process::switch_to_thread_process(thread0_tid);
-
-    // Release secondary CPUs from early boot hold loop only after thread0
-    // bootstrap context is fully committed.
-    set_primary_boot_ready();
-
-    crate::kinfo!(
-        "kernel: thread0 tid={} enter bootstrap dispatch",
-        thread0_tid
-    );
-    sched::enter_current_core_scheduler()
 }
 
 #[panic_handler]
