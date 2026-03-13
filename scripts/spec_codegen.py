@@ -13,12 +13,14 @@ TARGET_TAGS = {"arm64", "win64"}
 class SpecExport:
     ordinal: int
     name: str
+    public_name: str | None
     is_data: bool
     is_syscall: bool
     forward: str | None
     impl_name: str | None = None
     arg_count: int = 0
     syscall_nr: int | None = None
+    noname: bool = False
 
 
 def _target_tag_matches(tag: str) -> bool:
@@ -64,6 +66,17 @@ def _split_kind_and_options(body: str) -> tuple[str, list[str], str] | None:
         opts.append(seg[0])
         rest = seg[1].strip() if len(seg) > 1 else ""
     return kind, opts, rest
+
+
+def _split_ordinal_and_body(line: str) -> tuple[int | None, str] | None:
+    if not line:
+        return None
+    if line.startswith("@"):
+        return None, line[1:].strip()
+    match = re.match(r"^(\d+)\s+(.*)$", line)
+    if match:
+        return int(match.group(1)), match.group(2).strip()
+    return None
 
 
 def _find_matching_paren(s: str, start_idx: int) -> int:
@@ -133,25 +146,31 @@ def _parse_export_fields(
     if not name:
         return None
     forward = None
+    impl_name = None
     if tail:
         tok = tail.split()[0]
         if "." in tok:
             forward = tok
-    return name, forward, False, arg_count, None
+        else:
+            impl_name = tok
+    return name, forward, False, arg_count, impl_name
 
 
 def parse_spec(spec_path: Path) -> list[SpecExport]:
     lines = spec_path.read_text(encoding="utf-8", errors="replace").splitlines()
     out: list[SpecExport] = []
     seen_names: set[str] = set()
+    used_ordinals: set[int] = set()
+    next_auto_ordinal = 1
 
     for raw in lines:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        if not line.startswith("@"):
+        ordinal_body = _split_ordinal_and_body(line)
+        if ordinal_body is None:
             continue
-        body = line[1:].strip()
+        explicit_ordinal, body = ordinal_body
         if not body or body.startswith("#"):
             continue
 
@@ -175,19 +194,33 @@ def parse_spec(spec_path: Path) -> list[SpecExport]:
         if fields is None:
             continue
         name, forward, is_data, arg_count, impl_name = fields
-        if name in seen_names:
+        noname = "-noname" in opts or name == "@"
+        public_name = None if noname else name
+        if explicit_ordinal is not None:
+            ordinal = explicit_ordinal
+        else:
+            ordinal = next_auto_ordinal
+            while ordinal in used_ordinals:
+                ordinal += 1
+        dedup_key = public_name if public_name is not None else f"@{ordinal}"
+        if dedup_key in seen_names:
             continue
-        seen_names.add(name)
+        seen_names.add(dedup_key)
+        used_ordinals.add(ordinal)
+        next_auto_ordinal = max(next_auto_ordinal, ordinal + 1)
+        impl_symbol = impl_name or (name if name != "@" else f"ordinal_{ordinal}")
 
         out.append(
             SpecExport(
-                ordinal=len(out) + 1,
-                name=name,
+                ordinal=ordinal,
+                name=impl_symbol,
+                public_name=public_name,
                 is_data=is_data,
                 is_syscall=("-syscall" in opts),
                 forward=forward,
                 impl_name=impl_name,
                 arg_count=arg_count,
+                noname=noname,
             )
         )
 
@@ -291,21 +324,39 @@ def emit_def(
     lines.append(f"LIBRARY {dll_name}")
     lines.append("EXPORTS")
     for e in entries:
-        if e.name in passthrough_exports and not e.forward:
-            passthrough_target = e.impl_name if e.impl_name else e.name
-            if e.is_data:
-                line = f"    {e.name}={passthrough_target} @{e.ordinal} DATA"
+        export_key = e.public_name if e.public_name is not None else e.name
+        if export_key in passthrough_exports and not e.forward:
+            passthrough_target = e.name
+            if e.noname:
+                if e.is_data:
+                    line = f"    {passthrough_target} @{e.ordinal} NONAME DATA"
+                else:
+                    line = f"    {passthrough_target} @{e.ordinal} NONAME"
+            elif e.is_data:
+                line = f"    {e.public_name}={passthrough_target} @{e.ordinal} DATA"
             else:
-                line = f"    {e.name}={passthrough_target} @{e.ordinal}"
+                line = f"    {e.public_name}={passthrough_target} @{e.ordinal}"
         elif e.forward:
             target = e.forward
-            line = f"    {e.name}={target} @{e.ordinal}"
+            if e.noname:
+                line = f"    {target} @{e.ordinal} NONAME"
+            else:
+                line = f"    {e.public_name}={target} @{e.ordinal}"
         elif e.is_data:
-            line = f"    {e.name}=winemu_data_export @{e.ordinal} DATA"
+            if e.noname:
+                line = f"    winemu_data_export @{e.ordinal} NONAME DATA"
+            else:
+                line = f"    {e.public_name}=winemu_data_export @{e.ordinal} DATA"
         elif e.is_syscall:
-            line = f"    {e.name}={dll_name}_syscall_{e.ordinal:04d} @{e.ordinal}"
+            if e.noname:
+                line = f"    {dll_name}_syscall_{e.ordinal:04d} @{e.ordinal} NONAME"
+            else:
+                line = f"    {e.public_name}={dll_name}_syscall_{e.ordinal:04d} @{e.ordinal}"
         else:
-            line = f"    {e.name}=winemu_stub_export @{e.ordinal}"
+            if e.noname:
+                line = f"    winemu_stub_export @{e.ordinal} NONAME"
+            else:
+                line = f"    {e.public_name}=winemu_stub_export @{e.ordinal}"
         lines.append(line)
     lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -323,7 +374,8 @@ def emit_win32k_sysno_header(path: Path, entries: Iterable[SpecExport]) -> None:
     for e in entries:
         if not e.is_syscall or e.syscall_nr is None:
             continue
-        macro = f"WIN32K_SYSCALL_{_sanitize_ident(e.name)}"
+        export_name = e.public_name if e.public_name is not None else e.name
+        macro = f"WIN32K_SYSCALL_{_sanitize_ident(export_name)}"
         if macro in used:
             continue
         used.add(macro)
@@ -344,7 +396,8 @@ def emit_win32k_sysno_rust(path: Path, entries: Iterable[SpecExport]) -> None:
     for e in entries:
         if not e.is_syscall or e.syscall_nr is None:
             continue
-        name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", e.name)
+        export_name = e.public_name if e.public_name is not None else e.name
+        name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", export_name)
         name = _sanitize_ident(name).upper()
         if not name:
             continue
@@ -365,8 +418,9 @@ def emit_win32syscalls_header(path: Path, entries: Iterable[SpecExport]) -> None
     lines.append("#define ALL_SYSCALLS64 \\")
     for idx, e in enumerate(entries):
         suffix = " \\" if idx != len(entries) - 1 else ""
+        export_name = e.public_name if e.public_name is not None else e.name
         lines.append(
-            f"    SYSCALL_ENTRY(0x{(e.syscall_nr & 0x0FFF):03x}, {e.name}, {e.arg_count}){suffix}"
+            f"    SYSCALL_ENTRY(0x{(e.syscall_nr & 0x0FFF):03x}, {export_name}, {e.arg_count}){suffix}"
         )
     if not entries:
         lines.append("    /* no syscalls */")

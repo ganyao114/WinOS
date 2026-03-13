@@ -25,13 +25,12 @@ GEN_MAP         := $(GEN_DIR)/win32k_sysno_map.csv
 GEN_SYSNO_RS    := $(ROOT)/crates/winemu-shared/src/win32k_sysno_generated.rs
 REAL_OBJ_DIR    := $(GEN_DIR)/real
 OBJCPY          ?= objcopy
-REAL_FULL_OBJS  := $(REAL_OBJ_DIR)/main.full.o
-REAL_OBJS       := $(REAL_OBJ_DIR)/main.o \
-                   $(REAL_OBJ_DIR)/syscall.o
+REAL_OBJS       := $(REAL_OBJ_DIR)/bootstrap.o
 REAL_CFLAGS     := $(CFLAGS) $(WINE_CFLAGS) -I$(GEN_DIR) -I$(WINE_INCLUDE_DIR)/msvcrt -D_CRTIMP= -D__WINESRC__ -D__WINE_PE_BUILD -ffunction-sections -fdata-sections
 REAL_SYSCALL_CFLAGS := $(REAL_CFLAGS) -DWINEMU_PE_GUEST
 GEN_STAMP       := $(GEN_DIR)/.exports.stamp
 OUT             := $(SYSROOT)/win32u.dll
+IMAGE_BASE      := 0x71fc0000
 
 all: $(OUT)
 
@@ -61,36 +60,13 @@ $(GEN_STAMP): $(GEN_SCRIPT) $(SPEC_DEPS) $(PASSTHROUGH_DEP) $(SYSCALL_REF_DEP) |
 
 $(GEN_C) $(GEN_DEF) $(GEN_SYSNO) $(GEN_SYSCALLS_H): $(GEN_STAMP)
 
-$(REAL_OBJ_DIR)/main.full.o: main.c $(GEN_SYSCALLS_H) | $(REAL_OBJ_DIR)
+$(REAL_OBJ_DIR)/bootstrap.o: bootstrap.c $(GEN_SYSCALLS_H) | $(REAL_OBJ_DIR)
 	$(CC) $(REAL_CFLAGS) -c $< -o $@
 
-$(REAL_OBJ_DIR)/syscall.o: syscall.c $(GEN_SYSCALLS_H) | $(REAL_OBJ_DIR)
-	$(CC) $(REAL_SYSCALL_CFLAGS) -c $< -o $@
 
-$(REAL_OBJ_DIR)/main.o: $(REAL_OBJ_DIR)/main.full.o
-	$(OBJCPY) -w \
-		-j '.text$$DllMain' \
-		-j '.xdata$$DllMain' \
-		-j '.pdata$$DllMain' \
-		-j '.text$$__wine_spec_unimplemented_stub' \
-		-j '.xdata$$__wine_spec_unimplemented_stub' \
-		-j '.pdata$$__wine_spec_unimplemented_stub' \
-		-j '.bss$$__wine_syscall_dispatcher' \
-		-j '.rdata$$.refptr.__wine_unix_call_dispatcher' \
-		-j '.rdata$$.refptr.__wine_unixlib_handle' \
-		-j '.data$$dummy' \
-		-j '.rdata*' \
-		$< $@
-	$(OBJCPY) --strip-unneeded \
-		-K DllMain \
-		-K __wine_spec_unimplemented_stub \
-		-K __wine_syscall_dispatcher \
-		-K dummy \
-		$@
-
-$(OUT): $(GEN_C) $(GEN_DEF) $(REAL_OBJS) | $(SYSROOT)
+$(OUT): $(GEN_C) $(GEN_DEF) $(REAL_OBJS) $(SYSROOT)/ntdll.lib | $(SYSROOT)
 	rm -f "$@"
-	$(CC) $(CFLAGS) $(WINE_CFLAGS) -shared -o $@ $(GEN_C) $(GEN_DEF) $(REAL_OBJS) -Wl,--gc-sections -Wl,--out-implib,$(SYSROOT)/win32u.lib
+	$(CC) $(CFLAGS) $(WINE_CFLAGS) -shared -o $@ $(GEN_C) $(GEN_DEF) $(REAL_OBJS) $(SYSROOT)/ntdll.lib -Wl,--gc-sections -Wl,--image-base,$(IMAGE_BASE) -Wl,--out-implib,$(SYSROOT)/win32u.lib
 
 .PHONY: all clean
 clean:

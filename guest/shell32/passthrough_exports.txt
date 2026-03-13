@@ -1,0 +1,9 @@
+# Minimal real Wine-derived allocator exports required by CPU-Z.
+SHAlloc
+SHFree
+SHGetMalloc
+SHGetFolderPathA
+SHGetFolderPathW
+SHGetKnownFolderPath
+SHGetSpecialFolderPathA
+SHGetSpecialFolderPathW

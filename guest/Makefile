@@ -1,9 +1,11 @@
 include common.mk
 
-DLLS := ntdll win32u msvcrt
+DLLS := ntdll win32u msvcrt shell32 fastprox winspool.drv wined3d
+DATA_DIRS := nls
 TEST_EXE_DIR := ../tests/guest
 EXES := \
 	$(TEST_EXE_DIR)/hello_win \
+	$(TEST_EXE_DIR)/com_wbem_test \
 	$(TEST_EXE_DIR)/open_process_test \
 	$(TEST_EXE_DIR)/process_test \
 	$(TEST_EXE_DIR)/syscall_sysinfo_test \
@@ -18,9 +20,9 @@ EXES := \
 	$(TEST_EXE_DIR)/syscall_section_open_test \
 	$(TEST_EXE_DIR)/vm_rw_test
 
-.PHONY: all clean $(DLLS) $(EXES)
+.PHONY: all clean runtime-data $(DLLS) $(EXES)
 
-all: $(DLLS) $(EXES)
+all: $(DLLS) runtime-data $(EXES)
 
 $(DLLS): | $(SYSROOT)
 	$(MAKE) -C $@ SYSROOT=$(SYSROOT)
@@ -31,6 +33,11 @@ $(EXES): $(DLLS) | $(SYSROOT)
 
 $(SYSROOT):
 	mkdir -p $(SYSROOT)
+
+runtime-data: | $(SYSROOT)
+	rm -rf $(SYSROOT)/nls
+	mkdir -p $(SYSROOT)
+	cp -R $(DATA_DIRS) $(SYSROOT)/
 
 clean:
 	for d in $(DLLS) $(EXES); do $(MAKE) -C $$d clean SYSROOT=$(SYSROOT); done

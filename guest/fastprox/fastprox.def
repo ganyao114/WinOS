@@ -1,0 +1,4 @@
+LIBRARY fastprox.dll
+EXPORTS
+    DllCanUnloadNow
+    DllGetClassObject

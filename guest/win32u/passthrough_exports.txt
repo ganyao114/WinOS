@@ -1,4 +1,8 @@
 # Exports listed here are emitted as direct symbol exports in DEF:
 #   <name> @ordinal
 #
-# Keep this list empty until a real Wine source object is compiled and linked.
+NtGdiCreateCompatibleDC
+NtUserBeginPaint
+NtUserGetDC
+NtUserGetDCEx
+NtUserGetWindowDC
