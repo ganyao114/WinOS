@@ -67,12 +67,7 @@ fn query_vm_counters(buf: *mut u8, buf_len: usize, ret_len: *mut u32) -> u32 {
     status::SUCCESS
 }
 
-fn query_default_hard_error_mode(
-    pid: u32,
-    buf: *mut u8,
-    buf_len: usize,
-    ret_len: *mut u32,
-) -> u32 {
+fn query_default_hard_error_mode(pid: u32, buf: *mut u8, buf_len: usize, ret_len: *mut u32) -> u32 {
     if buf.is_null() || buf_len != PROCESS_DEFAULT_HARD_ERROR_MODE_SIZE {
         write_ret_len(ret_len, PROCESS_DEFAULT_HARD_ERROR_MODE_SIZE as u32);
         return status::INFO_LENGTH_MISMATCH;

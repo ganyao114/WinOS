@@ -349,11 +349,7 @@ fn load_dll_file(
     key_name: &str,
     display_name: &str,
 ) -> Result<ldr::LoadedImage, ldr::LdrError> {
-    crate::ktrace!(
-        "dll: load start {} size={:#x}",
-        display_name,
-        file_size
-    );
+    crate::ktrace!("dll: load start {} size={:#x}", display_name, file_size);
     let loaded =
         unsafe { ldr::load_from_file_unlinked(file, file_size, crate::mm::VmaType::DllImage) }?;
     crate::ktrace!(

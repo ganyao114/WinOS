@@ -288,7 +288,9 @@ pub unsafe fn load_from_file(
         return Err(LdrError::NotArm64);
     }
 
-    let reloc_dir = hdrs.data_dir(pe::DIR_BASERELOC).filter(|dir| dir.is_present());
+    let reloc_dir = hdrs
+        .data_dir(pe::DIR_BASERELOC)
+        .filter(|dir| dir.is_present());
 
     // 3. 分配镜像内存
     let image = alloc_image_buffer(
@@ -335,12 +337,7 @@ pub unsafe fn load_from_file(
         };
         image
             .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
-                apply_relocations(
-                    buf.as_mut_ptr(),
-                    dir.rva as usize,
-                    dir.size as usize,
-                    delta,
-                )
+                apply_relocations(buf.as_mut_ptr(), dir.rva as usize, dir.size as usize, delta)
             })
             .ok_or(LdrError::AllocFailed)??;
     }
@@ -379,7 +376,9 @@ pub unsafe fn load(
         return Err(LdrError::NotArm64);
     }
 
-    let reloc_dir = hdrs.data_dir(pe::DIR_BASERELOC).filter(|dir| dir.is_present());
+    let reloc_dir = hdrs
+        .data_dir(pe::DIR_BASERELOC)
+        .filter(|dir| dir.is_present());
     let image_buf = alloc_image_buffer(
         hdrs.size_of_image as usize,
         hdrs.image_base,
@@ -422,12 +421,7 @@ pub unsafe fn load(
         };
         image_buf
             .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
-                apply_relocations(
-                    buf.as_mut_ptr(),
-                    dir.rva as usize,
-                    dir.size as usize,
-                    delta,
-                )
+                apply_relocations(buf.as_mut_ptr(), dir.rva as usize, dir.size as usize, delta)
             })
             .ok_or(LdrError::AllocFailed)??;
     }
@@ -479,7 +473,9 @@ pub unsafe fn load_from_file_unlinked(
         return Err(LdrError::NotArm64);
     }
 
-    let reloc_dir = hdrs.data_dir(pe::DIR_BASERELOC).filter(|dir| dir.is_present());
+    let reloc_dir = hdrs
+        .data_dir(pe::DIR_BASERELOC)
+        .filter(|dir| dir.is_present());
     let image = alloc_image_buffer(
         hdrs.size_of_image as usize,
         hdrs.image_base,
@@ -535,12 +531,7 @@ pub unsafe fn load_from_file_unlinked(
         };
         image
             .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
-                apply_relocations(
-                    buf.as_mut_ptr(),
-                    dir.rva as usize,
-                    dir.size as usize,
-                    delta,
-                )
+                apply_relocations(buf.as_mut_ptr(), dir.rva as usize, dir.size as usize, delta)
             })
             .ok_or_else(|| {
                 crate::kdebug!(
@@ -570,7 +561,9 @@ pub unsafe fn load_unlinked(image: &[u8], vma_type: VmaType) -> LdrResult<Loaded
         return Err(LdrError::NotArm64);
     }
 
-    let reloc_dir = hdrs.data_dir(pe::DIR_BASERELOC).filter(|dir| dir.is_present());
+    let reloc_dir = hdrs
+        .data_dir(pe::DIR_BASERELOC)
+        .filter(|dir| dir.is_present());
     let image_buf = alloc_image_buffer(
         hdrs.size_of_image as usize,
         hdrs.image_base,
@@ -610,12 +603,7 @@ pub unsafe fn load_unlinked(image: &[u8], vma_type: VmaType) -> LdrResult<Loaded
         };
         image_buf
             .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
-                apply_relocations(
-                    buf.as_mut_ptr(),
-                    dir.rva as usize,
-                    dir.size as usize,
-                    delta,
-                )
+                apply_relocations(buf.as_mut_ptr(), dir.rva as usize, dir.size as usize, delta)
             })
             .ok_or(LdrError::AllocFailed)??;
     }

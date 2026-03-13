@@ -218,9 +218,12 @@ pub extern "C" fn kernel_main() -> ! {
 
     // ── 4. 通知 VMM 内核已就绪 + 内核侧直入首用户线程 ───────────
     let app_entry_va = loaded.base + loaded.entry_rva as u64;
-    let start_thunk_va = dll::resolve_import("ntdll.dll", ldr::ImportRef::Name("WinEmuProcessStart"))
-        .or_else(|| dll::resolve_import("ntdll.dll", ldr::ImportRef::Name("RtlUserThreadStart")))
-        .unwrap_or(app_entry_va);
+    let start_thunk_va =
+        dll::resolve_import("ntdll.dll", ldr::ImportRef::Name("WinEmuProcessStart"))
+            .or_else(|| {
+                dll::resolve_import("ntdll.dll", ldr::ImportRef::Name("RtlUserThreadStart"))
+            })
+            .unwrap_or(app_entry_va);
     if start_thunk_va == app_entry_va {
         crate::kwarn!("kernel: start thunk missing, fallback to app entry");
     }

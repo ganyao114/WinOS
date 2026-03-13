@@ -271,7 +271,12 @@ pub fn terminate_process(pid: u32, exit_status: u32) -> u32 {
     crate::nt::file::cancel_pending_dir_notify_for_pid(pid);
 
     let tids = crate::sched::thread_ids_by_pid(pid);
-    crate::ktrace!("proc: terminate pid={} exit_status={:#x} tids={:?}", pid, exit_status, tids);
+    crate::ktrace!(
+        "proc: terminate pid={} exit_status={:#x} tids={:?}",
+        pid,
+        exit_status,
+        tids
+    );
     for tid in tids {
         let _ = crate::sched::terminate_thread_by_tid(tid);
     }

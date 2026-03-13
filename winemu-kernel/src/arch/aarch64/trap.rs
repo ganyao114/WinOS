@@ -161,11 +161,7 @@ fn read_user_ascii(pid: u32, ptr: u64, buf: &mut [u8]) -> Option<usize> {
 #[inline]
 fn log_user_fault_region(owner_pid: u32, label: &str, addr: u64) {
     let Some(info) = crate::mm::vm_query_region(owner_pid, crate::mm::UserVa::new(addr)) else {
-        crate::kerror!(
-            "user_fault_region: {} addr={:#x} region=none",
-            label,
-            addr
-        );
+        crate::kerror!("user_fault_region: {} addr={:#x} region=none", label, addr);
         return;
     };
     crate::kerror!(
@@ -202,12 +198,16 @@ fn log_user_fault_thread_stack(owner_pid: u32, sp: u64) {
     if teb_va == 0 {
         return;
     }
-    let teb_stack_base =
-        read_user_u64(owner_pid, teb_va.saturating_add(winemu_shared::teb::STACK_BASE as u64))
-            .unwrap_or(0);
-    let teb_stack_limit =
-        read_user_u64(owner_pid, teb_va.saturating_add(winemu_shared::teb::STACK_LIMIT as u64))
-            .unwrap_or(0);
+    let teb_stack_base = read_user_u64(
+        owner_pid,
+        teb_va.saturating_add(winemu_shared::teb::STACK_BASE as u64),
+    )
+    .unwrap_or(0);
+    let teb_stack_limit = read_user_u64(
+        owner_pid,
+        teb_va.saturating_add(winemu_shared::teb::STACK_LIMIT as u64),
+    )
+    .unwrap_or(0);
     crate::kerror!(
         "user_fault_teb_stack: teb={:#x} stack_base={:#x} stack_limit={:#x}",
         teb_va,
@@ -265,11 +265,7 @@ fn log_loaded_module_for_addr(label: &str, addr: u64) {
         );
     });
     if !matched {
-        crate::kerror!(
-            "user_fault_module: {} addr={:#x} module=none",
-            label,
-            addr
-        );
+        crate::kerror!("user_fault_module: {} addr={:#x} module=none", label, addr);
     }
 }
 
@@ -282,12 +278,7 @@ fn log_user_ascii_ptr(owner_pid: u32, label: &str, ptr: u64) {
     let Ok(text) = core::str::from_utf8(&buf[..len]) else {
         return;
     };
-    crate::kerror!(
-        "user_fault_ptr: {}={:#x} ascii=\"{}\"",
-        label,
-        ptr,
-        text
-    );
+    crate::kerror!("user_fault_ptr: {}={:#x} ascii=\"{}\"", label, ptr, text);
 }
 
 #[inline]
@@ -304,12 +295,7 @@ fn log_user_fp_chain(owner_pid: u32, mut fp: u64, max_depth: usize) {
             crate::kerror!("user_fault_bt[{}]: fp={:#x} ret=unreadable", depth, fp);
             break;
         };
-        crate::kerror!(
-            "user_fault_bt[{}]: fp={:#x} ret={:#x}",
-            depth,
-            fp,
-            ret
-        );
+        crate::kerror!("user_fault_bt[{}]: fp={:#x} ret={:#x}", depth, fp, ret);
         if ret != 0 {
             log_loaded_module_for_addr("bt", ret);
         }
@@ -325,13 +311,12 @@ fn log_user_fault_translation_state(owner_pid: u32, fault_addr: u64, pc: u64, lr
     let current_root = crate::arch::mmu::current_user_table_root();
     let expected_root =
         crate::process::with_process(owner_pid, |p| p.address_space.ttbr0()).unwrap_or(0);
-    let current_elr_pa =
-        crate::mm::address_space::translate_current_user_va_for_access(
-            crate::mm::UserVa::new(pc),
-            crate::mm::VM_ACCESS_EXEC,
-        )
-        .map(|pa| pa.get())
-        .unwrap_or(0);
+    let current_elr_pa = crate::mm::address_space::translate_current_user_va_for_access(
+        crate::mm::UserVa::new(pc),
+        crate::mm::VM_ACCESS_EXEC,
+    )
+    .map(|pa| pa.get())
+    .unwrap_or(0);
     let owner_elr_pa = crate::mm::usercopy::translate_user_va(
         owner_pid,
         crate::mm::UserVa::new(pc),
@@ -339,13 +324,12 @@ fn log_user_fault_translation_state(owner_pid: u32, fault_addr: u64, pc: u64, lr
     )
     .map(|pa| pa.get())
     .unwrap_or(0);
-    let current_far_pa =
-        crate::mm::address_space::translate_current_user_va_for_access(
-            crate::mm::UserVa::new(fault_addr),
-            crate::mm::VM_ACCESS_EXEC,
-        )
-        .map(|pa| pa.get())
-        .unwrap_or(0);
+    let current_far_pa = crate::mm::address_space::translate_current_user_va_for_access(
+        crate::mm::UserVa::new(fault_addr),
+        crate::mm::VM_ACCESS_EXEC,
+    )
+    .map(|pa| pa.get())
+    .unwrap_or(0);
     let owner_far_pa = crate::mm::usercopy::translate_user_va(
         owner_pid,
         crate::mm::UserVa::new(fault_addr),
@@ -353,13 +337,12 @@ fn log_user_fault_translation_state(owner_pid: u32, fault_addr: u64, pc: u64, lr
     )
     .map(|pa| pa.get())
     .unwrap_or(0);
-    let current_lr_pa =
-        crate::mm::address_space::translate_current_user_va_for_access(
-            crate::mm::UserVa::new(lr),
-            crate::mm::VM_ACCESS_EXEC,
-        )
-        .map(|pa| pa.get())
-        .unwrap_or(0);
+    let current_lr_pa = crate::mm::address_space::translate_current_user_va_for_access(
+        crate::mm::UserVa::new(lr),
+        crate::mm::VM_ACCESS_EXEC,
+    )
+    .map(|pa| pa.get())
+    .unwrap_or(0);
     let owner_lr_pa = crate::mm::usercopy::translate_user_va(
         owner_pid,
         crate::mm::UserVa::new(lr),

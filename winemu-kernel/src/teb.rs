@@ -11,9 +11,9 @@ use crate::mm::{
     vm_alloc_region_typed, vm_free_region, vm_make_guard_page, UserVa, VM_ACCESS_READ,
     VM_ACCESS_WRITE,
 };
+use crate::nt::constants::PAGE_SIZE_4K;
 use crate::rust_alloc::string::String;
 use crate::rust_alloc::vec::Vec;
-use crate::nt::constants::PAGE_SIZE_4K;
 use winemu_shared::{pe, peb, teb};
 
 /// 已初始化的 TEB/PEB 描述符
@@ -777,11 +777,7 @@ fn alloc_user_region_at(
     }
 }
 
-fn init_kuser_shared_data(
-    pid: u32,
-    regions: &mut [u64],
-    count: &mut usize,
-) -> Option<u64> {
+fn init_kuser_shared_data(pid: u32, regions: &mut [u64], count: &mut usize) -> Option<u64> {
     let base = alloc_user_region_at(
         pid,
         KUSER_SHARED_DATA_VA,
@@ -798,7 +794,11 @@ fn init_kuser_shared_data(
     let tick_ms = mono_100ns / 10_000;
     let mut page = [0u8; KUSER_SHARED_DATA_SIZE];
 
-    wu32(page.as_mut_slice(), kusd::TICK_COUNT_LOW_DEPRECATED, tick_ms as u32);
+    wu32(
+        page.as_mut_slice(),
+        kusd::TICK_COUNT_LOW_DEPRECATED,
+        tick_ms as u32,
+    );
     wu32(page.as_mut_slice(), kusd::TICK_COUNT_MULTIPLIER, 0);
     write_ksystem_time(page.as_mut_slice(), kusd::INTERRUPT_TIME, mono_100ns);
     write_ksystem_time(page.as_mut_slice(), kusd::SYSTEM_TIME, system_100ns);
@@ -806,7 +806,11 @@ fn init_kuser_shared_data(
     let mut root_off = kusd::NT_SYSTEM_ROOT;
     let _ = write_utf16(page.as_mut_slice(), &mut root_off, "C:\\Windows", 0);
     wu32(page.as_mut_slice(), kusd::NT_BUILD_NUMBER, 22631);
-    wu32(page.as_mut_slice(), kusd::NT_PRODUCT_TYPE, NT_PRODUCT_WIN_NT);
+    wu32(
+        page.as_mut_slice(),
+        kusd::NT_PRODUCT_TYPE,
+        NT_PRODUCT_WIN_NT,
+    );
     wu8(page.as_mut_slice(), kusd::PRODUCT_TYPE_IS_VALID, 1);
     wu16(
         page.as_mut_slice(),
@@ -859,8 +863,10 @@ fn align_up(v: u64, align: u64) -> u64 {
 }
 
 fn normalize_thread_stack_sizes(stack_reserve: u64, stack_commit: u64) -> (u64, u64) {
-    let reserve_size =
-        align_up(stack_reserve.max(DEFAULT_THREAD_STACK_RESERVE), THREAD_STACK_RESERVE_ALIGN);
+    let reserve_size = align_up(
+        stack_reserve.max(DEFAULT_THREAD_STACK_RESERVE),
+        THREAD_STACK_RESERVE_ALIGN,
+    );
     let max_commit = reserve_size.saturating_sub(PAGE_SIZE_4K);
     let mut commit_size = align_up(stack_commit.max(PAGE_SIZE_4K), PAGE_SIZE_4K);
     if commit_size > max_commit {
@@ -904,29 +910,32 @@ pub fn alloc_teb(pid: u32) -> Option<u64> {
     Some(teb_va)
 }
 
-pub fn init_thread_teb(
-    pid: u32,
-    tid: u32,
-    teb_va: u64,
-    stack_base: u64,
-    stack_limit: u64,
-) -> bool {
+pub fn init_thread_teb(pid: u32, tid: u32, teb_va: u64, stack_base: u64, stack_limit: u64) -> bool {
     use winemu_shared::teb as teb_off;
 
     let Some(peb_va) = crate::process::with_process(pid, |p| p.peb_va) else {
         return false;
     };
 
-    write_user_value(pid, (teb_va + teb_off::EXCEPTION_LIST as u64) as *mut u64, u64::MAX)
-        && write_user_value(pid, (teb_va + teb_off::STACK_BASE as u64) as *mut u64, stack_base)
+    write_user_value(
+        pid,
+        (teb_va + teb_off::EXCEPTION_LIST as u64) as *mut u64,
+        u64::MAX,
+    ) && write_user_value(
+        pid,
+        (teb_va + teb_off::STACK_BASE as u64) as *mut u64,
+        stack_base,
+    ) && write_user_value(
+        pid,
+        (teb_va + teb_off::STACK_LIMIT as u64) as *mut u64,
+        stack_limit,
+    ) && write_user_value(pid, (teb_va + teb_off::SELF as u64) as *mut u64, teb_va)
+        && write_user_value(pid, (teb_va + teb_off::PEB as u64) as *mut u64, peb_va)
         && write_user_value(
             pid,
-            (teb_va + teb_off::STACK_LIMIT as u64) as *mut u64,
-            stack_limit,
+            (teb_va + teb_off::CLIENT_ID as u64) as *mut u64,
+            pid as u64,
         )
-        && write_user_value(pid, (teb_va + teb_off::SELF as u64) as *mut u64, teb_va)
-        && write_user_value(pid, (teb_va + teb_off::PEB as u64) as *mut u64, peb_va)
-        && write_user_value(pid, (teb_va + teb_off::CLIENT_ID as u64) as *mut u64, pid as u64)
         && write_user_value(
             pid,
             (teb_va + teb_off::CLIENT_ID as u64 + 8) as *mut u64,

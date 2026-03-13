@@ -8,10 +8,10 @@ use crate::kobj::ObjectStore;
 ///   - NT 完整语义：Reserve / Commit / Decommit / Release / Protect / Guard / COW
 use crate::mm::areaset::{AreaEntry, AreaSeg, AreaSet};
 use crate::mm::range::Range;
-use crate::mm::vm_area::{PAGE_SIZE, VmArea, VmKind};
+use crate::mm::vm_area::{VmArea, VmKind, PAGE_SIZE};
 use crate::mm::{
-    PhysAddr, UserVa, VmQueryInfo, vm_access_allowed, vm_is_copy_on_write_prot,
-    vm_promote_cow_prot, vm_sanitize_nt_prot,
+    vm_access_allowed, vm_is_copy_on_write_prot, vm_promote_cow_prot, vm_sanitize_nt_prot,
+    PhysAddr, UserVa, VmQueryInfo,
 };
 use crate::process::ProcessAddressSpace;
 use crate::rust_alloc::vec::Vec;

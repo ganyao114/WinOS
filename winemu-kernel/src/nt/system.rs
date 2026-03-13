@@ -3,8 +3,8 @@ use core::mem::size_of;
 use winemu_shared::hostcall as hc;
 use winemu_shared::status;
 
-use crate::sched::types::WaitDeadline;
 use crate::rust_alloc::vec::Vec;
+use crate::sched::types::WaitDeadline;
 
 use super::common::GuestWriter;
 use super::constants::PAGE_SIZE_4K;
@@ -29,9 +29,9 @@ const SYSTEM_FIRMWARE_TABLE_GET: u32 = 1;
 const SMBIOS_MAJOR_VERSION: u8 = 3;
 const SMBIOS_MINOR_VERSION: u8 = 0;
 const SMBIOS_UNKNOWN_U8: u8 = 0xff;
-const TOTAL_PHYS_PAGES: u32 =
-    ((crate::arch::mmu::GUEST_PHYS_LIMIT - crate::arch::mmu::GUEST_PHYS_BASE) / PAGE_SIZE_4K)
-        as u32;
+const TOTAL_PHYS_PAGES: u32 = ((crate::arch::mmu::GUEST_PHYS_LIMIT
+    - crate::arch::mmu::GUEST_PHYS_BASE)
+    / PAGE_SIZE_4K) as u32;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -571,7 +571,14 @@ fn append_smbios_processor(bytes: &mut Vec<u8>, next_handle: &mut u16, processor
     push_u16(bytes, 0xffff);
     push_u16(bytes, 0xffff);
     push_u16(bytes, 0xffff);
-    bytes.extend_from_slice(&[0, 0, 0, core_count as u8, core_count as u8, core_count as u8]);
+    bytes.extend_from_slice(&[
+        0,
+        0,
+        0,
+        core_count as u8,
+        core_count as u8,
+        core_count as u8,
+    ]);
     push_u16(bytes, characteristics);
     push_u16(bytes, 2);
     push_u16(bytes, core_count);
@@ -611,12 +618,7 @@ fn build_fake_raw_smbios_data() -> Vec<u8> {
     append_smbios_end(&mut table, &mut next_handle);
 
     let mut raw = Vec::with_capacity(size_of::<RawSmbiosDataHeader>() + table.len());
-    raw.extend_from_slice(&[
-        0,
-        SMBIOS_MAJOR_VERSION,
-        SMBIOS_MINOR_VERSION,
-        0,
-    ]);
+    raw.extend_from_slice(&[0, SMBIOS_MAJOR_VERSION, SMBIOS_MINOR_VERSION, 0]);
     push_u32(&mut raw, table.len() as u32);
     raw.extend_from_slice(&table);
     raw
@@ -644,7 +646,8 @@ fn write_firmware_response(
     }
 
     if buf_len < total_len {
-        let Some(mut w) = GuestWriter::new(buf, buf_len, size_of::<SystemFirmwareTableInformation>())
+        let Some(mut w) =
+            GuestWriter::new(buf, buf_len, size_of::<SystemFirmwareTableInformation>())
         else {
             write_ret_len(ret_len, total_len as u32);
             return status::INVALID_PARAMETER;
@@ -686,9 +689,14 @@ fn query_system_firmware_table_information(buf: *mut u8, buf_len: usize, ret_len
     );
 
     match (req.provider_signature, req.action) {
-        (FIRMWARE_PROVIDER_RSMB, SYSTEM_FIRMWARE_TABLE_ENUMERATE) => {
-            write_firmware_response(&req, size_of::<u32>() as u32, &0u32.to_le_bytes(), buf, buf_len, ret_len)
-        }
+        (FIRMWARE_PROVIDER_RSMB, SYSTEM_FIRMWARE_TABLE_ENUMERATE) => write_firmware_response(
+            &req,
+            size_of::<u32>() as u32,
+            &0u32.to_le_bytes(),
+            buf,
+            buf_len,
+            ret_len,
+        ),
         (FIRMWARE_PROVIDER_RSMB, SYSTEM_FIRMWARE_TABLE_GET) => {
             let raw = build_fake_raw_smbios_data();
             write_firmware_response(&req, raw.len() as u32, &raw, buf, buf_len, ret_len)

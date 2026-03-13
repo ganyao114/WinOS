@@ -13,9 +13,9 @@ const CHUNK_PAGES: usize = 64;
 const CHUNK_SIZE: usize = CHUNK_PAGES * 4096;
 const PAGE_SIZE: u64 = 4096;
 /// 最大 chunk 数。覆盖整个 guest 物理地址窗，避免人为把页分配器卡死在 16MB。
-const MAX_CHUNKS: usize =
-    ((crate::arch::mmu::GUEST_PHYS_LIMIT - crate::arch::mmu::GUEST_PHYS_BASE) as usize)
-        / CHUNK_SIZE;
+const MAX_CHUNKS: usize = ((crate::arch::mmu::GUEST_PHYS_LIMIT - crate::arch::mmu::GUEST_PHYS_BASE)
+    as usize)
+    / CHUNK_SIZE;
 /// 低水位：空闲页低于此值触发 grow
 const LOW_PAGES: usize = 16;
 /// 高水位：空闲页超过此值触发 shrink

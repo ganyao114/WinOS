@@ -343,15 +343,18 @@ pub(crate) fn handle_create_mutex(frame: &mut SvcFrame) {
             m.owner_tid = crate::sched::current_tid();
             m.recursion = 1;
         }
-        let obj_idx =
-            match alloc_named_sync_object(KObjectKind::Mutex, SyncObject::Mutex(m), &name, name_len)
-            {
-                Ok(idx) => idx,
-                Err(st) => {
-                    frame.x[0] = st as u64;
-                    return;
-                }
-            };
+        let obj_idx = match alloc_named_sync_object(
+            KObjectKind::Mutex,
+            SyncObject::Mutex(m),
+            &name,
+            name_len,
+        ) {
+            Ok(idx) => idx,
+            Err(st) => {
+                frame.x[0] = st as u64;
+                return;
+            }
+        };
         let pid = current_pid();
         match super::kobject::install_handle_for_pid(pid, KObjectRef::mutex(obj_idx), out_ptr) {
             Ok(_) => {
@@ -385,9 +388,7 @@ pub(crate) fn handle_release_mutant_or_set_information_process(frame: &mut SvcFr
     }
     let handle = frame.x[0];
     let st = release_mutex(handle);
-    if st != status::SUCCESS
-        && st != crate::sched::sync::primitives_api::STATUS_MUTANT_NOT_OWNED
-    {
+    if st != status::SUCCESS && st != crate::sched::sync::primitives_api::STATUS_MUTANT_NOT_OWNED {
         crate::log::debug_print("nt: ReleaseMutant failed handle=");
         crate::log::debug_u64(handle);
         crate::log::debug_print(" st=");
@@ -400,7 +401,8 @@ pub(crate) fn handle_release_mutant_or_set_information_process(frame: &mut SvcFr
             crate::log::debug_print(" obj_idx=");
             crate::log::debug_u64(obj_idx as u64);
             if kind == KObjectKind::Mutex {
-                if let Some(SyncObject::Mutex(m)) = crate::sched::sync::state::sync_get_by_idx(obj_idx)
+                if let Some(SyncObject::Mutex(m)) =
+                    crate::sched::sync::state::sync_get_by_idx(obj_idx)
                 {
                     crate::log::debug_print(" owner_tid=");
                     crate::log::debug_u64(m.owner_tid as u64);
@@ -459,8 +461,7 @@ pub(crate) fn handle_create_semaphore(frame: &mut SvcFrame) {
             }
         };
         let pid = current_pid();
-        match super::kobject::install_handle_for_pid(pid, KObjectRef::semaphore(obj_idx), out_ptr)
-        {
+        match super::kobject::install_handle_for_pid(pid, KObjectRef::semaphore(obj_idx), out_ptr) {
             Ok(_) => {
                 frame.x[0] = STATUS_SUCCESS as u64;
             }
