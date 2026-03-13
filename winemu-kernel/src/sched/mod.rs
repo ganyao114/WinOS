@@ -23,14 +23,14 @@ pub use types::{ThreadState, WaitDeadline, MAX_VCPUS};
 pub use global::{init_scheduler, thread_exists, with_thread, with_thread_mut, SCHED};
 
 // Per-vCPU TLS
-pub use cpu::{current_tid, init_cpu_local, set_current_tid, set_needs_reschedule, vcpu_id};
+pub use cpu::{current_tid, init_cpu_local, set_needs_reschedule, vcpu_id};
 
 // Scheduler lock
 pub use lock::{KSchedulerLock, SCHED_LOCK};
 
 // Topology / state transitions
 pub use topology::{
-    set_thread_affinity_mask_locked, set_thread_state_locked, set_vcpu_current_thread,
+    bind_running_thread_to_vcpu, set_thread_affinity_mask_locked,
 };
 
 // Context switch
@@ -50,15 +50,15 @@ pub use thread_control::{
 
 // Thread lifecycle
 pub use threads::{
-    create_user_thread_locked, exit_thread_locked, register_idle_thread_for_vcpu,
-    terminate_thread_by_tid, thread_ids_by_pid, UserThreadParams,
+    create_boot_thread_for_current_vcpu_locked, create_user_thread_locked, exit_thread_locked,
+    prepare_boot_thread_user_entry_locked, terminate_thread_by_tid, thread_ids_by_pid,
+    UserThreadParams,
 };
 
 // Scheduler core
 pub use schedule::{
-    enter_core_scheduler_entry, enter_kernel_continuation_noreturn,
-    execute_kernel_continuation_switch, scheduler_round_locked, ScheduleReason,
-    SchedulerRoundAction,
+    enter_current_core_scheduler, enter_kernel_continuation_noreturn,
+    execute_kernel_continuation_switch, schedule_core_locked, ScheduleDecision, ScheduleReason,
 };
 
 // Sync objects
@@ -78,15 +78,6 @@ pub fn wake(tid: u32, result: u32) {
 #[inline]
 pub fn deadline_after_100ns(timeout_100ns: i64) -> WaitDeadline {
     timeout_to_deadline(timeout_100ns)
-}
-
-/// Yield the current thread: move it back to Ready so others can run.
-/// Must be called with the scheduler lock held.
-pub fn yield_current_thread_locked() {
-    let tid = current_tid();
-    if tid != 0 {
-        set_thread_state_locked(tid, ThreadState::Ready);
-    }
 }
 
 /// Get the PID of a thread.

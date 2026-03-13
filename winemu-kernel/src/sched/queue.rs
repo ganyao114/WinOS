@@ -230,7 +230,7 @@ impl KReadyQueue {
     }
 
     /// Peek at the highest-priority thread satisfying `pred` without removing it.
-    /// Used by `update_highest_priority_threads` to scan all vCPUs without
+    /// Used by `compute_remote_reschedule_mask_locked()` to scan all vCPUs without
     /// disturbing the queue.
     pub fn peek_highest_matching(
         &self,

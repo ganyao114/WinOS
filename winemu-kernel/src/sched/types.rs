@@ -97,7 +97,8 @@ pub struct KThread {
 
     // kernel continuation context
     pub kctx: KernelContext,
-    /// true = kctx is valid / thread is currently executing in kernel mode
+    /// True while the live execution carrier is a kernel continuation pinned
+    /// to `last_vcpu_hint`, rather than a normal user-return path.
     pub in_kernel: bool,
 
     // stacks
@@ -154,6 +155,19 @@ impl KThread {
             sched_next: 0,
             in_ready_queue: false,
         }
+    }
+
+    #[inline]
+    pub fn has_kernel_continuation(&self) -> bool {
+        self.is_idle_thread || self.kctx.has_continuation()
+    }
+
+    #[inline]
+    pub fn can_run_on_vcpu(&self, vid: u32) -> bool {
+        !self.is_idle_thread
+            && self.state == ThreadState::Ready
+            && (self.affinity_mask & (1u32 << vid)) != 0
+            && (!self.in_kernel || self.last_vcpu_hint as u32 == vid)
     }
 }
 

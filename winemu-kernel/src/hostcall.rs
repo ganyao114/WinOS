@@ -335,7 +335,7 @@ pub fn wait_current_for_request_pending(request_id: u64, timeout: WaitDeadline) 
         let _slp = sched::lock::SchedLockAndSleep::new();
         sched::with_thread_mut(cur, |t| t.wait.kind = sched::WAIT_KIND_HOSTCALL);
         sched::block_thread_locked(cur, deadline);
-        // _slp drops here → flush_unlock_edge → thread switches out
+        // _slp drops here → unlock-edge plan apply → thread switches out
     }
     // Thread resumes here after pump_completions calls sched::wake().
     STATUS_PENDING

@@ -6,6 +6,7 @@
 //   - On final unlock, runs deferred topology updates then checks reschedule.
 
 use crate::sched::cpu::vcpu_id;
+use crate::sched::types::MAX_VCPUS;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 // ── Raw spinlock ──────────────────────────────────────────────────────────────
@@ -53,16 +54,7 @@ impl SchedSpinlock {
 pub static SCHED_LOCK: SchedSpinlock = SchedSpinlock::new();
 
 // Per-vCPU lock depth (not in KCpuLocal to avoid circular dep at static init).
-static LOCK_DEPTH: [AtomicU32; 8] = [
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-];
+static LOCK_DEPTH: [AtomicU32; MAX_VCPUS] = [const { AtomicU32::new(0) }; MAX_VCPUS];
 
 // ── KSchedulerLock RAII guard ─────────────────────────────────────────────────
 
@@ -124,18 +116,38 @@ pub fn unlock_after_raw_or_scoped(vid: usize) {
     }
 }
 
+/// Raw scheduler spinlock guard that does not participate in unlock-edge
+/// scheduling. Use only for bootstrap/pre-entry setup that must touch scheduler
+/// state without committing a scheduling decision on drop.
+pub struct RawSchedLockGuard;
+
+impl RawSchedLockGuard {
+    #[inline]
+    pub fn lock() -> Self {
+        SCHED_LOCK.acquire();
+        Self
+    }
+}
+
+impl Drop for RawSchedLockGuard {
+    fn drop(&mut self) {
+        SCHED_LOCK.release();
+    }
+}
+
 impl Drop for KSchedulerLock {
     fn drop(&mut self) {
         let depth = LOCK_DEPTH[self.vid].fetch_sub(1, Ordering::Relaxed);
         if depth == 1 {
             // Final unlock — mirrors Atmosphere's KAbstractSchedulerLock::Unlock():
-            //   1. flush_unlock_edge: run scheduler round + UpdateHighestPriorityThreads
-            //      → returns bitmask of cores needing reschedule.
+            //   1. build_unlock_edge_dispatch_locked: run scheduler core and build
+            //      the unlock-edge dispatch object.
             //   2. Release the spinlock.
-            //   3. enable_scheduling: IPI other cores, switch current core inline.
-            let cores_mask = crate::sched::schedule::flush_unlock_edge(self.vid);
+            //   3. dispatch.apply_after_unlock(): IPI other cores, then perform
+            //      the local switch inline.
+            let dispatch = crate::sched::schedule::build_unlock_edge_dispatch_locked(self.vid);
             SCHED_LOCK.release();
-            crate::sched::schedule::enable_scheduling(cores_mask, self.vid);
+            dispatch.apply_after_unlock(self.vid);
         }
     }
 }
@@ -156,15 +168,23 @@ pub fn with_sched_lock_vid0<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Run `f` under the raw scheduler spinlock without triggering unlock-edge
+/// scheduling on scope exit.
+#[inline]
+pub fn with_sched_raw_lock<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = RawSchedLockGuard::lock();
+    f()
+}
+
 // ── SchedLockAndSleep ─────────────────────────────────────────────────────────
 
 /// RAII equivalent of Atmosphere's KScopedSchedulerLockAndSleep.
 ///
 /// Acquires the scheduler lock on construction.  On drop:
-///   1. If not cancelled and a deadline was set, the timer is already registered
-///      via `block_thread_locked`'s `wait.deadline` field — no extra action needed.
-///   2. The inner `KSchedulerLock` drops, triggering `flush_unlock_edge` +
-///      `reschedule_current_core`, which performs the actual context switch.
+///   1. Any wait deadline is already registered via `block_thread_locked`'s
+///      `wait.deadline` field — no extra action needed here.
+///   2. The inner `KSchedulerLock` drops, triggering unlock-edge plan building
+///      and local plan execution, which performs the actual context switch.
 ///
 /// Usage pattern (syscall handler):
 /// ```ignore
@@ -185,7 +205,6 @@ pub fn with_sched_lock_vid0<R>(f: impl FnOnce() -> R) -> R {
 /// ```
 pub struct SchedLockAndSleep {
     _guard: KSchedulerLock,
-    cancelled: bool,
 }
 
 impl SchedLockAndSleep {
@@ -193,19 +212,11 @@ impl SchedLockAndSleep {
     pub fn new() -> Self {
         Self {
             _guard: KSchedulerLock::lock(),
-            cancelled: false,
         }
     }
 
-    /// Cancel the sleep — the lock will still be released on drop, but
-    /// `flush_unlock_edge` will see no state change and skip the switch.
+    /// No-op compatibility helper for legacy wait paths that call `cancel()`
+    /// before returning without changing thread state.
     #[inline]
-    pub fn cancel(&mut self) {
-        self.cancelled = true;
-    }
-
-    #[inline]
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled
-    }
+    pub fn cancel(&mut self) {}
 }

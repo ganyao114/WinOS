@@ -52,7 +52,7 @@ pub fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
         }
     }
 
-    // Notify flush_unlock_edge that a full re-scan is needed.
+    // Notify the unlock-edge planner that a full topology re-scan is needed.
     SCHED.scheduler_update_needed.store(true, Ordering::Relaxed);
 }
 
@@ -71,11 +71,17 @@ pub fn request_reschedule_vcpu(vid: u32) {
     }
 }
 
+#[inline]
+fn vcpu_is_idle_locked(vid: usize) -> bool {
+    let vs = unsafe { SCHED.vcpu_raw(vid) };
+    let cur = vs.current_tid;
+    cur == 0 || cur == vs.idle_tid || with_thread(cur, |t| t.is_idle_thread).unwrap_or(true)
+}
+
 /// Find an idle vCPU and mark it for reschedule (to pick up a newly ready thread).
 pub fn hint_reschedule_any_idle() {
     for vid in 0..MAX_VCPUS {
-        let vs = unsafe { SCHED.vcpu_raw(vid) };
-        if vs.is_idle {
+        if vcpu_is_idle_locked(vid) {
             unsafe { SCHED.vcpu_raw_mut(vid) }.needs_scheduling = true;
             return;
         }
@@ -224,6 +230,16 @@ pub fn set_vcpu_current_thread(vid: usize, tid: u32) {
     if vid == vcpu_id() as usize {
         cpu_local().current_tid = tid;
     }
+}
+
+/// Bind `tid` as the currently running thread on `vid` and refresh the thread's
+/// running-state metadata.
+pub fn bind_running_thread_to_vcpu(vid: usize, tid: u32) {
+    set_vcpu_current_thread(vid, tid);
+    with_thread_mut(tid, |t| {
+        t.state = ThreadState::Running;
+        t.last_vcpu_hint = vid as u8;
+    });
 }
 
 /// Get the TID currently running on `vid` (0 = idle).

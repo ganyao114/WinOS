@@ -79,6 +79,12 @@ pub fn vcpu_id() -> u32 {
     cpu_local().vcpu_id
 }
 
+/// Returns the current vCPU index clamped to the scheduler's configured range.
+#[inline(always)]
+pub fn current_vcpu_index() -> usize {
+    (vcpu_id() as usize).min(MAX_VCPUS - 1)
+}
+
 /// Returns the TID currently running on this vCPU (0 = idle/none).
 #[inline(always)]
 pub fn current_tid() -> u32 {

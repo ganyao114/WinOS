@@ -63,9 +63,9 @@ fn waitable_handle_state(handle: u64, tid: u32) -> Result<bool, u32> {
         return Err(STATUS_INVALID_HANDLE);
     };
     match kind {
-        crate::process::KObjectKind::Thread => Ok(
-            with_thread(obj_idx, |t| t.state == ThreadState::Terminated).unwrap_or(true),
-        ),
+        crate::process::KObjectKind::Thread => {
+            Ok(with_thread(obj_idx, |t| t.state == ThreadState::Terminated).unwrap_or(true))
+        }
         crate::process::KObjectKind::Process => Ok(crate::process::process_signaled(obj_idx)),
         crate::process::KObjectKind::Event
         | crate::process::KObjectKind::Mutex

@@ -52,55 +52,12 @@ pub unsafe extern "C" fn idle_thread_fn() -> ! {
         let vid = crate::sched::vcpu_id() as usize;
         crate::sched::SCHED_LOCK.acquire();
         let from_tid = crate::sched::current_tid();
-        match crate::sched::scheduler_round_locked(
-            vid as u32,
+        crate::sched::schedule::run_local_scheduler_iteration(
+            vid,
             from_tid,
             crate::timer::DEFAULT_TIMESLICE_100NS,
             crate::sched::ScheduleReason::Ipi,
-        ) {
-            crate::sched::SchedulerRoundAction::RunThread {
-                now_100ns,
-                next_deadline_100ns,
-                slice_remaining_100ns,
-                from_tid,
-                to_tid,
-                ..
-            } => {
-                if from_tid == to_tid {
-                    crate::sched::with_thread_mut(to_tid, |t| {
-                        t.state = crate::sched::ThreadState::Running;
-                    });
-                    crate::sched::lock::unlock_after_raw_or_scoped(vid);
-                    crate::timer::schedule_running_slice_100ns(
-                        now_100ns,
-                        next_deadline_100ns,
-                        slice_remaining_100ns,
-                    );
-                    continue;
-                }
-                crate::sched::execute_kernel_continuation_switch(
-                    from_tid,
-                    to_tid,
-                    now_100ns,
-                    next_deadline_100ns,
-                    slice_remaining_100ns,
-                    "idle",
-                );
-            }
-            crate::sched::SchedulerRoundAction::ContinueCurrent {
-                now_100ns,
-                next_deadline_100ns,
-                ..
-            }
-            | crate::sched::SchedulerRoundAction::IdleWait {
-                now_100ns,
-                next_deadline_100ns,
-                ..
-            } => {
-                crate::sched::lock::unlock_after_raw_or_scoped(vid);
-                crate::sched::schedule::idle_wait_or_exit(vid, now_100ns, next_deadline_100ns);
-            }
-        }
+        );
     }
 }
 
@@ -109,13 +66,13 @@ pub unsafe extern "C" fn idle_thread_fn() -> ! {
 /// Ensure a user thread has a valid kernel continuation (kctx) so it can be
 /// scheduled by the unlock-edge or a secondary vCPU.
 ///
-/// If the thread already has a kctx (in_kernel=true or kctx.has_continuation()),
+/// If the thread already has a kernel continuation,
 /// this is a no-op.
 ///
 /// Must be called with the scheduler lock held.
 pub fn ensure_user_entry_continuation_locked(tid: u32) {
     with_thread_mut(tid, |t| {
-        if t.in_kernel || t.kctx.has_continuation() {
+        if t.has_kernel_continuation() {
             return;
         }
         // Set up a fresh kernel continuation that will return into user mode.

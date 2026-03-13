@@ -2,14 +2,6 @@
 // This layer owns generic syscall dispatch and post-trap scheduling policy.
 
 use crate::hypercall;
-use crate::sched::{
-    current_tid, drain_deferred_kstacks, enter_kernel_continuation_noreturn,
-    execute_kernel_continuation_switch, scheduler_round_locked, set_current_tid,
-    set_needs_reschedule, set_thread_in_kernel_locked, set_vcpu_current_thread, vcpu_id,
-    with_thread, with_thread_mut, ScheduleReason, SchedulerRoundAction, ThreadState, SCHED_LOCK,
-};
-use crate::timer;
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::constants::{
     KERNEL_FAULT_ADDRESS_TAG, KERNEL_FAULT_PC_TAG, KERNEL_FAULT_STATE_TAG,
@@ -18,60 +10,13 @@ use super::constants::{
 };
 use super::sysno;
 use super::sysno_table::{lookup, NtHandlerId, HANDLER_NONE};
+use super::trap_schedule::{
+    begin_syscall_trap, finish_nt_syscall_trap, schedule_syscall_unlock_edge,
+};
 use super::{
     file, loader, memory, object, process, registry, section, sync, system, thread, token, win32k,
     SvcFrame,
 };
-
-const DEFERRED_RESCHED_RETRY_100NS: u64 = 10_000; // 1ms
-static TRAP_SCHED_ACTIVE: [AtomicU32; 8] = [
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-];
-
-struct TrapSchedGuard {
-    vid: usize,
-    active: bool,
-}
-
-impl TrapSchedGuard {
-    #[inline]
-    fn enter(vid: usize) -> Self {
-        TRAP_SCHED_ACTIVE[vid].fetch_add(1, Ordering::AcqRel);
-        Self { vid, active: true }
-    }
-
-    #[inline]
-    fn suspend(&mut self) {
-        if self.active {
-            TRAP_SCHED_ACTIVE[self.vid].fetch_sub(1, Ordering::AcqRel);
-            self.active = false;
-        }
-    }
-
-    #[inline]
-    fn resume(&mut self) {
-        if !self.active {
-            TRAP_SCHED_ACTIVE[self.vid].fetch_add(1, Ordering::AcqRel);
-            self.active = true;
-        }
-    }
-}
-
-impl Drop for TrapSchedGuard {
-    #[inline]
-    fn drop(&mut self) {
-        if self.active {
-            TRAP_SCHED_ACTIVE[self.vid].fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-}
 
 #[no_mangle]
 pub extern "C" fn svc_migrate_frame_to_thread_stack(_frame_ptr: u64, _frame_size: u64) -> u64 {
@@ -81,11 +26,7 @@ pub extern "C" fn svc_migrate_frame_to_thread_stack(_frame_ptr: u64, _frame_size
 
 #[no_mangle]
 pub extern "C" fn syscall_dispatch(frame: &mut SvcFrame) {
-    let cur = current_tid();
-    if cur != 0 {
-        set_thread_in_kernel_locked(cur, true);
-    }
-    drain_deferred_kstacks();
+    let cur = begin_syscall_trap();
 
     let tag = frame.x8_orig;
     let table = ((tag >> SVC_TAG_TABLE_SHIFT) & SVC_TAG_TABLE_MASK) as u8;
@@ -97,13 +38,13 @@ pub extern "C" fn syscall_dispatch(frame: &mut SvcFrame) {
         } else {
             forward_to_vmm(frame, nr, table);
         }
-        schedule_from_trap(frame, true, true, 0, ScheduleReason::UnlockEdge);
+        schedule_syscall_unlock_edge(frame);
         return;
     }
 
     if nr == sysno::WINEMU_LOAD_DLL {
         loader::handle_load_dll(frame);
-        schedule_from_trap(frame, true, true, 0, ScheduleReason::UnlockEdge);
+        schedule_syscall_unlock_edge(frame);
         return;
     }
 
@@ -117,8 +58,7 @@ pub extern "C" fn syscall_dispatch(frame: &mut SvcFrame) {
         dispatch_nt_handler(frame, handler_id);
     }
 
-    let sched_reason = schedule_reason_for_handler(handler_id, frame, cur, is_delay_execution);
-    schedule_from_trap(frame, true, true, 0, sched_reason);
+    finish_nt_syscall_trap(frame, handler_id, cur, is_delay_execution);
 }
 
 fn dispatch_nt_handler(frame: &mut SvcFrame, handler_id: u8) {
@@ -223,288 +163,6 @@ fn dispatch_nt_handler(frame: &mut SvcFrame, handler_id: u8) {
             forward_to_vmm(frame, nr, 0);
         }
     }
-}
-
-fn schedule_reason_for_handler(
-    handler_id: u8,
-    frame: &SvcFrame,
-    current: u32,
-    is_delay_execution: bool,
-) -> ScheduleReason {
-    use NtHandlerId::*;
-    if handler_id == YieldExecution as u8 {
-        return ScheduleReason::Yield;
-    }
-    if handler_id == WaitForSingleObject as u8
-        || handler_id == WaitForMultipleObjects as u8
-        || handler_id == WaitForAlertByThreadId as u8
-    {
-        return if current != 0
-            && with_thread(current, |t| t.state == ThreadState::Waiting).unwrap_or(false)
-        {
-            ScheduleReason::Timeout
-        } else {
-            ScheduleReason::UnlockEdge
-        };
-    }
-    if handler_id == SetEvent as u8
-        || handler_id == ReleaseMutant as u8
-        || handler_id == ReleaseSemaphore as u8
-        || handler_id == ResumeThread as u8
-        || handler_id == CreateThreadEx as u8
-    {
-        return if frame.x[0] as u32 == crate::sched::STATUS_SUCCESS {
-            ScheduleReason::Wakeup
-        } else {
-            ScheduleReason::UnlockEdge
-        };
-    }
-    if handler_id == ResetEvent as u8 || handler_id == DelayExecution as u8 {
-        return if is_delay_execution {
-            ScheduleReason::Timeout
-        } else {
-            ScheduleReason::UnlockEdge
-        };
-    }
-    ScheduleReason::UnlockEdge
-}
-
-fn save_ctx_for(tid: u32, frame: &SvcFrame) {
-    if tid == 0 || !crate::sched::thread_exists(tid) {
-        return;
-    }
-    with_thread_mut(tid, |t| {
-        t.ctx.copy_general_registers_from(&frame.x);
-        t.ctx.set_user_sp(frame.user_sp());
-        t.ctx.set_program_counter(frame.program_counter());
-        t.ctx.set_processor_state(frame.processor_state());
-        t.ctx.set_thread_pointer(frame.thread_pointer());
-    });
-}
-
-fn restore_ctx_to_frame(tid: u32, frame: &mut SvcFrame) {
-    if tid == 0 || !crate::sched::thread_exists(tid) {
-        return;
-    }
-    with_thread_mut(tid, |t| {
-        frame.x.copy_from_slice(t.ctx.general_registers());
-        frame.set_user_sp(t.ctx.user_sp());
-        frame.set_program_counter(t.ctx.program_counter());
-        frame.set_processor_state(t.ctx.processor_state());
-        frame.set_thread_pointer(t.ctx.thread_pointer());
-    });
-}
-
-fn schedule_from_trap(
-    frame: &mut SvcFrame,
-    allow_idle_wait: bool,
-    drain_hostcall: bool,
-    quantum_100ns: u64,
-    reason: ScheduleReason,
-) -> bool {
-    let vid = vcpu_id();
-    let vid_u8 = vid as u8;
-    let mut active_guard = TrapSchedGuard::enter(vid as usize);
-    let mut from = current_tid();
-    if from != 0 {
-        save_ctx_for(from, frame);
-    }
-    loop {
-        if drain_hostcall {
-            crate::hostcall::pump_completions();
-        }
-        SCHED_LOCK.acquire();
-        match scheduler_round_locked(vid, from, quantum_100ns, reason) {
-            SchedulerRoundAction::ContinueCurrent {
-                now_100ns,
-                next_deadline_100ns,
-                slice_remaining_100ns,
-            } => {
-                let cur = current_tid();
-                if cur != 0 {
-                    crate::process::switch_to_thread_process(cur);
-                    with_thread_mut(cur, |t| {
-                        t.state = ThreadState::Running;
-                        t.last_vcpu_hint = vid_u8;
-                    });
-                    set_thread_in_kernel_locked(cur, false);
-                }
-                crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
-                timer::schedule_running_slice_100ns(
-                    now_100ns,
-                    next_deadline_100ns,
-                    slice_remaining_100ns,
-                );
-                return false;
-            }
-            SchedulerRoundAction::RunThread {
-                now_100ns,
-                next_deadline_100ns,
-                slice_remaining_100ns,
-                from_tid: from_sched,
-                to_tid: to,
-                pending_resched,
-                timeout_woke,
-                cur_not_running,
-            } => {
-                if from_sched != 0 && from_sched != to {
-                    let to_has_kctx =
-                        with_thread(to, |t| t.kctx.has_continuation()).unwrap_or(false);
-                    let mut to_in_kernel = with_thread(to, |t| t.in_kernel).unwrap_or(false);
-                    if cur_not_running && to_in_kernel && !to_has_kctx {
-                        set_thread_in_kernel_locked(to, false);
-                        to_in_kernel = false;
-                    }
-                    if cur_not_running
-                        && with_thread(from_sched, |t| t.state == ThreadState::Terminated)
-                            .unwrap_or(false)
-                    {
-                        set_thread_in_kernel_locked(from_sched, false);
-                    }
-                    if to_has_kctx {
-                        save_ctx_for(from_sched, frame);
-                        active_guard.suspend();
-                        execute_kernel_continuation_switch(
-                            from_sched,
-                            to,
-                            now_100ns,
-                            next_deadline_100ns,
-                            slice_remaining_100ns,
-                            "trap",
-                        );
-                        active_guard.resume();
-                        let cur = current_tid();
-                        if cur != 0 {
-                            set_vcpu_current_thread(vid as usize, cur);
-                            set_current_tid(cur);
-                            with_thread_mut(cur, |t| {
-                                t.state = ThreadState::Running;
-                                t.last_vcpu_hint = vid_u8;
-                            });
-                            crate::process::switch_to_thread_process(cur);
-                            restore_ctx_to_frame(cur, frame);
-                            set_thread_in_kernel_locked(cur, false);
-                        }
-                        timer::schedule_running_slice_100ns(
-                            now_100ns,
-                            next_deadline_100ns,
-                            slice_remaining_100ns,
-                        );
-                        return cur != from_sched;
-                    }
-                    if to_in_kernel {
-                        panic!(
-                            "sched: in-kernel target missing continuation from={} to={}",
-                            from_sched, to
-                        );
-                    }
-                    set_vcpu_current_thread(vid as usize, to);
-                    set_current_tid(to);
-                    with_thread_mut(to, |t| {
-                        t.state = ThreadState::Running;
-                        t.last_vcpu_hint = vid_u8;
-                    });
-                    crate::process::switch_to_thread_process(to);
-                    save_ctx_for(from_sched, frame);
-                    restore_ctx_to_frame(to, frame);
-                    crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
-                    if !cur_not_running {
-                        set_thread_in_kernel_locked(from_sched, false);
-                    }
-                    set_thread_in_kernel_locked(to, false);
-                    timer::schedule_running_slice_100ns(
-                        now_100ns,
-                        next_deadline_100ns,
-                        slice_remaining_100ns,
-                    );
-                    return true;
-                }
-                crate::process::switch_to_thread_process(to);
-                if from_sched == 0 {
-                    if with_thread(to, |t| t.is_idle_thread).unwrap_or(false) {
-                        active_guard.suspend();
-                        unsafe { enter_kernel_continuation_noreturn(to) }
-                    }
-                    set_vcpu_current_thread(vid as usize, to);
-                    set_current_tid(to);
-                    with_thread_mut(to, |t| {
-                        t.state = ThreadState::Running;
-                        t.last_vcpu_hint = vid_u8;
-                    });
-                    restore_ctx_to_frame(to, frame);
-                } else if from_sched == to && (cur_not_running || pending_resched || timeout_woke) {
-                    set_vcpu_current_thread(vid as usize, to);
-                    set_current_tid(to);
-                    with_thread_mut(to, |t| {
-                        t.state = ThreadState::Running;
-                        t.last_vcpu_hint = vid_u8;
-                    });
-                    restore_ctx_to_frame(to, frame);
-                }
-                set_thread_in_kernel_locked(to, false);
-                crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
-                timer::schedule_running_slice_100ns(
-                    now_100ns,
-                    next_deadline_100ns,
-                    slice_remaining_100ns,
-                );
-                return from_sched != to;
-            }
-            SchedulerRoundAction::IdleWait {
-                now_100ns,
-                next_deadline_100ns,
-                from_tid: from_sched,
-            } => {
-                if !allow_idle_wait {
-                    crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
-                    timer::schedule_running_slice_100ns(
-                        now_100ns,
-                        next_deadline_100ns,
-                        quantum_100ns,
-                    );
-                    return false;
-                }
-                if from_sched != 0 {
-                    save_ctx_for(from_sched, frame);
-                    from = 0;
-                }
-                crate::sched::lock::unlock_after_raw_or_scoped(vid as usize);
-                crate::sched::schedule::idle_wait_or_exit(
-                    vid as usize,
-                    now_100ns,
-                    next_deadline_100ns,
-                );
-                continue;
-            }
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn user_irq_dispatch(frame: &mut SvcFrame) {
-    let vid = vcpu_id() as usize;
-    let cur = current_tid();
-    let in_nested_trap_sched = TRAP_SCHED_ACTIVE[vid].load(Ordering::Acquire) != 0;
-    let interrupted_user = crate::arch::trap::interrupted_user_mode(frame);
-    if in_nested_trap_sched || !interrupted_user {
-        set_needs_reschedule();
-        let now = crate::sched::wait::current_ticks();
-        // Nested-trap / in-kernel IRQ path cannot switch immediately.
-        // Re-arm a short retry slice so deferred preemption is observed before
-        // CPU-bound user code can run to completion.
-        timer::schedule_running_slice_100ns(now, u64::MAX, DEFERRED_RESCHED_RETRY_100NS);
-        return;
-    }
-    if cur != 0 {
-        set_thread_in_kernel_locked(cur, true);
-    }
-    drain_deferred_kstacks();
-    let reason = if crate::sched::cpu::cpu_local().needs_reschedule {
-        ScheduleReason::Ipi
-    } else {
-        ScheduleReason::TimerPreempt
-    };
-    schedule_from_trap(frame, false, true, timer::DEFAULT_TIMESLICE_100NS, reason);
 }
 
 #[no_mangle]

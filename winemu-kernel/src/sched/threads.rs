@@ -7,11 +7,13 @@
 
 use crate::sched::context::{
     alloc_kstack, defer_kstack_free, ensure_user_entry_continuation_locked,
+    set_thread_in_kernel_locked,
     setup_idle_thread_continuation_locked,
 };
-use crate::sched::global::{with_thread, SCHED};
+use crate::sched::cpu::current_vcpu_index;
+use crate::sched::global::{with_thread, with_thread_mut, SCHED};
 use crate::sched::thread_control::terminate_thread_locked;
-use crate::sched::topology::set_thread_state_locked;
+use crate::sched::topology::{bind_running_thread_to_vcpu, set_thread_state_locked};
 use crate::sched::types::{KThread, ThreadState, MAX_VCPUS};
 
 // ── spawn ─────────────────────────────────────────────────────────────────────
@@ -84,6 +86,49 @@ pub fn create_user_thread_locked(p: UserThreadParams) -> Option<u32> {
     Some(tid)
 }
 
+/// Allocate thread0 and bind it to the current vCPU's bootstrap execution
+/// context before the first real scheduler entry.
+///
+/// Must be called with the scheduler lock held.
+pub fn create_boot_thread_for_current_vcpu_locked(priority: u8) -> Option<u32> {
+    let tid = create_user_thread_locked(UserThreadParams {
+        pid: 0,
+        entry: 0,
+        stack_base: 0,
+        stack_size: 0,
+        teb_va: 0,
+        arg0: 0,
+        arg1: 0,
+        priority,
+    })?;
+    let vid = current_vcpu_index();
+    set_thread_state_locked(tid, ThreadState::Running);
+    bind_running_thread_to_vcpu(vid, tid);
+    set_thread_in_kernel_locked(tid, true);
+    Some(tid)
+}
+
+/// Finalize thread0's first user entry and place it back into the ready queue
+/// so the unified scheduler entry can launch it like any other thread.
+///
+/// Must be called with the scheduler lock held.
+pub fn prepare_boot_thread_user_entry_locked(
+    tid: u32,
+    start: crate::arch::context::UserThreadStart,
+    now_100ns: u64,
+) {
+    with_thread_mut(tid, |t| {
+        crate::arch::context::initialize_user_thread_context(&mut t.ctx, start);
+        t.slice_remaining_100ns = crate::timer::DEFAULT_TIMESLICE_100NS;
+        t.last_start_100ns = now_100ns;
+        // Keep the prebuilt kctx continuation for first user entry, but mark
+        // the live carrier as user-return so scheduler policy sees a normal
+        // ready thread instead of an in-kernel continuation.
+        t.in_kernel = false;
+    });
+    set_thread_state_locked(tid, ThreadState::Ready);
+}
+
 // ── register_idle_thread_for_vcpu ─────────────────────────────────────────────
 
 /// Create and register the idle thread for `vcpu_id`.
@@ -119,6 +164,20 @@ pub fn register_idle_thread_for_vcpu(vcpu_id: u32) -> u32 {
     }
 
     tid
+}
+
+/// Ensure `vcpu_id` has an idle thread registered and return its TID.
+/// Must be called with the scheduler lock held.
+pub fn ensure_idle_thread_for_vcpu_locked(vcpu_id: u32) -> u32 {
+    let existing = unsafe { SCHED.vcpu_raw(vcpu_id as usize) }.idle_tid;
+    if existing != 0 {
+        use crate::sched::cpu::{cpu_local, vcpu_id as get_vcpu_id};
+        if get_vcpu_id() == vcpu_id {
+            cpu_local().idle_tid = existing;
+        }
+        return existing;
+    }
+    register_idle_thread_for_vcpu(vcpu_id)
 }
 
 // ── exit_thread_locked ────────────────────────────────────────────────────────
@@ -160,7 +219,7 @@ pub fn free_terminated_threads_locked() {
             }
             // Conservative safety gates: a terminated thread can still be
             // transiently referenced by scheduler handoff metadata.
-            if t.in_kernel || t.kctx.has_continuation() {
+            if t.has_kernel_continuation() {
                 return;
             }
             // Do not free a terminated thread that is still the active current
@@ -168,7 +227,7 @@ pub fn free_terminated_threads_locked() {
             // in-flight switch path.
             for vid in 0..MAX_VCPUS {
                 let vs = unsafe { SCHED.vcpu_raw(vid) };
-                if vs.current_tid == tid || vs.highest_priority_tid == tid {
+                if vs.current_tid == tid {
                     return;
                 }
             }

@@ -19,6 +19,7 @@ pub mod sysno_table;
 pub mod system;
 pub mod thread;
 pub mod token;
+pub mod trap_schedule;
 pub mod user_args;
 pub mod win32k;
 

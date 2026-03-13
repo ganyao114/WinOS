@@ -13,9 +13,6 @@ pub struct KVcpuState {
     pub current_tid: u32,
     pub idle_tid: u32,
     pub needs_scheduling: bool,
-    pub is_idle: bool,
-    /// Next thread selected by flush_unlock_edge (0 = none/idle).
-    pub highest_priority_tid: u32,
 }
 
 impl KVcpuState {
@@ -24,8 +21,6 @@ impl KVcpuState {
             current_tid: 0,
             idle_tid: 0,
             needs_scheduling: false,
-            is_idle: false,
-            highest_priority_tid: 0,
         }
     }
 }
@@ -80,7 +75,8 @@ pub struct KGlobalScheduler {
     pub reschedule_mask: AtomicU32,
     /// monotonic schedule-event counter (for debug)
     pub schedule_events: AtomicU32,
-    /// Set when thread state changes; cleared by update_highest_priority_threads.
+    /// Set when thread state changes; cleared by
+    /// `compute_remote_reschedule_mask_locked()`.
     /// Mirrors Atmosphere's s_scheduler_update_needed.
     pub scheduler_update_needed: AtomicBool,
     initialized: AtomicU32,

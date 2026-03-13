@@ -15,7 +15,7 @@ use super::constants::{
 use super::user_args::{SyscallArgs, UserInPtr, UserOutPtr};
 use super::SvcFrame;
 use crate::mm::usercopy::read_current_user_bytes;
-use crate::mm::{UserVa, usercopy::read_user_at};
+use crate::mm::{usercopy::read_user_at, UserVa};
 
 // ── Handle type constant ──────────────────────────────────────────────────────
 
@@ -252,7 +252,8 @@ fn trace_raise_exception(frame: &SvcFrame) {
     }
 
     if frame.x[1] != 0 {
-        if let Some(ctx) = read_current_user_bytes(frame.x[1] as *const u8, ARM64_CONTEXT_PC_OFF + 8)
+        if let Some(ctx) =
+            read_current_user_bytes(frame.x[1] as *const u8, ARM64_CONTEXT_PC_OFF + 8)
         {
             let x29 = read_u64_le(&ctx, ARM64_CONTEXT_X29_OFF).unwrap_or(0);
             let x30 = read_u64_le(&ctx, ARM64_CONTEXT_X30_OFF).unwrap_or(0);
@@ -351,9 +352,8 @@ pub fn create_user_thread(
     stack_reserve: u64,
     priority: u8,
 ) -> Result<u32, CreateThreadError> {
-    let stack =
-        crate::teb::alloc_thread_stack(pid, stack_reserve, stack_commit)
-            .ok_or(CreateThreadError::NoMemory)?;
+    let stack = crate::teb::alloc_thread_stack(pid, stack_reserve, stack_commit)
+        .ok_or(CreateThreadError::NoMemory)?;
     let teb_va = crate::teb::alloc_teb(pid).unwrap_or(0);
     if teb_va == 0 {
         let _ = crate::mm::vm_free_region(pid, stack.reserve_base);
@@ -478,13 +478,13 @@ pub fn set_thread_affinity_by_handle(handle: u64, affinity_mask: u64) -> u32 {
 
 // ── yield ─────────────────────────────────────────────────────────────────────
 
-pub fn yield_current_thread() {
+pub fn request_current_thread_yield() {
     let tid = current_tid();
     if tid == 0 {
         return;
     }
     // Voluntary yield should request a reschedule, but keep the current thread
-    // in Running until scheduler_round_locked decides whether to switch.
+    // in Running until schedule_core_locked decides whether to switch.
     // This preserves Yield semantics: switch to peer if available, otherwise
     // continue current without transiently self-selecting from ready-queue.
     sched::set_needs_reschedule();
@@ -573,7 +573,7 @@ pub(crate) fn handle_set_information_thread(frame: &mut SvcFrame) {
 }
 
 pub(crate) fn handle_yield(frame: &mut SvcFrame) {
-    yield_current_thread();
+    request_current_thread_yield();
     frame.x[0] = status::SUCCESS as u64;
 }
 
