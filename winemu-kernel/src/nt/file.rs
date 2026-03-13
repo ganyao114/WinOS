@@ -438,11 +438,7 @@ fn cancel_pending_host_ioctl_for_file(owner_pid: u32, file: FsFileHandle) {
                 if req.request_id != 0 {
                     let _ = crate::fs::cancel_async_request(req.request_id);
                 }
-                complete_pending_host_ioctl(
-                    &req,
-                    status::INVALID_HANDLE,
-                    None,
-                );
+                complete_pending_host_ioctl(&req, status::INVALID_HANDLE, None);
                 let _ = to_remove.try_reserve(1);
                 to_remove.push(id);
             }
@@ -505,11 +501,7 @@ pub(crate) fn cancel_pending_dir_notify_for_pid(owner_pid: u32) {
                 if req.request_id != 0 {
                     let _ = crate::fs::cancel_async_request(req.request_id);
                 }
-                complete_pending_host_ioctl(
-                    &req,
-                    status::INVALID_HANDLE,
-                    None,
-                );
+                complete_pending_host_ioctl(&req, status::INVALID_HANDLE, None);
                 let _ = ioctl_remove.try_reserve(1);
                 ioctl_remove.push(id);
             }
@@ -548,7 +540,10 @@ fn fs_error_to_status(err: crate::fs::FsError) -> u32 {
 }
 
 fn fs_file_is_device(file: crate::fs::FsFileHandle) -> bool {
-    matches!(crate::fs::file_kind(file), Ok(crate::fs::FsFileKind::Device))
+    matches!(
+        crate::fs::file_kind(file),
+        Ok(crate::fs::FsFileKind::Device)
+    )
 }
 
 fn write_device_ioctl_output_for_pid(
@@ -981,7 +976,9 @@ fn find_pending_host_ioctl_id_by_request(request_id: u64) -> u32 {
     found
 }
 
-pub(crate) fn dispatch_async_hostcall_completion(cpl: crate::hypercall::HostCallCompletion) -> bool {
+pub(crate) fn dispatch_async_hostcall_completion(
+    cpl: crate::hypercall::HostCallCompletion,
+) -> bool {
     let Some(done) = crate::fs::dispatch_async_completion(cpl) else {
         return false;
     };
@@ -1019,8 +1016,9 @@ pub(crate) fn handle_create_file(frame: &mut SvcFrame) {
     let iosb_ptr = frame.x[3] as *mut IoStatusBlock;
     let iosb = IoStatusBlockPtr::from_raw(iosb_ptr);
     let disposition = frame.x[7] as u32;
-    let create_options =
-        UserInPtr::from_raw(frame.user_sp() as *const u64).read_current().unwrap_or(0) as u32;
+    let create_options = UserInPtr::from_raw(frame.user_sp() as *const u64)
+        .read_current()
+        .unwrap_or(0) as u32;
     let mut path_buf = [0u8; 512];
 
     let meta = super::kobject::object_type_meta_for_kind(crate::process::KObjectKind::File);
@@ -1179,22 +1177,15 @@ pub(crate) fn handle_write_file(frame: &mut SvcFrame) {
                 return;
             }
         };
-        let mut req = match prepare_async_file_io(
-            owner_pid,
-            file,
-            true,
-            event_handle,
-            iosb,
-            user_buf,
-            len,
-        ) {
-            Ok(req) => req,
-            Err(st) => {
-                iosb.write_current(st, 0);
-                frame.x[0] = st as u64;
-                return;
-            }
-        };
+        let mut req =
+            match prepare_async_file_io(owner_pid, file, true, event_handle, iosb, user_buf, len) {
+                Ok(req) => req,
+                Err(st) => {
+                    iosb.write_current(st, 0);
+                    frame.x[0] = st as u64;
+                    return;
+                }
+            };
         let submit = crate::fs::write_at_phys_async(
             crate::fs::FsWritePhysRequest {
                 file,
@@ -1255,13 +1246,7 @@ pub(crate) fn handle_write_file(frame: &mut SvcFrame) {
         }
         NtFileHandleTarget::Fs(file) => {
             if fs_file_is_device(file) {
-                complete_inline_file_io(
-                    owner_pid,
-                    event_handle,
-                    iosb,
-                    status::NOT_IMPLEMENTED,
-                    0,
-                );
+                complete_inline_file_io(owner_pid, event_handle, iosb, status::NOT_IMPLEMENTED, 0);
                 frame.x[0] = status::NOT_IMPLEMENTED as u64;
                 return;
             }
@@ -1381,8 +1366,7 @@ pub(crate) fn handle_read_file(frame: &mut SvcFrame) {
                         req.user_buffer,
                         req.bounce_pa,
                         read,
-                    )
-                {
+                    ) {
                     status::INVALID_PARAMETER
                 } else if read == 0 {
                     status::END_OF_FILE
@@ -1422,13 +1406,7 @@ pub(crate) fn handle_read_file(frame: &mut SvcFrame) {
         }
         NtFileHandleTarget::Fs(file) => {
             if fs_file_is_device(file) {
-                complete_inline_file_io(
-                    owner_pid,
-                    event_handle,
-                    iosb,
-                    status::NOT_IMPLEMENTED,
-                    0,
-                );
+                complete_inline_file_io(owner_pid, event_handle, iosb, status::NOT_IMPLEMENTED, 0);
                 frame.x[0] = status::NOT_IMPLEMENTED as u64;
                 return;
             }
@@ -1475,7 +1453,9 @@ pub(crate) fn handle_query_information_file(frame: &mut SvcFrame) {
             return;
         }
         let info = match target {
-            NtFileHandleTarget::Std(std_handle) => Ok(crate::fs::query_std_standard_info(std_handle)),
+            NtFileHandleTarget::Std(std_handle) => {
+                Ok(crate::fs::query_std_standard_info(std_handle))
+            }
             NtFileHandleTarget::Fs(file) => crate::fs::query_standard_info(file),
         };
         let std_info = match info {
@@ -1599,8 +1579,8 @@ pub(crate) fn handle_set_information_file(frame: &mut SvcFrame) {
                             Err(status::INVALID_PARAMETER)
                         } else {
                             crate::fs::seek(file, pos as i64, 0)
-                            .map(|_| ())
-                            .map_err(fs_error_to_status)
+                                .map(|_| ())
+                                .map_err(fs_error_to_status)
                         }
                     }
                     None => Err(status::INVALID_PARAMETER),
@@ -1837,13 +1817,7 @@ pub(crate) fn handle_notify_change_directory_file(frame: &mut SvcFrame) {
             request_id
         }
         Ok(FsAsyncSubmit::Completed(record)) => {
-            match write_notify_record(
-                owner_pid,
-                out_ptr,
-                out_len,
-                record.action(),
-                record.name(),
-            ) {
+            match write_notify_record(owner_pid, out_ptr, out_len, record.action(), record.name()) {
                 Ok(written) => {
                     iosb.write_current(status::SUCCESS, written as u64);
                     frame.x[0] = status::SUCCESS as u64;
@@ -2091,34 +2065,33 @@ pub(crate) fn handle_device_io_control_file(frame: &mut SvcFrame) {
 
     match submit {
         FsDeviceIoctlSubmit::Completed(output) => {
-            let written = match write_device_ioctl_output_for_pid(
-                owner_pid,
-                output_ptr,
-                output_len,
-                &output,
-            ) {
-                Some(Ok(info)) => info,
-                Some(Err(st)) => {
-                    if io_control_code == IOCTL_WINEMU_HOST_PING && st == status::BUFFER_TOO_SMALL {
-                        0
-                    } else {
-                        iosb.write_current(st, 0);
-                        frame.x[0] = st as u64;
-                        return;
+            let written =
+                match write_device_ioctl_output_for_pid(owner_pid, output_ptr, output_len, &output)
+                {
+                    Some(Ok(info)) => info,
+                    Some(Err(st)) => {
+                        if io_control_code == IOCTL_WINEMU_HOST_PING
+                            && st == status::BUFFER_TOO_SMALL
+                        {
+                            0
+                        } else {
+                            iosb.write_current(st, 0);
+                            frame.x[0] = st as u64;
+                            return;
+                        }
                     }
-                }
-                None => {
-                    if io_control_code == IOCTL_WINEMU_HOST_PING
-                        && (output_ptr.is_null() || output_len < output.len())
-                    {
-                        0
-                    } else {
-                        iosb.write_current(status::INVALID_PARAMETER, 0);
-                        frame.x[0] = status::INVALID_PARAMETER as u64;
-                        return;
+                    None => {
+                        if io_control_code == IOCTL_WINEMU_HOST_PING
+                            && (output_ptr.is_null() || output_len < output.len())
+                        {
+                            0
+                        } else {
+                            iosb.write_current(status::INVALID_PARAMETER, 0);
+                            frame.x[0] = status::INVALID_PARAMETER as u64;
+                            return;
+                        }
                     }
-                }
-            };
+                };
             complete_inline_file_io(owner_pid, event_handle, iosb, status::SUCCESS, written);
             frame.x[0] = status::SUCCESS as u64;
         }

@@ -2,8 +2,8 @@ use crate::process::{with_process_mut, KObjectKind, KObjectRef};
 use crate::rust_alloc::vec::Vec;
 use winemu_shared::status;
 
-use super::{file, named_objects, registry, section};
 use super::user_args::UserOutPtr;
+use super::{file, named_objects, registry, section};
 
 // ── Object type metadata ──────────────────────────────────────────────────────
 

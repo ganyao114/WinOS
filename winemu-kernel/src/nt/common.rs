@@ -1,10 +1,10 @@
 use crate::fs::{FsFileHandle, FsOpenMode, FsStdHandle};
-use crate::process::{with_process_mut, KObjectKind};
 use crate::mm::usercopy::{
     copy_to_process_user, current_pid, ensure_user_range_access, write_user_value,
 };
 use crate::mm::UserVa;
 use crate::mm::VM_ACCESS_WRITE;
+use crate::process::{with_process_mut, KObjectKind};
 
 pub(crate) const STD_INPUT_HANDLE: u64 = 0xFFFF_FFFF_FFFF_FFF6;
 pub(crate) const STD_OUTPUT_HANDLE: u64 = 0xFFFF_FFFF_FFFF_FFF5;
@@ -117,11 +117,7 @@ pub(crate) fn map_file_generic_access(access: u32) -> u32 {
         mapped |= FILE_ALL_ACCESS;
     }
     if (access & GENERIC_READ) != 0 {
-        mapped |= READ_CONTROL
-            | SYNCHRONIZE
-            | FILE_READ_DATA
-            | FILE_READ_ATTRIBUTES
-            | FILE_READ_EA;
+        mapped |= READ_CONTROL | SYNCHRONIZE | FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA;
     }
     if (access & GENERIC_WRITE) != 0 {
         mapped |= READ_CONTROL

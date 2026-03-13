@@ -70,7 +70,10 @@ fn ensure_state() -> &'static mut RegistryState {
 fn set_string_value(node: &KeyNode, name: &str, value: &str) {
     node.borrow_mut().set_value(
         name.to_string(),
-        RegistryValue::new(name.to_string(), RegistryValueData::String(value.to_string())),
+        RegistryValue::new(
+            name.to_string(),
+            RegistryValueData::String(value.to_string()),
+        ),
     );
 }
 
@@ -269,7 +272,8 @@ fn write_ret_len(ptr: u64, len: usize) {
 #[inline(always)]
 fn validate_key_desired_access(desired_access: u32) -> bool {
     let meta = super::kobject::object_type_meta_for_kind(KObjectKind::Key);
-    let allowed = meta.valid_access_mask | MAXIMUM_ALLOWED | ACCESS_SYSTEM_SECURITY | KEY_WOW64_FLAGS;
+    let allowed =
+        meta.valid_access_mask | MAXIMUM_ALLOWED | ACCESS_SYSTEM_SECURITY | KEY_WOW64_FLAGS;
     (desired_access & !allowed) == 0
 }
 

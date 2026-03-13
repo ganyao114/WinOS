@@ -17,8 +17,8 @@ mod volume;
 pub(crate) use async_io::FsAsyncCompletion;
 #[allow(unused_imports)]
 pub use device::{
-    FsDeviceIoctlRequest, FsDeviceIoctlSubmit, FsIoctlOutput, IOCTL_WINEMU_HOST_PING,
-    IOCTL_WINEMU_HOSTCALL_SYNC, WinEmuHostcallRequest, WinEmuHostcallResponse,
+    FsDeviceIoctlRequest, FsDeviceIoctlSubmit, FsIoctlOutput, WinEmuHostcallRequest,
+    WinEmuHostcallResponse, IOCTL_WINEMU_HOSTCALL_SYNC, IOCTL_WINEMU_HOST_PING,
 };
 #[allow(unused_imports)]
 pub use dir::{readdir, readdir_std};
@@ -42,8 +42,8 @@ pub use types::{
 };
 #[allow(unused_imports)]
 pub use volume::{
-    FsVolumeAttributeInfo, FsVolumeDeviceInfo, FsVolumeSizeInfo, FsVolumeTarget,
     query_volume_attribute_info, query_volume_device_info, query_volume_size_info,
+    FsVolumeAttributeInfo, FsVolumeDeviceInfo, FsVolumeSizeInfo, FsVolumeTarget,
 };
 
 pub fn device_io_control(req: FsDeviceIoctlRequest) -> Result<FsDeviceIoctlSubmit, FsError> {

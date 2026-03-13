@@ -2,19 +2,19 @@ use core::cell::UnsafeCell;
 
 use crate::fs::FsError;
 use crate::kobj::ObjectStore;
-use crate::mm::{VmaType, vm_alloc_region_typed, vm_free_region, vm_set_section_backing};
-use crate::process::{KObjectKind, KObjectRef, with_process_mut};
+use crate::mm::{vm_alloc_region_typed, vm_free_region, vm_set_section_backing, VmaType};
+use crate::process::{with_process_mut, KObjectKind, KObjectRef};
 use crate::rust_alloc::vec::Vec;
 use winemu_shared::status;
 
-use super::SvcFrame;
-use super::common::{GuestWriter, NtFileHandleTarget, align_up_4k, file_handle_target};
+use super::common::{align_up_4k, file_handle_target, GuestWriter, NtFileHandleTarget};
 use super::constants::PAGE_SIZE_4K;
 use super::path::ObjectAttributesView;
 use super::state::{
     section_alloc, section_exists, section_free, section_get, section_retain, view_alloc, view_free,
 };
 use super::user_args::{SyscallArgs, UserInPtr, UserOutPtr};
+use super::SvcFrame;
 // ── Guest-memory layout structs ───────────────────────────────────────────────
 
 #[repr(C)]
@@ -64,7 +64,11 @@ fn named_sections_mut() -> &'static mut ObjectStore<NamedSection> {
 }
 
 fn ascii_lower(b: u8) -> u8 {
-    if b >= b'A' && b <= b'Z' { b + 32 } else { b }
+    if b >= b'A' && b <= b'Z' {
+        b + 32
+    } else {
+        b
+    }
 }
 
 fn skip_prefix(name: &[u8], prefix: &[u8]) -> Option<usize> {
