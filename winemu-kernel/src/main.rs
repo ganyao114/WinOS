@@ -160,8 +160,8 @@ pub extern "C" fn kernel_main() -> ! {
 
     let loaded = match loaded {
         Ok(img) => img,
-        Err(_) => {
-            crate::kerror!("kernel: PE load failed");
+        Err(err) => {
+            crate::kerror!("kernel: PE load failed: {:?}", err);
             hypercall::process_exit(1);
         }
     };

@@ -70,35 +70,27 @@ unsafe fn nt_write_file(handle: u64, buf: *const u8, len: u32) {
     let buf_ptr  = buf as u64;
     let len_u64  = len as u64;
     asm!(
-        "mov x0, {handle}",
-        "mov x1, xzr",
-        "mov x2, xzr",
-        "mov x3, xzr",
-        "mov x4, {iosb}",
-        "mov x5, {buf}",
-        "mov x6, {len}",
-        "mov x7, xzr",
-        "mov x8, {nr}",
         "str xzr, [sp, #-16]!",
         "svc #0",
         "add sp, sp, #16",
-        nr     = in(reg) NR_WRITE_FILE,
-        handle = in(reg) handle,
-        iosb   = in(reg) iosb_ptr,
-        buf    = in(reg) buf_ptr,
-        len    = in(reg) len_u64,
-        out("x0") _, out("x1") _, out("x2") _, out("x3") _,
-        out("x4") _, out("x5") _, out("x6") _, out("x7") _,
-        out("x8") _,
-        options(nostack),
+        inlateout("x0") handle => _,
+        inlateout("x1") 0u64 => _,
+        inlateout("x2") 0u64 => _,
+        inlateout("x3") 0u64 => _,
+        inlateout("x4") iosb_ptr => _,
+        inlateout("x5") buf_ptr => _,
+        inlateout("x6") len_u64 => _,
+        inlateout("x7") 0u64 => _,
+        inlateout("x8") NR_WRITE_FILE => _,
     );
 }
 
 unsafe fn nt_terminate_process(code: u32) -> ! {
     asm!(
-        "mov x8, {nr}", "mov x0, xzr", "mov x1, {code}", "svc #0",
-        nr   = in(reg) NR_TERMINATE_PROCESS,
-        code = in(reg) code as u64,
+        "svc #0",
+        in("x0") 0u64,
+        in("x1") code as u64,
+        in("x8") NR_TERMINATE_PROCESS,
         options(noreturn, nostack),
     );
 }
@@ -106,15 +98,16 @@ unsafe fn nt_terminate_process(code: u32) -> ! {
 unsafe fn nt_delay_execution_ms(ms: u32) {
     let mut rel_100ns: i64 = -((ms as i64) * 10_000);
     asm!(
-        "mov x0, xzr",
-        "mov x1, {timeout}",
-        "mov x8, {nr}",
         "svc #0",
-        nr = in(reg) NR_DELAY_EXECUTION,
-        timeout = in(reg) (&mut rel_100ns as *mut i64 as u64),
-        out("x0") _, out("x1") _, out("x2") _, out("x3") _,
-        out("x4") _, out("x5") _, out("x6") _, out("x7") _,
-        out("x8") _,
+        inlateout("x0") 0u64 => _,
+        inlateout("x1") (&mut rel_100ns as *mut i64 as u64) => _,
+        lateout("x2") _,
+        lateout("x3") _,
+        lateout("x4") _,
+        lateout("x5") _,
+        lateout("x6") _,
+        lateout("x7") _,
+        inlateout("x8") NR_DELAY_EXECUTION => _,
         options(nostack),
     );
 }
@@ -135,28 +128,18 @@ unsafe fn win32k_call(table: u32, syscall_nr: u32, args: &[u64]) -> u64 {
         if args.len() > 6 { args[6] } else { 0 },
         if args.len() > 7 { args[7] } else { 0 },
     ];
-    let mut ret: u64;
+    let ret: u64;
     asm!(
-        "mov x0, {a0}",
-        "mov x1, {a1}",
-        "mov x2, {a2}",
-        "mov x3, {a3}",
-        "mov x4, {a4}",
-        "mov x5, {a5}",
-        "mov x6, {a6}",
-        "mov x7, {a7}",
-        "mov x8, {nr}",
         "svc #0",
-        "mov {ret}, x0",
-        a0  = in(reg) a[0], a1 = in(reg) a[1],
-        a2  = in(reg) a[2], a3 = in(reg) a[3],
-        a4  = in(reg) a[4], a5 = in(reg) a[5],
-        a6  = in(reg) a[6], a7 = in(reg) a[7],
-        nr  = in(reg) x8_val,
-        ret = out(reg) ret,
-        out("x1") _, out("x2") _, out("x3") _,
-        out("x4") _, out("x5") _, out("x6") _, out("x7") _,
-        out("x8") _,
+        inlateout("x0") a[0] => ret,
+        inlateout("x1") a[1] => _,
+        inlateout("x2") a[2] => _,
+        inlateout("x3") a[3] => _,
+        inlateout("x4") a[4] => _,
+        inlateout("x5") a[5] => _,
+        inlateout("x6") a[6] => _,
+        inlateout("x7") a[7] => _,
+        inlateout("x8") x8_val => _,
         options(nostack),
     );
     ret

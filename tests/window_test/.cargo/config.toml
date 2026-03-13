@@ -8,5 +8,6 @@ rustflags = [
     "-C", "link-arg=/NODEFAULTLIB",
     "-C", "link-arg=/SUBSYSTEM:CONSOLE",
     "-C", "link-arg=/ENTRY:mainCRTStartup",
+    "-C", "link-arg=/BASE:0x70000000",
     "-C", "link-arg=/FORCE:UNRESOLVED",
 ]

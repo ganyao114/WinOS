@@ -2,7 +2,6 @@
 // This layer owns generic syscall dispatch and post-trap scheduling policy.
 
 use crate::hypercall;
-use crate::mm::UserVa;
 use crate::sched::{
     current_tid, drain_deferred_kstacks, enter_kernel_continuation_noreturn,
     execute_kernel_continuation_switch, scheduler_round_locked, set_current_tid,
@@ -10,7 +9,7 @@ use crate::sched::{
     with_thread, with_thread_mut, ScheduleReason, SchedulerRoundAction, ThreadState, SCHED_LOCK,
 };
 use crate::timer;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::constants::{
     KERNEL_FAULT_ADDRESS_TAG, KERNEL_FAULT_PC_TAG, KERNEL_FAULT_STATE_TAG,
@@ -24,7 +23,6 @@ use super::{
     SvcFrame,
 };
 
-static SYSCALL_ERR_TRACE_BUDGET: AtomicU32 = AtomicU32::new(512);
 const DEFERRED_RESCHED_RETRY_100NS: u64 = 10_000; // 1ms
 static TRAP_SCHED_ACTIVE: [AtomicU32; 8] = [
     AtomicU32::new(0),
@@ -36,119 +34,6 @@ static TRAP_SCHED_ACTIVE: [AtomicU32; 8] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
 ];
-static USER_IRQ_LAST_PC: [AtomicU64; 8] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-static USER_IRQ_REPEAT_COUNT: [AtomicU32; 8] = [
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-];
-static BAD_USER_SP_TRACE_BUDGET: AtomicU32 = AtomicU32::new(32);
-const TRACE_SYSTEM_INFO_CLASS_FIRMWARE_TABLE: u32 = 76;
-
-#[derive(Clone, Copy)]
-struct SyscallTraceContext {
-    query_system_information_class: Option<u32>,
-}
-
-#[inline]
-fn trace_repeated_user_irq_pc(vid: usize, tid: u32, frame: &SvcFrame) {
-    if tid == 0 || vid >= TRAP_SCHED_ACTIVE.len() {
-        return;
-    }
-    if with_thread(tid, |t| t.is_idle_thread).unwrap_or(true) {
-        return;
-    }
-
-    let last_pc = USER_IRQ_LAST_PC[vid].load(Ordering::Acquire);
-    let repeat = if last_pc == frame.program_counter() {
-        USER_IRQ_REPEAT_COUNT[vid].fetch_add(1, Ordering::AcqRel) + 1
-    } else {
-        USER_IRQ_LAST_PC[vid].store(frame.program_counter(), Ordering::Release);
-        USER_IRQ_REPEAT_COUNT[vid].store(1, Ordering::Release);
-        1
-    };
-
-    if repeat < 64 || (repeat & (repeat - 1)) != 0 {
-        return;
-    }
-
-    crate::kwarn!(
-        "user_irq_repeat: vid={} repeat={} tid={} pid={} pc={:#x} user_sp={:#x} x0={:#x} x1={:#x} user_root={:#x}",
-        vid,
-        repeat,
-        tid,
-        crate::sched::thread_pid(tid),
-        frame.program_counter(),
-        frame.user_sp(),
-        frame.x[0],
-        frame.x[1],
-        crate::arch::mmu::current_user_table_root(),
-    );
-}
-
-#[inline]
-fn trace_bad_user_sp(frame: &SvcFrame, nr: u16, table: u8, cur: u32) {
-    if cur == 0 {
-        return;
-    }
-    let Some((pid, stack_base, stack_size, teb_va)) =
-        with_thread(cur, |t| (t.pid, t.stack_base, t.stack_size, t.teb_va))
-    else {
-        return;
-    };
-    let stack_limit = stack_base.saturating_sub(stack_size);
-    let sp = frame.user_sp();
-    if sp >= stack_limit && sp < stack_base {
-        return;
-    }
-    if BAD_USER_SP_TRACE_BUDGET
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
-        .is_err()
-    {
-        return;
-    }
-    crate::kwarn!(
-        "svc_bad_sp: pid={} tid={} nr={:#x} table={} pc={:#x} lr={:#x} sp={:#x} stack_limit={:#x} stack_base={:#x} teb={:#x}",
-        pid,
-        cur,
-        nr,
-        table,
-        frame.program_counter(),
-        frame.x[30],
-        sp,
-        stack_limit,
-        stack_base,
-        teb_va
-    );
-    if let Some(info) = crate::mm::vm_query_region(pid, UserVa::new(sp)) {
-        crate::kwarn!(
-            "svc_bad_sp_region: pid={} tid={} base={:#x} size={:#x} alloc_base={:#x} alloc_prot={:#x} prot={:#x} state={:#x} type={:#x}",
-            pid,
-            cur,
-            info.base.get(),
-            info.size,
-            info.allocation_base.get(),
-            info.allocation_prot,
-            info.prot,
-            info.state,
-            info.mem_type
-        );
-    }
-}
 
 struct TrapSchedGuard {
     vid: usize,
@@ -203,12 +88,8 @@ pub extern "C" fn syscall_dispatch(frame: &mut SvcFrame) {
     drain_deferred_kstacks();
 
     let tag = frame.x8_orig;
-    let nr = (tag & SVC_TAG_NR_MASK) as u16;
     let table = ((tag >> SVC_TAG_TABLE_SHIFT) & SVC_TAG_TABLE_MASK) as u8;
-    trace_bad_user_sp(frame, nr, table, cur);
-    if crate::log::log_enabled(crate::log::LogLevel::Trace) {
-        crate::log::debug_u64(0xE200_0000 | ((table as u64) << 12) | nr as u64);
-    }
+    let nr = (tag & SVC_TAG_NR_MASK) as u16;
 
     if table != 0 {
         if table == 1 {
@@ -230,15 +111,12 @@ pub extern "C" fn syscall_dispatch(frame: &mut SvcFrame) {
     let is_delay_execution = handler_id == NtHandlerId::DelayExecution as u8
         || (handler_id == NtHandlerId::ResetEvent as u8
             && system::should_dispatch_delay_execution(frame));
-    let trace_ctx = capture_syscall_trace_context(handler_id, frame);
     if handler_id == HANDLER_NONE {
         forward_to_vmm(frame, nr, table);
     } else {
         dispatch_nt_handler(frame, handler_id);
     }
 
-    trace_syscall_error(handler_id, trace_ctx, nr, table, frame);
-    trace_bad_user_sp(frame, nr, table, cur);
     let sched_reason = schedule_reason_for_handler(handler_id, frame, cur, is_delay_execution);
     schedule_from_trap(frame, true, true, 0, sched_reason);
 }
@@ -389,95 +267,6 @@ fn schedule_reason_for_handler(
         };
     }
     ScheduleReason::UnlockEdge
-}
-
-fn capture_syscall_trace_context(handler_id: u8, frame: &SvcFrame) -> SyscallTraceContext {
-    let query_system_information_class = if handler_id == NtHandlerId::QuerySystemInformation as u8
-    {
-        Some(frame.x[0] as u32)
-    } else {
-        None
-    };
-    SyscallTraceContext {
-        query_system_information_class,
-    }
-}
-
-fn should_suppress_syscall_error(
-    handler_id: u8,
-    trace_ctx: SyscallTraceContext,
-    status: u32,
-) -> bool {
-    use NtHandlerId::*;
-
-    if status == winemu_shared::status::OBJECT_NAME_NOT_FOUND
-        && (handler_id == OpenKey as u8
-            || handler_id == OpenKeyEx as u8
-            || handler_id == QueryValueKey as u8)
-    {
-        return true;
-    }
-
-    if status == winemu_shared::status::BUFFER_TOO_SMALL
-        && handler_id == QuerySystemInformation as u8
-        && trace_ctx.query_system_information_class == Some(TRACE_SYSTEM_INFO_CLASS_FIRMWARE_TABLE)
-    {
-        return true;
-    }
-
-    if status == crate::sched::sync::primitives_api::STATUS_MUTANT_NOT_OWNED
-        && handler_id == ReleaseMutant as u8
-    {
-        return true;
-    }
-
-    false
-}
-
-fn trace_syscall_error(
-    handler_id: u8,
-    trace_ctx: SyscallTraceContext,
-    nr: u16,
-    table: u8,
-    frame: &SvcFrame,
-) {
-    if table != 0 {
-        return;
-    }
-    let status = frame.x[0] as u32;
-    if status < 0xC000_0000 {
-        return;
-    }
-    if should_suppress_syscall_error(handler_id, trace_ctx, status) {
-        return;
-    }
-    let remain = SYSCALL_ERR_TRACE_BUDGET.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-        if v == 0 {
-            None
-        } else {
-            Some(v - 1)
-        }
-    });
-    if remain.is_err() {
-        return;
-    }
-    crate::kerror!(
-        "nt: syscall error nr={:#x} st={:#x} pc={:#x} lr={:#x}",
-        nr,
-        status,
-        frame.program_counter(),
-        frame.x[30]
-    );
-    if handler_id == NtHandlerId::QueryVirtualMemory as u8 {
-        crate::kerror!(
-            "nt: NtQueryVirtualMemory args addr={:#x} class={:#x} buf={:#x} len={:#x} ret_len_ptr={:#x}",
-            frame.x[1],
-            frame.x[2],
-            frame.x[3],
-            frame.x[4],
-            frame.x[5]
-        );
-    }
 }
 
 fn save_ctx_for(tid: u32, frame: &SvcFrame) {
@@ -697,10 +486,6 @@ pub extern "C" fn user_irq_dispatch(frame: &mut SvcFrame) {
     let cur = current_tid();
     let in_nested_trap_sched = TRAP_SCHED_ACTIVE[vid].load(Ordering::Acquire) != 0;
     let interrupted_user = crate::arch::trap::interrupted_user_mode(frame);
-    if interrupted_user {
-        trace_repeated_user_irq_pc(vid, cur, frame);
-        trace_bad_user_sp(frame, 0xffff, 0xff, cur);
-    }
     if in_nested_trap_sched || !interrupted_user {
         set_needs_reschedule();
         let now = crate::sched::wait::current_ticks();
