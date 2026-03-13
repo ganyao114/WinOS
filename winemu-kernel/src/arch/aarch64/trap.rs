@@ -110,6 +110,276 @@ fn try_patch_init_locale_fault(fault_addr: u64, pc: u64, frame_ptr: u64) -> bool
     true
 }
 
+#[inline]
+fn user_fault_frame_read_u64(frame_ptr: u64, offset: usize) -> u64 {
+    if frame_ptr == 0 {
+        return 0;
+    }
+    let Some(addr) = frame_ptr.checked_add(offset as u64) else {
+        return 0;
+    };
+    // SAFETY: `frame_ptr` is produced by the EL0 sync vector and points to the
+    // saved user fault frame on the current thread stack for the duration of
+    // this dispatch.
+    unsafe { (addr as *const u64).read_volatile() }
+}
+
+#[inline]
+fn read_user_u8(pid: u32, va: u64) -> Option<u8> {
+    crate::mm::usercopy::read_user_at(pid, crate::mm::UserVa::new(va))
+}
+
+#[inline]
+fn read_user_u64(pid: u32, va: u64) -> Option<u64> {
+    let mut out = 0u64;
+    for i in 0..8u64 {
+        out |= (read_user_u8(pid, va.checked_add(i)?)? as u64) << (i * 8);
+    }
+    Some(out)
+}
+
+#[inline]
+fn read_user_ascii(pid: u32, ptr: u64, buf: &mut [u8]) -> Option<usize> {
+    if ptr == 0 || buf.is_empty() {
+        return None;
+    }
+    let mut len = 0usize;
+    while len < buf.len() {
+        let ch = read_user_u8(pid, ptr.checked_add(len as u64)?)?;
+        if ch == 0 {
+            return if len == 0 { None } else { Some(len) };
+        }
+        if !(0x20..=0x7e).contains(&ch) {
+            return None;
+        }
+        buf[len] = ch;
+        len += 1;
+    }
+    None
+}
+
+#[inline]
+fn log_user_fault_region(owner_pid: u32, label: &str, addr: u64) {
+    let Some(info) = crate::mm::vm_query_region(owner_pid, crate::mm::UserVa::new(addr)) else {
+        crate::kerror!(
+            "user_fault_region: {} addr={:#x} region=none",
+            label,
+            addr
+        );
+        return;
+    };
+    crate::kerror!(
+        "user_fault_region: {} addr={:#x} base={:#x} size={:#x} alloc_base={:#x} alloc_prot={:#x} prot={:#x} state={:#x} type={:#x}",
+        label,
+        addr,
+        info.base.get(),
+        info.size,
+        info.allocation_base.get(),
+        info.allocation_prot,
+        info.prot,
+        info.state,
+        info.mem_type
+    );
+}
+
+#[inline]
+fn log_user_fault_thread_stack(owner_pid: u32, sp: u64) {
+    let tid = crate::sched::current_tid();
+    let Some((thread_stack_base, thread_stack_size, teb_va)) =
+        crate::sched::with_thread(tid, |t| (t.stack_base, t.stack_size, t.teb_va))
+    else {
+        return;
+    };
+    crate::kerror!(
+        "user_fault_thread: pid={} tid={} sp={:#x} stack_base={:#x} stack_size={:#x} teb={:#x}",
+        owner_pid,
+        tid,
+        sp,
+        thread_stack_base,
+        thread_stack_size,
+        teb_va
+    );
+    if teb_va == 0 {
+        return;
+    }
+    let teb_stack_base =
+        read_user_u64(owner_pid, teb_va.saturating_add(winemu_shared::teb::STACK_BASE as u64))
+            .unwrap_or(0);
+    let teb_stack_limit =
+        read_user_u64(owner_pid, teb_va.saturating_add(winemu_shared::teb::STACK_LIMIT as u64))
+            .unwrap_or(0);
+    crate::kerror!(
+        "user_fault_teb_stack: teb={:#x} stack_base={:#x} stack_limit={:#x}",
+        teb_va,
+        teb_stack_base,
+        teb_stack_limit
+    );
+    let path_saved_fp = read_user_u64(owner_pid, sp.saturating_add(0x840)).unwrap_or(0);
+    let path_saved_lr = read_user_u64(owner_pid, sp.saturating_add(0x848)).unwrap_or(0);
+    let wrapper_saved_lr = read_user_u64(owner_pid, sp.saturating_add(0x850)).unwrap_or(0);
+    let wrapper_caller_sp = sp.saturating_add(0x860);
+    let caller_saved_fp = read_user_u64(owner_pid, sp.saturating_add(0x960)).unwrap_or(0);
+    let caller_saved_lr = read_user_u64(owner_pid, sp.saturating_add(0x968)).unwrap_or(0);
+    let caller_entry_sp = sp.saturating_add(0x970);
+    crate::kerror!(
+        "user_fault_stack_frames: path_saved_fp={:#x} path_saved_lr={:#x} wrapper_saved_lr={:#x} wrapper_caller_sp={:#x} caller_saved_fp={:#x} caller_saved_lr={:#x} caller_entry_sp={:#x}",
+        path_saved_fp,
+        path_saved_lr,
+        wrapper_saved_lr,
+        wrapper_caller_sp,
+        caller_saved_fp,
+        caller_saved_lr,
+        caller_entry_sp
+    );
+    if path_saved_lr != 0 {
+        log_loaded_module_for_addr("path_saved_lr", path_saved_lr);
+    }
+    if wrapper_saved_lr != 0 {
+        log_loaded_module_for_addr("wrapper_saved_lr", wrapper_saved_lr);
+    }
+    if caller_saved_lr != 0 {
+        log_loaded_module_for_addr("caller_saved_lr", caller_saved_lr);
+    }
+}
+
+#[inline]
+fn log_loaded_module_for_addr(label: &str, addr: u64) {
+    let mut matched = false;
+    crate::dll::for_each_loaded(|name, base, size, entry| {
+        if matched || size == 0 {
+            return;
+        }
+        let end = base.saturating_add(size as u64);
+        if addr < base || addr >= end {
+            return;
+        }
+        matched = true;
+        crate::kerror!(
+            "user_fault_module: {} addr={:#x} module={} base={:#x} size={:#x} entry={:#x}",
+            label,
+            addr,
+            name,
+            base,
+            size,
+            entry
+        );
+    });
+    if !matched {
+        crate::kerror!(
+            "user_fault_module: {} addr={:#x} module=none",
+            label,
+            addr
+        );
+    }
+}
+
+#[inline]
+fn log_user_ascii_ptr(owner_pid: u32, label: &str, ptr: u64) {
+    let mut buf = [0u8; 64];
+    let Some(len) = read_user_ascii(owner_pid, ptr, &mut buf) else {
+        return;
+    };
+    let Ok(text) = core::str::from_utf8(&buf[..len]) else {
+        return;
+    };
+    crate::kerror!(
+        "user_fault_ptr: {}={:#x} ascii=\"{}\"",
+        label,
+        ptr,
+        text
+    );
+}
+
+#[inline]
+fn log_user_fp_chain(owner_pid: u32, mut fp: u64, max_depth: usize) {
+    for depth in 0..max_depth {
+        if fp == 0 {
+            break;
+        }
+        let Some(next_fp) = read_user_u64(owner_pid, fp) else {
+            crate::kerror!("user_fault_bt[{}]: fp={:#x} unreadable", depth, fp);
+            break;
+        };
+        let Some(ret) = read_user_u64(owner_pid, fp.saturating_add(8)) else {
+            crate::kerror!("user_fault_bt[{}]: fp={:#x} ret=unreadable", depth, fp);
+            break;
+        };
+        crate::kerror!(
+            "user_fault_bt[{}]: fp={:#x} ret={:#x}",
+            depth,
+            fp,
+            ret
+        );
+        if ret != 0 {
+            log_loaded_module_for_addr("bt", ret);
+        }
+        if next_fp <= fp {
+            break;
+        }
+        fp = next_fp;
+    }
+}
+
+#[inline]
+fn log_user_fault_translation_state(owner_pid: u32, fault_addr: u64, pc: u64, lr: u64) {
+    let current_root = crate::arch::mmu::current_user_table_root();
+    let expected_root =
+        crate::process::with_process(owner_pid, |p| p.address_space.ttbr0()).unwrap_or(0);
+    let current_elr_pa =
+        crate::mm::address_space::translate_current_user_va_for_access(
+            crate::mm::UserVa::new(pc),
+            crate::mm::VM_ACCESS_EXEC,
+        )
+        .map(|pa| pa.get())
+        .unwrap_or(0);
+    let owner_elr_pa = crate::mm::usercopy::translate_user_va(
+        owner_pid,
+        crate::mm::UserVa::new(pc),
+        crate::mm::VM_ACCESS_EXEC,
+    )
+    .map(|pa| pa.get())
+    .unwrap_or(0);
+    let current_far_pa =
+        crate::mm::address_space::translate_current_user_va_for_access(
+            crate::mm::UserVa::new(fault_addr),
+            crate::mm::VM_ACCESS_EXEC,
+        )
+        .map(|pa| pa.get())
+        .unwrap_or(0);
+    let owner_far_pa = crate::mm::usercopy::translate_user_va(
+        owner_pid,
+        crate::mm::UserVa::new(fault_addr),
+        crate::mm::VM_ACCESS_EXEC,
+    )
+    .map(|pa| pa.get())
+    .unwrap_or(0);
+    let current_lr_pa =
+        crate::mm::address_space::translate_current_user_va_for_access(
+            crate::mm::UserVa::new(lr),
+            crate::mm::VM_ACCESS_EXEC,
+        )
+        .map(|pa| pa.get())
+        .unwrap_or(0);
+    let owner_lr_pa = crate::mm::usercopy::translate_user_va(
+        owner_pid,
+        crate::mm::UserVa::new(lr),
+        crate::mm::VM_ACCESS_EXEC,
+    )
+    .map(|pa| pa.get())
+    .unwrap_or(0);
+    crate::kerror!(
+        "user_fault_xlate: current_root={:#x} expected_root={:#x} far_cur={:#x} far_owner={:#x} elr_cur={:#x} elr_owner={:#x} lr_cur={:#x} lr_owner={:#x}",
+        current_root,
+        expected_root,
+        current_far_pa,
+        owner_far_pa,
+        current_elr_pa,
+        owner_elr_pa,
+        current_lr_pa,
+        owner_lr_pa
+    );
+}
+
 #[no_mangle]
 pub extern "C" fn user_page_fault_dispatch(
     fault_addr: u64,
@@ -142,18 +412,67 @@ pub extern "C" fn user_page_fault_dispatch(
         return 1;
     }
 
-    crate::log::debug_print("PAGE_FAULT_UNRESOLVED FAR=");
-    crate::log::debug_u64(fault_addr);
-    crate::log::debug_print(" ESR=");
-    crate::log::debug_u64(syndrome);
-    crate::log::debug_print(" ELR=");
-    crate::log::debug_u64(pc);
     let owner_pid = crate::process::current_pid();
-    crate::log::debug_print(" PID=");
-    crate::log::debug_u64(owner_pid as u64);
-    crate::log::debug_print(" TID=");
-    crate::log::debug_u64(crate::sched::current_tid() as u64);
-    crate::log::debug_print("\n");
+    let lr = user_fault_frame_read_u64(frame_ptr, 0x0f0);
+    let fp = user_fault_frame_read_u64(frame_ptr, 0x0e8);
+    let sp = user_fault_frame_read_u64(frame_ptr, 0x108);
+    let x0 = user_fault_frame_read_u64(frame_ptr, 0x000);
+    let x1 = user_fault_frame_read_u64(frame_ptr, 0x008);
+    let x2 = user_fault_frame_read_u64(frame_ptr, 0x010);
+    let x3 = user_fault_frame_read_u64(frame_ptr, 0x018);
+    let x18 = user_fault_frame_read_u64(frame_ptr, 0x090);
+    let x19 = user_fault_frame_read_u64(frame_ptr, 0x098);
+    let x20 = user_fault_frame_read_u64(frame_ptr, 0x0a0);
+    let x21 = user_fault_frame_read_u64(frame_ptr, 0x0a8);
+    let x22 = user_fault_frame_read_u64(frame_ptr, 0x0b0);
+    let x23 = user_fault_frame_read_u64(frame_ptr, 0x0b8);
+    let tpidr = user_fault_frame_read_u64(frame_ptr, 0x118);
+    let image_base = crate::process::with_process(owner_pid, |p| p.image_base).unwrap_or(0);
+    crate::kerror!(
+        "PAGE_FAULT_UNRESOLVED far={:#x} esr={:#x} elr={:#x} lr={:#x} fp={:#x} sp={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x18={:#x} x19={:#x} x20={:#x} x21={:#x} x22={:#x} x23={:#x} tpidr={:#x} pid={} tid={} image_base={:#x}",
+        fault_addr,
+        syndrome,
+        pc,
+        lr,
+        fp,
+        sp,
+        x0,
+        x1,
+        x2,
+        x3,
+        x18,
+        x19,
+        x20,
+        x21,
+        x22,
+        x23,
+        tpidr,
+        owner_pid,
+        crate::sched::current_tid(),
+        image_base
+    );
+    log_user_fault_thread_stack(owner_pid, sp);
+    log_user_fault_translation_state(owner_pid, fault_addr, pc, lr);
+    log_user_fault_region(owner_pid, "far", fault_addr);
+    log_user_fault_region(owner_pid, "sp", sp);
+    log_user_fault_region(owner_pid, "x0", x0);
+    log_user_fault_region(owner_pid, "elr", pc);
+    if lr != 0 {
+        log_user_fault_region(owner_pid, "lr", lr);
+    }
+    log_loaded_module_for_addr("elr", pc);
+    if lr != 0 {
+        log_loaded_module_for_addr("lr", lr);
+    }
+    log_loaded_module_for_addr("x18", x18);
+    log_loaded_module_for_addr("x19", x19);
+    log_loaded_module_for_addr("x20", x20);
+    log_loaded_module_for_addr("x21", x21);
+    log_loaded_module_for_addr("x23", x23);
+    log_user_ascii_ptr(owner_pid, "x0", x0);
+    log_user_ascii_ptr(owner_pid, "x1", x1);
+    log_user_ascii_ptr(owner_pid, "x19", x19);
+    log_user_fp_chain(owner_pid, fp, 8);
     crate::hypercall::process_exit(0xFF)
 }
 

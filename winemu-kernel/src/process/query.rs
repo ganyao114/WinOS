@@ -6,7 +6,9 @@ use super::with_process;
 use crate::nt::common::GuestWriter;
 
 const PROCESS_BASIC_INFORMATION_SIZE: usize = 48;
+const PROCESS_DEFAULT_HARD_ERROR_MODE_SIZE: usize = 4;
 const PROCESS_IMAGE_FILE_NAME_SIZE: usize = 16;
+const PROCESS_VM_COUNTERS_SIZE: usize = 88;
 const PROCESS_WOW64_INFORMATION_SIZE: usize = 8;
 
 pub fn query_information_process(
@@ -27,6 +29,8 @@ pub fn query_information_process(
 
     match info_class {
         0 => query_basic(pid, buf, buf_len, ret_len),
+        3 => query_vm_counters(buf, buf_len, ret_len),
+        12 => query_default_hard_error_mode(pid, buf, buf_len, ret_len),
         26 => query_wow64_information(buf, buf_len, ret_len),
         27 => query_image_file_name(buf, buf_len, ret_len),
         _ => {
@@ -46,6 +50,42 @@ fn query_wow64_information(buf: *mut u8, buf_len: usize, ret_len: *mut u32) -> u
     };
     w.u64(0);
     write_ret_len(ret_len, PROCESS_WOW64_INFORMATION_SIZE as u32);
+    status::SUCCESS
+}
+
+fn query_vm_counters(buf: *mut u8, buf_len: usize, ret_len: *mut u32) -> u32 {
+    if buf.is_null() || buf_len < PROCESS_VM_COUNTERS_SIZE {
+        write_ret_len(ret_len, PROCESS_VM_COUNTERS_SIZE as u32);
+        return status::INFO_LENGTH_MISMATCH;
+    }
+
+    let Some(mut w) = GuestWriter::new(buf, buf_len, PROCESS_VM_COUNTERS_SIZE) else {
+        return status::INVALID_PARAMETER;
+    };
+    w.zeros(PROCESS_VM_COUNTERS_SIZE);
+    write_ret_len(ret_len, PROCESS_VM_COUNTERS_SIZE as u32);
+    status::SUCCESS
+}
+
+fn query_default_hard_error_mode(
+    pid: u32,
+    buf: *mut u8,
+    buf_len: usize,
+    ret_len: *mut u32,
+) -> u32 {
+    if buf.is_null() || buf_len != PROCESS_DEFAULT_HARD_ERROR_MODE_SIZE {
+        write_ret_len(ret_len, PROCESS_DEFAULT_HARD_ERROR_MODE_SIZE as u32);
+        return status::INFO_LENGTH_MISMATCH;
+    }
+
+    let Some(mode) = with_process(pid, |p| p.default_hard_error_mode) else {
+        return status::INVALID_HANDLE;
+    };
+    let Some(mut w) = GuestWriter::new(buf, buf_len, PROCESS_DEFAULT_HARD_ERROR_MODE_SIZE) else {
+        return status::INVALID_PARAMETER;
+    };
+    w.u32(mode);
+    write_ret_len(ret_len, PROCESS_DEFAULT_HARD_ERROR_MODE_SIZE as u32);
     status::SUCCESS
 }
 

@@ -32,10 +32,43 @@ pub(crate) fn vm_alloc_region_typed(
 
     crate::process::with_process_mut(owner_pid, |p| {
         let (vm, aspace) = (&mut p.vm, &mut p.address_space);
-        let base = vm.find_and_reserve(hint, size, prot, kind)?;
+        let base = match vm.find_and_reserve(hint, size, prot, kind) {
+            Some(base) => base,
+            None => {
+                if matches!(kind, VmKind::Image) {
+                    crate::ktrace!(
+                        "vm: reserve failed pid={} hint={:#x} size={:#x} prot={:#x} kind={:?}",
+                        owner_pid,
+                        hint,
+                        size,
+                        prot,
+                        kind
+                    );
+                } else {
+                    crate::kdebug!(
+                        "vm: reserve failed pid={} hint={:#x} size={:#x} prot={:#x} kind={:?}",
+                        owner_pid,
+                        hint,
+                        size,
+                        prot,
+                        kind
+                    );
+                }
+                return None;
+            }
+        };
         if vm.commit_pages(aspace, owner_pid, base, size, prot, eager) {
             Some(base)
         } else {
+            crate::kdebug!(
+                "vm: commit failed pid={} base={:#x} size={:#x} prot={:#x} kind={:?} eager={}",
+                owner_pid,
+                base,
+                size,
+                prot,
+                kind,
+                eager
+            );
             let _ = vm.release_region(aspace, owner_pid, base);
             None
         }

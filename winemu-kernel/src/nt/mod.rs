@@ -3,6 +3,7 @@ pub mod constants;
 pub mod dispatch;
 pub mod file;
 pub mod kobject;
+pub mod loader;
 pub mod memory;
 pub mod named_objects;
 pub mod object;

@@ -43,7 +43,8 @@ pub struct UserThreadParams {
     pub stack_base: u64, // user stack top (high address)
     pub stack_size: u64,
     pub teb_va: u64,
-    pub arg: u64, // first user argument on entry
+    pub arg0: u64,
+    pub arg1: u64,
     pub priority: u8,
 }
 
@@ -71,8 +72,8 @@ pub fn create_user_thread_locked(p: UserThreadParams) -> Option<u32> {
             program_counter: p.entry,
             stack_pointer: p.stack_base,
             thread_pointer: p.teb_va,
-            arg0: p.arg,
-            arg1: 0,
+            arg0: p.arg0,
+            arg1: p.arg1,
         },
     );
 

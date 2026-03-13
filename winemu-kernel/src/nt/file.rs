@@ -27,8 +27,9 @@ fn handle_idx_for_pid(handle: u64, pid: u32) -> u32 {
 }
 
 use super::common::{
-    file_handle_target, map_open_mode, GuestWriter, IoStatusBlock, IoStatusBlockPtr,
-    NtFileHandleTarget, FILE_OPEN, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    file_handle_target, map_file_generic_access, map_open_mode, GuestWriter, IoStatusBlock,
+    IoStatusBlockPtr, NtFileHandleTarget, FILE_OPEN, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE,
 };
 use super::path::{ObjectAttributesView, UnicodeStringView};
 use super::user_args::{SyscallArgs, UserInPtr, UserOutPtr};
@@ -38,6 +39,12 @@ use crate::mm::usercopy::{copy_from_phys_to_process_user, copy_from_process_user
 const FILE_BASIC_INFORMATION_SIZE: usize = 40;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+const FILE_STANDARD_INFORMATION_CLASS: u32 = 5;
+const FILE_POSITION_INFORMATION_CLASS: u32 = 14;
+const FILE_ALLOCATION_INFORMATION_CLASS: u32 = 19;
+const FILE_END_OF_FILE_INFORMATION_CLASS: u32 = 20;
+const FILE_POSITION_INFORMATION_SIZE: usize = 8;
+const FILE_END_OF_FILE_INFORMATION_SIZE: usize = 8;
 
 const FILE_DIRECTORY_INFORMATION: u32 = 1;
 const FILE_FULL_DIRECTORY_INFORMATION: u32 = 2;
@@ -535,6 +542,7 @@ fn fs_error_to_status(err: crate::fs::FsError) -> u32 {
         crate::fs::FsError::Unsupported => status::NOT_IMPLEMENTED,
         crate::fs::FsError::NoMemory => status::NO_MEMORY,
         crate::fs::FsError::InvalidHandle => status::INVALID_HANDLE,
+        crate::fs::FsError::AlreadyExists => status::OBJECT_NAME_COLLISION,
         crate::fs::FsError::NotFound | crate::fs::FsError::IoError => status::INVALID_PARAMETER,
     }
 }
@@ -997,12 +1005,22 @@ pub(crate) fn dispatch_async_hostcall_completion(cpl: crate::hypercall::HostCall
 // x0=*FileHandle, x1=DesiredAccess, x2=ObjectAttributes, x3=*IoStatusBlock
 // x7=CreateDisposition
 pub(crate) fn handle_create_file(frame: &mut SvcFrame) {
+    const FILE_SUPERSEDE: u32 = 0;
+    const FILE_OPEN: u32 = 1;
+    const FILE_CREATE: u32 = 2;
+    const FILE_OPEN_IF: u32 = 3;
+    const FILE_OVERWRITE: u32 = 4;
+    const FILE_OVERWRITE_IF: u32 = 5;
+    const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+
     let out_ptr = UserOutPtr::from_raw(frame.x[0] as *mut u64);
-    let access = frame.x[1] as u32;
+    let access = map_file_generic_access(frame.x[1] as u32);
     let oa = ObjectAttributesView::from_ptr(frame.x[2]);
     let iosb_ptr = frame.x[3] as *mut IoStatusBlock;
     let iosb = IoStatusBlockPtr::from_raw(iosb_ptr);
     let disposition = frame.x[7] as u32;
+    let create_options =
+        UserInPtr::from_raw(frame.user_sp() as *const u64).read_current().unwrap_or(0) as u32;
     let mut path_buf = [0u8; 512];
 
     let meta = super::kobject::object_type_meta_for_kind(crate::process::KObjectKind::File);
@@ -1031,9 +1049,48 @@ pub(crate) fn handle_create_file(frame: &mut SvcFrame) {
             return;
         }
     };
+    if disposition != FILE_OPEN || create_options != 0 {
+        crate::kdebug!(
+            "nt:file create tid={} pc={:#x} sp={:#x} path={} disp={} create_options={:#x}",
+            crate::sched::current_tid(),
+            frame.program_counter(),
+            frame.user_sp(),
+            path,
+            disposition,
+            create_options
+        );
+    }
+    if (create_options & FILE_DIRECTORY_FILE) != 0 {
+        match disposition {
+            FILE_OPEN => {}
+            FILE_CREATE | FILE_OPEN_IF => {
+                if let Err(err) = crate::fs::create_dir(path) {
+                    crate::kdebug!("nt:file create_dir failed path={} err={:?}", path, err);
+                    let st = fs_error_to_status(err);
+                    iosb.write_current(st, 0);
+                    frame.x[0] = st as u64;
+                    return;
+                }
+            }
+            FILE_SUPERSEDE | FILE_OVERWRITE | FILE_OVERWRITE_IF => {
+                iosb.write_current(status::INVALID_PARAMETER, 0);
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            }
+            _ => {
+                iosb.write_current(status::INVALID_PARAMETER, 0);
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            }
+        }
+    }
     let file = match crate::fs::open(&crate::fs::FsOpenRequest {
         path,
-        mode: map_open_mode(access, disposition),
+        mode: if (create_options & FILE_DIRECTORY_FILE) != 0 {
+            crate::fs::FsOpenMode::Read
+        } else {
+            map_open_mode(access, disposition)
+        },
     }) {
         Ok(v) => v,
         Err(crate::fs::FsError::NoMemory) => {
@@ -1411,7 +1468,7 @@ pub(crate) fn handle_query_information_file(frame: &mut SvcFrame) {
             return;
         }
     };
-    if info_class == 5 {
+    if info_class == FILE_STANDARD_INFORMATION_CLASS {
         if out_ptr.is_null() || out_len < 24 {
             iosb.write_current(status::INFO_LENGTH_MISMATCH, 0);
             frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
@@ -1446,6 +1503,47 @@ pub(crate) fn handle_query_information_file(frame: &mut SvcFrame) {
         frame.x[0] = status::SUCCESS as u64;
         return;
     }
+    if info_class == FILE_POSITION_INFORMATION_CLASS {
+        if out_ptr.is_null() || out_len < FILE_POSITION_INFORMATION_SIZE {
+            iosb.write_current(status::INFO_LENGTH_MISMATCH, 0);
+            frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
+            return;
+        }
+        let pos = match target {
+            NtFileHandleTarget::Std(_) => {
+                iosb.write_current(status::INVALID_HANDLE, 0);
+                frame.x[0] = status::INVALID_HANDLE as u64;
+                return;
+            }
+            NtFileHandleTarget::Fs(file) => {
+                if fs_file_is_device(file) {
+                    iosb.write_current(status::INVALID_HANDLE, 0);
+                    frame.x[0] = status::INVALID_HANDLE as u64;
+                    return;
+                }
+                match crate::fs::seek(file, 0, 1) {
+                    Ok(pos) => pos,
+                    Err(err) => {
+                        let st = fs_error_to_status(err);
+                        iosb.write_current(st, 0);
+                        frame.x[0] = st as u64;
+                        return;
+                    }
+                }
+            }
+        };
+        let Some(mut w) =
+            GuestWriter::for_pid(owner_pid, out_ptr, out_len, FILE_POSITION_INFORMATION_SIZE)
+        else {
+            iosb.write_current(status::INVALID_PARAMETER, 0);
+            frame.x[0] = status::INVALID_PARAMETER as u64;
+            return;
+        };
+        w.u64(pos);
+        iosb.write_current(status::SUCCESS, FILE_POSITION_INFORMATION_SIZE as u64);
+        frame.x[0] = status::SUCCESS as u64;
+        return;
+    }
     if !out_ptr.is_null() && out_len != 0 {
         let Some(mut w) = GuestWriter::for_pid(owner_pid, out_ptr, out_len, out_len) else {
             iosb.write_current(status::INVALID_PARAMETER, 0);
@@ -1459,10 +1557,79 @@ pub(crate) fn handle_query_information_file(frame: &mut SvcFrame) {
 }
 
 pub(crate) fn handle_set_information_file(frame: &mut SvcFrame) {
+    let file_handle = frame.x[0];
     let iosb_ptr = frame.x[1] as *mut IoStatusBlock;
     let iosb = IoStatusBlockPtr::from_raw(iosb_ptr);
-    iosb.write_current(status::SUCCESS, 0);
-    frame.x[0] = status::SUCCESS as u64;
+    let info_ptr = frame.x[2] as *const u8;
+    let info_len = frame.x[3] as usize;
+    let info_class = frame.x[4] as u32;
+    let target = match file_handle_target(file_handle) {
+        Some(v) => v,
+        None => {
+            iosb.write_current(status::INVALID_HANDLE, 0);
+            frame.x[0] = status::INVALID_HANDLE as u64;
+            return;
+        }
+    };
+
+    let file = match target {
+        NtFileHandleTarget::Std(_) => {
+            iosb.write_current(status::INVALID_HANDLE, 0);
+            frame.x[0] = status::INVALID_HANDLE as u64;
+            return;
+        }
+        NtFileHandleTarget::Fs(file) => {
+            if fs_file_is_device(file) {
+                iosb.write_current(status::INVALID_HANDLE, 0);
+                frame.x[0] = status::INVALID_HANDLE as u64;
+                return;
+            }
+            file
+        }
+    };
+
+    let result = match info_class {
+        FILE_POSITION_INFORMATION_CLASS => {
+            if info_ptr.is_null() || info_len < FILE_POSITION_INFORMATION_SIZE {
+                Err(status::INVALID_PARAMETER)
+            } else {
+                match UserInPtr::from_raw(info_ptr as *const u64).read_current() {
+                    Some(pos) => {
+                        if pos > i64::MAX as u64 {
+                            Err(status::INVALID_PARAMETER)
+                        } else {
+                            crate::fs::seek(file, pos as i64, 0)
+                            .map(|_| ())
+                            .map_err(fs_error_to_status)
+                        }
+                    }
+                    None => Err(status::INVALID_PARAMETER),
+                }
+            }
+        }
+        FILE_ALLOCATION_INFORMATION_CLASS | FILE_END_OF_FILE_INFORMATION_CLASS => {
+            if info_ptr.is_null() || info_len < FILE_END_OF_FILE_INFORMATION_SIZE {
+                Err(status::INVALID_PARAMETER)
+            } else {
+                match UserInPtr::from_raw(info_ptr as *const u64).read_current() {
+                    Some(len) => crate::fs::set_len(file, len).map_err(fs_error_to_status),
+                    None => Err(status::INVALID_PARAMETER),
+                }
+            }
+        }
+        _ => Ok(()),
+    };
+
+    match result {
+        Ok(()) => {
+            iosb.write_current(status::SUCCESS, 0);
+            frame.x[0] = status::SUCCESS as u64;
+        }
+        Err(st) => {
+            iosb.write_current(st, 0);
+            frame.x[0] = st as u64;
+        }
+    }
 }
 
 pub(crate) fn handle_query_directory_file(frame: &mut SvcFrame) {

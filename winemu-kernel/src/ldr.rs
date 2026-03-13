@@ -94,9 +94,24 @@ impl ImageBuffer {
     }
 }
 
-fn alloc_image_buffer(size: usize, vma_type: VmaType) -> LdrResult<ImageBuffer> {
+fn alloc_image_buffer(
+    size: usize,
+    preferred_base: u64,
+    allow_relocate: bool,
+    vma_type: VmaType,
+) -> LdrResult<ImageBuffer> {
     if let Some(pid) = current_user_pid() {
-        let Some(base) = vm_alloc_region_typed(pid, 0, size as u64, 0x04, vma_type) else {
+        let exact = if preferred_base != 0 {
+            vm_alloc_region_typed(pid, preferred_base, size as u64, 0x04, vma_type)
+        } else {
+            None
+        };
+        let base = if allow_relocate {
+            exact.or_else(|| vm_alloc_region_typed(pid, 0, size as u64, 0x04, vma_type))
+        } else {
+            exact
+        };
+        let Some(base) = base else {
             return Err(LdrError::AllocFailed);
         };
         return Ok(ImageBuffer {
@@ -105,6 +120,14 @@ fn alloc_image_buffer(size: usize, vma_type: VmaType) -> LdrResult<ImageBuffer> 
             size,
             owner_pid: Some(pid),
         });
+    }
+
+    if !allow_relocate && preferred_base != 0 {
+        crate::kdebug!(
+            "ldr: non-reloc image requires preferred base={:#x}",
+            preferred_base
+        );
+        return Err(LdrError::BadReloc);
     }
 
     let ptr = alloc::alloc_zeroed(size, PAGE_SIZE as usize).ok_or(LdrError::AllocFailed)?;
@@ -259,14 +282,21 @@ pub unsafe fn load_from_file(
 
     // 2. 解析 PE 头
     let hdrs = PeHeaders::from_slice(hdr_slice)?;
-    crate::kdebug!("ldr: parsed PE headers from fd");
+    crate::ktrace!("ldr: parsed PE headers from fd");
 
     if hdrs.machine != pe::MACHINE_ARM64 {
         return Err(LdrError::NotArm64);
     }
 
+    let reloc_dir = hdrs.data_dir(pe::DIR_BASERELOC).filter(|dir| dir.is_present());
+
     // 3. 分配镜像内存
-    let image = alloc_image_buffer(hdrs.size_of_image as usize, vma_type)?;
+    let image = alloc_image_buffer(
+        hdrs.size_of_image as usize,
+        hdrs.image_base,
+        reloc_dir.is_some(),
+        vma_type,
+    )?;
     let load_base = image.base;
 
     // 4. 复制头部到镜像基址
@@ -295,20 +325,24 @@ pub unsafe fn load_from_file(
     // 6. 基址重定位
     let delta = load_base.wrapping_sub(hdrs.image_base) as i64;
     if delta != 0 {
-        if let Some(dir) = hdrs.data_dir(pe::DIR_BASERELOC) {
-            if dir.is_present() {
-                image
-                    .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
-                        apply_relocations(
-                            buf.as_mut_ptr(),
-                            dir.rva as usize,
-                            dir.size as usize,
-                            delta,
-                        )
-                    })
-                    .ok_or(LdrError::AllocFailed)??;
-            }
-        }
+        let Some(dir) = reloc_dir else {
+            crate::kdebug!(
+                "ldr: non-reloc image loaded away from preferred base load={:#x} image={:#x}",
+                load_base,
+                hdrs.image_base
+            );
+            return Err(LdrError::BadReloc);
+        };
+        image
+            .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
+                apply_relocations(
+                    buf.as_mut_ptr(),
+                    dir.rva as usize,
+                    dir.size as usize,
+                    delta,
+                )
+            })
+            .ok_or(LdrError::AllocFailed)??;
     }
 
     // 7. 导入表
@@ -339,14 +373,20 @@ pub unsafe fn load(
     resolve_import: impl Fn(&str, ImportRef) -> Option<u64>,
 ) -> LdrResult<LoadedImage> {
     let hdrs = PeHeaders::from_slice(image)?;
-    crate::kdebug!("ldr: parsed PE headers");
+    crate::ktrace!("ldr: parsed PE headers");
 
     if hdrs.machine != pe::MACHINE_ARM64 {
         return Err(LdrError::NotArm64);
     }
 
-    let image_buf = alloc_image_buffer(hdrs.size_of_image as usize, vma_type)?;
-    crate::kdebug!("ldr: alloc ok");
+    let reloc_dir = hdrs.data_dir(pe::DIR_BASERELOC).filter(|dir| dir.is_present());
+    let image_buf = alloc_image_buffer(
+        hdrs.size_of_image as usize,
+        hdrs.image_base,
+        reloc_dir.is_some(),
+        vma_type,
+    )?;
+    crate::ktrace!("ldr: alloc ok");
     let load_base = image_buf.base;
 
     // 先复制 PE headers（导出解析依赖 DOS/NT 头）
@@ -372,20 +412,24 @@ pub unsafe fn load(
     // 基址重定位
     let delta = load_base.wrapping_sub(hdrs.image_base) as i64;
     if delta != 0 {
-        if let Some(dir) = hdrs.data_dir(pe::DIR_BASERELOC) {
-            if dir.is_present() {
-                image_buf
-                    .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
-                        apply_relocations(
-                            buf.as_mut_ptr(),
-                            dir.rva as usize,
-                            dir.size as usize,
-                            delta,
-                        )
-                    })
-                    .ok_or(LdrError::AllocFailed)??;
-            }
-        }
+        let Some(dir) = reloc_dir else {
+            crate::kdebug!(
+                "ldr: non-reloc image loaded away from preferred base load={:#x} image={:#x}",
+                load_base,
+                hdrs.image_base
+            );
+            return Err(LdrError::BadReloc);
+        };
+        image_buf
+            .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
+                apply_relocations(
+                    buf.as_mut_ptr(),
+                    dir.rva as usize,
+                    dir.size as usize,
+                    delta,
+                )
+            })
+            .ok_or(LdrError::AllocFailed)??;
     }
 
     // 导入表
@@ -429,18 +473,30 @@ pub unsafe fn load_from_file_unlinked(
     }
     let hdr_slice = core::slice::from_raw_parts(hdr_buf as *const u8, got);
     let hdrs = PeHeaders::from_slice(hdr_slice)?;
-    crate::kdebug!("ldr: parsed PE headers");
+    crate::ktrace!("ldr: parsed PE headers");
 
     if hdrs.machine != pe::MACHINE_ARM64 {
         return Err(LdrError::NotArm64);
     }
 
-    let image = alloc_image_buffer(hdrs.size_of_image as usize, vma_type)?;
-    crate::kdebug!("ldr: alloc ok");
+    let reloc_dir = hdrs.data_dir(pe::DIR_BASERELOC).filter(|dir| dir.is_present());
+    let image = alloc_image_buffer(
+        hdrs.size_of_image as usize,
+        hdrs.image_base,
+        reloc_dir.is_some(),
+        vma_type,
+    )?;
+    crate::ktrace!("ldr: alloc ok");
     let load_base = image.base;
 
     let hdr_copy = (hdrs.size_of_headers as usize).min(got);
     if !image.copy_from_bytes(0, &hdr_slice[..hdr_copy]) {
+        crate::kdebug!(
+            "ldr: header copy failed base={:#x} size={:#x} hdr_copy={:#x}",
+            load_base,
+            hdrs.size_of_image,
+            hdr_copy
+        );
         return Err(LdrError::AllocFailed);
     }
 
@@ -454,7 +510,14 @@ pub unsafe fn load_from_file_unlinked(
                 read_size,
                 sec.raw_off as u64,
             ) {
-                crate::kerror!("ldr: section read failed");
+                crate::kerror!(
+                    "ldr: section read failed name={:?} vaddr={:#x} raw_off={:#x} raw_size={:#x} vsize={:#x}",
+                    sec.name,
+                    sec.vaddr,
+                    sec.raw_off,
+                    sec.raw_size,
+                    sec.vsize
+                );
                 return Err(LdrError::IoError);
             }
         }
@@ -462,20 +525,33 @@ pub unsafe fn load_from_file_unlinked(
 
     let delta = load_base.wrapping_sub(hdrs.image_base) as i64;
     if delta != 0 {
-        if let Some(dir) = hdrs.data_dir(pe::DIR_BASERELOC) {
-            if dir.is_present() {
-                image
-                    .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
-                        apply_relocations(
-                            buf.as_mut_ptr(),
-                            dir.rva as usize,
-                            dir.size as usize,
-                            delta,
-                        )
-                    })
-                    .ok_or(LdrError::AllocFailed)??;
-            }
-        }
+        let Some(dir) = reloc_dir else {
+            crate::kdebug!(
+                "ldr: non-reloc image loaded away from preferred base load={:#x} image={:#x}",
+                load_base,
+                hdrs.image_base
+            );
+            return Err(LdrError::BadReloc);
+        };
+        image
+            .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
+                apply_relocations(
+                    buf.as_mut_ptr(),
+                    dir.rva as usize,
+                    dir.size as usize,
+                    delta,
+                )
+            })
+            .ok_or_else(|| {
+                crate::kdebug!(
+                    "ldr: reloc view failed base={:#x} size={:#x} reloc_rva={:#x} reloc_size={:#x}",
+                    load_base,
+                    hdrs.size_of_image,
+                    dir.rva,
+                    dir.size
+                );
+                LdrError::AllocFailed
+            })??;
     }
 
     Ok(LoadedImage {
@@ -488,14 +564,20 @@ pub unsafe fn load_from_file_unlinked(
 /// Load PE image into memory (with relocations) but do not resolve IAT yet.
 pub unsafe fn load_unlinked(image: &[u8], vma_type: VmaType) -> LdrResult<LoadedImage> {
     let hdrs = PeHeaders::from_slice(image)?;
-    crate::kdebug!("ldr: parsed PE headers");
+    crate::ktrace!("ldr: parsed PE headers");
 
     if hdrs.machine != pe::MACHINE_ARM64 {
         return Err(LdrError::NotArm64);
     }
 
-    let image_buf = alloc_image_buffer(hdrs.size_of_image as usize, vma_type)?;
-    crate::kdebug!("ldr: alloc ok");
+    let reloc_dir = hdrs.data_dir(pe::DIR_BASERELOC).filter(|dir| dir.is_present());
+    let image_buf = alloc_image_buffer(
+        hdrs.size_of_image as usize,
+        hdrs.image_base,
+        reloc_dir.is_some(),
+        vma_type,
+    )?;
+    crate::ktrace!("ldr: alloc ok");
     let load_base = image_buf.base;
 
     let hdr_copy = (hdrs.size_of_headers as usize).min(image.len());
@@ -518,20 +600,24 @@ pub unsafe fn load_unlinked(image: &[u8], vma_type: VmaType) -> LdrResult<Loaded
 
     let delta = load_base.wrapping_sub(hdrs.image_base) as i64;
     if delta != 0 {
-        if let Some(dir) = hdrs.data_dir(pe::DIR_BASERELOC) {
-            if dir.is_present() {
-                image_buf
-                    .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
-                        apply_relocations(
-                            buf.as_mut_ptr(),
-                            dir.rva as usize,
-                            dir.size as usize,
-                            delta,
-                        )
-                    })
-                    .ok_or(LdrError::AllocFailed)??;
-            }
-        }
+        let Some(dir) = reloc_dir else {
+            crate::kdebug!(
+                "ldr: non-reloc image loaded away from preferred base load={:#x} image={:#x}",
+                load_base,
+                hdrs.image_base
+            );
+            return Err(LdrError::BadReloc);
+        };
+        image_buf
+            .with_slice_mut(VM_ACCESS_WRITE, |buf| unsafe {
+                apply_relocations(
+                    buf.as_mut_ptr(),
+                    dir.rva as usize,
+                    dir.size as usize,
+                    delta,
+                )
+            })
+            .ok_or(LdrError::AllocFailed)??;
     }
 
     Ok(LoadedImage {
@@ -564,7 +650,14 @@ pub unsafe fn link_imports(
                 ))
             },
         )
-        .ok_or(LdrError::ProtectFailed)??;
+        .ok_or_else(|| {
+            crate::kdebug!(
+                "ldr: import header view failed pid={} base={:#x}",
+                pid,
+                image_base
+            );
+            LdrError::ProtectFailed
+        })??;
         if import_rva == 0 || import_size == 0 {
             return Ok(());
         }
@@ -575,7 +668,17 @@ pub unsafe fn link_imports(
             VM_ACCESS_WRITE,
             |image| unsafe { apply_imports(image.as_mut_ptr(), import_rva, &resolve_import) },
         )
-        .ok_or(LdrError::ProtectFailed)??;
+        .ok_or_else(|| {
+            crate::kdebug!(
+                "ldr: import patch view failed pid={} base={:#x} size={:#x} import_rva={:#x} import_size={:#x}",
+                pid,
+                image_base,
+                image_size,
+                import_rva,
+                import_size
+            );
+            LdrError::ProtectFailed
+        })??;
         return Ok(());
     }
 
@@ -682,36 +785,44 @@ unsafe fn apply_imports(
                 ImportRef::Name(cstr(base.add(ibn + 2)))
             };
             let (resolved_dll, resolved_iref, remapped) = match iref {
-                ImportRef::Name(fn_name)
-                    if dll_name.eq_ignore_ascii_case("kernel32.dll")
-                        && should_remap_kernel32_to_ntdll(fn_name) =>
-                {
+                ImportRef::Name(fn_name) if should_remap_import_to_ntdll(dll_name, fn_name) => {
                     ("ntdll.dll", ImportRef::Name(fn_name), true)
                 }
                 _ => (dll_name, iref, false),
             };
             let Some(addr) = resolve(resolved_dll, resolved_iref) else {
-                crate::log::debug_print("ldr: unresolved import ");
-                crate::log::debug_print(dll_name);
-                crate::log::debug_print("!");
                 match iref {
                     ImportRef::Name(fn_name) => {
-                        crate::log::debug_print(fn_name);
+                        if remapped {
+                            crate::kdebug!(
+                                "ldr: unresolved import {}!{} via {}",
+                                dll_name,
+                                fn_name,
+                                resolved_dll
+                            );
+                        } else {
+                            crate::kdebug!("ldr: unresolved import {}!{}", dll_name, fn_name);
+                        }
                     }
                     ImportRef::Ordinal(ord) => {
-                        crate::log::debug_print("#");
-                        crate::log::debug_u64(ord as u64);
+                        if remapped {
+                            crate::kdebug!(
+                                "ldr: unresolved import {}!#{} via {}",
+                                dll_name,
+                                ord,
+                                resolved_dll
+                            );
+                        } else {
+                            crate::kdebug!("ldr: unresolved import {}!#{}", dll_name, ord);
+                        }
                     }
                 }
-                if remapped {
-                    crate::log::debug_print(" via ");
-                    crate::log::debug_print(resolved_dll);
-                }
-                crate::log::debug_print("\n");
                 return Err(LdrError::BadImport);
             };
             if let ImportRef::Name(fn_name) = iref {
-                if fn_name == "RtlOpenCrossProcessEmulatorWorkConnection" {
+                if fn_name == "RtlOpenCrossProcessEmulatorWorkConnection"
+                    && crate::log::log_enabled(crate::log::LogLevel::Trace)
+                {
                     crate::log::debug_print("ldr: import ");
                     crate::log::debug_print(dll_name);
                     crate::log::debug_print("!");
@@ -752,6 +863,7 @@ unsafe fn apply_imports(
                         || fn_name == "EnterCriticalSection"
                         || fn_name == "LeaveCriticalSection"
                         || fn_name == "RaiseException")
+                    && crate::log::log_enabled(crate::log::LogLevel::Trace)
                 {
                     crate::log::debug_print("ldr: import ");
                     crate::log::debug_print(dll_name);
@@ -774,26 +886,34 @@ unsafe fn apply_imports(
     Ok(())
 }
 
-fn should_remap_kernel32_to_ntdll(fn_name: &str) -> bool {
-    matches!(
-        fn_name,
-        "GlobalAlloc"
-            | "GlobalReAlloc"
-            | "GlobalFree"
-            | "GlobalLock"
-            | "GlobalUnlock"
-            | "GlobalHandle"
-            | "GlobalSize"
-            | "GlobalFlags"
-            | "LocalAlloc"
-            | "LocalReAlloc"
-            | "LocalFree"
-            | "LocalLock"
-            | "LocalUnlock"
-            | "LocalHandle"
-            | "LocalSize"
-            | "LocalFlags"
-    )
+fn should_remap_import_to_ntdll(dll_name: &str, fn_name: &str) -> bool {
+    if dll_name.eq_ignore_ascii_case("kernel32.dll") {
+        return matches!(
+            fn_name,
+            "GlobalAlloc"
+                | "GlobalReAlloc"
+                | "GlobalFree"
+                | "GlobalLock"
+                | "GlobalUnlock"
+                | "GlobalHandle"
+                | "GlobalSize"
+                | "GlobalFlags"
+                | "LocalAlloc"
+                | "LocalReAlloc"
+                | "LocalFree"
+                | "LocalLock"
+                | "LocalUnlock"
+                | "LocalHandle"
+                | "LocalSize"
+                | "LocalFlags"
+                | "MultiByteToWideChar"
+                | "WideCharToMultiByte"
+        );
+    }
+    if dll_name.eq_ignore_ascii_case("kernelbase.dll") {
+        return matches!(fn_name, "MultiByteToWideChar" | "WideCharToMultiByte");
+    }
+    false
 }
 
 unsafe fn cstr<'a>(p: *const u8) -> &'a str {

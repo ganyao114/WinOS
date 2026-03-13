@@ -2,6 +2,7 @@
 // This layer owns generic syscall dispatch and post-trap scheduling policy.
 
 use crate::hypercall;
+use crate::mm::UserVa;
 use crate::sched::{
     current_tid, drain_deferred_kstacks, enter_kernel_continuation_noreturn,
     execute_kernel_continuation_switch, scheduler_round_locked, set_current_tid,
@@ -19,7 +20,8 @@ use super::constants::{
 use super::sysno;
 use super::sysno_table::{lookup, NtHandlerId, HANDLER_NONE};
 use super::{
-    file, memory, object, process, registry, section, sync, system, thread, token, win32k, SvcFrame,
+    file, loader, memory, object, process, registry, section, sync, system, thread, token, win32k,
+    SvcFrame,
 };
 
 static SYSCALL_ERR_TRACE_BUDGET: AtomicU32 = AtomicU32::new(512);
@@ -54,6 +56,13 @@ static USER_IRQ_REPEAT_COUNT: [AtomicU32; 8] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
 ];
+static BAD_USER_SP_TRACE_BUDGET: AtomicU32 = AtomicU32::new(32);
+const TRACE_SYSTEM_INFO_CLASS_FIRMWARE_TABLE: u32 = 76;
+
+#[derive(Clone, Copy)]
+struct SyscallTraceContext {
+    query_system_information_class: Option<u32>,
+}
 
 #[inline]
 fn trace_repeated_user_irq_pc(vid: usize, tid: u32, frame: &SvcFrame) {
@@ -89,6 +98,56 @@ fn trace_repeated_user_irq_pc(vid: usize, tid: u32, frame: &SvcFrame) {
         frame.x[1],
         crate::arch::mmu::current_user_table_root(),
     );
+}
+
+#[inline]
+fn trace_bad_user_sp(frame: &SvcFrame, nr: u16, table: u8, cur: u32) {
+    if cur == 0 {
+        return;
+    }
+    let Some((pid, stack_base, stack_size, teb_va)) =
+        with_thread(cur, |t| (t.pid, t.stack_base, t.stack_size, t.teb_va))
+    else {
+        return;
+    };
+    let stack_limit = stack_base.saturating_sub(stack_size);
+    let sp = frame.user_sp();
+    if sp >= stack_limit && sp < stack_base {
+        return;
+    }
+    if BAD_USER_SP_TRACE_BUDGET
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+        .is_err()
+    {
+        return;
+    }
+    crate::kwarn!(
+        "svc_bad_sp: pid={} tid={} nr={:#x} table={} pc={:#x} lr={:#x} sp={:#x} stack_limit={:#x} stack_base={:#x} teb={:#x}",
+        pid,
+        cur,
+        nr,
+        table,
+        frame.program_counter(),
+        frame.x[30],
+        sp,
+        stack_limit,
+        stack_base,
+        teb_va
+    );
+    if let Some(info) = crate::mm::vm_query_region(pid, UserVa::new(sp)) {
+        crate::kwarn!(
+            "svc_bad_sp_region: pid={} tid={} base={:#x} size={:#x} alloc_base={:#x} alloc_prot={:#x} prot={:#x} state={:#x} type={:#x}",
+            pid,
+            cur,
+            info.base.get(),
+            info.size,
+            info.allocation_base.get(),
+            info.allocation_prot,
+            info.prot,
+            info.state,
+            info.mem_type
+        );
+    }
 }
 
 struct TrapSchedGuard {
@@ -146,7 +205,10 @@ pub extern "C" fn syscall_dispatch(frame: &mut SvcFrame) {
     let tag = frame.x8_orig;
     let nr = (tag & SVC_TAG_NR_MASK) as u16;
     let table = ((tag >> SVC_TAG_TABLE_SHIFT) & SVC_TAG_TABLE_MASK) as u8;
-    crate::log::debug_u64(0xE200_0000 | ((table as u64) << 12) | nr as u64);
+    trace_bad_user_sp(frame, nr, table, cur);
+    if crate::log::log_enabled(crate::log::LogLevel::Trace) {
+        crate::log::debug_u64(0xE200_0000 | ((table as u64) << 12) | nr as u64);
+    }
 
     if table != 0 {
         if table == 1 {
@@ -158,17 +220,25 @@ pub extern "C" fn syscall_dispatch(frame: &mut SvcFrame) {
         return;
     }
 
+    if nr == sysno::WINEMU_LOAD_DLL {
+        loader::handle_load_dll(frame);
+        schedule_from_trap(frame, true, true, 0, ScheduleReason::UnlockEdge);
+        return;
+    }
+
     let handler_id = lookup(nr);
     let is_delay_execution = handler_id == NtHandlerId::DelayExecution as u8
         || (handler_id == NtHandlerId::ResetEvent as u8
             && system::should_dispatch_delay_execution(frame));
+    let trace_ctx = capture_syscall_trace_context(handler_id, frame);
     if handler_id == HANDLER_NONE {
         forward_to_vmm(frame, nr, table);
     } else {
         dispatch_nt_handler(frame, handler_id);
     }
 
-    trace_syscall_error(nr, table, frame);
+    trace_syscall_error(handler_id, trace_ctx, nr, table, frame);
+    trace_bad_user_sp(frame, nr, table, cur);
     let sched_reason = schedule_reason_for_handler(handler_id, frame, cur, is_delay_execution);
     schedule_from_trap(frame, true, true, 0, sched_reason);
 }
@@ -321,12 +391,64 @@ fn schedule_reason_for_handler(
     ScheduleReason::UnlockEdge
 }
 
-fn trace_syscall_error(nr: u16, table: u8, frame: &SvcFrame) {
+fn capture_syscall_trace_context(handler_id: u8, frame: &SvcFrame) -> SyscallTraceContext {
+    let query_system_information_class = if handler_id == NtHandlerId::QuerySystemInformation as u8
+    {
+        Some(frame.x[0] as u32)
+    } else {
+        None
+    };
+    SyscallTraceContext {
+        query_system_information_class,
+    }
+}
+
+fn should_suppress_syscall_error(
+    handler_id: u8,
+    trace_ctx: SyscallTraceContext,
+    status: u32,
+) -> bool {
+    use NtHandlerId::*;
+
+    if status == winemu_shared::status::OBJECT_NAME_NOT_FOUND
+        && (handler_id == OpenKey as u8
+            || handler_id == OpenKeyEx as u8
+            || handler_id == QueryValueKey as u8)
+    {
+        return true;
+    }
+
+    if status == winemu_shared::status::BUFFER_TOO_SMALL
+        && handler_id == QuerySystemInformation as u8
+        && trace_ctx.query_system_information_class == Some(TRACE_SYSTEM_INFO_CLASS_FIRMWARE_TABLE)
+    {
+        return true;
+    }
+
+    if status == crate::sched::sync::primitives_api::STATUS_MUTANT_NOT_OWNED
+        && handler_id == ReleaseMutant as u8
+    {
+        return true;
+    }
+
+    false
+}
+
+fn trace_syscall_error(
+    handler_id: u8,
+    trace_ctx: SyscallTraceContext,
+    nr: u16,
+    table: u8,
+    frame: &SvcFrame,
+) {
     if table != 0 {
         return;
     }
     let status = frame.x[0] as u32;
     if status < 0xC000_0000 {
+        return;
+    }
+    if should_suppress_syscall_error(handler_id, trace_ctx, status) {
         return;
     }
     let remain = SYSCALL_ERR_TRACE_BUDGET.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -346,6 +468,16 @@ fn trace_syscall_error(nr: u16, table: u8, frame: &SvcFrame) {
         frame.program_counter(),
         frame.x[30]
     );
+    if handler_id == NtHandlerId::QueryVirtualMemory as u8 {
+        crate::kerror!(
+            "nt: NtQueryVirtualMemory args addr={:#x} class={:#x} buf={:#x} len={:#x} ret_len_ptr={:#x}",
+            frame.x[1],
+            frame.x[2],
+            frame.x[3],
+            frame.x[4],
+            frame.x[5]
+        );
+    }
 }
 
 fn save_ctx_for(tid: u32, frame: &SvcFrame) {
@@ -567,6 +699,7 @@ pub extern "C" fn user_irq_dispatch(frame: &mut SvcFrame) {
     let interrupted_user = crate::arch::trap::interrupted_user_mode(frame);
     if interrupted_user {
         trace_repeated_user_irq_pc(vid, cur, frame);
+        trace_bad_user_sp(frame, 0xffff, 0xff, cur);
     }
     if in_nested_trap_sched || !interrupted_user {
         set_needs_reschedule();

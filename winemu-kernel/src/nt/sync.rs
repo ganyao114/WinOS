@@ -6,6 +6,7 @@ use crate::sched::sync::{
 };
 use crate::sched::types::WaitDeadline;
 use crate::sched::wait::{timeout_to_deadline, STATUS_SUCCESS};
+use core::sync::atomic::{AtomicU32, Ordering};
 use winemu_shared::status;
 
 use super::common::GuestWriter;
@@ -22,6 +23,7 @@ const ACCESS_MASK_MUTEX: u32 = 0x001F_0001;
 const ACCESS_MASK_SEMAPHORE: u32 = 0x001F_0003;
 
 const OBJ_OPENIF: u32 = 0x80;
+static WAIT_TRACE_BUDGET: AtomicU32 = AtomicU32::new(128);
 
 // ── OA name helpers ───────────────────────────────────────────────────────────
 
@@ -108,6 +110,76 @@ fn publish_created_handle(out_ptr: UserOutPtr<u64>, handle: u64) -> Result<(), u
         let _ = super::kobject::close_handle_for_current(handle);
         Err(status::INVALID_PARAMETER)
     }
+}
+
+fn trace_wait_single(handle: u64, deadline: WaitDeadline, result: u32) {
+    if !crate::log::log_enabled(crate::log::LogLevel::Trace) {
+        return;
+    }
+    if WAIT_TRACE_BUDGET
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+        .is_err()
+    {
+        return;
+    }
+    crate::log::debug_print("nt: WaitSingle tid=");
+    crate::log::debug_u64(crate::sched::current_tid() as u64);
+    crate::log::debug_print(" pid=");
+    crate::log::debug_u64(current_pid() as u64);
+    crate::log::debug_print(" handle=");
+    crate::log::debug_u64(handle);
+    crate::log::debug_print(" deadline=");
+    crate::log::debug_u64(deadline.to_ticks());
+    if let Some((kind, obj_idx)) = super::kobject::resolve_handle_target(handle) {
+        crate::log::debug_print(" kind=");
+        crate::log::debug_u64(kind as u64);
+        crate::log::debug_print(" obj_idx=");
+        crate::log::debug_u64(obj_idx as u64);
+    } else {
+        crate::log::debug_print(" kind=<unresolved>");
+    }
+    crate::log::debug_print(" result=");
+    crate::log::debug_u64(result as u64);
+    crate::log::debug_print("\n");
+}
+
+fn trace_wait_multiple(handles: &[u64], wait_all: bool, deadline: WaitDeadline, result: u32) {
+    if !crate::log::log_enabled(crate::log::LogLevel::Trace) {
+        return;
+    }
+    if WAIT_TRACE_BUDGET
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+        .is_err()
+    {
+        return;
+    }
+    crate::log::debug_print("nt: WaitMultiple tid=");
+    crate::log::debug_u64(crate::sched::current_tid() as u64);
+    crate::log::debug_print(" pid=");
+    crate::log::debug_u64(current_pid() as u64);
+    crate::log::debug_print(" count=");
+    crate::log::debug_u64(handles.len() as u64);
+    crate::log::debug_print(" wait_all=");
+    crate::log::debug_u64(wait_all as u64);
+    crate::log::debug_print(" deadline=");
+    crate::log::debug_u64(deadline.to_ticks());
+    crate::log::debug_print(" result=");
+    crate::log::debug_u64(result as u64);
+    let limit = core::cmp::min(handles.len(), 4);
+    for (idx, handle) in handles.iter().take(limit).enumerate() {
+        crate::log::debug_print(" h[");
+        crate::log::debug_u64(idx as u64);
+        crate::log::debug_print("]=");
+        crate::log::debug_u64(*handle);
+        if let Some((kind, obj_idx)) = super::kobject::resolve_handle_target(*handle) {
+            crate::log::debug_print("(");
+            crate::log::debug_u64(kind as u64);
+            crate::log::debug_print(",");
+            crate::log::debug_u64(obj_idx as u64);
+            crate::log::debug_print(")");
+        }
+    }
+    crate::log::debug_print("\n");
 }
 
 // x0 = EventHandle* (out), x1 = DesiredAccess, x2 = ObjectAttributes*
@@ -200,7 +272,9 @@ pub(crate) fn handle_reset_event_or_delay(frame: &mut SvcFrame) {
 pub(crate) fn handle_wait_single(frame: &mut SvcFrame) {
     let h = frame.x[0];
     let timeout = parse_timeout(UserInPtr::from_raw(frame.x[2] as *const i64));
-    frame.x[0] = wait_for_single_object(h, timeout) as u64;
+    let st = wait_for_single_object(h, timeout);
+    trace_wait_single(h, timeout, st);
+    frame.x[0] = st as u64;
 }
 
 pub(crate) fn handle_wait_multiple(frame: &mut SvcFrame) {
@@ -229,7 +303,9 @@ pub(crate) fn handle_wait_multiple(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
-    frame.x[0] = wait_for_multiple_objects(&handles[..count], wait_all, timeout) as u64;
+    let st = wait_for_multiple_objects(&handles[..count], wait_all, timeout);
+    trace_wait_multiple(&handles[..count], wait_all, timeout, st);
+    frame.x[0] = st as u64;
 }
 
 // x0 = MutantHandle* (out), x1 = DesiredAccess, x2 = ObjAttr*, x3 = InitialOwner
@@ -307,7 +383,35 @@ pub(crate) fn handle_release_mutant_or_set_information_process(frame: &mut SvcFr
         super::process::handle_set_information_process(frame);
         return;
     }
-    frame.x[0] = release_mutex(frame.x[0]) as u64;
+    let handle = frame.x[0];
+    let st = release_mutex(handle);
+    if st != status::SUCCESS
+        && st != crate::sched::sync::primitives_api::STATUS_MUTANT_NOT_OWNED
+    {
+        crate::log::debug_print("nt: ReleaseMutant failed handle=");
+        crate::log::debug_u64(handle);
+        crate::log::debug_print(" st=");
+        crate::log::debug_u64(st as u64);
+        crate::log::debug_print(" current_tid=");
+        crate::log::debug_u64(crate::sched::current_tid() as u64);
+        if let Some((kind, obj_idx)) = super::kobject::resolve_handle_target(handle) {
+            crate::log::debug_print(" kind=");
+            crate::log::debug_u64(kind as u64);
+            crate::log::debug_print(" obj_idx=");
+            crate::log::debug_u64(obj_idx as u64);
+            if kind == KObjectKind::Mutex {
+                if let Some(SyncObject::Mutex(m)) = crate::sched::sync::state::sync_get_by_idx(obj_idx)
+                {
+                    crate::log::debug_print(" owner_tid=");
+                    crate::log::debug_u64(m.owner_tid as u64);
+                    crate::log::debug_print(" recursion=");
+                    crate::log::debug_u64(m.recursion as u64);
+                }
+            }
+        }
+        crate::log::debug_print("\n");
+    }
+    frame.x[0] = st as u64;
 }
 
 // x0 = SemaphoreHandle* (out), x1 = DesiredAccess, x2 = ObjAttr*

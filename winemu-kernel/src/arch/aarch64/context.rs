@@ -127,8 +127,8 @@ pub fn restore_user_context_record(frame: &mut SvcFrame, context: &[u8]) -> bool
         return false;
     }
 
-    // Guest CONTEXT layout:
-    // ContextFlags(4)+pad(4)+X0..X28(29x8)+Fp(8)+Lr(8)+Sp(8)+Pc(8)+Cpsr(4)+pad(4)
+    // Guest ARM64 CONTEXT layout matches guest/ntdll/src/exception.c:
+    // ContextFlags(4), Cpsr(4), X0..X30(31x8), Sp(8), Pc(8), ...
     let read_u64 = |off: usize| -> u64 {
         let bytes = &context[off..off + 8];
         u64::from_le_bytes(bytes.try_into().unwrap())
@@ -138,12 +138,12 @@ pub fn restore_user_context_record(frame: &mut SvcFrame, context: &[u8]) -> bool
         u32::from_le_bytes(bytes.try_into().unwrap())
     };
 
-    for i in 0u64..19 {
+    for i in 0u64..31 {
         frame.x[i as usize] = read_u64(8 + i as usize * 8);
     }
-    frame.set_program_counter(read_u64(256));
-    frame.set_user_sp(read_u64(248));
-    frame.set_processor_state(read_u32(264) as u64);
+    frame.set_user_sp(read_u64(256));
+    frame.set_program_counter(read_u64(264));
+    frame.set_processor_state(read_u32(4) as u64);
     true
 }
 

@@ -1,4 +1,5 @@
 // Table 0 = Nt*, Table 1 = Win32k.
+pub const WINEMU_LOAD_DLL: u16 = 0x0F00;
 pub const CREATE_EVENT: u16 = 0x0048;
 pub const SET_INFORMATION_THREAD: u16 = 0x000D;
 pub const DELETE_KEY: u16 = 0x000C;

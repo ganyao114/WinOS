@@ -5,6 +5,7 @@ pub enum FsError {
     NotFound,
     InvalidHandle,
     IoError,
+    AlreadyExists,
     NoMemory,
     Unsupported,
 }

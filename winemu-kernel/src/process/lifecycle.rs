@@ -213,7 +213,7 @@ pub fn destroy_unpublished_process(pid: u32) {
 }
 
 pub fn on_thread_created(pid: u32, tid: u32) {
-    let _ = with_process_mut(pid, |p| {
+    let thread_count = with_process_mut(pid, |p| {
         p.thread_count = p.thread_count.saturating_add(1);
         if p.main_thread_tid == 0 {
             p.main_thread_tid = tid;
@@ -221,11 +221,18 @@ pub fn on_thread_created(pid: u32, tid: u32) {
         if p.state == ProcessState::Creating {
             p.state = ProcessState::Running;
         }
+        p.thread_count
     });
+    crate::ktrace!(
+        "proc: thread created pid={} tid={} count={:?}",
+        pid,
+        tid,
+        thread_count
+    );
 }
 
 pub fn on_thread_terminated(pid: u32, tid: u32) {
-    let _ = with_process_mut(pid, |p| {
+    let (thread_count, main_thread_tid, state) = with_process_mut(pid, |p| {
         if p.thread_count > 0 {
             p.thread_count -= 1;
         }
@@ -235,7 +242,17 @@ pub fn on_thread_terminated(pid: u32, tid: u32) {
         if p.thread_count == 0 {
             p.state = ProcessState::Terminated;
         }
-    });
+        (p.thread_count, p.main_thread_tid, p.state as u32)
+    })
+    .unwrap_or((u32::MAX, u32::MAX, u32::MAX));
+    crate::ktrace!(
+        "proc: thread terminated pid={} tid={} count={} main_tid={} state={}",
+        pid,
+        tid,
+        thread_count,
+        main_thread_tid,
+        state
+    );
     finalize_process_if_no_threads(pid);
 }
 
@@ -252,9 +269,9 @@ pub fn terminate_process(pid: u32, exit_status: u32) -> u32 {
     });
 
     crate::nt::file::cancel_pending_dir_notify_for_pid(pid);
-    crate::nt::state::cleanup_process_owned_resources(pid);
 
     let tids = crate::sched::thread_ids_by_pid(pid);
+    crate::ktrace!("proc: terminate pid={} exit_status={:#x} tids={:?}", pid, exit_status, tids);
     for tid in tids {
         let _ = crate::sched::terminate_thread_by_tid(tid);
     }
@@ -298,6 +315,7 @@ fn finalize_process_if_no_threads(pid: u32) {
     let Some(thread_count) = with_process(pid, |p| p.thread_count) else {
         return;
     };
+    crate::ktrace!("proc: finalize check pid={} count={}", pid, thread_count);
     if thread_count != 0 {
         return;
     }

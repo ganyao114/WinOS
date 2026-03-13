@@ -6,9 +6,9 @@ use crate::hypercall;
 use crate::hypercall::HostCallCompletion;
 
 use super::super::device::{
-    FsDeviceIoctlRequest, FsDeviceIoctlSubmit, FsIoctlOutput, WinEmuHostcallRequest,
-    WinEmuHostcallResponse, IOCTL_WINEMU_HOSTCALL_SYNC, IOCTL_WINEMU_HOST_PING,
-    WINEMU_HOSTCALL_PACKET_VERSION,
+    FsDeviceIoctlRequest, FsDeviceIoctlSubmit, FsIoctlOutput, IOCTL_WINEMU_HOST_PING,
+    IOCTL_WINEMU_HOSTCALL_SYNC, WINEMU_HOSTCALL_PACKET_VERSION, WinEmuHostcallRequest,
+    WinEmuHostcallResponse,
 };
 use super::super::types::{FsError, FsFileInfo};
 

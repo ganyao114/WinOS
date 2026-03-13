@@ -2,37 +2,37 @@ mod async_io;
 mod backing;
 pub mod bootstrap;
 mod devfs;
-mod dir;
 pub mod device;
+mod dir;
 mod file;
 mod hostfs;
 mod namespace;
 mod notify;
 mod object;
-pub(crate) mod path;
 mod pager;
+pub(crate) mod path;
 pub mod types;
 mod volume;
 
+pub(crate) use async_io::FsAsyncCompletion;
 #[allow(unused_imports)]
 pub use device::{
-    FsDeviceIoctlRequest, FsDeviceIoctlSubmit, FsIoctlOutput, WinEmuHostcallRequest,
-    WinEmuHostcallResponse, IOCTL_WINEMU_HOSTCALL_SYNC, IOCTL_WINEMU_HOST_PING,
+    FsDeviceIoctlRequest, FsDeviceIoctlSubmit, FsIoctlOutput, IOCTL_WINEMU_HOST_PING,
+    IOCTL_WINEMU_HOSTCALL_SYNC, WinEmuHostcallRequest, WinEmuHostcallResponse,
 };
 #[allow(unused_imports)]
 pub use dir::{readdir, readdir_std};
+pub(crate) use file::file_name_utf16;
+pub(crate) use file::file_ref_count;
+pub(crate) use file::retain_file;
 #[allow(unused_imports)]
 pub use file::{
-    close, file_kind, file_size, open, open_readonly, query_info, query_path_info,
+    close, create_dir, file_kind, file_size, open, open_readonly, query_info, query_path_info,
     query_standard_info, query_std_standard_info, read_at, read_at_phys, read_exact_at,
-    read_exact_at_phys, read_std_at_phys, write_at_phys, write_std_at_phys,
+    read_exact_at_phys, read_std_at_phys, seek, set_len, write_at_phys, write_std_at_phys,
 };
-pub(crate) use file::file_name_utf16;
 #[allow(unused_imports)]
 pub use notify::notify_dir;
-pub(crate) use async_io::FsAsyncCompletion;
-pub(crate) use file::retain_file;
-pub(crate) use file::file_ref_count;
 pub(crate) use types::FsBackingHandle;
 #[allow(unused_imports)]
 pub use types::{
@@ -42,8 +42,8 @@ pub use types::{
 };
 #[allow(unused_imports)]
 pub use volume::{
-    query_volume_attribute_info, query_volume_device_info, query_volume_size_info,
     FsVolumeAttributeInfo, FsVolumeDeviceInfo, FsVolumeSizeInfo, FsVolumeTarget,
+    query_volume_attribute_info, query_volume_device_info, query_volume_size_info,
 };
 
 pub fn device_io_control(req: FsDeviceIoctlRequest) -> Result<FsDeviceIoctlSubmit, FsError> {
@@ -81,6 +81,15 @@ pub(crate) fn pager_read_into_phys(
     len: usize,
 ) -> Result<usize, FsError> {
     pager::read_into_phys(backing, file_off, dst, len)
+}
+
+pub(crate) fn pager_write_from_phys(
+    backing: FsBackingHandle,
+    file_off: u64,
+    src: crate::mm::PhysAddr,
+    len: usize,
+) -> Result<usize, FsError> {
+    pager::write_from_phys(backing, file_off, src, len)
 }
 
 fn complete_async_device_io_control(cpl: crate::hypercall::HostCallCompletion) -> FsIoctlOutput {

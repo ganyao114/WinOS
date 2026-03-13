@@ -79,6 +79,10 @@ pub(crate) fn open(req: &FsOpenRequest<'_>) -> Result<u32, FsError> {
     alloc_host_file(fd, 0)
 }
 
+pub(crate) fn create_dir(path: &str) -> Result<(), FsError> {
+    crate::hypercall::host_mkdir(path)
+}
+
 pub(crate) fn import_existing(fd: u64, size_hint: u64) -> Result<u32, FsError> {
     if fd == u64::MAX {
         return Err(FsError::InvalidHandle);
@@ -142,6 +146,31 @@ pub(crate) fn query_info(id: u32) -> Result<FsFileInfo, FsError> {
         size
     };
     Ok(FsFileInfo { size })
+}
+
+pub(crate) fn seek(id: u32, offset: i64, whence: u32) -> Result<u64, FsError> {
+    let ptr = files_mut().get_ptr(id);
+    if ptr.is_null() {
+        return Err(FsError::InvalidHandle);
+    }
+    // SAFETY: object store returns a stable live pointer for this id.
+    let entry = unsafe { &mut *ptr };
+    crate::hypercall::host_seek(entry.fd, offset, whence).ok_or(FsError::IoError)
+}
+
+pub(crate) fn set_len(id: u32, len: u64) -> Result<(), FsError> {
+    let ptr = files_mut().get_ptr(id);
+    if ptr.is_null() {
+        return Err(FsError::InvalidHandle);
+    }
+    // SAFETY: object store returns a stable live pointer for this id.
+    let entry = unsafe { &mut *ptr };
+    if crate::hypercall::host_set_len(entry.fd, len) {
+        entry.size_hint = len;
+        Ok(())
+    } else {
+        Err(FsError::IoError)
+    }
 }
 
 pub(crate) fn read_at(id: u32, dst: *mut u8, len: usize, offset: u64) -> Result<usize, FsError> {
@@ -221,19 +250,12 @@ pub(crate) fn readdir_std(
     restart: bool,
 ) -> Result<Option<FsDirEntry>, FsError> {
     let mut name_buf = [0u8; 512];
-    let packed = hypercall::host_readdir(
-        std_fd(std),
-        name_buf.as_mut_ptr(),
-        name_buf.len(),
-        restart,
-    );
+    let packed =
+        hypercall::host_readdir(std_fd(std), name_buf.as_mut_ptr(), name_buf.len(), restart);
     decode_dir_entry(packed, &name_buf)
 }
 
-fn decode_notify_record(
-    packed: u64,
-    name_buf: &[u8],
-) -> Result<Option<FsNotifyRecord>, FsError> {
+fn decode_notify_record(packed: u64, name_buf: &[u8]) -> Result<Option<FsNotifyRecord>, FsError> {
     if packed == u64::MAX {
         return Err(FsError::IoError);
     }
@@ -273,7 +295,9 @@ pub(crate) fn submit_async_read(
     len: usize,
     offset: u64,
 ) -> Result<crate::hostcall::SubmitOutcome, u32> {
-    let fd = host_file(id).map_err(|_| winemu_shared::status::INVALID_HANDLE)?.fd;
+    let fd = host_file(id)
+        .map_err(|_| winemu_shared::status::INVALID_HANDLE)?
+        .fd;
     crate::hostcall::submit_tracked(
         owner_pid,
         waiter_tid,
@@ -297,7 +321,9 @@ pub(crate) fn submit_async_write(
     len: usize,
     offset: u64,
 ) -> Result<crate::hostcall::SubmitOutcome, u32> {
-    let fd = host_file(id).map_err(|_| winemu_shared::status::INVALID_HANDLE)?.fd;
+    let fd = host_file(id)
+        .map_err(|_| winemu_shared::status::INVALID_HANDLE)?
+        .fd;
     crate::hostcall::submit_tracked(
         owner_pid,
         waiter_tid,
@@ -322,7 +348,9 @@ pub(crate) fn submit_async_notify_dir(
     watch_tree: bool,
     completion_filter: u32,
 ) -> Result<crate::hostcall::SubmitOutcome, u32> {
-    let fd = host_file(id).map_err(|_| winemu_shared::status::INVALID_HANDLE)?.fd;
+    let fd = host_file(id)
+        .map_err(|_| winemu_shared::status::INVALID_HANDLE)?
+        .fd;
     let mut notify_opts = completion_filter as u64;
     if watch_tree {
         notify_opts |= 1u64 << 63;

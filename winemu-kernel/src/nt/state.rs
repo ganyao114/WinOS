@@ -50,6 +50,7 @@ struct GuestView {
     owner_pid: u32,
     base: u64,
     size: u64,
+    section_idx: u32,
 }
 
 struct NtState {
@@ -162,12 +163,13 @@ pub(crate) fn section_free(idx: u32) -> bool {
 
 // ─── View 管理 ───────────────────────────────────────────────────────────────
 
-pub(crate) fn view_alloc(owner_pid: u32, base: u64, size: u64) -> bool {
+pub(crate) fn view_alloc(owner_pid: u32, base: u64, size: u64, section_idx: u32) -> bool {
     views_store_mut()
         .alloc_with(|_| GuestView {
             owner_pid,
             base,
             size,
+            section_idx,
         })
         .is_some()
 }
@@ -183,7 +185,17 @@ pub(crate) fn view_free(owner_pid: u32, base: u64) -> bool {
     if id == 0 {
         return false;
     }
-    store.free(id)
+    let ptr = store.get_ptr(id);
+    if ptr.is_null() {
+        return false;
+    }
+    // SAFETY: pointer comes from the live view store entry.
+    let section_idx = unsafe { (*ptr).section_idx };
+    let freed = store.free(id);
+    if freed && section_idx != 0 {
+        let _ = section_free(section_idx);
+    }
+    freed
 }
 
 // ─── 进程资源清理 ─────────────────────────────────────────────────────────────
@@ -192,6 +204,7 @@ pub(crate) fn cleanup_process_owned_resources(owner_pid: u32) {
     if owner_pid == 0 {
         return;
     }
+    crate::ktrace!("proc: cleanup resources pid={}", owner_pid);
 
     let mut view_ids = Vec::new();
     views_store_mut().for_each_live_ptr(|id, ptr| unsafe {
@@ -201,7 +214,17 @@ pub(crate) fn cleanup_process_owned_resources(owner_pid: u32) {
         }
     });
     for id in view_ids {
-        let _ = views_store_mut().free(id);
+        let store = views_store_mut();
+        let ptr = store.get_ptr(id);
+        if ptr.is_null() {
+            continue;
+        }
+        // SAFETY: pointer comes from the live view store entry.
+        let section_idx = unsafe { (*ptr).section_idx };
+        let freed = store.free(id);
+        if freed && section_idx != 0 {
+            let _ = section_free(section_idx);
+        }
     }
 
     // Cleanup VM regions owned by KProcess.vm

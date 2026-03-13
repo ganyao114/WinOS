@@ -11,10 +11,20 @@ use crate::mm::{
     vm_commit_private, vm_decommit_private, vm_protect_range, vm_query_region, vm_release_private,
     vm_reserve_private, UserVa, VM_ACCESS_WRITE,
 };
+use core::sync::atomic::{AtomicU32, Ordering};
 
 const PAGE_SIZE_4K: u64 = 0x1000;
 const USER_VA_BASE: u64 = crate::process::USER_VA_BASE;
 const USER_VA_LIMIT: u64 = crate::process::USER_VA_LIMIT;
+const MEMORY_BASIC_INFORMATION_CLASS: u32 = 0;
+const MEMORY_WINE_UNIX_FUNCS_CLASS: u32 = 1000;
+const MEMORY_WINE_UNIX_WOW64_FUNCS_CLASS: u32 = 1001;
+const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
+const WINE_UNIX_FUNCS_EXPORT: &str = "__wine_unix_call_funcs";
+const WINE_UNIX_WOW64_FUNCS_EXPORT: &str = "__wine_unix_call_wow64_funcs";
+static TRACE_PRIVATE_ALLOC_4K_BUDGET: AtomicU32 = AtomicU32::new(128);
+
 fn read_user_u64(pid: u32, user_ptr: UserOutPtr<u64>) -> Option<u64> {
     user_ptr.read_for_pid(pid)
 }
@@ -25,6 +35,59 @@ fn write_user_u64(pid: u32, user_ptr: UserOutPtr<u64>, value: u64) -> bool {
 
 fn write_user_u32(pid: u32, user_ptr: UserOutPtr<u32>, value: u32) -> bool {
     user_ptr.write_for_pid(pid, value)
+}
+
+#[inline]
+fn trace_private_alloc_4k(
+    frame: &SvcFrame,
+    target_pid: u32,
+    base: u64,
+    size: u64,
+    alloc_type: u32,
+    prot: u32,
+) {
+    if target_pid != 1 || size != PAGE_SIZE_4K {
+        return;
+    }
+    if TRACE_PRIVATE_ALLOC_4K_BUDGET
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+        .is_err()
+    {
+        return;
+    }
+    crate::kdebug!(
+        "nt: alloc4k pid={} tid={} base={:#x} size={:#x} type={:#x} prot={:#x} pc={:#x} lr={:#x} sp={:#x}",
+        target_pid,
+        crate::sched::current_tid(),
+        base,
+        size,
+        alloc_type,
+        prot,
+        frame.program_counter(),
+        frame.x[30],
+        frame.user_sp()
+    );
+    let mut lr_matched = false;
+    crate::dll::for_each_loaded(|name, dll_base, dll_size, entry| {
+        if lr_matched || dll_size == 0 {
+            return;
+        }
+        let end = dll_base.saturating_add(dll_size as u64);
+        if frame.x[30] < dll_base || frame.x[30] >= end {
+            return;
+        }
+        lr_matched = true;
+        crate::kdebug!(
+            "nt: alloc4k_lr_module pid={} tid={} addr={:#x} module={} base={:#x} size={:#x} entry={:#x}",
+            target_pid,
+            crate::sched::current_tid(),
+            frame.x[30],
+            name,
+            dll_base,
+            dll_size,
+            entry
+        );
+    });
 }
 
 // NtAllocateVirtualMemory:
@@ -114,6 +177,7 @@ pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
             frame.x[0] = status::INVALID_PARAMETER as u64;
             return;
         }
+        trace_private_alloc_4k(frame, target_pid, base, size, alloc_type, prot);
         if base < USER_VA_BASE || base >= USER_VA_LIMIT {
             crate::log::debug_u64(0xE215_E00B);
             crate::log::debug_u64(base);
@@ -144,6 +208,7 @@ pub(crate) fn handle_allocate_virtual_memory(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
+    trace_private_alloc_4k(frame, target_pid, req_base, size, alloc_type, prot);
     if req_base < USER_VA_BASE || req_base >= USER_VA_LIMIT {
         crate::log::debug_u64(0xE215_E00C);
         crate::log::debug_u64(req_base);
@@ -277,14 +342,6 @@ pub(crate) fn handle_query_virtual_memory(frame: &mut SvcFrame) {
     let buf = frame.x[3] as *mut u8;
     let buf_len = frame.x[4] as usize;
     let ret_len_ptr = UserOutPtr::from_raw(frame.x[5] as *mut u64);
-    if info_class != 0 {
-        frame.x[0] = status::INVALID_PARAMETER as u64;
-        return;
-    }
-    if buf_len < 48 || buf.is_null() {
-        frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
-        return;
-    }
     let caller_pid = crate::process::current_pid();
     if caller_pid == 0 {
         frame.x[0] = status::INVALID_PARAMETER as u64;
@@ -294,9 +351,16 @@ pub(crate) fn handle_query_virtual_memory(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     };
-    if !ensure_user_range_access(caller_pid, UserVa::new(buf as u64), 48, VM_ACCESS_WRITE) {
-        frame.x[0] = status::INVALID_PARAMETER as u64;
-        return;
+    if info_class != MEMORY_BASIC_INFORMATION_CLASS {
+        crate::ktrace!(
+            "nt: NtQueryVirtualMemory class={} addr={:#x} buf={:#x} len={:#x} caller_pid={} target_pid={}",
+            info_class,
+            addr,
+            buf as u64,
+            buf_len,
+            caller_pid,
+            target_pid
+        );
     }
     if !ret_len_ptr.is_null()
         && !ensure_user_range_access(
@@ -306,6 +370,93 @@ pub(crate) fn handle_query_virtual_memory(frame: &mut SvcFrame) {
             VM_ACCESS_WRITE,
         )
     {
+        frame.x[0] = status::INVALID_PARAMETER as u64;
+        return;
+    }
+    match info_class {
+        MEMORY_BASIC_INFORMATION_CLASS => {}
+        MEMORY_WINE_UNIX_FUNCS_CLASS | MEMORY_WINE_UNIX_WOW64_FUNCS_CLASS => {
+            if target_pid != caller_pid {
+                frame.x[0] = status::INVALID_HANDLE as u64;
+                return;
+            }
+            if buf.is_null() || buf_len != core::mem::size_of::<u64>() {
+                frame.x[0] = status::INFO_LENGTH_MISMATCH as u64;
+                return;
+            }
+            if !ensure_user_range_access(
+                caller_pid,
+                UserVa::new(buf as u64),
+                core::mem::size_of::<u64>(),
+                VM_ACCESS_WRITE,
+            ) {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            }
+
+            let export_name = if info_class == MEMORY_WINE_UNIX_WOW64_FUNCS_CLASS {
+                WINE_UNIX_WOW64_FUNCS_EXPORT
+            } else {
+                WINE_UNIX_FUNCS_EXPORT
+            };
+            let Some(module_base) = crate::dll::find_loaded_base_for_addr(addr) else {
+                crate::kdebug!(
+                    "nt: NtQueryVirtualMemory wine-unix module-miss class={} addr={:#x}",
+                    info_class,
+                    addr
+                );
+                frame.x[0] = STATUS_DLL_NOT_FOUND as u64;
+                return;
+            };
+            let Some(handle) = crate::dll::resolve_loaded_export(module_base, export_name) else {
+                let null_handle = 0u64;
+                if !copy_to_process_user(
+                    caller_pid,
+                    UserVa::new(buf as u64),
+                    (&null_handle as *const u64).cast(),
+                    core::mem::size_of::<u64>(),
+                ) {
+                    frame.x[0] = status::INVALID_PARAMETER as u64;
+                    return;
+                }
+                if !ret_len_ptr.is_null()
+                    && !write_user_u64(caller_pid, ret_len_ptr, core::mem::size_of::<u64>() as u64)
+                {
+                    frame.x[0] = status::INVALID_PARAMETER as u64;
+                    return;
+                }
+                frame.x[0] = status::SUCCESS as u64;
+                return;
+            };
+            if !copy_to_process_user(
+                caller_pid,
+                UserVa::new(buf as u64),
+                (&handle as *const u64).cast(),
+                core::mem::size_of::<u64>(),
+            ) {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            }
+            if !ret_len_ptr.is_null()
+                && !write_user_u64(caller_pid, ret_len_ptr, core::mem::size_of::<u64>() as u64)
+            {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            }
+            frame.x[0] = status::SUCCESS as u64;
+            return;
+        }
+        _ => {
+            crate::kdebug!(
+                "nt: NtQueryVirtualMemory unsupported class={} addr={:#x}",
+                info_class,
+                addr
+            );
+            frame.x[0] = STATUS_INVALID_INFO_CLASS as u64;
+            return;
+        }
+    }
+    if !ensure_user_range_access(caller_pid, UserVa::new(buf as u64), 48, VM_ACCESS_WRITE) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
@@ -322,6 +473,12 @@ pub(crate) fn handle_query_virtual_memory(frame: &mut SvcFrame) {
                 q.mem_type,
             )
         } else {
+            crate::kdebug!(
+                "nt: NtQueryVirtualMemory basic query miss addr={:#x} caller_pid={} target_pid={}",
+                addr,
+                caller_pid,
+                target_pid
+            );
             frame.x[0] = status::INVALID_PARAMETER as u64;
             return;
         };

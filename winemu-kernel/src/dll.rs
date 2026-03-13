@@ -1,7 +1,7 @@
 use core::cell::UnsafeCell;
 use core::mem::size_of;
 
-use winemu_shared::pe;
+use winemu_shared::{pe, status};
 
 use crate::fs::{self, FsFileHandle};
 use crate::ldr::{self, ImportRef};
@@ -68,8 +68,69 @@ static DLL_RUNTIME: DllRuntime = DllRuntime {
     entries: UnsafeCell::new([DllEntry::empty(); MAX_DLLS]),
 };
 
+pub struct LoadedModuleInfo {
+    pub base: u64,
+    pub size: u32,
+    pub entry: u64,
+}
+
 pub fn resolve_import(dll_name: &str, imp: ImportRef<'_>) -> Option<u64> {
     resolve_import_depth(dll_name, imp, 0)
+}
+
+pub fn load_module(dll_name: &str) -> Result<LoadedModuleInfo, u32> {
+    const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
+    const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xC000_007B;
+
+    let mut key_buf = [0u8; MAX_DLL_NAME];
+    let Some(key_name) = module_key_name(dll_name, &mut key_buf) else {
+        return Err(status::INVALID_PARAMETER);
+    };
+
+    if let Some(base) = find_loaded_base(key_name) {
+        return loaded_module_info(base).ok_or(STATUS_DLL_NOT_FOUND);
+    }
+
+    let Some(file) = open_dll_file(dll_name) else {
+        return Err(STATUS_DLL_NOT_FOUND);
+    };
+    let Some(file_size) = fs::file_size(file).ok() else {
+        fs::close(file);
+        return Err(STATUS_DLL_NOT_FOUND);
+    };
+    if file_size == 0 {
+        fs::close(file);
+        return Err(STATUS_DLL_NOT_FOUND);
+    }
+
+    let loaded = load_dll_file(file, file_size, key_name, dll_name);
+    fs::close(file);
+
+    match loaded {
+        Ok(img) => loaded_module_info(img.base).ok_or(STATUS_INVALID_IMAGE_FORMAT),
+        Err(ldr::LdrError::AllocFailed) => Err(status::NO_MEMORY),
+        Err(ldr::LdrError::IoError) => Err(STATUS_DLL_NOT_FOUND),
+        Err(_) => Err(STATUS_INVALID_IMAGE_FORMAT),
+    }
+}
+
+pub fn find_loaded_base_for_addr(addr: u64) -> Option<u64> {
+    let entries = unsafe { &*DLL_RUNTIME.entries.get() };
+    for entry in entries.iter() {
+        if entry.state != ENTRY_READY {
+            continue;
+        }
+        let base = entry.base;
+        let end = base.saturating_add(entry.size as u64);
+        if addr >= base && addr < end {
+            return Some(base);
+        }
+    }
+    None
+}
+
+pub fn resolve_loaded_export(base: u64, name: &str) -> Option<u64> {
+    resolve_export_by_name(base, name, 0)
 }
 
 fn resolve_import_depth(dll_name: &str, imp: ImportRef<'_>, depth: u8) -> Option<u64> {
@@ -84,7 +145,9 @@ fn resolve_import_depth(dll_name: &str, imp: ImportRef<'_>, depth: u8) -> Option
 }
 
 fn ensure_loaded(dll_name: &str) -> Option<u64> {
-    if let Some(base) = find_loaded_base(dll_name) {
+    let mut key_buf = [0u8; MAX_DLL_NAME];
+    let key_name = module_key_name(dll_name, &mut key_buf)?;
+    if let Some(base) = find_loaded_base(key_name) {
         return Some(base);
     }
 
@@ -95,10 +158,16 @@ fn ensure_loaded(dll_name: &str) -> Option<u64> {
         return None;
     }
 
-    let loaded = load_dll_file(file, file_size, dll_name);
+    let loaded = load_dll_file(file, file_size, key_name, dll_name);
     fs::close(file);
 
-    loaded.ok().map(|img| img.base)
+    match loaded {
+        Ok(img) => Some(img.base),
+        Err(err) => {
+            crate::kdebug!("dll: load failed {}: {:?}", dll_name, err);
+            None
+        }
+    }
 }
 
 fn find_loaded_base(dll_name: &str) -> Option<u64> {
@@ -143,12 +212,28 @@ fn remember_loaded(dll_name: &str, base: u64, size: u32, entry_va: u64, user_bac
     false
 }
 
+fn loaded_module_info(base: u64) -> Option<LoadedModuleInfo> {
+    let entries = unsafe { &*DLL_RUNTIME.entries.get() };
+    for entry in entries.iter() {
+        if entry.state != ENTRY_READY || entry.base != base {
+            continue;
+        }
+        return Some(LoadedModuleInfo {
+            base: entry.base,
+            size: entry.size,
+            entry: entry.entry,
+        });
+    }
+    None
+}
+
 fn open_dll_file(dll_name: &str) -> Option<FsFileHandle> {
+    let canonical_name = canonical_dll_name(dll_name);
     let mut lower_name = [0u8; MAX_DLL_NAME];
-    let lower_len = normalize_lower_ascii(dll_name, &mut lower_name);
+    let lower_len = normalize_lower_ascii(canonical_name, &mut lower_name);
 
     let mut path = [0u8; MAX_DLL_PATH];
-    if let Some(path_len) = build_sysroot_path(dll_name, &mut path) {
+    if let Some(path_len) = build_sysroot_path(canonical_name, &mut path) {
         let p = unsafe { core::str::from_utf8_unchecked(&path[..path_len]) };
         if let Some(fd) = try_open_path(p) {
             return Some(fd);
@@ -169,6 +254,24 @@ fn open_dll_file(dll_name: &str) -> Option<FsFileHandle> {
         .iter()
         .any(|b| *b == b'/' || *b == b'\\' || *b == b':');
     if has_path {
+        let leaf = dll_leaf_name(dll_name);
+        if leaf != dll_name {
+            if let Some(path_len) = build_sysroot_path(leaf, &mut path) {
+                let p = unsafe { core::str::from_utf8_unchecked(&path[..path_len]) };
+                if let Some(fd) = try_open_path(p) {
+                    return Some(fd);
+                }
+            }
+            if let Some(len) = normalize_lower_ascii(leaf, &mut lower_name) {
+                let lower = unsafe { core::str::from_utf8_unchecked(&lower_name[..len]) };
+                if let Some(path_len) = build_sysroot_path(lower, &mut path) {
+                    let p = unsafe { core::str::from_utf8_unchecked(&path[..path_len]) };
+                    if let Some(fd) = try_open_path(p) {
+                        return Some(fd);
+                    }
+                }
+            }
+        }
         if let Some(fd) = try_open_path(dll_name) {
             return Some(fd);
         }
@@ -183,13 +286,83 @@ fn open_dll_file(dll_name: &str) -> Option<FsFileHandle> {
     None
 }
 
+fn dll_leaf_name(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    let mut start = 0usize;
+    for (idx, b) in bytes.iter().enumerate() {
+        if *b == b'/' || *b == b'\\' || *b == b':' {
+            start = idx.saturating_add(1);
+        }
+    }
+    &name[start..]
+}
+
+fn canonical_dll_name(name: &str) -> &str {
+    let leaf = dll_leaf_name(name);
+    remap_api_set_name(leaf).unwrap_or(leaf)
+}
+
+fn remap_api_set_name(name: &str) -> Option<&'static str> {
+    if name.eq_ignore_ascii_case("api-ms-win-core-synch-l1-2-0")
+        || name.eq_ignore_ascii_case("api-ms-win-core-synch-l1-2-0.dll")
+    {
+        return Some("kernelbase.dll");
+    }
+    if name.eq_ignore_ascii_case("api-ms-win-appmodel-runtime-l1-1-2")
+        || name.eq_ignore_ascii_case("api-ms-win-appmodel-runtime-l1-1-2.dll")
+    {
+        return Some("kernelbase.dll");
+    }
+    if name.eq_ignore_ascii_case("api-ms-win-appmodel-runtime-internal-l1-1-1")
+        || name.eq_ignore_ascii_case("api-ms-win-appmodel-runtime-internal-l1-1-1.dll")
+    {
+        return Some("kernelbase.dll");
+    }
+    None
+}
+
+fn normalize_module_name(name: &str, out: &mut [u8; MAX_DLL_NAME]) -> Option<usize> {
+    let bytes = name.as_bytes();
+    let needs_dll_suffix = !bytes.iter().any(|b| *b == b'.');
+    let extra = if needs_dll_suffix { 4 } else { 0 };
+    if bytes.len().saturating_add(extra) > out.len() {
+        return None;
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        out[i] = b.to_ascii_lowercase();
+    }
+    if needs_dll_suffix {
+        out[bytes.len()..bytes.len() + 4].copy_from_slice(b".dll");
+    }
+    Some(bytes.len() + extra)
+}
+
+fn module_key_name<'a>(name: &str, buf: &'a mut [u8; MAX_DLL_NAME]) -> Option<&'a str> {
+    let canonical = canonical_dll_name(name);
+    let len = normalize_module_name(canonical, buf)?;
+    core::str::from_utf8(&buf[..len]).ok()
+}
+
 fn load_dll_file(
     file: FsFileHandle,
     file_size: u64,
-    dll_name: &str,
+    key_name: &str,
+    display_name: &str,
 ) -> Result<ldr::LoadedImage, ldr::LdrError> {
+    crate::ktrace!(
+        "dll: load start {} size={:#x}",
+        display_name,
+        file_size
+    );
     let loaded =
         unsafe { ldr::load_from_file_unlinked(file, file_size, crate::mm::VmaType::DllImage) }?;
+    crate::ktrace!(
+        "dll: unlinked ok {} base={:#x} size={:#x} entry_rva={:#x}",
+        display_name,
+        loaded.base,
+        loaded.size,
+        loaded.entry_rva
+    );
 
     // Register before linking imports to break recursive DLL cycles
     // (e.g. user32 <-> gdi32) during resolve_import().
@@ -200,7 +373,7 @@ fn load_dll_file(
     };
     let user_backed = current_user_pid().is_some();
     if !remember_loaded(
-        dll_name,
+        key_name,
         loaded.base,
         loaded.size as u32,
         entry,
@@ -214,15 +387,19 @@ fn load_dll_file(
         })
     };
     if linked.is_err() {
-        forget_loaded(dll_name);
+        crate::kdebug!("dll: link failed {}: {:?}", display_name, linked);
+        forget_loaded(key_name);
         return linked.map(|_| loaded);
     }
 
-    apply_runtime_compat_bootstrap(dll_name, loaded.base, loaded.size as u64);
+    apply_runtime_compat_bootstrap(key_name, loaded.base, loaded.size as u64);
     if ldr::finalize_loaded_image(loaded.base).is_err() {
-        forget_loaded(dll_name);
+        crate::kdebug!("dll: finalize failed {}", display_name);
+        forget_loaded(key_name);
         return Err(ldr::LdrError::ProtectFailed);
     }
+
+    crate::ktrace!("dll: load complete {}", display_name);
 
     Ok(loaded)
 }
@@ -270,22 +447,10 @@ fn apply_runtime_compat_bootstrap(dll_name: &str, base: u64, size: u64) {
     }
 
     if dll_name.eq_ignore_ascii_case("kernelbase.dll") {
-        // Some ARM64X builds read this import via an alternate .rdata slot
-        // (base + 0xE47C0) instead of the primary FirstThunk slot.
-        const ALT_IAT_RTL_OPEN_CROSS: u64 = 0xE47C0;
         // Locale pointers used by kernelbase locale bootstrap paths.
         const KB_LOCALE_FALLBACK_PTR: u64 = 0x13F938;
         const KB_LOCALE_RUNTIME_PTR: u64 = 0x13F948;
         const KB_LOCALE_TABLE_PTR: u64 = 0x13F950;
-        let slot_va = base.saturating_add(ALT_IAT_RTL_OPEN_CROSS);
-        if slot_va >= base && slot_va.saturating_add(8) <= base.saturating_add(size) {
-            if let Some(addr) = resolve_import(
-                "ntdll.dll",
-                ImportRef::Name("RtlOpenCrossProcessEmulatorWorkConnection"),
-            ) {
-                let _ = write_mapped_value(slot_va, addr);
-            }
-        }
 
         // Some startup paths hit init_locale before this fallback pointer gets
         // initialized by user-mode runtime, which leads to NULL dereference.

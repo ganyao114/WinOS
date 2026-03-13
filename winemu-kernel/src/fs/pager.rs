@@ -11,3 +11,12 @@ pub(crate) fn read_into_phys(
 ) -> Result<usize, FsError> {
     backing::pager_read_into_phys(backing, file_off, dst, len)
 }
+
+pub(crate) fn write_from_phys(
+    backing: FsBackingHandle,
+    file_off: u64,
+    src: PhysAddr,
+    len: usize,
+) -> Result<usize, FsError> {
+    backing::pager_write_from_phys(backing, file_off, src, len)
+}

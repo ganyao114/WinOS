@@ -8,10 +8,10 @@ use crate::kobj::ObjectStore;
 ///   - NT 完整语义：Reserve / Commit / Decommit / Release / Protect / Guard / COW
 use crate::mm::areaset::{AreaEntry, AreaSeg, AreaSet};
 use crate::mm::range::Range;
-use crate::mm::vm_area::{VmArea, VmKind, PAGE_SIZE};
+use crate::mm::vm_area::{PAGE_SIZE, VmArea, VmKind};
 use crate::mm::{
-    vm_access_allowed, vm_is_copy_on_write_prot, vm_promote_cow_prot, vm_sanitize_nt_prot,
-    PhysAddr, UserVa, VmQueryInfo,
+    PhysAddr, UserVa, VmQueryInfo, vm_access_allowed, vm_is_copy_on_write_prot,
+    vm_promote_cow_prot, vm_sanitize_nt_prot,
 };
 use crate::process::ProcessAddressSpace;
 use crate::rust_alloc::vec::Vec;
@@ -160,6 +160,34 @@ fn vm_fill_section_page(area: &VmArea, idx: usize, pa: PhysAddr) -> bool {
         phys_memset(zero_pa, 0, read_len - read);
     }
     true
+}
+
+fn vm_section_page_writeback(area: &VmArea, idx: usize, pa: PhysAddr) -> bool {
+    let Some(backing) = area.section_backing else {
+        return true;
+    };
+    if area.section_is_image {
+        return true;
+    }
+    let prot = vm_sanitize_nt_prot(
+        area.prot_pages
+            .get(idx)
+            .copied()
+            .unwrap_or(area.default_prot),
+    );
+    if !vm_access_allowed(prot, crate::mm::VM_ACCESS_WRITE) {
+        return true;
+    }
+    let page_off = (idx as u64) * PAGE_SIZE;
+    if page_off >= area.section_view_size {
+        return true;
+    }
+    let write_len = PAGE_SIZE.min(area.section_view_size - page_off) as usize;
+    let file_off = area.section_file_offset.saturating_add(page_off);
+    match crate::fs::pager_write_from_phys(backing, file_off, pa, write_len) {
+        Ok(written) => written == write_len,
+        Err(_) => false,
+    }
 }
 
 #[inline]
@@ -485,11 +513,24 @@ impl ProcessVmManager {
         let page_va = UserVa::new(fault_va.get() & !(PAGE_SIZE - 1));
         let seg = self.areas.find_seg(page_va.get());
         if !seg.ok() {
+            crate::kdebug!(
+                "vm: pf miss pid={} fault_va={:#x} page_va={:#x}",
+                pid,
+                fault_va.get(),
+                page_va.get()
+            );
             return false;
         }
         let r = seg.range();
         let idx = ((page_va.get() - r.start) / PAGE_SIZE) as usize;
         if !seg.value().is_page_committed(idx) {
+            crate::kdebug!(
+                "vm: pf uncommitted pid={} page_va={:#x} idx={} kind={:?}",
+                pid,
+                page_va.get(),
+                idx,
+                seg.value().kind
+            );
             return false;
         }
 
@@ -512,12 +553,32 @@ impl ProcessVmManager {
             return self.handle_cow_fault(aspace, &seg, idx, page_va, prot);
         }
         if !vm_access_allowed(prot, access) {
+            crate::kdebug!(
+                "vm: pf access denied pid={} page_va={:#x} idx={} prot={:#x} access={:#x} kind={:?}",
+                pid,
+                page_va.get(),
+                idx,
+                prot,
+                access,
+                seg.value().kind
+            );
             return false;
         }
 
         let pa = seg.value().phys_page(idx);
         if !pa.is_null() {
             let mapped = aspace.map_user_range(page_va, pa, PAGE_SIZE, prot);
+            if !mapped {
+                crate::kdebug!(
+                    "vm: pf remap failed pid={} page_va={:#x} idx={} pa={:#x} prot={:#x} kind={:?}",
+                    pid,
+                    page_va.get(),
+                    idx,
+                    pa.get(),
+                    prot,
+                    seg.value().kind
+                );
+            }
             if mapped && had_guard && seg.value().kind == VmKind::ThreadStack {
                 self.on_thread_stack_guard_hit(aspace, pid, &seg, idx, page_va);
             }
@@ -525,6 +586,13 @@ impl ProcessVmManager {
         }
 
         let Some(new_pa) = crate::mm::phys::alloc_pages(1) else {
+            crate::kdebug!(
+                "vm: pf alloc failed pid={} page_va={:#x} idx={} kind={:?}",
+                pid,
+                page_va.get(),
+                idx,
+                seg.value().kind
+            );
             return false;
         };
         phys_memset(new_pa, 0, PAGE_SIZE as usize);
@@ -533,6 +601,15 @@ impl ProcessVmManager {
             return false;
         }
         if !aspace.map_user_range(page_va, new_pa, PAGE_SIZE, prot) {
+            crate::kdebug!(
+                "vm: pf map new failed pid={} page_va={:#x} idx={} pa={:#x} prot={:#x} kind={:?}",
+                pid,
+                page_va.get(),
+                idx,
+                new_pa.get(),
+                prot,
+                seg.value().kind
+            );
             crate::mm::phys::free_pages(new_pa, 1);
             return false;
         }
@@ -892,14 +969,26 @@ impl ProcessVmManager {
 
     fn free_seg_pages(&self, aspace: &mut ProcessAddressSpace, seg: &AreaSeg<VmArea>) {
         let r = seg.range();
-        let owns = seg.value().owns_phys_pages;
         let page_count = seg.value().page_count();
         for i in 0..page_count {
             let va = UserVa::new(r.start + (i as u64) * PAGE_SIZE);
             let pa = seg.value().phys_page(i);
             if !pa.is_null() {
+                if seg.value().kind == VmKind::Section
+                    && !vm_section_page_writeback(seg.value(), i, pa)
+                {
+                    crate::kerror!(
+                        "vm: section writeback failed va={:#x} idx={} pa={:#x} backing_off={:#x}",
+                        va.get(),
+                        i,
+                        pa.get(),
+                        seg.value()
+                            .section_file_offset
+                            .saturating_add((i as u64) * PAGE_SIZE)
+                    );
+                }
                 let _ = aspace.unmap_user_range(va, PAGE_SIZE);
-                if owns {
+                if seg.value().owns_phys_pages || seg.value().kind == VmKind::Section {
                     shared_phys_page_release(pa);
                 }
             }
@@ -915,14 +1004,35 @@ impl ProcessVmManager {
         prot: u32,
     ) -> bool {
         let Some(pa) = crate::mm::phys::alloc_pages(1) else {
+            crate::kdebug!(
+                "vm: phys alloc failed va={:#x} idx={} prot={:#x} kind={:?}",
+                va.get(),
+                idx,
+                prot,
+                seg.value().kind
+            );
             return false;
         };
         phys_memset(pa, 0, PAGE_SIZE as usize);
         if seg.value().kind == VmKind::Section && !vm_fill_section_page(seg.value(), idx, pa) {
+            crate::kdebug!(
+                "vm: section fill failed va={:#x} idx={} pa={:#x}",
+                va.get(),
+                idx,
+                pa.get()
+            );
             crate::mm::phys::free_pages(pa, 1);
             return false;
         }
         if !aspace.map_user_range(va, pa, PAGE_SIZE, prot) {
+            crate::kdebug!(
+                "vm: page map failed va={:#x} idx={} pa={:#x} prot={:#x} kind={:?}",
+                va.get(),
+                idx,
+                pa.get(),
+                prot,
+                seg.value().kind
+            );
             crate::mm::phys::free_pages(pa, 1);
             return false;
         }
@@ -943,8 +1053,19 @@ impl ProcessVmManager {
         if pa.is_null() {
             return;
         }
+        if seg.value().kind == VmKind::Section && !vm_section_page_writeback(seg.value(), idx, pa) {
+            crate::kerror!(
+                "vm: section writeback failed va={:#x} idx={} pa={:#x} backing_off={:#x}",
+                va.get(),
+                idx,
+                pa.get(),
+                seg.value()
+                    .section_file_offset
+                    .saturating_add((idx as u64) * PAGE_SIZE)
+            );
+        }
         let _ = aspace.unmap_user_range(va, PAGE_SIZE);
-        if seg.value().owns_phys_pages {
+        if seg.value().owns_phys_pages || seg.value().kind == VmKind::Section {
             shared_phys_page_release(pa);
         }
         let area = seg.value_mut();

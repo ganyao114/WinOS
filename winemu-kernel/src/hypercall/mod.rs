@@ -178,6 +178,15 @@ pub fn host_open(path: &str, flags: u64) -> u64 {
     }
 }
 
+pub fn host_mkdir(path: &str) -> Result<(), crate::fs::FsError> {
+    let (ret, aux) = hostcall_sync(hc::OP_MKDIR, path.as_ptr() as u64, path.len() as u64, 0, 0);
+    match (ret, aux) {
+        (r, _) if r == hc::HC_OK => Ok(()),
+        (r, 1) if r == hc::HC_IO_ERROR => Err(crate::fs::FsError::AlreadyExists),
+        _ => Err(crate::fs::FsError::IoError),
+    }
+}
+
 /// HOST_READ — 读取文件到 dst 指针，返回实际读取字节数
 pub fn host_read(fd: u64, dst: *mut u8, len: usize, offset: u64) -> usize {
     let (ret, aux) = hostcall_sync(hc::OP_READ, fd, dst as u64, len as u64, offset);
@@ -231,6 +240,20 @@ pub fn host_stat(fd: u64) -> u64 {
     } else {
         0
     }
+}
+
+pub fn host_seek(fd: u64, offset: i64, whence: u32) -> Option<u64> {
+    let (ret, aux) = hostcall_sync(hc::OP_SEEK, fd, offset as u64, whence as u64, 0);
+    if ret == hc::HC_OK {
+        Some(aux)
+    } else {
+        None
+    }
+}
+
+pub fn host_set_len(fd: u64, len: u64) -> bool {
+    let (ret, _) = hostcall_sync(hc::OP_SET_LEN, fd, len, 0, 0);
+    ret == hc::HC_OK
 }
 
 /// HOST_READDIR — 读取目录下一项名称

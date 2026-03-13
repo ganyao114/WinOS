@@ -4,6 +4,7 @@ use crate::sched::{
     terminate_thread_locked, thread_exists, timeout_to_deadline, wait_for_alert_by_tid,
     with_thread, KSchedulerLock, ThreadState, WaitDeadline,
 };
+use core::sync::atomic::{AtomicU32, Ordering};
 use winemu_shared::status;
 
 use super::common::GuestWriter;
@@ -14,6 +15,7 @@ use super::constants::{
 use super::user_args::{SyscallArgs, UserInPtr, UserOutPtr};
 use super::SvcFrame;
 use crate::mm::usercopy::read_current_user_bytes;
+use crate::mm::{UserVa, usercopy::read_user_at};
 
 // ── Handle type constant ──────────────────────────────────────────────────────
 
@@ -26,6 +28,28 @@ pub enum CreateThreadError {
     NoMemory,
 }
 
+const STATUS_INVALID_CRUNTIME_PARAMETER: u32 = 0xC000_0417;
+const EXCEPTION_WINE_STUB: u32 = 0x8000_0100;
+const ARM64_CONTEXT_X29_OFF: usize = 0xF0;
+const ARM64_CONTEXT_X30_OFF: usize = 0xF8;
+const ARM64_CONTEXT_SP_OFF: usize = 0x100;
+const ARM64_CONTEXT_PC_OFF: usize = 0x108;
+
+static RAISE_EXCEPTION_TRACE_BUDGET: AtomicU32 = AtomicU32::new(64);
+static CREATE_THREAD_TRACE_BUDGET: AtomicU32 = AtomicU32::new(32);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExceptionRecord64 {
+    exception_code: u32,
+    exception_flags: u32,
+    exception_record: u64,
+    exception_address: u64,
+    number_parameters: u32,
+    _pad: u32,
+    exception_information: [u64; 15],
+}
+
 #[inline]
 fn win_to_sched_priority(prio: u8) -> u8 {
     31u8.saturating_sub(prio.min(31))
@@ -34,6 +58,230 @@ fn win_to_sched_priority(prio: u8) -> u8 {
 #[inline]
 fn sched_to_win_priority(prio: u8) -> u8 {
     31u8.saturating_sub(prio.min(31))
+}
+
+#[inline]
+fn should_trace_raise_exception(code: u32) -> bool {
+    matches!(
+        code,
+        STATUS_INVALID_CRUNTIME_PARAMETER
+            | super::process::CPP_EH_EXCEPTION_CODE
+            | EXCEPTION_WINE_STUB
+    )
+}
+
+fn read_current_user_ascii_cstr(ptr: u64, out: &mut [u8]) -> Option<usize> {
+    if ptr == 0 || out.is_empty() {
+        return None;
+    }
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return None;
+    }
+    let mut len = 0usize;
+    while len < out.len() {
+        let b = read_user_at::<u8>(pid, UserVa::new(ptr.saturating_add(len as u64)))?;
+        if b == 0 {
+            return if len == 0 { None } else { Some(len) };
+        }
+        if !(0x20..=0x7e).contains(&b) {
+            return None;
+        }
+        out[len] = b;
+        len += 1;
+    }
+    None
+}
+
+fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
+    let end = offset.checked_add(8)?;
+    let chunk = bytes.get(offset..end)?;
+    let arr: [u8; 8] = chunk.try_into().ok()?;
+    Some(u64::from_le_bytes(arr))
+}
+
+fn trace_create_thread_request(
+    owner_pid: u32,
+    target_pid: u32,
+    entry_va: u64,
+    arg: u64,
+    create_flags: u32,
+) {
+    if !crate::log::log_enabled(crate::log::LogLevel::Trace) {
+        return;
+    }
+    if CREATE_THREAD_TRACE_BUDGET
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+        .is_err()
+    {
+        return;
+    }
+
+    crate::log::debug_print("nt: CreateThreadEx owner_pid=");
+    crate::log::debug_u64(owner_pid as u64);
+    crate::log::debug_print(" target_pid=");
+    crate::log::debug_u64(target_pid as u64);
+    crate::log::debug_print(" entry=");
+    crate::log::debug_u64(entry_va);
+    crate::log::debug_print(" arg=");
+    crate::log::debug_u64(arg);
+    crate::log::debug_print(" flags=");
+    crate::log::debug_u64(create_flags as u64);
+    crate::log::debug_print("\n");
+
+    if arg == 0 || owner_pid != target_pid {
+        return;
+    }
+
+    if let Some(bytes) = read_current_user_bytes(arg as *const u8, 16) {
+        let q0 = read_u64_le(&bytes, 0).unwrap_or(0);
+        let q1 = read_u64_le(&bytes, 8).unwrap_or(0);
+        crate::log::debug_print("nt: CreateThreadEx arg_q0=");
+        crate::log::debug_u64(q0);
+        crate::log::debug_print(" arg_q1=");
+        crate::log::debug_u64(q1);
+        crate::log::debug_print("\n");
+        trace_loaded_module_for_addr("nt: CreateThreadEx arg_q0=", q0);
+        trace_loaded_module_for_addr("nt: CreateThreadEx arg_q1=", q1);
+    }
+}
+
+fn trace_loaded_module_for_addr(prefix: &str, addr: u64) {
+    crate::log::debug_print(prefix);
+    crate::log::debug_u64(addr);
+    let mut found = false;
+    crate::dll::for_each_loaded(|name, base, size, _entry| {
+        if found {
+            return;
+        }
+        let end = base.saturating_add(size as u64);
+        if addr < base || addr >= end {
+            return;
+        }
+        found = true;
+        crate::log::debug_print(" module=");
+        crate::log::debug_print(name);
+        crate::log::debug_print("+");
+        crate::log::debug_u64(addr.saturating_sub(base));
+    });
+    if !found {
+        crate::log::debug_print(" module=<unknown>");
+    }
+    crate::log::debug_print("\n");
+}
+
+fn trace_raise_exception(frame: &SvcFrame) {
+    let record_ptr = UserInPtr::from_raw(frame.x[0] as *const ExceptionRecord64);
+    let Some(record) = record_ptr.read_current() else {
+        return;
+    };
+    if !should_trace_raise_exception(record.exception_code) {
+        return;
+    }
+    if RAISE_EXCEPTION_TRACE_BUDGET
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+        .is_err()
+    {
+        return;
+    }
+
+    crate::log::debug_print("nt: RaiseException code=");
+    crate::log::debug_u64(record.exception_code as u64);
+    crate::log::debug_print(" flags=");
+    crate::log::debug_u64(record.exception_flags as u64);
+    crate::log::debug_print(" first_chance=");
+    crate::log::debug_u64(frame.x[2]);
+    crate::log::debug_print(" rec=");
+    crate::log::debug_u64(frame.x[0]);
+    crate::log::debug_print(" ctx=");
+    crate::log::debug_u64(frame.x[1]);
+    crate::log::debug_print(" params=");
+    crate::log::debug_u64(record.number_parameters as u64);
+    crate::log::debug_print("\n");
+
+    trace_loaded_module_for_addr(
+        "nt: RaiseException exception_address=",
+        record.exception_address,
+    );
+
+    let max_params = core::cmp::min(record.number_parameters as usize, 4);
+    for i in 0..max_params {
+        crate::log::debug_print("nt: RaiseException info[");
+        crate::log::debug_u64(i as u64);
+        crate::log::debug_print("]=");
+        crate::log::debug_u64(record.exception_information[i]);
+        crate::log::debug_print("\n");
+    }
+
+    if record.exception_code == EXCEPTION_WINE_STUB && record.number_parameters >= 2 {
+        let mut module_buf = [0u8; 64];
+        let mut func_buf = [0u8; 96];
+        crate::log::debug_print("nt: RaiseException wine_stub module_ptr=");
+        crate::log::debug_u64(record.exception_information[0]);
+        crate::log::debug_print(" function_ptr=");
+        crate::log::debug_u64(record.exception_information[1]);
+        crate::log::debug_print("\n");
+        if let Some(module_len) =
+            read_current_user_ascii_cstr(record.exception_information[0], &mut module_buf)
+        {
+            crate::log::debug_print("nt: RaiseException wine_stub module=");
+            if let Ok(module) = core::str::from_utf8(&module_buf[..module_len]) {
+                crate::log::debug_print(module);
+            } else {
+                crate::log::debug_print("<utf8-error>");
+            }
+            crate::log::debug_print("\n");
+        }
+        if (record.exception_information[1] >> 16) != 0 {
+            if let Some(func_len) =
+                read_current_user_ascii_cstr(record.exception_information[1], &mut func_buf)
+            {
+                crate::log::debug_print("nt: RaiseException wine_stub function=");
+                if let Ok(function) = core::str::from_utf8(&func_buf[..func_len]) {
+                    crate::log::debug_print(function);
+                } else {
+                    crate::log::debug_print("<utf8-error>");
+                }
+                crate::log::debug_print("\n");
+            }
+        } else {
+            crate::log::debug_print("nt: RaiseException wine_stub ordinal=");
+            crate::log::debug_u64(record.exception_information[1]);
+            crate::log::debug_print("\n");
+        }
+    }
+
+    if frame.x[1] != 0 {
+        if let Some(ctx) = read_current_user_bytes(frame.x[1] as *const u8, ARM64_CONTEXT_PC_OFF + 8)
+        {
+            let x29 = read_u64_le(&ctx, ARM64_CONTEXT_X29_OFF).unwrap_or(0);
+            let x30 = read_u64_le(&ctx, ARM64_CONTEXT_X30_OFF).unwrap_or(0);
+            let sp = read_u64_le(&ctx, ARM64_CONTEXT_SP_OFF).unwrap_or(0);
+            let pc = read_u64_le(&ctx, ARM64_CONTEXT_PC_OFF).unwrap_or(0);
+            crate::log::debug_print("nt: RaiseException ctx sp=");
+            crate::log::debug_u64(sp);
+            crate::log::debug_print(" pc=");
+            crate::log::debug_u64(pc);
+            crate::log::debug_print(" lr=");
+            crate::log::debug_u64(x30);
+            crate::log::debug_print(" fp=");
+            crate::log::debug_u64(x29);
+            crate::log::debug_print("\n");
+            trace_loaded_module_for_addr("nt: RaiseException ctx.pc=", pc);
+            trace_loaded_module_for_addr("nt: RaiseException ctx.lr=", x30);
+        }
+    }
+
+    if record.exception_code == super::process::CPP_EH_EXCEPTION_CODE {
+        let pid = crate::process::current_pid();
+        if pid != 0 && record.number_parameters > 3 {
+            super::process::trace_cpp_exception_type_name(
+                pid,
+                record.exception_information[2],
+                record.exception_information[3],
+            );
+        }
+    }
 }
 
 // ── Thread handle resolution ──────────────────────────────────────────────────
@@ -99,25 +347,63 @@ pub fn create_user_thread(
     pid: u32,
     entry_va: u64,
     arg: u64,
-    stack_size: u64,
-    _max_stack_size: u64,
+    stack_commit: u64,
+    stack_reserve: u64,
     priority: u8,
 ) -> Result<u32, CreateThreadError> {
-    // Allocate user stack via VM.
-    let stack_base =
-        crate::mm::vm_alloc_stack(pid, stack_size).ok_or(CreateThreadError::NoMemory)?;
+    let stack =
+        crate::teb::alloc_thread_stack(pid, stack_reserve, stack_commit)
+            .ok_or(CreateThreadError::NoMemory)?;
     let teb_va = crate::teb::alloc_teb(pid).unwrap_or(0);
-    let _lock = KSchedulerLock::lock();
-    let params = sched::UserThreadParams {
-        pid,
-        entry: entry_va,
-        arg,
-        stack_base,
-        stack_size,
-        teb_va,
-        priority: win_to_sched_priority(priority),
+    if teb_va == 0 {
+        let _ = crate::mm::vm_free_region(pid, stack.reserve_base);
+        return Err(CreateThreadError::NoMemory);
+    }
+    let (initial_pc, arg0, arg1) = match crate::dll::resolve_import(
+        "ntdll.dll",
+        crate::ldr::ImportRef::Name("RtlUserThreadStart"),
+    ) {
+        Some(thunk) => (thunk, entry_va, arg),
+        None => (entry_va, arg, 0),
     };
-    let tid = create_user_thread_locked(params).ok_or(CreateThreadError::NoMemory)?;
+    let tid = {
+        let _lock = KSchedulerLock::lock();
+        let params = sched::UserThreadParams {
+            pid,
+            entry: initial_pc,
+            arg0,
+            arg1,
+            stack_base: stack.stack_base,
+            stack_size: stack.reserve_size,
+            teb_va,
+            priority: win_to_sched_priority(priority),
+        };
+        match create_user_thread_locked(params) {
+            Some(tid) => tid,
+            None => {
+                let _ = crate::mm::vm_free_region(pid, teb_va);
+                let _ = crate::mm::vm_free_region(pid, stack.reserve_base);
+                return Err(CreateThreadError::NoMemory);
+            }
+        }
+    };
+    if !crate::teb::init_thread_teb(pid, tid, teb_va, stack.stack_base, stack.stack_limit) {
+        let _ = terminate_thread_by_tid(tid);
+        let _ = crate::mm::vm_free_region(pid, teb_va);
+        let _ = crate::mm::vm_free_region(pid, stack.reserve_base);
+        return Err(CreateThreadError::NoMemory);
+    }
+    crate::kdebug!(
+        "nt: user thread created pid={} tid={} entry={:#x} start={:#x} arg={:#x} stack_limit={:#x} stack_base={:#x} teb={:#x}",
+        pid,
+        tid,
+        entry_va,
+        initial_pc,
+        arg,
+        stack.stack_limit,
+        stack.stack_base,
+        teb_va
+    );
     Ok(tid)
 }
 
@@ -325,6 +611,13 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     }
+    trace_create_thread_request(
+        crate::process::current_pid(),
+        target_pid,
+        entry_va,
+        arg,
+        create_flags,
+    );
     let tid = match create_user_thread(
         target_pid,
         entry_va,
@@ -434,6 +727,7 @@ pub(crate) fn handle_continue(frame: &mut SvcFrame) {
 // x0=ExceptionRecord*, x1=ContextRecord*, x2=FirstChance
 pub(crate) fn handle_raise_exception(frame: &mut SvcFrame) {
     use crate::ldr::ImportRef;
+    trace_raise_exception(frame);
     // Resolve KiUserExceptionDispatcher from ntdll (cached by the caller on first use).
     // ARM64 calling convention: x0=ExceptionRecord*, x1=Context*
     // The pointers are already in guest memory (passed by the caller).

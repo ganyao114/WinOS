@@ -17,6 +17,23 @@ pub(crate) const MEM_RESERVE: u32 = 0x2000;
 pub(crate) const MEM_DECOMMIT: u32 = 0x4000;
 pub(crate) const MEM_RELEASE: u32 = 0x8000;
 
+const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const GENERIC_EXECUTE: u32 = 0x2000_0000;
+const GENERIC_ALL: u32 = 0x1000_0000;
+
+const FILE_READ_DATA: u32 = 0x0001;
+const FILE_WRITE_DATA: u32 = 0x0002;
+const FILE_APPEND_DATA: u32 = 0x0004;
+const FILE_READ_EA: u32 = 0x0008;
+const FILE_WRITE_EA: u32 = 0x0010;
+const FILE_EXECUTE: u32 = 0x0020;
+const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+const READ_CONTROL: u32 = 0x0002_0000;
+const SYNCHRONIZE: u32 = 0x0010_0000;
+const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct IoStatusBlock {
@@ -91,6 +108,34 @@ pub(crate) fn map_open_mode(access: u32, disposition: u32) -> FsOpenMode {
         (false, true) => FsOpenMode::Write,
         _ => FsOpenMode::Read,
     }
+}
+
+pub(crate) fn map_file_generic_access(access: u32) -> u32 {
+    let mut mapped = access & !(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
+
+    if (access & GENERIC_ALL) != 0 {
+        mapped |= FILE_ALL_ACCESS;
+    }
+    if (access & GENERIC_READ) != 0 {
+        mapped |= READ_CONTROL
+            | SYNCHRONIZE
+            | FILE_READ_DATA
+            | FILE_READ_ATTRIBUTES
+            | FILE_READ_EA;
+    }
+    if (access & GENERIC_WRITE) != 0 {
+        mapped |= READ_CONTROL
+            | SYNCHRONIZE
+            | FILE_WRITE_DATA
+            | FILE_WRITE_ATTRIBUTES
+            | FILE_WRITE_EA
+            | FILE_APPEND_DATA;
+    }
+    if (access & GENERIC_EXECUTE) != 0 {
+        mapped |= READ_CONTROL | SYNCHRONIZE | FILE_EXECUTE | FILE_READ_ATTRIBUTES;
+    }
+
+    mapped
 }
 
 #[derive(Clone, Copy)]

@@ -2,20 +2,19 @@ use core::cell::UnsafeCell;
 
 use crate::fs::FsError;
 use crate::kobj::ObjectStore;
-use crate::mm::{vm_alloc_region_typed, vm_free_region, vm_set_section_backing, VmaType};
-use crate::process::{with_process_mut, KObjectKind, KObjectRef};
+use crate::mm::{VmaType, vm_alloc_region_typed, vm_free_region, vm_set_section_backing};
+use crate::process::{KObjectKind, KObjectRef, with_process_mut};
 use crate::rust_alloc::vec::Vec;
 use winemu_shared::status;
 
-use super::common::{align_up_4k, file_handle_target, GuestWriter, NtFileHandleTarget};
+use super::SvcFrame;
+use super::common::{GuestWriter, NtFileHandleTarget, align_up_4k, file_handle_target};
 use super::constants::PAGE_SIZE_4K;
 use super::path::ObjectAttributesView;
 use super::state::{
-    section_alloc, section_exists, section_free, section_get, section_retain, view_alloc,
-    view_free,
+    section_alloc, section_exists, section_free, section_get, section_retain, view_alloc, view_free,
 };
 use super::user_args::{SyscallArgs, UserInPtr, UserOutPtr};
-use super::SvcFrame;
 // ── Guest-memory layout structs ───────────────────────────────────────────────
 
 #[repr(C)]
@@ -36,6 +35,7 @@ struct SectionImageInformation {
 const SEC_IMAGE: u32 = 0x0100_0000;
 const PAGE_EXECUTE_READ: u32 = 0x20;
 const MAX_SECTION_NAME: usize = 256;
+const OBJ_OPENIF: u32 = 0x80;
 
 #[derive(Clone, Copy)]
 struct NamedSection {
@@ -64,28 +64,71 @@ fn named_sections_mut() -> &'static mut ObjectStore<NamedSection> {
 }
 
 fn ascii_lower(b: u8) -> u8 {
-    if b >= b'A' && b <= b'Z' {
-        b + 32
-    } else {
-        b
+    if b >= b'A' && b <= b'Z' { b + 32 } else { b }
+}
+
+fn skip_prefix(name: &[u8], prefix: &[u8]) -> Option<usize> {
+    if name.len() < prefix.len() {
+        return None;
     }
+    for (i, &p) in prefix.iter().enumerate() {
+        if ascii_lower(name[i]) != p {
+            return None;
+        }
+    }
+    Some(prefix.len())
+}
+
+fn normalize_section_name(raw: &[u8], out: &mut [u8; MAX_SECTION_NAME]) -> usize {
+    let mut src = raw;
+
+    if src.first() == Some(&b'\\') {
+        src = &src[1..];
+    }
+
+    if let Some(off) = skip_prefix(src, b"basenamedobjects\\") {
+        src = &src[off..];
+    } else if let Some(off) = skip_prefix(src, b"sessions\\") {
+        let mut i = off;
+        while i < src.len() && src[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i < src.len() && src[i] == b'\\' {
+            i += 1;
+        }
+        let rest = &src[i..];
+        if let Some(off2) = skip_prefix(rest, b"basenamedobjects\\") {
+            src = &rest[off2..];
+        } else {
+            src = rest;
+        }
+    } else if let Some(off) = skip_prefix(src, b"local\\") {
+        src = &src[off..];
+    } else if let Some(off) = skip_prefix(src, b"global\\") {
+        src = &src[off..];
+    }
+
+    let len = core::cmp::min(src.len(), MAX_SECTION_NAME);
+    for i in 0..len {
+        out[i] = ascii_lower(src[i]);
+    }
+    len
 }
 
 fn section_name_from_oa(
     oa: Option<ObjectAttributesView>,
     out: &mut [u8; MAX_SECTION_NAME],
-) -> usize {
+) -> (usize, u32) {
     let Some(oa) = oa else {
-        return 0;
+        return (0, 0);
     };
-    let len = oa.read_path(out);
-    if len == 0 {
-        return 0;
+    let attrs = oa.attributes();
+    let mut raw = [0u8; MAX_SECTION_NAME];
+    let raw_len = oa.read_name_ascii(&mut raw);
+    if raw_len == 0 {
+        return (0, attrs);
     }
-    for b in out.iter_mut().take(len) {
-        *b = ascii_lower(*b);
-    }
-    len
+    (normalize_section_name(&raw[..raw_len], out), attrs)
 }
 
 fn named_section_eq(lhs: &[u8], rhs: &[u8]) -> bool {
@@ -182,11 +225,31 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
     }
 
     let mut section_name = [0u8; MAX_SECTION_NAME];
-    let section_name_len = section_name_from_oa(oa, &mut section_name);
+    let (section_name_len, oa_attrs) = section_name_from_oa(oa, &mut section_name);
     named_section_gc_stale();
-    if section_name_len != 0 && named_section_find(&section_name[..section_name_len]).is_some() {
-        frame.x[0] = status::OBJECT_NAME_COLLISION as u64;
-        return;
+    if section_name_len != 0 {
+        if let Some(existing_idx) = named_section_find(&section_name[..section_name_len]) {
+            if (oa_attrs & OBJ_OPENIF) == 0 {
+                frame.x[0] = status::OBJECT_NAME_COLLISION as u64;
+                return;
+            }
+            if !section_retain(existing_idx) {
+                named_section_remove_by_section(existing_idx);
+            } else {
+                let pid = crate::process::current_pid();
+                if let Err(st) = super::kobject::install_handle_for_pid(
+                    pid,
+                    KObjectRef::section(existing_idx),
+                    out_ptr,
+                ) {
+                    let _ = section_free(existing_idx);
+                    frame.x[0] = st as u64;
+                    return;
+                }
+                frame.x[0] = status::OBJECT_NAME_EXISTS as u64;
+                return;
+            }
+        }
     }
 
     let file = if file_handle == 0 {
@@ -204,29 +267,51 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
         frame.x[0] = status::INVALID_HANDLE as u64;
         return;
     }
-    let size = if max_size_ptr.is_null() {
-        match file {
-            Some(file) => match crate::fs::file_size(file) {
-                Ok(size) => align_up_4k(size.max(PAGE_SIZE_4K)),
-                Err(_) => {
-                    frame.x[0] = status::INVALID_HANDLE as u64;
-                    return;
-                }
-            },
-            None => PAGE_SIZE_4K,
-        }
+    let requested_size = if max_size_ptr.is_null() {
+        None
     } else {
         let Some(max_size) = max_size_ptr.read_current() else {
             frame.x[0] = status::INVALID_PARAMETER as u64;
             return;
         };
-        align_up_4k(max_size.max(PAGE_SIZE_4K))
+        Some(max_size)
     };
     let is_image = (alloc_attrs & SEC_IMAGE) != 0;
     if is_image && file.is_none() {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
     }
+    let size = match file {
+        Some(file) => {
+            let file_size = match crate::fs::file_size(file) {
+                Ok(size) => size,
+                Err(_) => {
+                    frame.x[0] = status::INVALID_HANDLE as u64;
+                    return;
+                }
+            };
+            let effective = match requested_size {
+                Some(0) | None => file_size,
+                Some(size) => size,
+            };
+            if effective == 0 {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            }
+            align_up_4k(effective.max(PAGE_SIZE_4K))
+        }
+        None => {
+            let Some(size) = requested_size else {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            };
+            if size == 0 {
+                frame.x[0] = status::INVALID_PARAMETER as u64;
+                return;
+            }
+            align_up_4k(size.max(PAGE_SIZE_4K))
+        }
+    };
 
     let backing = match file {
         Some(file) => match crate::fs::create_backing_from_file(file, 0, size, is_image) {
@@ -239,7 +324,7 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
                 frame.x[0] = status::INVALID_HANDLE as u64;
                 return;
             }
-            Err(FsError::NotFound | FsError::IoError) => {
+            Err(FsError::AlreadyExists | FsError::NotFound | FsError::IoError) => {
                 frame.x[0] = status::INVALID_PARAMETER as u64;
                 return;
             }
@@ -254,6 +339,20 @@ pub(crate) fn handle_create_section(frame: &mut SvcFrame) {
             return;
         }
     };
+    if section_name_len != 0 {
+        if let Ok(name) = core::str::from_utf8(&section_name[..section_name_len]) {
+            crate::kdebug!(
+                "nt: create section tid={} pc={:#x} sp={:#x} name={} file_handle={:#x} size={:#x} attrs={:#x}",
+                crate::sched::current_tid(),
+                frame.program_counter(),
+                frame.user_sp(),
+                name,
+                file_handle,
+                size,
+                alloc_attrs
+            );
+        }
+    }
     if section_name_len != 0 && !named_section_insert(&section_name[..section_name_len], idx) {
         section_free(idx);
         frame.x[0] = status::NO_MEMORY as u64;
@@ -287,7 +386,7 @@ pub(crate) fn handle_open_section(frame: &mut SvcFrame) {
     }
 
     let mut section_name = [0u8; MAX_SECTION_NAME];
-    let section_name_len = section_name_from_oa(oa, &mut section_name);
+    let (section_name_len, _) = section_name_from_oa(oa, &mut section_name);
     if section_name_len == 0 {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
@@ -295,6 +394,15 @@ pub(crate) fn handle_open_section(frame: &mut SvcFrame) {
 
     named_section_gc_stale();
     let Some(section_idx) = named_section_find(&section_name[..section_name_len]) else {
+        if let Ok(name) = core::str::from_utf8(&section_name[..section_name_len]) {
+            crate::kdebug!(
+                "nt: open section not found tid={} pc={:#x} sp={:#x} name={}",
+                crate::sched::current_tid(),
+                frame.program_counter(),
+                frame.user_sp(),
+                name
+            );
+        }
         frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
         return;
     };
@@ -420,7 +528,14 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
         return;
     }
 
-    if !view_alloc(owner_pid, base, map_size) {
+    if !section_retain(sec_idx) {
+        let _ = vm_free_region(owner_pid, base);
+        frame.x[0] = status::INVALID_HANDLE as u64;
+        return;
+    }
+
+    if !view_alloc(owner_pid, base, map_size, sec_idx) {
+        let _ = section_free(sec_idx);
         let _ = vm_free_region(owner_pid, base);
         frame.x[0] = status::NO_MEMORY as u64;
         return;
@@ -433,6 +548,38 @@ pub(crate) fn handle_map_view_of_section(frame: &mut SvcFrame) {
     if !view_size_ptr.write_current_if_present(map_size) {
         frame.x[0] = status::INVALID_PARAMETER as u64;
         return;
+    }
+    if let Some(name) = section_name_utf16(sec_idx) {
+        let mut ascii = Vec::<u8>::new();
+        if ascii.try_reserve(name.len()).is_ok() {
+            for ch in name {
+                ascii.push(if ch < 0x80 { ch as u8 } else { b'?' });
+            }
+            if let Ok(name) = core::str::from_utf8(&ascii) {
+                crate::kdebug!(
+                    "nt: map section tid={} pc={:#x} sp={:#x} idx={} base={:#x} size={:#x} prot={:#x} name={}",
+                    crate::sched::current_tid(),
+                    frame.program_counter(),
+                    frame.user_sp(),
+                    sec_idx,
+                    base,
+                    map_size,
+                    prot,
+                    name
+                );
+            }
+        }
+    } else {
+        crate::kdebug!(
+            "nt: map section tid={} pc={:#x} sp={:#x} idx={} base={:#x} size={:#x} prot={:#x}",
+            crate::sched::current_tid(),
+            frame.program_counter(),
+            frame.user_sp(),
+            sec_idx,
+            base,
+            map_size,
+            prot
+        );
     }
     frame.x[0] = status::SUCCESS as u64;
 }

@@ -2,13 +2,19 @@
 // 参考: Wine dlls/ntdll/unix/signal_arm64.c call_init_thunk
 //       Wine dlls/ntdll/unix/virtual.c init_teb / init_peb
 
-use crate::mm::usercopy::{with_current_process_user_slice_mut, write_user_value};
+use crate::mm::usercopy::{
+    translate_user_va, with_current_process_user_slice, with_current_process_user_slice_mut,
+    write_user_value,
+};
 use crate::mm::VmaType;
 use crate::mm::{
-    vm_alloc_region_typed, vm_free_region, vm_make_guard_page, UserVa, VM_ACCESS_WRITE,
+    vm_alloc_region_typed, vm_free_region, vm_make_guard_page, UserVa, VM_ACCESS_READ,
+    VM_ACCESS_WRITE,
 };
+use crate::rust_alloc::string::String;
+use crate::rust_alloc::vec::Vec;
 use crate::nt::constants::PAGE_SIZE_4K;
-use winemu_shared::{peb, teb};
+use winemu_shared::{pe, peb, teb};
 
 /// 已初始化的 TEB/PEB 描述符
 pub struct TebPeb {
@@ -18,6 +24,39 @@ pub struct TebPeb {
     pub stack_base: u64,
     /// 栈底（StackLimit，低地址）
     pub stack_limit: u64,
+}
+
+pub struct UserThreadStack {
+    pub reserve_base: u64,
+    pub reserve_size: u64,
+    pub stack_base: u64,
+    pub stack_limit: u64,
+}
+
+const KUSER_SHARED_DATA_VA: u64 = 0x7ffe_0000;
+const KUSER_SHARED_DATA_SIZE: usize = PAGE_SIZE_4K as usize;
+const PERF_COUNTER_FREQUENCY_100NS: u64 = 10_000_000;
+const PROCESSOR_ARCHITECTURE_ARM64: u16 = 12;
+const NT_PRODUCT_WIN_NT: u32 = 1;
+const DEFAULT_THREAD_STACK_RESERVE: u64 = 0x10_0000;
+const THREAD_STACK_RESERVE_ALIGN: u64 = 0x1_0000;
+
+mod kusd {
+    pub const TICK_COUNT_LOW_DEPRECATED: usize = 0x000;
+    pub const TICK_COUNT_MULTIPLIER: usize = 0x004;
+    pub const INTERRUPT_TIME: usize = 0x008;
+    pub const SYSTEM_TIME: usize = 0x014;
+    pub const TIME_ZONE_BIAS: usize = 0x020;
+    pub const NT_SYSTEM_ROOT: usize = 0x030;
+    pub const NT_BUILD_NUMBER: usize = 0x260;
+    pub const NT_PRODUCT_TYPE: usize = 0x264;
+    pub const PRODUCT_TYPE_IS_VALID: usize = 0x268;
+    pub const NATIVE_PROCESSOR_ARCHITECTURE: usize = 0x26a;
+    pub const NT_MAJOR_VERSION: usize = 0x26c;
+    pub const NT_MINOR_VERSION: usize = 0x270;
+    pub const QPC_FREQUENCY: usize = 0x300;
+    pub const TICK_COUNT: usize = 0x320;
+    pub const COOKIE: usize = 0x330;
 }
 
 /// 写 u64 到 buf[offset]（小端）
@@ -36,6 +75,19 @@ fn wu32(buf: &mut [u8], offset: usize, val: u32) {
 #[inline(always)]
 fn wu16(buf: &mut [u8], offset: usize, val: u16) {
     buf[offset..offset + 2].copy_from_slice(&val.to_le_bytes());
+}
+
+#[inline(always)]
+fn wu8(buf: &mut [u8], offset: usize, val: u8) {
+    buf[offset] = val;
+}
+
+fn write_ksystem_time(buf: &mut [u8], offset: usize, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+    wu32(buf, offset, low);
+    wu32(buf, offset + 4, high);
+    wu32(buf, offset + 8, high);
 }
 
 /// RTL_USER_PROCESS_PARAMETERS 最小布局（64-bit）
@@ -161,6 +213,88 @@ fn with_process_user_buf_mut<R>(
     with_current_process_user_slice_mut(pid, UserVa::new(va), size, VM_ACCESS_WRITE, f)
 }
 
+fn read_ascii_cstr(bytes: &[u8], start: usize, out: &mut [u8]) -> Option<usize> {
+    if start >= bytes.len() || out.is_empty() {
+        return None;
+    }
+    let mut len = 0usize;
+    let mut idx = start;
+    while idx < bytes.len() && len < out.len() {
+        let ch = bytes[idx];
+        if ch == 0 {
+            return if len == 0 { None } else { Some(len) };
+        }
+        out[len] = ch.to_ascii_lowercase();
+        len += 1;
+        idx += 1;
+    }
+    None
+}
+
+fn module_import_dependencies(pid: u32, base: u64, size: u32, out: &mut Vec<String>) -> bool {
+    with_current_process_user_slice(
+        pid,
+        UserVa::new(base),
+        size as usize,
+        VM_ACCESS_READ,
+        |image| {
+            let Ok(hdrs) = pe::PeHeaders::from_slice(image) else {
+                return false;
+            };
+            let Some(dir) = hdrs.data_dir(pe::DIR_IMPORT) else {
+                return true;
+            };
+            if !dir.is_present() {
+                return true;
+            }
+            let mut desc_off = dir.rva as usize;
+            while desc_off + 20 <= image.len() {
+                let desc = &image[desc_off..desc_off + 20];
+                let orig_first_thunk = u32::from_le_bytes(desc[0..4].try_into().unwrap());
+                let time_date_stamp = u32::from_le_bytes(desc[4..8].try_into().unwrap());
+                let forwarder_chain = u32::from_le_bytes(desc[8..12].try_into().unwrap());
+                let name_rva = u32::from_le_bytes(desc[12..16].try_into().unwrap()) as usize;
+                let first_thunk = u32::from_le_bytes(desc[16..20].try_into().unwrap());
+                if orig_first_thunk == 0
+                    && time_date_stamp == 0
+                    && forwarder_chain == 0
+                    && name_rva == 0
+                    && first_thunk == 0
+                {
+                    break;
+                }
+                let mut buf = [0u8; 96];
+                let Some(len) = read_ascii_cstr(image, name_rva, &mut buf) else {
+                    desc_off += 20;
+                    continue;
+                };
+                let Ok(name) = core::str::from_utf8(&buf[..len]) else {
+                    desc_off += 20;
+                    continue;
+                };
+                let _ = out.try_reserve(1);
+                out.push(String::from(name));
+                desc_off += 20;
+            }
+            true
+        },
+    )
+    .unwrap_or(false)
+}
+
+fn topo_visit_module(idx: usize, deps: &[Vec<usize>], marks: &mut [u8], out: &mut Vec<usize>) {
+    if marks[idx] == 2 || marks[idx] == 1 {
+        return;
+    }
+    marks[idx] = 1;
+    for dep in deps[idx].iter().copied() {
+        topo_visit_module(dep, deps, marks, out);
+    }
+    marks[idx] = 2;
+    let _ = out.try_reserve(1);
+    out.push(idx);
+}
+
 fn init_ldr_entry(
     entry_buf: &mut [u8],
     entry_va: u64,
@@ -201,32 +335,17 @@ pub fn init(
     image_path: &str,
     cmdline: &str,
 ) -> Option<TebPeb> {
-    let stack_size = align_up(stack_reserve.max(0x10_0000), 0x10000) as usize;
-    let max_commit = (stack_size as u64).saturating_sub(PAGE_SIZE_4K);
-    let mut commit_size = align_up(stack_commit.max(PAGE_SIZE_4K), PAGE_SIZE_4K);
-    if commit_size > max_commit {
-        commit_size = max_commit.max(PAGE_SIZE_4K);
-    }
     let mut allocated = [0u64; 128];
     let mut allocated_count = 0usize;
-    let stack_reserve_base = match alloc_user_region(
-        pid,
-        stack_size,
-        VmaType::ThreadStack,
-        &mut allocated,
-        &mut allocated_count,
-    ) {
-        Some(v) => v,
+    let stack = match alloc_thread_stack(pid, stack_reserve, stack_commit) {
+        Some(stack) => stack,
         None => return None,
     };
-    let stack_base = stack_reserve_base + stack_size as u64;
-    let mut stack_limit = stack_base.saturating_sub(commit_size);
-    if stack_limit <= stack_reserve_base {
-        stack_limit = stack_reserve_base.saturating_add(PAGE_SIZE_4K);
-    }
-    let guard_page = stack_limit.saturating_sub(PAGE_SIZE_4K);
-    if guard_page < stack_reserve_base || !vm_make_guard_page(pid, guard_page) {
-        free_user_regions(pid, &allocated, allocated_count);
+    if allocated_count < allocated.len() {
+        allocated[allocated_count] = stack.reserve_base;
+        allocated_count += 1;
+    } else {
+        let _ = vm_free_region(pid, stack.reserve_base);
         return None;
     }
 
@@ -331,6 +450,11 @@ pub fn init(
         return None;
     }
 
+    if init_kuser_shared_data(pid, &mut allocated, &mut allocated_count).is_none() {
+        free_user_regions(pid, &allocated, allocated_count);
+        return None;
+    }
+
     // ── PEB ──────────────────────────────────────────────────
     let peb_ok = with_process_user_buf_mut(pid, peb_va, peb::SIZE, |peb_buf| {
         wu64(peb_buf, peb::IMAGE_BASE_ADDRESS, image_base);
@@ -418,11 +542,61 @@ pub fn init(
             return false;
         }
 
+        let mut loaded = Vec::new();
         crate::dll::for_each_loaded(|dll_name, dll_base, dll_size, dll_entry| {
-            if !ok || dll_base == 0 || dll_base == image_base {
+            if dll_base == 0 || dll_base == image_base {
                 return;
             }
+            let _ = loaded.try_reserve(1);
+            loaded.push((String::from(dll_name), dll_base, dll_size, dll_entry));
+        });
 
+        let mut deps = Vec::new();
+        let _ = deps.try_reserve(loaded.len());
+        for _ in 0..loaded.len() {
+            deps.push(Vec::new());
+        }
+        for idx in 0..loaded.len() {
+            let (_, dll_base, dll_size, _) = &loaded[idx];
+            let mut import_names = Vec::new();
+            if !module_import_dependencies(pid, *dll_base, *dll_size, &mut import_names) {
+                ok = false;
+                break;
+            }
+            for import_name in import_names {
+                for dep_idx in 0..loaded.len() {
+                    if dep_idx != idx && loaded[dep_idx].0 == import_name {
+                        let _ = deps[idx].try_reserve(1);
+                        deps[idx].push(dep_idx);
+                        break;
+                    }
+                }
+            }
+        }
+        if !ok {
+            return false;
+        }
+
+        let mut init_order = Vec::new();
+        let mut marks = Vec::new();
+        let _ = marks.try_reserve(loaded.len());
+        for _ in 0..loaded.len() {
+            marks.push(0u8);
+        }
+        for idx in 0..loaded.len() {
+            topo_visit_module(idx, &deps, &mut marks, &mut init_order);
+        }
+
+        let mut entry_vas = Vec::new();
+        let _ = entry_vas.try_reserve(loaded.len());
+        for _ in 0..loaded.len() {
+            entry_vas.push(0u64);
+        }
+
+        for (idx, (dll_name, dll_base, dll_size, dll_entry)) in loaded.iter().enumerate() {
+            if !ok {
+                break;
+            }
             let Some(dll_entry_va) = alloc_user_region(
                 pid,
                 ldr_entry::SIZE,
@@ -431,17 +605,18 @@ pub fn init(
                 &mut allocated_count,
             ) else {
                 ok = false;
-                return;
+                break;
             };
+            entry_vas[idx] = dll_entry_va;
 
             let inserted =
                 with_process_user_buf_mut(pid, dll_entry_va, ldr_entry::SIZE, |dll_entry_buf| {
                     init_ldr_entry(
                         dll_entry_buf,
                         dll_entry_va,
-                        dll_base,
-                        dll_size,
-                        dll_entry,
+                        *dll_base,
+                        *dll_size,
+                        *dll_entry,
                         dll_name,
                         dll_name,
                     );
@@ -461,21 +636,44 @@ pub fn init(
                         dll_entry_buf,
                         dll_entry_va,
                         ldr_entry::IN_MEMORY_ORDER,
-                    ) && list_insert_tail(
-                        pid,
-                        ldr_buf,
-                        ldr_va,
-                        ldr_data::IN_INIT_ORDER,
-                        dll_entry_buf,
-                        dll_entry_va,
-                        ldr_entry::IN_INIT_ORDER,
                     )
                 })
                 .unwrap_or(false);
             if !inserted {
                 ok = false;
             }
-        });
+        }
+
+        if ok {
+            for idx in init_order {
+                let dll_entry_va = entry_vas.get(idx).copied().unwrap_or(0);
+                if dll_entry_va == 0 {
+                    ok = false;
+                    break;
+                }
+                let inserted = with_process_user_buf_mut(
+                    pid,
+                    dll_entry_va,
+                    ldr_entry::SIZE,
+                    |dll_entry_buf| {
+                        list_insert_tail(
+                            pid,
+                            ldr_buf,
+                            ldr_va,
+                            ldr_data::IN_INIT_ORDER,
+                            dll_entry_buf,
+                            dll_entry_va,
+                            ldr_entry::IN_INIT_ORDER,
+                        )
+                    },
+                )
+                .unwrap_or(false);
+                if !inserted {
+                    ok = false;
+                    break;
+                }
+            }
+        }
         ok
     })
     .unwrap_or(false);
@@ -507,8 +705,8 @@ pub fn init(
     // ── TEB ──────────────────────────────────────────────────
     let teb_ok = with_process_user_buf_mut(pid, teb_va, teb::SIZE, |teb_buf| {
         wu64(teb_buf, teb::EXCEPTION_LIST, u64::MAX);
-        wu64(teb_buf, teb::STACK_BASE, stack_base);
-        wu64(teb_buf, teb::STACK_LIMIT, stack_limit);
+        wu64(teb_buf, teb::STACK_BASE, stack.stack_base);
+        wu64(teb_buf, teb::STACK_LIMIT, stack.stack_limit);
         wu64(teb_buf, teb::SELF, teb_va);
         wu64(teb_buf, teb::PEB, peb_va);
         wu64(teb_buf, teb::CLIENT_ID, pid as u64);
@@ -523,8 +721,8 @@ pub fn init(
     Some(TebPeb {
         teb_va,
         peb_va,
-        stack_base,
-        stack_limit,
+        stack_base: stack.stack_base,
+        stack_limit: stack.stack_limit,
     })
 }
 
@@ -555,6 +753,86 @@ fn alloc_user_region(
     }
 }
 
+fn alloc_user_region_at(
+    pid: u32,
+    base: u64,
+    size: usize,
+    prot: u32,
+    vma_type: VmaType,
+    regions: &mut [u64],
+    count: &mut usize,
+) -> Option<u64> {
+    let actual = vm_alloc_region_typed(pid, base, size as u64, prot, vma_type)?;
+    if actual != base {
+        let _ = vm_free_region(pid, actual);
+        return None;
+    }
+    if *count < regions.len() {
+        regions[*count] = actual;
+        *count += 1;
+        Some(actual)
+    } else {
+        let _ = vm_free_region(pid, actual);
+        None
+    }
+}
+
+fn init_kuser_shared_data(
+    pid: u32,
+    regions: &mut [u64],
+    count: &mut usize,
+) -> Option<u64> {
+    let base = alloc_user_region_at(
+        pid,
+        KUSER_SHARED_DATA_VA,
+        KUSER_SHARED_DATA_SIZE,
+        0x02,
+        VmaType::Private,
+        regions,
+        count,
+    )?;
+    let pa = translate_user_va(pid, UserVa::new(base), VM_ACCESS_READ)?;
+
+    let mono_100ns = crate::hypercall::query_mono_time_100ns();
+    let system_100ns = crate::hypercall::query_system_time_100ns();
+    let tick_ms = mono_100ns / 10_000;
+    let mut page = [0u8; KUSER_SHARED_DATA_SIZE];
+
+    wu32(page.as_mut_slice(), kusd::TICK_COUNT_LOW_DEPRECATED, tick_ms as u32);
+    wu32(page.as_mut_slice(), kusd::TICK_COUNT_MULTIPLIER, 0);
+    write_ksystem_time(page.as_mut_slice(), kusd::INTERRUPT_TIME, mono_100ns);
+    write_ksystem_time(page.as_mut_slice(), kusd::SYSTEM_TIME, system_100ns);
+    write_ksystem_time(page.as_mut_slice(), kusd::TIME_ZONE_BIAS, 0);
+    let mut root_off = kusd::NT_SYSTEM_ROOT;
+    let _ = write_utf16(page.as_mut_slice(), &mut root_off, "C:\\Windows", 0);
+    wu32(page.as_mut_slice(), kusd::NT_BUILD_NUMBER, 22631);
+    wu32(page.as_mut_slice(), kusd::NT_PRODUCT_TYPE, NT_PRODUCT_WIN_NT);
+    wu8(page.as_mut_slice(), kusd::PRODUCT_TYPE_IS_VALID, 1);
+    wu16(
+        page.as_mut_slice(),
+        kusd::NATIVE_PROCESSOR_ARCHITECTURE,
+        PROCESSOR_ARCHITECTURE_ARM64,
+    );
+    wu32(page.as_mut_slice(), kusd::NT_MAJOR_VERSION, 10);
+    wu32(page.as_mut_slice(), kusd::NT_MINOR_VERSION, 0);
+    wu64(
+        page.as_mut_slice(),
+        kusd::QPC_FREQUENCY,
+        PERF_COUNTER_FREQUENCY_100NS,
+    );
+    write_ksystem_time(page.as_mut_slice(), kusd::TICK_COUNT, tick_ms);
+    wu32(
+        page.as_mut_slice(),
+        kusd::COOKIE,
+        (system_100ns as u32) ^ (tick_ms as u32) ^ 0x4d45_5557,
+    );
+
+    if !crate::mm::linear_map::copy_to_phys(pa, page.as_ptr(), page.len()) {
+        return None;
+    }
+    Some(base)
+}
+
 /// 将 UTF-8 字符串编码为 UTF-16LE 写入 buf[*off..]，返回该字符串在 guest 内存中的 VA。
 /// 写完后 *off 向后推进（含 NUL 终止符）。
 fn write_utf16(buf: &mut [u8], off: &mut usize, s: &str, base_va: u64) -> u64 {
@@ -580,6 +858,39 @@ fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
 }
 
+fn normalize_thread_stack_sizes(stack_reserve: u64, stack_commit: u64) -> (u64, u64) {
+    let reserve_size =
+        align_up(stack_reserve.max(DEFAULT_THREAD_STACK_RESERVE), THREAD_STACK_RESERVE_ALIGN);
+    let max_commit = reserve_size.saturating_sub(PAGE_SIZE_4K);
+    let mut commit_size = align_up(stack_commit.max(PAGE_SIZE_4K), PAGE_SIZE_4K);
+    if commit_size > max_commit {
+        commit_size = max_commit.max(PAGE_SIZE_4K);
+    }
+    (reserve_size, commit_size)
+}
+
+pub fn alloc_thread_stack(
+    pid: u32,
+    stack_reserve: u64,
+    stack_commit: u64,
+) -> Option<UserThreadStack> {
+    let (reserve_size, commit_size) = normalize_thread_stack_sizes(stack_reserve, stack_commit);
+    let reserve_base = vm_alloc_region_typed(pid, 0, reserve_size, 0x04, VmaType::ThreadStack)?;
+    let stack_base = reserve_base + reserve_size;
+    let stack_limit = stack_base.saturating_sub(commit_size);
+    let guard_page = stack_limit.saturating_sub(PAGE_SIZE_4K);
+    if guard_page < reserve_base || !vm_make_guard_page(pid, guard_page) {
+        let _ = vm_free_region(pid, reserve_base);
+        return None;
+    }
+    Some(UserThreadStack {
+        reserve_base,
+        reserve_size,
+        stack_base,
+        stack_limit,
+    })
+}
+
 /// Allocate a minimal TEB page for a new thread in `pid`.
 /// Returns the TEB VA on success, or None on OOM.
 pub fn alloc_teb(pid: u32) -> Option<u64> {
@@ -591,4 +902,34 @@ pub fn alloc_teb(pid: u32) -> Option<u64> {
         return None;
     }
     Some(teb_va)
+}
+
+pub fn init_thread_teb(
+    pid: u32,
+    tid: u32,
+    teb_va: u64,
+    stack_base: u64,
+    stack_limit: u64,
+) -> bool {
+    use winemu_shared::teb as teb_off;
+
+    let Some(peb_va) = crate::process::with_process(pid, |p| p.peb_va) else {
+        return false;
+    };
+
+    write_user_value(pid, (teb_va + teb_off::EXCEPTION_LIST as u64) as *mut u64, u64::MAX)
+        && write_user_value(pid, (teb_va + teb_off::STACK_BASE as u64) as *mut u64, stack_base)
+        && write_user_value(
+            pid,
+            (teb_va + teb_off::STACK_LIMIT as u64) as *mut u64,
+            stack_limit,
+        )
+        && write_user_value(pid, (teb_va + teb_off::SELF as u64) as *mut u64, teb_va)
+        && write_user_value(pid, (teb_va + teb_off::PEB as u64) as *mut u64, peb_va)
+        && write_user_value(pid, (teb_va + teb_off::CLIENT_ID as u64) as *mut u64, pid as u64)
+        && write_user_value(
+            pid,
+            (teb_va + teb_off::CLIENT_ID as u64 + 8) as *mut u64,
+            tid as u64,
+        )
 }

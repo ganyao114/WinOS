@@ -13,6 +13,12 @@ pub fn open(req: &FsOpenRequest<'_>) -> Result<FsFileHandle, FsError> {
     namespace::open(req)
 }
 
+pub fn create_dir(path: &str) -> Result<(), FsError> {
+    let mut normalized_buf = [0u8; 512];
+    let path = super::path::normalize_path_str(path, &mut normalized_buf).unwrap_or(path);
+    hostfs::create_dir(path)
+}
+
 pub fn open_readonly(path: &str) -> Result<FsFileHandle, FsError> {
     open(&FsOpenRequest {
         path,
@@ -64,6 +70,22 @@ pub(crate) fn file_name_utf16(file: FsFileHandle) -> Option<crate::rust_alloc::v
 #[inline]
 pub fn file_size(file: FsFileHandle) -> Result<u64, FsError> {
     Ok(query_info(file)?.size)
+}
+
+pub fn seek(file: FsFileHandle, offset: i64, whence: u32) -> Result<u64, FsError> {
+    let record = object::file_record(file).ok_or(FsError::InvalidHandle)?;
+    match record.backend {
+        FsBackendKind::HostFs => hostfs::seek(record.backend_idx, offset, whence),
+        FsBackendKind::WinEmuHost => Err(FsError::Unsupported),
+    }
+}
+
+pub fn set_len(file: FsFileHandle, len: u64) -> Result<(), FsError> {
+    let record = object::file_record(file).ok_or(FsError::InvalidHandle)?;
+    match record.backend {
+        FsBackendKind::HostFs => hostfs::set_len(record.backend_idx, len),
+        FsBackendKind::WinEmuHost => Err(FsError::Unsupported),
+    }
 }
 
 pub fn query_standard_info(file: FsFileHandle) -> Result<FsStandardInfo, FsError> {

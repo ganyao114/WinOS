@@ -154,3 +154,26 @@ pub(crate) fn pager_read_into_phys(
         FsBackendKind::WinEmuHost => Err(FsError::Unsupported),
     }
 }
+
+pub(crate) fn pager_write_from_phys(
+    backing: FsBackingHandle,
+    file_off: u64,
+    src: PhysAddr,
+    len: usize,
+) -> Result<usize, FsError> {
+    let record = backing_record(backing).ok_or(FsError::InvalidHandle)?;
+    let _ = record.is_image;
+    if file_off >= record.size {
+        return Ok(0);
+    }
+
+    let remain = record.size.saturating_sub(file_off);
+    let write_len = core::cmp::min(remain.min(len as u64), usize::MAX as u64) as usize;
+    let abs_off = record.file_offset.saturating_add(file_off);
+    match record.backend {
+        FsBackendKind::HostFs => {
+            super::hostfs::write_at_phys(record.backend_idx, src, write_len, abs_off)
+        }
+        FsBackendKind::WinEmuHost => Err(FsError::Unsupported),
+    }
+}

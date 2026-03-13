@@ -1,10 +1,6 @@
 #[inline(always)]
 pub(crate) fn lower_ascii(b: u8) -> u8 {
-    if b.is_ascii_uppercase() {
-        b + 32
-    } else {
-        b
-    }
+    if b.is_ascii_uppercase() { b + 32 } else { b }
 }
 
 pub(crate) fn eq_ascii_ci(a: &str, b: &str) -> bool {

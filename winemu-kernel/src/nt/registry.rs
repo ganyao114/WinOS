@@ -29,6 +29,9 @@ const KEY_INFORMATION_NAME: u32 = 3;
 const KEY_BASIC_INFORMATION_SIZE: usize = 16;
 const KEY_FULL_INFORMATION_SIZE: usize = 44;
 const KEY_NAME_INFORMATION_SIZE: usize = 4;
+const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+const ACCESS_SYSTEM_SECURITY: u32 = 0x0100_0000;
+const KEY_WOW64_FLAGS: u32 = 0x0000_0300;
 
 struct RegistryState {
     root: KeyNode,
@@ -41,6 +44,11 @@ unsafe impl Sync for RegistryStateCell {}
 
 static REG_STATE: RegistryStateCell = RegistryStateCell(UnsafeCell::new(None));
 
+const WBEM_LOCATOR_CLSID: &str = "{4590F811-1D3A-11D0-891F-00AA004B2E24}";
+const WBEM_REFRESHER_CLSID: &str = "{C71566F2-561E-11D1-AD87-00C04FD8FDFF}";
+const WBEMPROX_DLL_PATH: &str = "C:\\windows\\system32\\wbem\\wbemprox.dll";
+const FASTPROX_DLL_PATH: &str = "C:\\windows\\system32\\wbem\\fastprox.dll";
+
 fn ensure_state() -> &'static mut RegistryState {
     // SAFETY: Registry state is process-global and accessed through the
     // existing serialized kernel paths. UnsafeCell here removes `static mut`
@@ -48,13 +56,55 @@ fn ensure_state() -> &'static mut RegistryState {
     unsafe {
         let slot = &mut *REG_STATE.0.get();
         if slot.is_none() {
+            let root = RegistryKey::create_root();
+            seed_registry_defaults(&root);
             *slot = Some(RegistryState {
-                root: RegistryKey::create_root(),
+                root,
                 handles: ObjectStore::new(),
             });
         }
         slot.as_mut().unwrap()
     }
+}
+
+fn set_string_value(node: &KeyNode, name: &str, value: &str) {
+    node.borrow_mut().set_value(
+        name.to_string(),
+        RegistryValue::new(name.to_string(), RegistryValueData::String(value.to_string())),
+    );
+}
+
+fn seed_inproc_clsid(root: &KeyNode, clsid_text: &str, display_name: &str, dll_path: &str) {
+    let base_path = "Software\\Classes\\CLSID\\";
+    let clsid_path = {
+        let mut s = String::with_capacity(base_path.len() + clsid_text.len());
+        s.push_str(base_path);
+        s.push_str(clsid_text);
+        s
+    };
+    let inproc_path = {
+        let mut s = String::with_capacity(clsid_path.len() + "\\InprocServer32".len());
+        s.push_str(&clsid_path);
+        s.push_str("\\InprocServer32");
+        s
+    };
+
+    let clsid = RegistryKey::create_key_recursive(root, &clsid_path);
+    set_string_value(&clsid, "", display_name);
+
+    let inproc = RegistryKey::create_key_recursive(root, &inproc_path);
+    set_string_value(&inproc, "", dll_path);
+    set_string_value(&inproc, "ThreadingModel", "Both");
+}
+
+fn seed_registry_defaults(root: &KeyNode) {
+    seed_inproc_clsid(root, WBEM_LOCATOR_CLSID, "WBEM Locator", WBEMPROX_DLL_PATH);
+    seed_inproc_clsid(
+        root,
+        WBEM_REFRESHER_CLSID,
+        "WBEM Refresher",
+        FASTPROX_DLL_PATH,
+    );
 }
 
 fn read_value_name(us_ptr: u64) -> String {
@@ -219,7 +269,8 @@ fn write_ret_len(ptr: u64, len: usize) {
 #[inline(always)]
 fn validate_key_desired_access(desired_access: u32) -> bool {
     let meta = super::kobject::object_type_meta_for_kind(KObjectKind::Key);
-    (desired_access & !meta.valid_access_mask) == 0
+    let allowed = meta.valid_access_mask | MAXIMUM_ALLOWED | ACCESS_SYSTEM_SECURITY | KEY_WOW64_FLAGS;
+    (desired_access & !allowed) == 0
 }
 
 fn gc_key_handles(state: &mut RegistryState) {
@@ -278,6 +329,12 @@ pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
         return;
     }
     if !validate_key_desired_access(desired_access) {
+        let path = oa_full_path(oa, state).unwrap_or_else(|| "<invalid>".to_string());
+        crate::kdebug!(
+            "reg: open key denied access={:#x} path={}",
+            desired_access,
+            path
+        );
         frame.x[0] = status::ACCESS_DENIED as u64;
         return;
     }
@@ -288,9 +345,13 @@ pub(crate) fn handle_open_key(frame: &mut SvcFrame) {
     };
 
     let Some(node) = RegistryKey::find_key(&state.root, &path) else {
+        crate::ktrace!("reg: open key miss path={}", path);
         frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
         return;
     };
+    if path.contains(WBEM_LOCATOR_CLSID) {
+        crate::ktrace!("reg: open key hit path={}", path);
+    }
 
     let Some(handle_idx) = alloc_key_handle(state, node) else {
         frame.x[0] = status::NO_MEMORY as u64;
@@ -336,6 +397,12 @@ pub(crate) fn handle_create_key(frame: &mut SvcFrame) {
         return;
     }
     if !validate_key_desired_access(desired_access) {
+        let path = oa_full_path(oa, state).unwrap_or_else(|| "<invalid>".to_string());
+        crate::kdebug!(
+            "reg: create key denied access={:#x} path={}",
+            desired_access,
+            path
+        );
         frame.x[0] = status::ACCESS_DENIED as u64;
         return;
     }
@@ -470,8 +537,19 @@ pub(crate) fn handle_query_value_key(frame: &mut SvcFrame) {
     };
 
     let value_name = read_value_name(value_name_us);
+    let full_path = RegistryKey::get_full_path(&node);
+    if full_path.contains(WBEM_LOCATOR_CLSID) {
+        crate::ktrace!("reg: query value path={} value={}", full_path, value_name);
+    }
     let guard = node.borrow();
     let Some(value) = guard.get_value(&value_name).cloned() else {
+        if full_path.contains(WBEM_LOCATOR_CLSID) {
+            crate::ktrace!(
+                "reg: query value miss path={} value={}",
+                full_path,
+                value_name
+            );
+        }
         frame.x[0] = status::OBJECT_NAME_NOT_FOUND as u64;
         return;
     };
