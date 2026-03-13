@@ -474,6 +474,18 @@ void __cdecl _invalid_parameter(const wchar_t *expr, const wchar_t *func,
     if (invalid_parameter_handler) invalid_parameter_handler( expr, func, file, line, arg );
     else
     {
+        void *caller = __builtin_return_address(0);
+        fprintf(
+            stderr,
+            "msvcrt: invalid_parameter caller=%p line=%u arg=%llx expr=%p func=%p file=%p\n",
+            caller,
+            line,
+            (unsigned long long)arg,
+            expr,
+            func,
+            file
+        );
+        fflush(stderr);
         ERR( "%s:%u %s: %s %Ix\n", debugstr_w(file), line, debugstr_w(func), debugstr_w(expr), arg );
 #if _MSVCR_VER >= 80
         RaiseException( STATUS_INVALID_CRUNTIME_PARAMETER, EXCEPTION_NONCONTINUABLE, 0, NULL );

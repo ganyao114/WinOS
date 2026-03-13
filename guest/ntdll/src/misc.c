@@ -63,8 +63,15 @@ EXPORT ULONG RtlNtStatusToDosError(NTSTATUS status) {
         case 0xC0000005:   return 5;
         case 0xC000000D:   return 87;
         case 0xC0000017:   return 14;
+        case 0xC0000034:   return 2;
+        case 0xC0000035:   return 183;
+        case 0xC000003A:   return 3;
         default:           return 317;
     }
+}
+
+EXPORT ULONG RtlNtStatusToDosErrorNoTeb(NTSTATUS status) {
+    return RtlNtStatusToDosError(status);
 }
 
 typedef struct {
@@ -480,6 +487,20 @@ typedef struct {
     double d[8];
 } WINEMU_JUMP_BUFFER_ARM64;
 
+typedef struct {
+    uint32_t ExceptionCode;
+    uint32_t ExceptionFlags;
+    void* ExceptionRecord;
+    void* ExceptionAddress;
+    uint32_t NumberParameters;
+    uint32_t __pad;
+    uint64_t ExceptionInformation[15];
+} WINEMU_EXCEPTION_RECORD64;
+
+#define STATUS_LONGJUMP ((NTSTATUS)0x80000026U)
+
+EXPORT void RtlUnwind();
+
 __attribute__((naked))
 EXPORT int _setjmpex(void* env, void* frame) {
     asm volatile(
@@ -511,39 +532,27 @@ EXPORT int _setjmp(void* env) {
     return _setjmpex(env, NULL);
 }
 
-__attribute__((naked))
 EXPORT void longjmp(void* env, int value) {
-    asm volatile(
-        "cbz x0, 3f\n\t"
-        "mov x16, x0\n\t"
-        "mov w0, w1\n\t"
-        "cbnz w0, 1f\n\t"
-        "mov w0, #1\n\t"
-        "1:\n\t"
-        "ldp x19, x20, [x16, #0x10]\n\t"
-        "ldp x21, x22, [x16, #0x20]\n\t"
-        "ldp x23, x24, [x16, #0x30]\n\t"
-        "ldp x25, x26, [x16, #0x40]\n\t"
-        "ldp x27, x28, [x16, #0x50]\n\t"
-        "ldp x29, x30, [x16, #0x60]\n\t"
-        "ldr x2, [x16, #0x70]\n\t"
-        "ldr w3, [x16, #0x78]\n\t"
-        "msr fpcr, x3\n\t"
-        "ldr w3, [x16, #0x7c]\n\t"
-        "msr fpsr, x3\n\t"
-        "ldp d8, d9, [x16, #0x80]\n\t"
-        "ldp d10, d11, [x16, #0x90]\n\t"
-        "ldp d12, d13, [x16, #0xa0]\n\t"
-        "ldp d14, d15, [x16, #0xb0]\n\t"
-        "mov sp, x2\n\t"
-        "ret\n\t"
-        "3:\n\t"
-        "mov x8, %0\n\t"
-        "mov x0, #-1\n\t"
-        "mov x1, #0\n\t"
-        "svc #0\n\t"
-        "b .\n\t"
-        :: "i"(NR_TERMINATE_PROCESS));
+    WINEMU_JUMP_BUFFER_ARM64* buf = (WINEMU_JUMP_BUFFER_ARM64*)env;
+    WINEMU_EXCEPTION_RECORD64 rec;
+
+    if (!buf) {
+        (void)syscall2(NR_TERMINATE_PROCESS, (uint64_t)(HANDLE)(uint64_t)-1, 0);
+        for (;;) {}
+    }
+
+    if (!value) value = 1;
+
+    rec.ExceptionCode = STATUS_LONGJUMP;
+    rec.ExceptionFlags = 0;
+    rec.ExceptionRecord = NULL;
+    rec.ExceptionAddress = NULL;
+    rec.NumberParameters = 1;
+    rec.__pad = 0;
+    rec.ExceptionInformation[0] = (uint64_t)(uintptr_t)buf;
+    for (size_t i = 1; i < 15; ++i) rec.ExceptionInformation[i] = 0;
+    RtlUnwind((void*)(uintptr_t)buf->frame, (void*)(uintptr_t)buf->lr, &rec, (void*)(uintptr_t)value);
+    for (;;) {}
 }
 
 EXPORT void RtlSetLastWin32Error(ULONG code) {
@@ -556,4 +565,3 @@ EXPORT ULONG RtlGetLastWin32Error(void) {
     if (!teb) return 0;
     return *(volatile uint32_t*)(teb + 0x68);
 }
-

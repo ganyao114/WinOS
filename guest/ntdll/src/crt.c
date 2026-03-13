@@ -2,27 +2,7 @@
 
 __attribute__((naked))
 EXPORT ULONG_PTR __chkstk(void) {
-    asm volatile(
-        // Windows arm64 ABI: allocation size is passed in x15 in 16-byte units.
-        // Probe one page at a time from current SP downward so guard growth and
-        // stack overflow behavior are fault-driven and deterministic.
-        "mov x9, sp\n\t"
-        "lsl x10, x15, #4\n\t"
-        "cbz x10, 2f\n\t"
-        "1:\n\t"
-        "cmp x10, #0x1000\n\t"
-        "b.lo 3f\n\t"
-        "sub x9, x9, #0x1000\n\t"
-        "ldr x11, [x9]\n\t"
-        "sub x10, x10, #0x1000\n\t"
-        "cbnz x10, 1b\n\t"
-        "b 2f\n\t"
-        "3:\n\t"
-        "sub x9, x9, x10\n\t"
-        "ldr x11, [x9]\n\t"
-        "2:\n\t"
-        "mov x0, x15\n\t"
-        "ret\n\t");
+    asm volatile("ret");
 }
 
 EXPORT void* memset(void* dst, int c, size_t n) {
@@ -384,4 +364,3 @@ EXPORT unsigned long wcstoul(const WCHAR* nptr, WCHAR** endptr, int base) {
     long v = wcstol(nptr, endptr, base);
     return (unsigned long)v;
 }
-

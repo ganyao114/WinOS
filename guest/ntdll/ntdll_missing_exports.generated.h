@@ -3,6 +3,7 @@
 
 #define WINEMU_STUB_RET0(name) EXPORT ULONG_PTR name(void) { return 0; }
 #define WINEMU_STUB_NT(name) EXPORT NTSTATUS name(void) { return STATUS_NOT_IMPLEMENTED; }
+#define WINEMU_STUB_SXS_NOT_FOUND(name) EXPORT NTSTATUS name(void) { return STATUS_NOT_IMPLEMENTED; }
 
 WINEMU_STUB_RET0(ApiSetQueryApiSetPresenceEx)
 WINEMU_STUB_RET0(DbgUiConnectToDbg)
@@ -37,12 +38,12 @@ WINEMU_STUB_NT(LdrAddRefDll)
 WINEMU_STUB_NT(LdrFindResourceDirectory_U)
 WINEMU_STUB_NT(LdrFindResource_U)
 WINEMU_STUB_NT(LdrGetDllDirectory)
-WINEMU_STUB_NT(LdrGetDllFullName)
+/* LdrGetDllFullName is implemented in src/loader.c */
 /* LdrGetDllHandle is implemented in src/loader.c */
 /* LdrGetDllHandleEx is implemented in src/loader.c */
-WINEMU_STUB_NT(LdrGetDllPath)
+/* LdrGetDllPath is implemented in src/loader.c */
 /* LdrGetProcedureAddress is implemented in src/loader.c */
-WINEMU_STUB_NT(LdrLoadDll)
+/* LdrLoadDll is implemented in src/loader.c */
 /* LdrQueryImageFileExecutionOptions is implemented in src/loader.c */
 WINEMU_STUB_NT(LdrRemoveDllDirectory)
 WINEMU_STUB_NT(LdrResolveDelayLoadedAPI)
@@ -86,7 +87,7 @@ WINEMU_STUB_NT(NtFlushProcessWriteBuffers)
 WINEMU_STUB_NT(NtFlushVirtualMemory)
 WINEMU_STUB_NT(NtGetContextThread)
 WINEMU_STUB_NT(NtGetCurrentProcessorNumber)
-WINEMU_STUB_NT(NtGetNlsSectionPtr)
+/* NtGetNlsSectionPtr is implemented in src/nls.c */
 WINEMU_STUB_NT(NtGetWriteWatch)
 WINEMU_STUB_NT(NtImpersonateAnonymousToken)
 WINEMU_STUB_NT(NtIsProcessInJob)
@@ -109,18 +110,18 @@ WINEMU_STUB_NT(NtOpenTimer)
 WINEMU_STUB_NT(NtPowerInformation)
 WINEMU_STUB_NT(NtPrivilegeCheck)
 WINEMU_STUB_NT(NtPulseEvent)
-WINEMU_STUB_NT(NtQueryDefaultLocale)
-WINEMU_STUB_NT(NtQueryDefaultUILanguage)
+/* NtQueryDefaultLocale is implemented in src/nls.c */
+/* NtQueryDefaultUILanguage is implemented in src/nls.c */
 WINEMU_STUB_NT(NtQueryDirectoryObject)
 WINEMU_STUB_NT(NtQueryFullAttributesFile)
 WINEMU_STUB_NT(NtQueryInformationAtom)
 WINEMU_STUB_NT(NtQueryInformationJobObject)
-WINEMU_STUB_NT(NtQueryInstallUILanguage)
+/* NtQueryInstallUILanguage is implemented in src/nls.c */
 WINEMU_STUB_NT(NtQuerySection)
 WINEMU_STUB_NT(NtQuerySecurityObject)
 WINEMU_STUB_NT(NtQuerySymbolicLinkObject)
 WINEMU_STUB_NT(NtQuerySystemInformationEx)
-WINEMU_STUB_NT(NtQueryValueKey)
+/* NtQueryValueKey is implemented in src/registry.c */
 WINEMU_STUB_NT(NtQueueApcThread)
 WINEMU_STUB_NT(NtReadFileScatter)
 WINEMU_STUB_NT(NtRemoveIoCompletion)
@@ -191,7 +192,7 @@ WINEMU_STUB_RET0(RtlCreateTimerQueue)
 WINEMU_STUB_RET0(RtlCreateUnicodeString)
 WINEMU_STUB_RET0(RtlCreateUnicodeStringFromAsciiz)
 WINEMU_STUB_RET0(RtlCreateUserStack)
-WINEMU_STUB_RET0(RtlCreateUserThread)
+/* Implemented in src/section_thread.c */
 WINEMU_STUB_RET0(RtlDeactivateActivationContext)
 WINEMU_STUB_RET0(RtlDecodePointer)
 WINEMU_STUB_RET0(RtlDecodeSystemPointer)
@@ -205,10 +206,10 @@ WINEMU_STUB_RET0(RtlDeregisterWaitEx)
 WINEMU_STUB_RET0(RtlDestroyAtomTable)
 WINEMU_STUB_RET0(RtlDestroyEnvironment)
 WINEMU_STUB_RET0(RtlDestroyProcessParameters)
-WINEMU_STUB_RET0(RtlDetermineDosPathNameType_U)
+/* RtlDetermineDosPathNameType_U is implemented in src/path.c */
 WINEMU_STUB_RET0(RtlDoesFileExists_U)
-WINEMU_STUB_RET0(RtlDosPathNameToNtPathName_U)
-WINEMU_STUB_RET0(RtlDosPathNameToNtPathName_U_WithStatus)
+/* RtlDosPathNameToNtPathName_U is implemented in src/path.c */
+/* RtlDosPathNameToNtPathName_U_WithStatus is implemented in src/path.c */
 WINEMU_STUB_RET0(RtlDosSearchPath_U)
 WINEMU_STUB_RET0(RtlDowncaseUnicodeChar)
 WINEMU_STUB_RET0(RtlDuplicateUnicodeString)
@@ -216,10 +217,9 @@ WINEMU_STUB_RET0(RtlEncodePointer)
 WINEMU_STUB_RET0(RtlEncodeSystemPointer)
 WINEMU_STUB_RET0(RtlEqualPrefixSid)
 WINEMU_STUB_RET0(RtlEqualSid)
-WINEMU_STUB_RET0(RtlExitUserThread)
 WINEMU_STUB_RET0(RtlExpandEnvironmentStrings_U)
-WINEMU_STUB_RET0(RtlFindActivationContextSectionGuid)
-WINEMU_STUB_RET0(RtlFindActivationContextSectionString)
+WINEMU_STUB_SXS_NOT_FOUND(RtlFindActivationContextSectionGuid)
+WINEMU_STUB_SXS_NOT_FOUND(RtlFindActivationContextSectionString)
 WINEMU_STUB_RET0(RtlFindClearBitsAndSet)
 /* RtlFindExportedRoutineByName is implemented in src/loader.c */
 WINEMU_STUB_RET0(RtlFindMessage)
@@ -228,20 +228,20 @@ WINEMU_STUB_RET0(RtlFormatMessage)
 WINEMU_STUB_RET0(RtlFreeActivationContextStack)
 WINEMU_STUB_RET0(RtlFreeAnsiString)
 WINEMU_STUB_RET0(RtlFreeSid)
-WINEMU_STUB_RET0(RtlFreeUnicodeString)
+/* RtlFreeUnicodeString is implemented in src/rtl_string.c */
 WINEMU_STUB_RET0(RtlFreeUserStack)
 WINEMU_STUB_RET0(RtlGUIDFromString)
 WINEMU_STUB_RET0(RtlGetAce)
 WINEMU_STUB_RET0(RtlGetActiveActivationContext)
 WINEMU_STUB_RET0(RtlGetControlSecurityDescriptor)
-WINEMU_STUB_RET0(RtlGetCurrentDirectory_U)
+/* RtlGetCurrentDirectory_U is implemented in src/path.c */
 WINEMU_STUB_RET0(RtlGetCurrentProcessorNumberEx)
 WINEMU_STUB_RET0(RtlGetDaclSecurityDescriptor)
 WINEMU_STUB_RET0(RtlGetExePath)
 WINEMU_STUB_RET0(RtlGetExtendedContextLength2)
-WINEMU_STUB_RET0(RtlGetFullPathName_U)
+/* RtlGetFullPathName_U is implemented in src/path.c */
 WINEMU_STUB_RET0(RtlGetGroupSecurityDescriptor)
-WINEMU_STUB_RET0(RtlGetLocaleFileMappingAddress)
+/* RtlGetLocaleFileMappingAddress is implemented in src/nls.c */
 WINEMU_STUB_RET0(RtlGetNativeSystemInformation)
 WINEMU_STUB_RET0(RtlGetOwnerSecurityDescriptor)
 WINEMU_STUB_RET0(RtlGetProcessPreferredUILanguages)
@@ -259,7 +259,7 @@ WINEMU_STUB_RET0(RtlIdnToAscii)
 WINEMU_STUB_RET0(RtlIdnToNameprepUnicode)
 WINEMU_STUB_RET0(RtlIdnToUnicode)
 WINEMU_STUB_RET0(RtlImpersonateSelf)
-WINEMU_STUB_RET0(RtlInitCodePageTable)
+/* RtlInitCodePageTable is implemented in src/nls.c */
 WINEMU_STUB_RET0(RtlInitUnicodeStringEx)
 WINEMU_STUB_RET0(RtlInitializeBitMap)
 WINEMU_STUB_RET0(RtlInitializeConditionVariable)
@@ -271,8 +271,8 @@ WINEMU_STUB_RET0(RtlInterlockedPopEntrySList)
 WINEMU_STUB_RET0(RtlInterlockedPushEntrySList)
 WINEMU_STUB_RET0(RtlInterlockedPushListSList)
 WINEMU_STUB_RET0(RtlInterlockedPushListSListEx)
-WINEMU_STUB_RET0(RtlIpv6AddressToStringExW)
-WINEMU_STUB_RET0(RtlIpv6StringToAddressW)
+/* RtlIpv6AddressToStringExW is implemented in src/rtl_string.c */
+/* RtlIpv6StringToAddressW is implemented in src/rtl_string.c */
 WINEMU_STUB_RET0(RtlIsDosDeviceName_U)
 WINEMU_STUB_RET0(RtlIsNameLegalDOS8Dot3)
 WINEMU_STUB_RET0(RtlIsNormalizedString)
@@ -308,11 +308,11 @@ WINEMU_STUB_RET0(RtlQueryInformationAcl)
 WINEMU_STUB_RET0(RtlQueryInformationActivationContext)
 WINEMU_STUB_RET0(RtlQueryTimeZoneInformation)
 WINEMU_STUB_RET0(RtlQueryUnbiasedInterruptTime)
-WINEMU_STUB_RET0(RtlQueueWorkItem)
+/* implemented in src/threadpool.c */
 WINEMU_STUB_RET0(RtlRaiseStatus)
 WINEMU_STUB_RET0(RtlRegisterWait)
 WINEMU_STUB_RET0(RtlReleaseActivationContext)
-WINEMU_STUB_RET0(RtlReleasePath)
+/* RtlReleasePath is implemented in src/loader.c */
 WINEMU_STUB_RET0(RtlReleasePebLock)
 WINEMU_STUB_RET0(RtlRemoveVectoredContinueHandler)
 WINEMU_STUB_RET0(RtlRemoveVectoredExceptionHandler)
@@ -320,8 +320,8 @@ WINEMU_STUB_RET0(RtlRestoreLastWin32Error)
 WINEMU_STUB_RET0(RtlSelfRelativeToAbsoluteSD)
 WINEMU_STUB_RET0(RtlSetBits)
 WINEMU_STUB_RET0(RtlSetControlSecurityDescriptor)
-WINEMU_STUB_RET0(RtlSetCriticalSectionSpinCount)
-WINEMU_STUB_RET0(RtlSetCurrentDirectory_U)
+/* RtlSetCriticalSectionSpinCount is implemented in src/sync.c */
+/* RtlSetCurrentDirectory_U is implemented in src/path.c */
 WINEMU_STUB_RET0(RtlSetCurrentEnvironment)
 WINEMU_STUB_RET0(RtlSetDaclSecurityDescriptor)
 WINEMU_STUB_RET0(RtlSetEnvironmentVariable)
@@ -404,7 +404,7 @@ WINEMU_STUB_RET0(TpSetPoolMinThreads)
 WINEMU_STUB_RET0(TpSetPoolStackInformation)
 WINEMU_STUB_RET0(TpSetTimer)
 WINEMU_STUB_RET0(TpSetWait)
-WINEMU_STUB_RET0(TpSimpleTryPost)
+/* implemented in src/threadpool.c */
 WINEMU_STUB_RET0(TpStartAsyncIoOperation)
 WINEMU_STUB_RET0(TpWaitForIoCompletion)
 WINEMU_STUB_RET0(TpWaitForTimer)

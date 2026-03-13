@@ -1,5 +1,37 @@
 /* ── Section ─────────────────────────────────────────────────── */
 
+typedef uint8_t BOOLEAN;
+typedef uint64_t SIZE_T;
+typedef struct _SECURITY_DESCRIPTOR SECURITY_DESCRIPTOR;
+typedef void (*PRTL_THREAD_START_ROUTINE)(void *);
+
+typedef struct _CLIENT_ID {
+    HANDLE UniqueProcess;
+    HANDLE UniqueThread;
+} CLIENT_ID;
+
+typedef struct _THREAD_BASIC_INFORMATION {
+    NTSTATUS ExitStatus;
+    void *TebBaseAddress;
+    CLIENT_ID ClientId;
+    ULONG_PTR AffinityMask;
+    LONG Priority;
+    LONG BasePriority;
+} THREAD_BASIC_INFORMATION;
+
+enum {
+    ThreadBasicInformation = 0,
+};
+
+#define THREAD_ALL_ACCESS 0x001fffffU
+
+EXPORT NTSTATUS NtQueryInformationThread(
+    HANDLE thread_handle,
+    ULONG thread_information_class,
+    void *thread_information,
+    ULONG thread_information_length,
+    ULONG *return_length);
+
 EXPORT NTSTATUS NtCreateSection(
     void** handle_out, ULONG access, void* oa,
     uint64_t* max_size, ULONG page_prot, ULONG alloc_attrs, void* file)
@@ -76,6 +108,58 @@ EXPORT NTSTATUS NtResumeThread(HANDLE thread_handle, ULONG* previous_suspend_cou
     );
 }
 
+EXPORT NTSTATUS RtlCreateUserThread(
+    HANDLE process,
+    SECURITY_DESCRIPTOR *security_descriptor,
+    BOOLEAN create_suspended,
+    ULONG zero_bits,
+    SIZE_T stack_reserve,
+    SIZE_T stack_commit,
+    PRTL_THREAD_START_ROUTINE start,
+    void *param,
+    HANDLE *thread_handle,
+    CLIENT_ID *client_id)
+{
+    HANDLE local_handle = 0;
+    HANDLE *create_out = thread_handle ? thread_handle : &local_handle;
+    NTSTATUS status;
+
+    (void)security_descriptor;
+
+    if (!start || (!thread_handle && !client_id)) return STATUS_INVALID_PARAMETER;
+
+    status = NtCreateThreadEx(
+        create_out,
+        THREAD_ALL_ACCESS,
+        NULL,
+        process,
+        (void *)start,
+        param,
+        create_suspended ? 0x1u : 0u,
+        zero_bits,
+        stack_commit,
+        stack_reserve,
+        NULL);
+    if (status) return status;
+
+    if (client_id)
+    {
+        THREAD_BASIC_INFORMATION basic_info;
+        ULONG ret_len = 0;
+
+        status = NtQueryInformationThread(
+            *create_out,
+            ThreadBasicInformation,
+            &basic_info,
+            sizeof(basic_info),
+            &ret_len);
+        if (!status) *client_id = basic_info.ClientId;
+    }
+
+    if (!thread_handle && local_handle) NtClose(local_handle);
+    return status;
+}
+
 EXPORT NTSTATUS NtQueryInformationThread(
     HANDLE thread_handle, ULONG thread_information_class, void* thread_information,
     ULONG thread_information_length, ULONG* return_length)
@@ -90,4 +174,3 @@ EXPORT NTSTATUS NtQueryInformationThread(
         0
     );
 }
-

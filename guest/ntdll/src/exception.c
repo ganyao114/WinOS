@@ -31,6 +31,26 @@ typedef struct {
     uint64_t Wvr[2];
 } ARM64_NT_CONTEXT;
 
+typedef struct {
+    uint64_t frame;
+    uint64_t lr;
+    uint64_t x19;
+    uint64_t x20;
+    uint64_t x21;
+    uint64_t x22;
+    uint64_t x23;
+    uint64_t x24;
+    uint64_t x25;
+    uint64_t x26;
+    uint64_t x27;
+    uint64_t x28;
+    uint64_t fp;
+    uint64_t sp;
+    uint32_t fpcr;
+    uint32_t fpsr;
+    double d[8];
+} WINEMU_RESTORE_JUMP_BUFFER_ARM64;
+
 typedef uint32_t EXCEPTION_DISPOSITION;
 
 enum {
@@ -55,6 +75,9 @@ enum {
 #define CONTEXT_ARM64 0x00400000U
 #define CONTEXT_FULL 0x00000007U
 #define CONTEXT_UNWOUND_TO_CALL 0x20000000U
+#ifndef STATUS_LONGJUMP
+#define STATUS_LONGJUMP 0x80000026U
+#endif
 
 typedef struct _DISPATCHER_CONTEXT_ARM64 DISPATCHER_CONTEXT_ARM64;
 
@@ -105,6 +128,288 @@ typedef char _winemu_dispatch_size_check[
         ? 1
         : -1
 ];
+
+#define STDOUT_HANDLE ((HANDLE)(uint64_t)0xFFFFFFFFFFFFFFF5ULL)
+#define EXCEPTION_WINE_STUB 0x80000100U
+
+typedef struct {
+    uint64_t Status;
+    uint64_t Information;
+} WINEMU_IO_STATUS_BLOCK64;
+
+static void winemu_exc_write_buf(const char* buf, ULONG len) {
+    WINEMU_IO_STATUS_BLOCK64 iosb;
+    iosb.Status = 0;
+    iosb.Information = 0;
+    (void)NtWriteFile(STDOUT_HANDLE, 0, 0, 0, &iosb, buf, len, 0, 0);
+}
+
+static void winemu_exc_write_str(const char* s) {
+    ULONG len = 0;
+    if (!s) return;
+    while (s[len]) len++;
+    winemu_exc_write_buf(s, len);
+}
+
+static void winemu_exc_write_hex32(uint32_t value) {
+    static const char digits[] = "0123456789abcdef";
+    char buf[10];
+    int i;
+
+    buf[0] = '0';
+    buf[1] = 'x';
+    for (i = 0; i < 8; ++i) {
+        buf[2 + i] = digits[(value >> ((7 - i) * 4)) & 0xf];
+    }
+    winemu_exc_write_buf(buf, (ULONG)sizeof(buf));
+}
+
+static void winemu_exc_write_hex64(uint64_t value) {
+    static const char digits[] = "0123456789abcdef";
+    char buf[18];
+    int i;
+
+    buf[0] = '0';
+    buf[1] = 'x';
+    for (i = 0; i < 16; ++i) {
+        buf[2 + i] = digits[(value >> ((15 - i) * 4)) & 0xf];
+    }
+    winemu_exc_write_buf(buf, (ULONG)sizeof(buf));
+}
+
+static void winemu_exc_write_cstr_trunc(const char* s, ULONG cap) {
+    ULONG len = 0;
+
+    if (!s) {
+        winemu_exc_write_str("<null>");
+        return;
+    }
+    while (len < cap && s[len]) len++;
+    winemu_exc_write_buf(s, len);
+    if (s[len]) winemu_exc_write_str("...");
+}
+
+static uint64_t winemu_exc_image_rel_or_abs(uint64_t image_base, uint32_t value) {
+    if (!value) return 0;
+    if (image_base && value < 0x10000000U) {
+        return image_base + (uint64_t)value;
+    }
+    return (uint64_t)value;
+}
+
+static int winemu_exc_read_ascii_cstr(uint64_t ptr, char* out, ULONG cap) {
+    ULONG len = 0;
+
+    if (!ptr || !out || !cap) return 0;
+    while (len + 1 < cap) {
+        char ch = *(const char*)(uintptr_t)(ptr + len);
+        if (!ch) {
+            out[len] = '\0';
+            return len != 0;
+        }
+        if ((unsigned char)ch < 0x20 || (unsigned char)ch > 0x7e) return 0;
+        out[len++] = ch;
+    }
+    out[cap - 1] = '\0';
+    return 0;
+}
+
+static int winemu_exc_copy_cpp_type_name(EXCEPTION_RECORD64* rec, char* out, ULONG cap) {
+    static const uint64_t name_offsets[] = {16, 8, 24, 0, 32};
+    uint64_t throw_info;
+    uint64_t image_base;
+    uint64_t cta;
+    uint32_t count;
+    uint32_t i;
+
+    if (!rec || rec->ExceptionCode != 0xE06D7363U || rec->NumberParameters < 4) return 0;
+    throw_info = rec->ExceptionInformation[2];
+    image_base = rec->ExceptionInformation[3];
+    if (!throw_info || !image_base) return 0;
+
+    cta = winemu_exc_image_rel_or_abs(
+        image_base,
+        *(const uint32_t*)(uintptr_t)(throw_info + 0x0c)
+    );
+    if (!cta) return 0;
+    count = *(const uint32_t*)(uintptr_t)cta;
+    if (!count || count > 32) return 0;
+
+    for (i = 0; i < count; ++i) {
+        uint64_t ct = winemu_exc_image_rel_or_abs(
+            image_base,
+            *(const uint32_t*)(uintptr_t)(cta + 4 + ((uint64_t)i * 4))
+        );
+        uint64_t td;
+        uint32_t j;
+
+        if (!ct) continue;
+        td = winemu_exc_image_rel_or_abs(
+            image_base,
+            *(const uint32_t*)(uintptr_t)(ct + 4)
+        );
+        if (!td) continue;
+        for (j = 0; j < sizeof(name_offsets) / sizeof(name_offsets[0]); ++j) {
+            if (winemu_exc_read_ascii_cstr(td + name_offsets[j], out, cap)) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void winemu_exc_log_cpp_diagnostics(EXCEPTION_RECORD64* rec) {
+    char type_name[128];
+
+    if (!winemu_exc_copy_cpp_type_name(rec, type_name, sizeof(type_name))) return;
+    winemu_exc_write_str(" cpp_type=");
+    winemu_exc_write_cstr_trunc(type_name, 96);
+    if (strcmp(type_name, ".?AV_com_error@@") == 0 && rec->NumberParameters > 1) {
+        uint64_t object_ptr = rec->ExceptionInformation[1];
+        uint32_t com_hr = *(const uint32_t*)(uintptr_t)(object_ptr + 8);
+        winemu_exc_write_str(" com_obj=");
+        winemu_exc_write_hex64(object_ptr);
+        winemu_exc_write_str(" com_hr=");
+        winemu_exc_write_hex32(com_hr);
+    }
+}
+
+static void winemu_exc_log_exception(
+    const char* stage,
+    EXCEPTION_RECORD64* rec,
+    NTSTATUS dispatch_status,
+    uint64_t first_unwound_pc,
+    uint64_t second_unwound_pc,
+    uint64_t third_unwound_pc)
+{
+    winemu_exc_write_str("ntdll-exc: ");
+    winemu_exc_write_str(stage);
+    if (rec) {
+        winemu_exc_write_str(" code=");
+        winemu_exc_write_hex32(rec->ExceptionCode);
+        winemu_exc_write_str(" flags=");
+        winemu_exc_write_hex32(rec->ExceptionFlags);
+        winemu_exc_write_str(" addr=");
+        winemu_exc_write_hex64((uint64_t)(uintptr_t)rec->ExceptionAddress);
+        winemu_exc_write_str(" params=");
+        winemu_exc_write_hex32(rec->NumberParameters);
+        if (rec->NumberParameters > 0) {
+            winemu_exc_write_str(" info0=");
+            winemu_exc_write_hex64(rec->ExceptionInformation[0]);
+        }
+        if (rec->NumberParameters > 1) {
+            winemu_exc_write_str(" info1=");
+            winemu_exc_write_hex64(rec->ExceptionInformation[1]);
+        }
+        if (rec->NumberParameters > 2) {
+            winemu_exc_write_str(" info2=");
+            winemu_exc_write_hex64(rec->ExceptionInformation[2]);
+        }
+        if (rec->NumberParameters > 3) {
+            winemu_exc_write_str(" info3=");
+            winemu_exc_write_hex64(rec->ExceptionInformation[3]);
+        }
+        if (rec->ExceptionCode == EXCEPTION_WINE_STUB && rec->NumberParameters >= 2) {
+            winemu_exc_write_str(" wine_stub=");
+            winemu_exc_write_cstr_trunc((const char*)(uintptr_t)rec->ExceptionInformation[0], 64);
+            winemu_exc_write_str(".");
+            if ((rec->ExceptionInformation[1] >> 16) != 0) {
+                winemu_exc_write_cstr_trunc(
+                    (const char*)(uintptr_t)rec->ExceptionInformation[1],
+                    96
+                );
+            } else {
+                winemu_exc_write_str("#");
+                winemu_exc_write_hex64(rec->ExceptionInformation[1]);
+            }
+        }
+        winemu_exc_log_cpp_diagnostics(rec);
+    }
+    winemu_exc_write_str(" dispatch_status=");
+    winemu_exc_write_hex32((uint32_t)dispatch_status);
+    winemu_exc_write_str(" unwind1=");
+    winemu_exc_write_hex64(first_unwound_pc);
+    winemu_exc_write_str(" unwind2=");
+    winemu_exc_write_hex64(second_unwound_pc);
+    winemu_exc_write_str(" unwind3=");
+    winemu_exc_write_hex64(third_unwound_pc);
+    winemu_exc_write_str("\r\n");
+}
+
+static volatile uint32_t g_winemu_sp_diag_budget = 128;
+
+static int winemu_exc_query_stack_bounds(uint64_t* stack_limit_out, uint64_t* stack_base_out) {
+    uint8_t* teb = (uint8_t*)NtCurrentTeb();
+    uint64_t stack_base;
+    uint64_t stack_limit;
+
+    if (!teb) return 0;
+    stack_base = *(const uint64_t*)(uintptr_t)(teb + 0x08);
+    stack_limit = *(const uint64_t*)(uintptr_t)(teb + 0x10);
+    if (!stack_base || stack_limit >= stack_base) return 0;
+    if (stack_limit_out) *stack_limit_out = stack_limit;
+    if (stack_base_out) *stack_base_out = stack_base;
+    return 1;
+}
+
+static int winemu_exc_sp_in_current_stack(uint64_t sp, uint64_t* stack_limit_out, uint64_t* stack_base_out) {
+    uint64_t stack_limit = 0;
+    uint64_t stack_base = 0;
+
+    if (!winemu_exc_query_stack_bounds(&stack_limit, &stack_base)) return 0;
+    if (stack_limit_out) *stack_limit_out = stack_limit;
+    if (stack_base_out) *stack_base_out = stack_base;
+    return sp >= stack_limit && sp < stack_base;
+}
+
+static void winemu_exc_log_sp_event(
+    const char* stage,
+    ARM64_NT_CONTEXT* context,
+    uint64_t prev_sp,
+    uint64_t aux0,
+    uint64_t aux1,
+    EXCEPTION_RECORD64* rec)
+{
+    uint64_t stack_limit = 0;
+    uint64_t stack_base = 0;
+    uint64_t current_sp = 0;
+    int target_in_stack;
+    int prev_in_stack;
+
+    if (!context) return;
+    target_in_stack = winemu_exc_sp_in_current_stack(context->Sp, &stack_limit, &stack_base);
+    prev_in_stack = prev_sp ? winemu_exc_sp_in_current_stack(prev_sp, NULL, NULL) : 1;
+    if (target_in_stack && prev_in_stack) return;
+    if (!g_winemu_sp_diag_budget) return;
+    g_winemu_sp_diag_budget--;
+
+    asm volatile("mov %0, sp" : "=r"(current_sp));
+    winemu_exc_write_str("ntdll-sp: ");
+    winemu_exc_write_str(stage);
+    winemu_exc_write_str(" pc=");
+    winemu_exc_write_hex64(context->Pc);
+    winemu_exc_write_str(" sp=");
+    winemu_exc_write_hex64(context->Sp);
+    winemu_exc_write_str(" prev_sp=");
+    winemu_exc_write_hex64(prev_sp);
+    winemu_exc_write_str(" cur_sp=");
+    winemu_exc_write_hex64(current_sp);
+    winemu_exc_write_str(" stack_limit=");
+    winemu_exc_write_hex64(stack_limit);
+    winemu_exc_write_str(" stack_base=");
+    winemu_exc_write_hex64(stack_base);
+    winemu_exc_write_str(" aux0=");
+    winemu_exc_write_hex64(aux0);
+    winemu_exc_write_str(" aux1=");
+    winemu_exc_write_hex64(aux1);
+    if (rec) {
+        winemu_exc_write_str(" code=");
+        winemu_exc_write_hex32(rec->ExceptionCode);
+        winemu_exc_write_str(" flags=");
+        winemu_exc_write_hex32(rec->ExceptionFlags);
+    }
+    winemu_exc_write_str("\r\n");
+}
 
 typedef struct {
     uint32_t FunctionLength : 18;
@@ -572,6 +877,8 @@ typedef struct _EXCEPTION_REGISTRATION_RECORD64 {
 EXPORT void RtlUnwindEx(
     void* end_frame, void* target_ip, EXCEPTION_RECORD64* rec, void* retval,
     ARM64_NT_CONTEXT* context, void* history_table);
+EXPORT NTSTATUS NtContinue(void* context, uint8_t test_alert);
+static int is_valid_teb_frame(uint64_t frame);
 
 __attribute__((naked))
 static LONG winemu_execute_exception_filter(
@@ -683,6 +990,7 @@ EXPORT EXCEPTION_DISPOSITION __C_specific_handler(
 static NTSTATUS virtual_unwind(ULONG type, DISPATCHER_CONTEXT_ARM64* dispatch, ARM64_NT_CONTEXT* context) {
     ULONG_PTR pc = context->Pc;
     ULONG_PTR frame = 0;
+    uint64_t orig_sp = context->Sp;
     void* handler_data = NULL;
     PEXCEPTION_ROUTINE_ARM64 handler = NULL;
     DISPATCHER_CONTEXT_NONVOLREG_ARM64* nonvol_regs =
@@ -720,16 +1028,14 @@ static NTSTATUS virtual_unwind(ULONG type, DISPATCHER_CONTEXT_ARM64* dispatch, A
     if (st != STATUS_SUCCESS) {
         return st;
     }
-    {
-        uint8_t* teb = (uint8_t*)NtCurrentTeb();
-        if (teb) {
-            uint64_t stack_base = *(uint64_t*)(teb + 0x08);
-            uint64_t stack_limit = *(uint64_t*)(teb + 0x10);
-            if (context->Sp < stack_limit || context->Sp >= stack_base) {
-                context->Sp = stack_limit;
-            }
-        }
-    }
+    winemu_exc_log_sp_event(
+        "virtual_unwind",
+        context,
+        orig_sp,
+        frame,
+        (uint64_t)(uintptr_t)handler,
+        NULL
+    );
     dispatch->LanguageHandler = handler;
     dispatch->HandlerData = handler_data;
     dispatch->EstablisherFrame = frame;
@@ -785,61 +1091,55 @@ EXPORT void RtlCaptureContext(ARM64_NT_CONTEXT* context) {
         "ret\n\t");
 }
 
-__attribute__((naked, noreturn))
-static void winemu_restore_context(ARM64_NT_CONTEXT* context) {
-    asm volatile(
-        "mov x9, x0\n\t"
-        "ldr w12, [x9, #0x310]\n\t"
-        "msr fpcr, x12\n\t"
-        "ldr w12, [x9, #0x314]\n\t"
-        "msr fpsr, x12\n\t"
-        "ldp d8, d9, [x9, #0x190]\n\t"
-        "ldp d10, d11, [x9, #0x1b0]\n\t"
-        "ldp d12, d13, [x9, #0x1d0]\n\t"
-        "ldp d14, d15, [x9, #0x1f0]\n\t"
-        "ldp x19, x20, [x9, #0xa0]\n\t"
-        "ldp x21, x22, [x9, #0xb0]\n\t"
-        "ldp x23, x24, [x9, #0xc0]\n\t"
-        "ldp x25, x26, [x9, #0xd0]\n\t"
-        "ldp x27, x28, [x9, #0xe0]\n\t"
-        "ldp x29, x30, [x9, #0xf0]\n\t"
-        "ldr x0, [x9, #0x8]\n\t"
-        "ldr x1, [x9, #0x10]\n\t"
-        "ldr x2, [x9, #0x18]\n\t"
-        "ldr x3, [x9, #0x20]\n\t"
-        "ldr x4, [x9, #0x28]\n\t"
-        "ldr x5, [x9, #0x30]\n\t"
-        "ldr x6, [x9, #0x38]\n\t"
-        "ldr x7, [x9, #0x40]\n\t"
-        "ldr x8, [x9, #0x48]\n\t"
-        "ldr x10, [x9, #0x100]\n\t"
-        "ldr x11, [x9, #0x108]\n\t"
-        "mov sp, x10\n\t"
-        "br x11\n\t");
-}
-
 EXPORT void RtlRestoreContext(ARM64_NT_CONTEXT* context, EXCEPTION_RECORD64* rec) {
-    (void)rec;
-    if (context) {
-        uint8_t* teb = (uint8_t*)NtCurrentTeb();
-        if (teb) {
-            uint64_t stack_base = *(uint64_t*)(teb + 0x08);
-            uint64_t stack_limit = *(uint64_t*)(teb + 0x10);
-            uint64_t target_sp = context->Sp;
-            if (target_sp < stack_limit || target_sp >= stack_base || (target_sp & 0x0fU)) {
-                uint64_t current_sp = 0;
-                asm volatile("mov %0, sp" : "=r"(current_sp));
-                if (current_sp >= stack_limit && current_sp < stack_base) {
-                    context->Sp = current_sp & ~0x0fULL;
-                } else {
-                    uint64_t safe_sp = (stack_base >= 0x100) ? (stack_base - 0x100) : stack_limit;
-                    if (safe_sp < stack_limit) safe_sp = stack_limit;
-                    context->Sp = safe_sp & ~0x0fULL;
-                }
-            }
+    if (context && rec && rec->ExceptionCode == STATUS_LONGJUMP && rec->NumberParameters >= 1) {
+        WINEMU_RESTORE_JUMP_BUFFER_ARM64* jmp =
+            (WINEMU_RESTORE_JUMP_BUFFER_ARM64*)(uintptr_t)rec->ExceptionInformation[0];
+        if (jmp) {
+            context->X[19] = jmp->x19;
+            context->X[20] = jmp->x20;
+            context->X[21] = jmp->x21;
+            context->X[22] = jmp->x22;
+            context->X[23] = jmp->x23;
+            context->X[24] = jmp->x24;
+            context->X[25] = jmp->x25;
+            context->X[26] = jmp->x26;
+            context->X[27] = jmp->x27;
+            context->X[28] = jmp->x28;
+            context->X[29] = jmp->fp;
+            context->X[30] = jmp->lr;
+            context->Sp = jmp->sp;
+            context->Pc = jmp->lr;
+            context->Fpcr = jmp->fpcr;
+            context->Fpsr = jmp->fpsr;
+            for (int i = 0; i < 8; ++i) context->V[8 + i].D[0] = jmp->d[i];
         }
     }
-    winemu_restore_context(context);
+    if (context) {
+        winemu_exc_log_sp_event("restore_target", context, 0, context->X[30], context->X[0], rec);
+    }
+    if (context) {
+        uint8_t* teb = (uint8_t*)NtCurrentTeb();
+        EXCEPTION_REGISTRATION_RECORD64* teb_frame = teb
+            ? (EXCEPTION_REGISTRATION_RECORD64*)(uintptr_t)(*(uint64_t*)(teb + 0x00))
+            : NULL;
+
+        while (teb && is_valid_teb_frame((uint64_t)(uintptr_t)teb_frame) &&
+               (uint64_t)(uintptr_t)teb_frame < context->Sp) {
+            winemu_exc_log_sp_event(
+                "restore_pop_teb",
+                context,
+                (uint64_t)(uintptr_t)teb_frame,
+                (uint64_t)(uintptr_t)teb_frame->Prev,
+                0,
+                rec
+            );
+            teb_frame = teb_frame->Prev;
+            *(uint64_t*)(teb + 0x00) = (uint64_t)(uintptr_t)teb_frame;
+        }
+    }
+    (void)NtContinue(context, 0);
+    for (;;) {}
 }
 
 static int is_valid_teb_frame(uint64_t frame) {
@@ -905,6 +1205,14 @@ static NTSTATUS dispatch_exception(EXCEPTION_RECORD64* rec, ARM64_NT_CONTEXT* or
 
         NTSTATUS status = virtual_unwind(UNW_FLAG_EHANDLER, &dispatch, &context);
         if (status != STATUS_SUCCESS) {
+            winemu_exc_log_exception(
+                "virtual_unwind_fail",
+                rec,
+                status,
+                first_unwound_pc,
+                second_unwound_pc,
+                third_unwound_pc
+            );
             FINISH_DISPATCH(status);
         }
         unwind_step++;
@@ -1050,6 +1358,14 @@ EXPORT void RtlUnwindEx(
 
         if (dispatch.EstablisherFrame == (uint64_t)(uintptr_t)end_frame) break;
         *context = walk;
+        winemu_exc_log_sp_event(
+            "unwind_step",
+            context,
+            prev_sp,
+            dispatch.EstablisherFrame,
+            (uint64_t)(uintptr_t)target_ip,
+            rec
+        );
         if (!walk.Pc) break;
         if (walk.Sp < prev_sp) break;
         if (walk.Sp == prev_sp && walk.Pc == prev_pc) break;
@@ -1093,6 +1409,14 @@ void winemu_raise_exception_dispatch(EXCEPTION_RECORD64* record, ARM64_NT_CONTEX
     if (dispatch_status == STATUS_SUCCESS) {
         RtlRestoreContext(context, record);
     }
+    winemu_exc_log_exception(
+        "terminate",
+        record,
+        dispatch_status,
+        g_dispatch_first_unwound_pc,
+        g_dispatch_second_unwound_pc,
+        g_dispatch_third_unwound_pc
+    );
 
     if (record) {
         code = record->ExceptionCode;
@@ -1163,4 +1487,3 @@ EXPORT void RtlRaiseException(EXCEPTION_RECORD64* record) {
         "brk #1\n\t"
     );
 }
-

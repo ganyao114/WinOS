@@ -1,8 +1,9 @@
 /* ── Heap ────────────────────────────────────────────────────── */
 
-typedef struct {
+typedef struct WINEMU_HEAP_HDR {
     uint64_t magic;
     uint64_t size;
+    struct WINEMU_HEAP_HDR* next;
 } WINEMU_HEAP_HDR;
 
 #define WINEMU_HEAP_HDR_MAGIC 0x5748454150484452ULL
@@ -11,9 +12,31 @@ typedef struct {
 static uint64_t g_heap_alloc_fail_count = 0;
 static uint64_t g_heap_last_fail_size = 0;
 static uint32_t g_heap_last_fail_status = STATUS_SUCCESS;
+static WINEMU_HEAP_HDR* g_heap_live_allocs = NULL;
 
 static size_t align_up(size_t v, size_t a) {
     return (v + (a - 1)) & ~(a - 1);
+}
+
+static WINEMU_HEAP_HDR* winemu_heap_find_live_alloc(
+    const void* ptr,
+    WINEMU_HEAP_HDR** prev_out)
+{
+    WINEMU_HEAP_HDR* prev = NULL;
+    WINEMU_HEAP_HDR* cur = g_heap_live_allocs;
+
+    while (cur) {
+        const void* payload = (const uint8_t*)cur + WINEMU_HEAP_HDR_SIZE;
+        if (payload == ptr) {
+            if (prev_out) *prev_out = prev;
+            return cur;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+
+    if (prev_out) *prev_out = NULL;
+    return NULL;
 }
 
 /* Minimal process-heap bootstrap for kernelbase/ucrt startup.
@@ -95,32 +118,50 @@ EXPORT void* RtlAllocateHeap(HANDLE heap, ULONG flags, size_t size) {
     WINEMU_HEAP_HDR* hdr = (WINEMU_HEAP_HDR*)raw;
     hdr->magic = WINEMU_HEAP_HDR_MAGIC;
     hdr->size = size;
+    hdr->next = g_heap_live_allocs;
+    g_heap_live_allocs = hdr;
     return (void*)((uint8_t*)raw + WINEMU_HEAP_HDR_SIZE);
 }
 
 EXPORT int RtlFreeHeap(HANDLE heap, ULONG flags, void* ptr) {
+    WINEMU_HEAP_HDR* prev = NULL;
+    WINEMU_HEAP_HDR* hdr;
+    void* raw;
+    size_t sz = 0;
+    NTSTATUS st;
+
     (void)heap; (void)flags;
     if (!ptr) return 1;
-    WINEMU_HEAP_HDR* hdr = (WINEMU_HEAP_HDR*)((uint8_t*)ptr - WINEMU_HEAP_HDR_SIZE);
-    if (hdr->magic != WINEMU_HEAP_HDR_MAGIC) return 1;
-    size_t sz = 0;
-    void* raw = (void*)hdr;
-    NTSTATUS st = NtFreeVirtualMemory((HANDLE)(uint64_t)-1, &raw, &sz, 0x8000);
+    hdr = winemu_heap_find_live_alloc(ptr, &prev);
+    if (!hdr || hdr->magic != WINEMU_HEAP_HDR_MAGIC) return 0;
+
+    if (prev) prev->next = hdr->next;
+    else g_heap_live_allocs = hdr->next;
+
+    raw = (void*)hdr;
+    st = NtFreeVirtualMemory((HANDLE)(uint64_t)-1, &raw, &sz, 0x8000);
     return st == 0 ? 1 : 0;
 }
 
 EXPORT void* RtlReAllocateHeap(HANDLE heap, ULONG flags, void* ptr, size_t size) {
-    if (!ptr) return RtlAllocateHeap(heap, flags, size);
-    WINEMU_HEAP_HDR* hdr = (WINEMU_HEAP_HDR*)((uint8_t*)ptr - WINEMU_HEAP_HDR_SIZE);
-    if (hdr->magic != WINEMU_HEAP_HDR_MAGIC) return NULL;
-    size_t old_size = (size_t)hdr->size;
+    WINEMU_HEAP_HDR* hdr;
+    size_t old_size;
+    void* newp;
+    const uint8_t* src;
+    uint8_t* dst;
+    size_t copy_len;
 
-    void* newp = RtlAllocateHeap(heap, flags, size);
+    if (!ptr) return RtlAllocateHeap(heap, flags, size);
+    hdr = winemu_heap_find_live_alloc(ptr, NULL);
+    if (!hdr || hdr->magic != WINEMU_HEAP_HDR_MAGIC) return NULL;
+    old_size = (size_t)hdr->size;
+
+    newp = RtlAllocateHeap(heap, flags, size);
     if (!newp) return NULL;
 
-    size_t copy_len = old_size < size ? old_size : size;
-    const uint8_t* src = (const uint8_t*)ptr;
-    uint8_t* dst = (uint8_t*)newp;
+    copy_len = old_size < size ? old_size : size;
+    src = (const uint8_t*)ptr;
+    dst = (uint8_t*)newp;
     for (size_t i = 0; i < copy_len; i++) {
         dst[i] = src[i];
     }
@@ -129,19 +170,20 @@ EXPORT void* RtlReAllocateHeap(HANDLE heap, ULONG flags, void* ptr, size_t size)
 }
 
 EXPORT size_t RtlSizeHeap(HANDLE heap, ULONG flags, const void* ptr) {
+    const WINEMU_HEAP_HDR* hdr;
+
     (void)heap; (void)flags;
     if (!ptr) return (size_t)-1;
-    const WINEMU_HEAP_HDR* hdr =
-        (const WINEMU_HEAP_HDR*)((const uint8_t*)ptr - WINEMU_HEAP_HDR_SIZE);
-    if (hdr->magic != WINEMU_HEAP_HDR_MAGIC) return (size_t)-1;
+    hdr = winemu_heap_find_live_alloc(ptr, NULL);
+    if (!hdr || hdr->magic != WINEMU_HEAP_HDR_MAGIC) return (size_t)-1;
     return (size_t)hdr->size;
 }
 
 EXPORT int RtlValidateHeap(HANDLE heap, ULONG flags, const void* ptr) {
+    const WINEMU_HEAP_HDR* hdr;
+
     (void)heap; (void)flags;
     if (!ptr) return 1;
-    const WINEMU_HEAP_HDR* hdr =
-        (const WINEMU_HEAP_HDR*)((const uint8_t*)ptr - WINEMU_HEAP_HDR_SIZE);
-    return hdr->magic == WINEMU_HEAP_HDR_MAGIC ? 1 : 0;
+    hdr = winemu_heap_find_live_alloc(ptr, NULL);
+    return hdr && hdr->magic == WINEMU_HEAP_HDR_MAGIC ? 1 : 0;
 }
-

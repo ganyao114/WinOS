@@ -28,22 +28,7 @@
 #include <wctype.h>
 #include "msvcrt.h"
 #include "winnls.h"
-#ifndef WINEMU_MSVCRT_NO_WTYPES
 #include "wtypes.h"
-#else
-#ifndef VT_R8
-#define VT_R8 5
-#endif
-#ifndef VT_I8
-#define VT_I8 20
-#endif
-#ifndef VT_INT
-#define VT_INT 22
-#endif
-#ifndef VT_PTR
-#define VT_PTR 26
-#endif
-#endif
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(msvcrt);

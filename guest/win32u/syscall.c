@@ -24,31 +24,6 @@
 
 #include <stdarg.h>
 
-#ifdef WINEMU_PE_GUEST
-
-#include "ntstatus.h"
-#define WIN32_NO_STATUS
-#include "windef.h"
-#include "winternl.h"
-#include "win32syscalls.h"
-
-typedef NTSTATUS (*unixlib_entry_t)( void *args );
-
-ULONG_PTR zero_bits = 0;
-
-static NTSTATUS init( void *args )
-{
-    (void)args;
-    return STATUS_SUCCESS;
-}
-
-const unixlib_entry_t __wine_unix_call_funcs[] =
-{
-    init,
-};
-
-#else
-
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "windef.h"
@@ -102,5 +77,3 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     init,
 };
-
-#endif /* WINEMU_PE_GUEST */

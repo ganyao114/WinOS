@@ -52,7 +52,21 @@ EXPORT NTSTATUS NtQueryKey(
     );
 }
 
+EXPORT NTSTATUS NtQueryValueKey(
+    HANDLE key_handle, void* value_name, ULONG key_value_information_class,
+    void* key_value_information, ULONG length, ULONG* result_length)
+{
+    return syscall6(
+        NR_QUERY_VALUE_KEY,
+        (uint64_t)key_handle,
+        (uint64_t)value_name,
+        (uint64_t)key_value_information_class,
+        (uint64_t)key_value_information,
+        (uint64_t)length,
+        (uint64_t)result_length
+    );
+}
+
 EXPORT NTSTATUS NtDeleteValueKey(HANDLE key_handle, void* value_name) {
     return syscall2(NR_DELETE_VALUE_KEY, (uint64_t)key_handle, (uint64_t)value_name);
 }
-

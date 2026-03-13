@@ -74,3 +74,11 @@ EXPORT NTSTATUS NtWriteVirtualMemory(
     );
 }
 
+EXPORT NTSTATUS NtContinue(void* context, uint8_t test_alert)
+{
+    return syscall2(
+        NR_CONTINUE,
+        (uint64_t)context,
+        (uint64_t)test_alert
+    );
+}

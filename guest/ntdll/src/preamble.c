@@ -13,6 +13,8 @@
 #  include "syscall_nrs_22631.h"
 #endif
 
+#define NR_WINEMU_LOAD_DLL 0x0F00U
+
 typedef uint32_t NTSTATUS;
 typedef uint32_t ULONG;
 typedef uint64_t ULONG_PTR;
@@ -82,4 +84,3 @@ static inline NTSTATUS syscall4(uint64_t nr,
 EXPORT NTSTATUS NtQueryVirtualMemory(
     HANDLE process_handle, void* base_address, ULONG memory_information_class,
     void* memory_information, size_t memory_information_length, size_t* return_length);
-

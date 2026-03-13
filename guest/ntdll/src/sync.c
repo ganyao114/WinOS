@@ -55,6 +55,24 @@ static void cs_debug_info_release(RTL_CRITICAL_SECTION* cs) {
     }
 }
 
+static inline uint64_t cs_current_owner_id(void) {
+    uint8_t *teb = (uint8_t *)NtCurrentTeb();
+    uint64_t tid;
+
+    if (!teb) return 1;
+    tid = *(uint64_t *)(teb + 0x48);
+    if (tid) return tid;
+    return (uint64_t)(uintptr_t)teb;
+}
+
+static inline void cs_cpu_relax(void) {
+#if defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#else
+    asm volatile("" ::: "memory");
+#endif
+}
+
 EXPORT NTSTATUS RtlInitializeCriticalSection(RTL_CRITICAL_SECTION* cs) {
     if (!cs) return STATUS_INVALID_PARAMETER;
     cs->debug_info   = cs_debug_info_acquire(cs);
@@ -85,20 +103,112 @@ EXPORT NTSTATUS RtlDeleteCriticalSection(RTL_CRITICAL_SECTION* cs) {
 }
 
 EXPORT NTSTATUS RtlEnterCriticalSection(RTL_CRITICAL_SECTION* cs) {
-    cs->lock_count++;
-    cs->recursion++;
+    uint64_t self;
+    uint64_t unlocked = 0;
+    uint32_t spin = 0;
+
+    if (!cs) return STATUS_INVALID_PARAMETER;
+
+    self = cs_current_owner_id();
+    if (__atomic_load_n(&cs->owner_thread, __ATOMIC_RELAXED) == self) {
+        cs->lock_count++;
+        cs->recursion++;
+        return 0;
+    }
+
+    for (;;) {
+        unlocked = 0;
+        if (__atomic_compare_exchange_n(
+                &cs->owner_thread,
+                &unlocked,
+                self,
+                0,
+                __ATOMIC_ACQUIRE,
+                __ATOMIC_RELAXED)) {
+            cs->lock_count = 0;
+            cs->recursion = 1;
+            return 0;
+        }
+
+        if (unlocked == self) {
+            cs->lock_count++;
+            cs->recursion++;
+            return 0;
+        }
+
+        if (++spin >= 256) {
+            spin = 0;
+            NtYieldExecution();
+        } else {
+            cs_cpu_relax();
+        }
+    }
     return 0;
 }
 
 EXPORT NTSTATUS RtlLeaveCriticalSection(RTL_CRITICAL_SECTION* cs) {
-    cs->lock_count--;
-    cs->recursion--;
+    uint64_t self;
+
+    if (!cs) return STATUS_INVALID_PARAMETER;
+
+    self = cs_current_owner_id();
+    if (__atomic_load_n(&cs->owner_thread, __ATOMIC_RELAXED) != self || cs->recursion <= 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (--cs->recursion == 0) {
+        cs->lock_count = -1;
+        __atomic_store_n(&cs->owner_thread, 0, __ATOMIC_RELEASE);
+    } else {
+        cs->lock_count--;
+    }
     return 0;
 }
 
 EXPORT int RtlTryEnterCriticalSection(RTL_CRITICAL_SECTION* cs) {
-    RtlEnterCriticalSection(cs);
-    return 1;
+    uint64_t self;
+    uint64_t unlocked = 0;
+
+    if (!cs) return 0;
+
+    self = cs_current_owner_id();
+    if (__atomic_load_n(&cs->owner_thread, __ATOMIC_RELAXED) == self) {
+        cs->lock_count++;
+        cs->recursion++;
+        return 1;
+    }
+
+    if (__atomic_compare_exchange_n(
+            &cs->owner_thread,
+            &unlocked,
+            self,
+            0,
+            __ATOMIC_ACQUIRE,
+            __ATOMIC_RELAXED)) {
+        cs->lock_count = 0;
+        cs->recursion = 1;
+        return 1;
+    }
+    return 0;
+}
+
+EXPORT int RtlIsCriticalSectionLocked(RTL_CRITICAL_SECTION* cs) {
+    if (!cs) return 0;
+    return __atomic_load_n(&cs->owner_thread, __ATOMIC_RELAXED) != 0;
+}
+
+EXPORT int RtlIsCriticalSectionLockedByThread(RTL_CRITICAL_SECTION* cs) {
+    if (!cs) return 0;
+    return __atomic_load_n(&cs->owner_thread, __ATOMIC_RELAXED) == cs_current_owner_id();
+}
+
+EXPORT ULONG_PTR RtlSetCriticalSectionSpinCount(RTL_CRITICAL_SECTION* cs, ULONG_PTR spin_count) {
+    ULONG_PTR prev;
+
+    if (!cs) return 0;
+    prev = cs->spin_count;
+    cs->spin_count = spin_count;
+    return prev;
 }
 
 EXPORT void RtlInitializeSRWLock(void* lock) {
@@ -161,4 +271,3 @@ EXPORT int __wine_dbg_output(const char* str) {
 EXPORT const char* __wine_dbg_strdup(const char* str) {
     return str ? str : "";
 }
-

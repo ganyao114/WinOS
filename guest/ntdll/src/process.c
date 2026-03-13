@@ -10,10 +10,16 @@ void RtlExitUserProcess(NTSTATUS exit_code) {
     for (;;) {}
 }
 
+EXPORT NTSTATUS NtTerminateThread(HANDLE thread, NTSTATUS exit_code) {
+    return syscall2(NR_TERMINATE_THREAD, (uint64_t)thread, (uint64_t)exit_code);
+}
+
 EXPORT __attribute__((noreturn))
-void NtTerminateThread(HANDLE thread, NTSTATUS exit_code) {
-    syscall2(NR_TERMINATE_THREAD, (uint64_t)thread, (uint64_t)exit_code);
-    __builtin_unreachable();
+void RtlExitUserThread(NTSTATUS exit_code) {
+    const HANDLE current_thread = (HANDLE)(uintptr_t)~(uintptr_t)1;
+    for (;;) {
+        (void)NtTerminateThread(current_thread, exit_code);
+    }
 }
 
 EXPORT NTSTATUS NtYieldExecution(void) {
@@ -217,4 +223,3 @@ EXPORT NTSTATUS NtDuplicateObject(
         "ret\n"
         :: "i"(NR_DUPLICATE_OBJECT));
 }
-
