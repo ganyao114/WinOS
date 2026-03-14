@@ -9,6 +9,7 @@ use winemu_core::{Result, WinemuError};
 pub(super) struct HvfVTimer {
     waiting_guest_clear: bool,
     pending_irq_asserted: bool,
+    guest_clear_mask_passes_remaining: u8,
 }
 
 impl HvfVTimer {
@@ -16,6 +17,7 @@ impl HvfVTimer {
         Self {
             waiting_guest_clear: false,
             pending_irq_asserted: false,
+            guest_clear_mask_passes_remaining: 0,
         }
     }
 
@@ -29,6 +31,11 @@ impl HvfVTimer {
             self.pending_irq_asserted = true;
         }
         self.waiting_guest_clear = true;
+        // Keep the next re-entry masked so the injected IRQ can be consumed by
+        // guest code before HVF reports another VTIMER_ACTIVATED exit. After
+        // that single masked pass we must stop waiting, otherwise a quick
+        // guest re-arm can leave us stuck in waiting_guest_clear forever.
+        self.guest_clear_mask_passes_remaining = 1;
         // Avoid repeated VTIMER_ACTIVATED exits until guest handles this tick.
         set_vtimer_mask(vcpu, true)?;
         Ok(())
@@ -45,6 +52,7 @@ impl HvfVTimer {
                 set_pending_irq(vcpu, false)?;
                 self.pending_irq_asserted = false;
             }
+            self.guest_clear_mask_passes_remaining = 0;
             return set_vtimer_mask(vcpu, true);
         }
 
@@ -55,11 +63,13 @@ impl HvfVTimer {
             // Guest EOI contract: IRQ entry writes CNTV_CTL_EL0=0.
             // Treat "disabled" as an acknowledged tick, otherwise we can keep
             // IRQ pending forever when ISTATUS stays set in HVF.
-            if enabled && fired {
+            if enabled && fired && self.guest_clear_mask_passes_remaining > 0 {
+                self.guest_clear_mask_passes_remaining -= 1;
                 return set_vtimer_mask(vcpu, true);
             }
 
             self.waiting_guest_clear = false;
+            self.guest_clear_mask_passes_remaining = 0;
             if self.pending_irq_asserted {
                 set_pending_irq(vcpu, false)?;
                 self.pending_irq_asserted = false;

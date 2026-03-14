@@ -8,8 +8,17 @@ use core::arch::asm;
 
 use crate::arch::context::KernelContext;
 use crate::sched::context::drain_deferred_kstacks;
-use crate::sched::cpu::{take_needs_reschedule, vcpu_id};
+use crate::sched::cpu::vcpu_id;
 use crate::sched::global::{with_thread, with_thread_mut, SCHED};
+use crate::sched::ready::{
+    dequeue_ready_thread_locked, peek_next_ready_thread_for_vcpu_locked,
+    take_next_ready_thread_for_vcpu_locked,
+};
+use crate::sched::resched::{
+    clear_remote_vcpu_reschedule_locked, remote_vcpu_reschedule_pending_locked,
+    request_remote_vcpu_reschedule_locked, take_local_trap_reschedule,
+    take_local_unlock_edge_schedule_reason_locked,
+};
 use crate::sched::thread_control::reset_quantum_locked;
 use crate::sched::threads::free_terminated_threads_locked;
 use crate::sched::topology::{bind_running_thread_to_vcpu, set_thread_state_locked};
@@ -174,46 +183,6 @@ impl UnlockEdgeDispatch {
     }
 }
 
-// ── pick_next_thread_locked ───────────────────────────────────────────────────
-
-fn pick_next_thread_locked(vid: u32) -> u32 {
-    let queue = unsafe { SCHED.queue_raw_mut() };
-    let store = unsafe { SCHED.threads_raw() };
-    let tid = queue.pop_highest_matching(&|id| store.get_ptr(id), &|t| t.can_run_on_vcpu(vid));
-    if tid != 0 {
-        with_thread_mut(tid, |t| {
-            t.in_ready_queue = false;
-            t.sched_next = 0;
-        });
-    }
-    tid
-}
-
-fn peek_next_thread_locked(vid: u32) -> u32 {
-    let queue = unsafe { SCHED.queue_raw_mut() };
-    let store = unsafe { SCHED.threads_raw() };
-    queue.peek_highest_matching(&|id| store.get_ptr(id).map(|p| p as *const _), &|t| {
-        t.can_run_on_vcpu(vid)
-    })
-}
-
-fn dequeue_ready_tid_locked(tid: u32) -> bool {
-    let Some((prio, in_queue)) = with_thread(tid, |t| (t.priority, t.in_ready_queue)) else {
-        return false;
-    };
-    if !in_queue {
-        return false;
-    }
-    let queue = unsafe { SCHED.queue_raw_mut() };
-    let store = unsafe { SCHED.threads_raw() };
-    let removed = queue.remove(tid, prio, &|id| store.get_ptr(id));
-    with_thread_mut(tid, |t| {
-        t.in_ready_queue = false;
-        t.sched_next = 0;
-    });
-    removed
-}
-
 fn continue_current_decision(
     now_100ns: u64,
     next_deadline_100ns: u64,
@@ -226,7 +195,11 @@ fn continue_current_decision(
     }
 }
 
-fn enter_idle_decision(now_100ns: u64, next_deadline_100ns: u64, from_tid: u32) -> ScheduleDecision {
+fn enter_idle_decision(
+    now_100ns: u64,
+    next_deadline_100ns: u64,
+    from_tid: u32,
+) -> ScheduleDecision {
     ScheduleDecision::EnterIdle {
         now_100ns,
         next_deadline_100ns,
@@ -310,10 +283,15 @@ pub fn schedule_core_locked(
     quantum_100ns: u64,
     reason: ScheduleReason,
 ) -> ScheduleDecision {
-    unsafe { SCHED.vcpu_raw_mut(vid as usize) }.needs_scheduling = false;
+    clear_remote_vcpu_reschedule_locked(vid as usize);
     drain_deferred_kstacks();
     let timeout_woke = check_wait_timeouts_locked() > 0;
     free_terminated_threads_locked();
+    let reason = if reason == ScheduleReason::UnlockEdge && timeout_woke {
+        ScheduleReason::Timeout
+    } else {
+        reason
+    };
 
     let now_100ns = crate::sched::wait::current_ticks();
     let next_deadline_100ns = next_wait_deadline_locked();
@@ -323,7 +301,7 @@ pub fn schedule_core_locked(
             .unwrap_or(0)
             .saturating_sub(quantum_100ns);
         with_thread_mut(from_tid, |t| t.slice_remaining_100ns = rem);
-        let pending = take_needs_reschedule();
+        let pending = take_local_trap_reschedule();
         (rem, pending)
     } else {
         (0u64, false)
@@ -332,7 +310,7 @@ pub fn schedule_core_locked(
     let from_state = current_thread_state(from_tid);
     let cur_not_running = from_tid == 0 || from_state != ThreadState::Running;
 
-    let mut to_tid = peek_next_thread_locked(vid);
+    let mut to_tid = peek_next_ready_thread_for_vcpu_locked(vid);
 
     if to_tid == 0 {
         if let Some(decision) = continue_current_without_ready_candidate(
@@ -365,8 +343,8 @@ pub fn schedule_core_locked(
     }
 
     // Commit selection: dequeue chosen ready thread only after policy decided.
-    if to_tid != 0 && !dequeue_ready_tid_locked(to_tid) {
-        to_tid = pick_next_thread_locked(vid);
+    if to_tid != 0 && !dequeue_ready_thread_locked(to_tid) {
+        to_tid = take_next_ready_thread_for_vcpu_locked(vid);
         if to_tid == 0 {
             if from_tid != 0 && !cur_not_running {
                 return continue_current_decision(now_100ns, next_deadline_100ns, slice_remaining);
@@ -502,11 +480,7 @@ pub unsafe fn enter_kernel_continuation_noreturn(to_tid: u32) -> ! {
 /// Non-destructive: peek at the highest-priority thread runnable on `vid`
 /// without popping it from the queue. Used by compute_remote_reschedule_mask_locked.
 fn peek_next_thread_for_vcpu(vid: u32) -> u32 {
-    let queue = unsafe { SCHED.queue_raw_mut() };
-    let store = unsafe { SCHED.threads_raw() };
-    queue.peek_highest_matching(&|id| store.get_ptr(id).map(|p| p as *const _), &|t| {
-        t.can_run_on_vcpu(vid)
-    })
+    peek_next_ready_thread_for_vcpu_locked(vid)
 }
 
 fn should_reschedule_remote_vcpu_locked(vid: usize, candidate_tid: u32) -> bool {
@@ -537,7 +511,7 @@ fn collect_explicit_reschedule_mask_locked() -> u32 {
     let mut cores_needing_scheduling: u32 = 0;
     for vid in 0..MAX_VCPUS {
         let vs = unsafe { SCHED.vcpu_raw(vid) };
-        if vs.idle_tid != 0 && vs.needs_scheduling {
+        if vs.idle_tid != 0 && remote_vcpu_reschedule_pending_locked(vid) {
             cores_needing_scheduling |= 1u32 << vid;
         }
     }
@@ -554,7 +528,7 @@ fn refresh_remote_reschedule_mask_locked(mut mask: u32) -> u32 {
         }
         let candidate = peek_next_thread_for_vcpu(vid as u32);
         if should_reschedule_remote_vcpu_locked(vid, candidate) {
-            unsafe { SCHED.vcpu_raw_mut(vid) }.needs_scheduling = true;
+            request_remote_vcpu_reschedule_locked(vid);
             mask |= 1u32 << vid;
         }
     }
@@ -563,7 +537,7 @@ fn refresh_remote_reschedule_mask_locked(mut mask: u32) -> u32 {
 }
 
 /// Build a cross-core reschedule mask from:
-/// 1) explicit `needs_scheduling` flags already raised by state transitions, and
+/// 1) explicit remote-reschedule flags already raised by state transitions, and
 /// 2) a global ready-queue snapshot that detects higher-priority remote work.
 ///
 /// Must be called with the scheduler spinlock held.
@@ -621,7 +595,8 @@ pub(crate) fn build_unlock_edge_dispatch_locked(vid: usize) -> UnlockEdgeDispatc
     // free terminated threads, and pop the next thread from the ready queue.
     // This also handles the ContinueCurrent / EnterIdle cases for this vCPU.
     let from_tid = unsafe { SCHED.vcpu_raw(vid) }.current_tid;
-    let decision = schedule_core_locked(vid as u32, from_tid, 0, ScheduleReason::UnlockEdge);
+    let reason = take_local_unlock_edge_schedule_reason_locked(vid);
+    let decision = schedule_core_locked(vid as u32, from_tid, 0, reason);
 
     // Apply the round result to the current vCPU's state.
     match decision {
@@ -638,7 +613,7 @@ pub(crate) fn build_unlock_edge_dispatch_locked(vid: usize) -> UnlockEdgeDispatc
     // current queue snapshot.
     let mut mask = compute_remote_reschedule_mask_locked();
     mask &= !(1u32 << vid);
-    unsafe { SCHED.vcpu_raw_mut(vid) }.needs_scheduling = false;
+    clear_remote_vcpu_reschedule_locked(vid);
 
     let plan = LocalSchedulePlan::from_decision(vid, decision);
 
@@ -680,7 +655,8 @@ pub fn run_local_scheduler_iteration(
 /// Caller must hold the scheduler lock.
 pub fn schedule_noreturn_locked(from_tid: u32) -> ! {
     let vid = vcpu_id() as usize;
-    let decision = schedule_core_locked(vid as u32, from_tid, 0, ScheduleReason::UnlockEdge);
+    let reason = take_local_unlock_edge_schedule_reason_locked(vid);
+    let decision = schedule_core_locked(vid as u32, from_tid, 0, reason);
     let plan = LocalSchedulePlan::from_decision(vid, decision);
     plan.apply_noreturn(vid, "schedule_noreturn_locked")
 }

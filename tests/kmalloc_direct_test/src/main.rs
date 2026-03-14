@@ -2,11 +2,16 @@
 #![no_main]
 
 use core::arch::asm;
+use winemu_shared::nt_sysno::{nt_sysno_nr_for_build, NtHandlerId};
 
 const STDOUT: u64 = 0xFFFF_FFFF_FFFF_FFF5;
-const NR_WRITE_FILE: u64 = 0x0008;
-const NR_TERMINATE_PROCESS: u64 = 0x002C;
+const WINDOWS_BUILD: u32 = 22631;
 const LARGE_BSS_SIZE: usize = 5 * 1024 * 1024;
+
+#[inline(always)]
+fn nt_nr(handler: NtHandlerId) -> u64 {
+    nt_sysno_nr_for_build(WINDOWS_BUILD, handler).expect("missing NT syscall") as u64
+}
 
 static mut LARGE_BSS: [u8; LARGE_BSS_SIZE] = [0; LARGE_BSS_SIZE];
 
@@ -31,7 +36,7 @@ unsafe fn nt_write_file(handle: u64, buf: *const u8, len: u32) {
         "str xzr, [sp, #-16]!",
         "svc #0",
         "add sp, sp, #16",
-        nr = in(reg) NR_WRITE_FILE,
+        nr = in(reg) nt_nr(NtHandlerId::WriteFile),
         handle = in(reg) handle,
         iosb = in(reg) (&mut iosb as *mut IoStatusBlock as u64),
         buf = in(reg) (buf as u64),
@@ -46,7 +51,7 @@ unsafe fn nt_terminate_process(code: u32) -> ! {
     asm!(
         "mov x0, xzr",
         "svc #0",
-        in("x8") NR_TERMINATE_PROCESS,
+        in("x8") nt_nr(NtHandlerId::TerminateProcess),
         in("x1") (code as u64),
         options(noreturn, nostack),
     );

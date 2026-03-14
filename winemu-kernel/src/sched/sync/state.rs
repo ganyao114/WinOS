@@ -5,6 +5,8 @@
 // All access here requires the scheduler lock to be held.
 
 use crate::kobj::ObjectStore;
+use crate::sched::request_local_unlock_edge_schedule;
+use crate::sched::ScheduleReason;
 use crate::sched::sync::primitives_api::{KEvent, KMutex, KSemaphore};
 use winemu_shared::status;
 
@@ -194,21 +196,31 @@ pub fn sync_free_idx(idx: u32) -> bool {
     if ptr.is_null() {
         return false;
     }
-
-    unsafe {
+    // SAFETY: `ptr` comes from the live object store lookup above, and the
+    // scheduler lock serializes all sync-object access while we mutate waiters.
+    let woke_waiters = unsafe {
         match &mut *ptr {
             SyncObject::Event(e) => {
+                let woke = !e.waiters.is_empty();
                 e.waiters.wake_all_with_status(status::INVALID_HANDLE);
+                woke
             }
             SyncObject::Mutex(m) => {
                 m.owner_tid = 0;
                 m.recursion = 0;
+                let woke = !m.waiters.is_empty();
                 m.waiters.wake_all_with_status(status::INVALID_HANDLE);
+                woke
             }
             SyncObject::Semaphore(s) => {
+                let woke = !s.waiters.is_empty();
                 s.waiters.wake_all_with_status(status::INVALID_HANDLE);
+                woke
             }
         }
+    };
+    if woke_waiters {
+        request_local_unlock_edge_schedule(ScheduleReason::Wakeup);
     }
 
     store.store.free(idx)

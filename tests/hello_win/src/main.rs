@@ -2,15 +2,15 @@
 #![no_main]
 
 use core::arch::asm;
+use winemu_shared::nt_sysno::{nt_sysno_nr_for_build, NtHandlerId};
 
 const STDOUT: u64 = 0xFFFF_FFFF_FFFF_FFF5;
+const WINDOWS_BUILD: u32 = 22631;
 
-// NT syscall numbers (Windows 11 ARM64, build 22631)
-const NR_WRITE_FILE:          u64 = 0x0008;
-const NR_TERMINATE_PROCESS:   u64 = 0x002C;
-const NR_CREATE_SECTION:      u64 = 0x004A;
-const NR_MAP_VIEW_OF_SECTION: u64 = 0x0028;
-const NR_UNMAP_VIEW_OF_SECTION: u64 = 0x002A;
+#[inline(always)]
+fn nt_nr(handler: NtHandlerId) -> u64 {
+    nt_sysno_nr_for_build(WINDOWS_BUILD, handler).expect("missing NT syscall") as u64
+}
 
 #[repr(C)]
 struct IoStatusBlock { status: u64, info: u64 }
@@ -33,7 +33,7 @@ unsafe fn nt_write_file(handle: u64, buf: *const u8, len: u32) {
         "str xzr, [sp, #-16]!",
         "svc #0",
         "add sp, sp, #16",
-        nr     = in(reg) NR_WRITE_FILE,
+        nr     = in(reg) nt_nr(NtHandlerId::WriteFile),
         handle = in(reg) handle,
         iosb   = in(reg) iosb_ptr,
         buf    = in(reg) buf_ptr,
@@ -46,7 +46,7 @@ unsafe fn nt_write_file(handle: u64, buf: *const u8, len: u32) {
 }
 
 unsafe fn nt_terminate_process(code: u32) -> ! {
-    let nr = NR_TERMINATE_PROCESS;
+    let nr = nt_nr(NtHandlerId::TerminateProcess);
     let code_u64 = code as u64;
     asm!(
         "mov x0, xzr",
@@ -74,7 +74,7 @@ unsafe fn nt_create_section(size: u64, prot: u32) -> u64 {
         "mov x6, xzr",
         "mov x8, {nr}",
         "svc #0",
-        nr   = in(reg) NR_CREATE_SECTION,
+        nr   = in(reg) nt_nr(NtHandlerId::CreateSection),
         hout = in(reg) hout,
         szp  = in(reg) szp,
         prot = in(reg) prot_u64,
@@ -95,7 +95,7 @@ unsafe fn nt_map_view(section: u64, size: u64, prot: u32) -> u64 {
     let sizep = &mut view_size as *mut u64 as u64;
     let prot_u64 = prot as u64;
     let sec = section;
-    let nr = NR_MAP_VIEW_OF_SECTION;
+    let nr = nt_nr(NtHandlerId::MapViewOfSection);
     asm!(
         "mov x0, {sec}",
         "mov x1, #-1",
@@ -127,7 +127,7 @@ unsafe fn nt_map_view(section: u64, size: u64, prot: u32) -> u64 {
 
 unsafe fn nt_unmap_view(base: u64) {
     let b = base;
-    let nr = NR_UNMAP_VIEW_OF_SECTION;
+    let nr = nt_nr(NtHandlerId::UnmapViewOfSection);
     asm!(
         "mov x8, {nr}",
         "mov x0, #-1",   // ProcessHandle

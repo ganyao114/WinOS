@@ -4,8 +4,8 @@
 // unblock_thread_locked — wake a waiting thread (set Ready)
 // check_wait_timeout    — called from scheduler round to expire deadlines
 
-use crate::sched::cpu::set_needs_reschedule;
 use crate::sched::global::{with_thread, with_thread_mut, SCHED};
+use crate::sched::resched::request_local_trap_reschedule;
 use crate::sched::topology::set_thread_state_locked;
 use crate::sched::types::{
     ThreadState, WaitDeadline, WAIT_KIND_DELAY, WAIT_KIND_MULTIPLE, WAIT_KIND_NONE,
@@ -80,7 +80,7 @@ pub fn unblock_thread_locked(tid: u32, result: u32) {
     set_thread_state_locked(tid, ThreadState::Ready);
     // Wake-up should be observed at the current unlock edge so syscall paths
     // can promptly hand off to newly readied peers.
-    set_needs_reschedule();
+    request_local_trap_reschedule();
 }
 
 /// Wake a waiting thread due to timeout.

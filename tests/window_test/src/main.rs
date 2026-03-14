@@ -2,11 +2,14 @@
 #![no_main]
 
 use core::arch::asm;
+use winemu_shared::nt_sysno::{nt_sysno_nr_for_build, NtHandlerId};
 
-// ── NT syscall numbers ────────────────────────────────────────────────────────
-const NR_WRITE_FILE:        u64 = 0x0008;
-const NR_DELAY_EXECUTION:   u64 = 0x0034;
-const NR_TERMINATE_PROCESS: u64 = 0x002C;
+const WINDOWS_BUILD: u32 = 22631;
+
+#[inline(always)]
+fn nt_nr(handler: NtHandlerId) -> u64 {
+    nt_sysno_nr_for_build(WINDOWS_BUILD, handler).expect("missing NT syscall") as u64
+}
 
 // ── Win32k syscall numbers (table 1 = NtUser*, table 0 = NtGdi*) ─────────────
 const NT_USER_CREATE_WINDOW_EX:   u32 = 0x06f;
@@ -81,7 +84,7 @@ unsafe fn nt_write_file(handle: u64, buf: *const u8, len: u32) {
         inlateout("x5") buf_ptr => _,
         inlateout("x6") len_u64 => _,
         inlateout("x7") 0u64 => _,
-        inlateout("x8") NR_WRITE_FILE => _,
+        inlateout("x8") nt_nr(NtHandlerId::WriteFile) => _,
     );
 }
 
@@ -90,7 +93,7 @@ unsafe fn nt_terminate_process(code: u32) -> ! {
         "svc #0",
         in("x0") 0u64,
         in("x1") code as u64,
-        in("x8") NR_TERMINATE_PROCESS,
+        in("x8") nt_nr(NtHandlerId::TerminateProcess),
         options(noreturn, nostack),
     );
 }
@@ -107,7 +110,7 @@ unsafe fn nt_delay_execution_ms(ms: u32) {
         lateout("x5") _,
         lateout("x6") _,
         lateout("x7") _,
-        inlateout("x8") NR_DELAY_EXECUTION => _,
+        inlateout("x8") nt_nr(NtHandlerId::DelayExecution) => _,
         options(nostack),
     );
 }

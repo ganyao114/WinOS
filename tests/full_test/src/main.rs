@@ -3,27 +3,16 @@
 #![allow(dead_code)]
 
 use core::arch::asm;
+use winemu_shared::nt_sysno::{nt_sysno_nr_for_build, NtHandlerId};
 
 // ── Well-known handles ──────────────────────────────────────────
 const STDOUT: u64 = 0xFFFF_FFFF_FFFF_FFF5;
+const WINDOWS_BUILD: u32 = 22631;
 
-// ── NT syscall numbers (Windows 11 ARM64 build 22631, table 0) ──
-const NR_WRITE_FILE: u64 = 0x0008;
-const NR_CLOSE: u64 = 0x000F;
-const NR_TERMINATE_PROCESS: u64 = 0x002C;
-const NR_ALLOCATE_VIRTUAL_MEMORY: u64 = 0x0018;
-const NR_FREE_VIRTUAL_MEMORY: u64 = 0x001E;
-const NR_PROTECT_VIRTUAL_MEMORY: u64 = 0x0050;
-const NR_QUERY_VIRTUAL_MEMORY: u64 = 0x0023;
-const NR_CREATE_SECTION: u64 = 0x004A;
-const NR_MAP_VIEW_OF_SECTION: u64 = 0x0028;
-const NR_UNMAP_VIEW_OF_SECTION: u64 = 0x002A;
-const NR_CREATE_EVENT: u64 = 0x0048;
-const NR_SET_EVENT: u64 = 0x000E;
-const NR_RESET_EVENT: u64 = 0x0185;
-const NR_YIELD_EXECUTION: u64 = 0x0046;
-const NR_QUERY_INFORMATION_PROCESS: u64 = 0x0019;
-const NR_DUPLICATE_OBJECT: u64 = 0x003C;
+#[inline(always)]
+fn nt_nr(handler: NtHandlerId) -> u64 {
+    nt_sysno_nr_for_build(WINDOWS_BUILD, handler).expect("missing NT syscall") as u64
+}
 
 const STATUS_SUCCESS: u64 = 0;
 const STATUS_INVALID_PARAMETER: u64 = 0xC000000D;
@@ -110,7 +99,7 @@ struct IoStatusBlock {
 unsafe fn nt_write_stdout(buf: *const u8, len: u32) -> u64 {
     let mut iosb = IoStatusBlock { status: 0, info: 0 };
     svc10(
-        NR_WRITE_FILE,
+        nt_nr(NtHandlerId::WriteFile),
         STDOUT,
         0,
         0,
@@ -173,7 +162,7 @@ unsafe fn check(name: &[u8], ok: bool) {
 
 unsafe fn exit(code: u32) -> ! {
     svc(
-        NR_TERMINATE_PROCESS,
+        nt_nr(NtHandlerId::TerminateProcess),
         0xFFFFFFFFFFFFFFFF,
         code as u64,
         0,
@@ -192,7 +181,7 @@ unsafe fn exit(code: u32) -> ! {
 unsafe fn nt_query_virtual(addr: u64, out: &mut [u8; 48]) -> u64 {
     let mut ret_len: u64 = 0;
     svc(
-        NR_QUERY_VIRTUAL_MEMORY,
+        nt_nr(NtHandlerId::QueryVirtualMemory),
         0xFFFF_FFFF_FFFF_FFFF,
         addr,
         0,
@@ -227,7 +216,7 @@ unsafe fn test_virtual_memory() {
     let mut base: u64 = 0;
     let mut size: u64 = 0x10000;
     let st = svc(
-        NR_ALLOCATE_VIRTUAL_MEMORY,
+        nt_nr(NtHandlerId::AllocateVirtualMemory),
         0xFFFFFFFFFFFFFFFF,           // ProcessHandle (-1 = self)
         &mut base as *mut u64 as u64, // BaseAddress ptr
         0,                            // ZeroBits
@@ -260,7 +249,7 @@ unsafe fn test_virtual_memory() {
     let mut reserve_protect_size: u64 = 0x1000;
     let mut reserve_old_prot: u32 = 0xFFFF_FFFF;
     let st = svc(
-        NR_PROTECT_VIRTUAL_MEMORY,
+        nt_nr(NtHandlerId::ProtectVirtualMemory),
         0xFFFFFFFFFFFFFFFF,
         &mut reserve_protect_base as *mut u64 as u64,
         &mut reserve_protect_size as *mut u64 as u64,
@@ -279,7 +268,7 @@ unsafe fn test_virtual_memory() {
     let mut commit_base = base;
     let mut commit_size: u64 = 0x2000;
     let st = svc(
-        NR_ALLOCATE_VIRTUAL_MEMORY,
+        nt_nr(NtHandlerId::AllocateVirtualMemory),
         0xFFFFFFFFFFFFFFFF,
         &mut commit_base as *mut u64 as u64,
         0,
@@ -332,7 +321,7 @@ unsafe fn test_virtual_memory() {
     let mut prot_size: u64 = 0x1000;
     let mut old_prot: u32 = 0;
     let st = svc(
-        NR_PROTECT_VIRTUAL_MEMORY,
+        nt_nr(NtHandlerId::ProtectVirtualMemory),
         0xFFFFFFFFFFFFFFFF,
         &mut prot_base as *mut u64 as u64,
         &mut prot_size as *mut u64 as u64,
@@ -355,7 +344,7 @@ unsafe fn test_virtual_memory() {
     let mut wx_size: u64 = 0x1000;
     let mut wx_old: u32 = 0;
     let st = svc(
-        NR_PROTECT_VIRTUAL_MEMORY,
+        nt_nr(NtHandlerId::ProtectVirtualMemory),
         0xFFFFFFFFFFFFFFFF,
         &mut wx_base as *mut u64 as u64,
         &mut wx_size as *mut u64 as u64,
@@ -390,7 +379,7 @@ unsafe fn test_virtual_memory() {
     let mut cow_size: u64 = 0x1000;
     let mut cow_old: u32 = 0;
     let st = svc(
-        NR_PROTECT_VIRTUAL_MEMORY,
+        nt_nr(NtHandlerId::ProtectVirtualMemory),
         0xFFFFFFFFFFFFFFFF,
         &mut cow_base as *mut u64 as u64,
         &mut cow_size as *mut u64 as u64,
@@ -439,7 +428,7 @@ unsafe fn test_virtual_memory() {
     let mut decommit_base = base + 0x1000;
     let mut decommit_size: u64 = 0x1000;
     let st = svc(
-        NR_FREE_VIRTUAL_MEMORY,
+        nt_nr(NtHandlerId::FreeVirtualMemory),
         0xFFFFFFFFFFFFFFFF,
         &mut decommit_base as *mut u64 as u64,
         &mut decommit_size as *mut u64 as u64,
@@ -469,7 +458,7 @@ unsafe fn test_virtual_memory() {
     let mut recommit_base = base + 0x1000;
     let mut recommit_size: u64 = 0x1000;
     let st = svc(
-        NR_ALLOCATE_VIRTUAL_MEMORY,
+        nt_nr(NtHandlerId::AllocateVirtualMemory),
         0xFFFFFFFFFFFFFFFF,
         &mut recommit_base as *mut u64 as u64,
         0,
@@ -491,7 +480,7 @@ unsafe fn test_virtual_memory() {
     let mut overlap_base = base;
     let mut overlap_size: u64 = 0x1000;
     let st = svc(
-        NR_ALLOCATE_VIRTUAL_MEMORY,
+        nt_nr(NtHandlerId::AllocateVirtualMemory),
         0xFFFFFFFFFFFFFFFF,
         &mut overlap_base as *mut u64 as u64,
         0,
@@ -507,7 +496,7 @@ unsafe fn test_virtual_memory() {
     let mut free_base = base;
     let mut free_size: u64 = 0;
     let st = svc(
-        NR_FREE_VIRTUAL_MEMORY,
+        nt_nr(NtHandlerId::FreeVirtualMemory),
         0xFFFFFFFFFFFFFFFF,
         &mut free_base as *mut u64 as u64,
         &mut free_size as *mut u64 as u64,
@@ -538,7 +527,7 @@ unsafe fn test_virtual_memory() {
     let mut bad_commit_base = base;
     let mut bad_commit_size: u64 = 0x1000;
     let st = svc(
-        NR_ALLOCATE_VIRTUAL_MEMORY,
+        nt_nr(NtHandlerId::AllocateVirtualMemory),
         0xFFFFFFFFFFFFFFFF,
         &mut bad_commit_base as *mut u64 as u64,
         0,
@@ -565,7 +554,7 @@ unsafe fn test_section() {
     let mut bad_sec: u64 = 0;
     let mut bad_size: u64 = 0x1000;
     let st = svc(
-        NR_CREATE_SECTION,
+        nt_nr(NtHandlerId::CreateSection),
         &mut bad_sec as *mut u64 as u64,
         0x000F001F,
         0,
@@ -585,7 +574,7 @@ unsafe fn test_section() {
     let mut sec_handle: u64 = 0;
     let mut sec_size: u64 = 0x10000;
     let st = svc(
-        NR_CREATE_SECTION,
+        nt_nr(NtHandlerId::CreateSection),
         &mut sec_handle as *mut u64 as u64, // SectionHandle out
         0x000F001F,                         // DesiredAccess (SECTION_ALL_ACCESS)
         0,                                  // ObjectAttributes
@@ -603,7 +592,7 @@ unsafe fn test_section() {
     let mut view_size: u64 = 0;
     let mut view_off: u64 = 0;
     let st = svc10(
-        NR_MAP_VIEW_OF_SECTION,
+        nt_nr(NtHandlerId::MapViewOfSection),
         sec_handle,                        // SectionHandle
         0xFFFFFFFFFFFFFFFF,                // ProcessHandle
         &mut view_base as *mut u64 as u64, // BaseAddress ptr
@@ -627,7 +616,7 @@ unsafe fn test_section() {
 
     // Unmap
     let st = svc(
-        NR_UNMAP_VIEW_OF_SECTION,
+        nt_nr(NtHandlerId::UnmapViewOfSection),
         0xFFFFFFFFFFFFFFFF,
         view_base,
         0,
@@ -643,7 +632,7 @@ unsafe fn test_section() {
     );
 
     // Close section handle
-    let st = svc(NR_CLOSE, sec_handle, 0, 0, 0, 0, 0, 0, 0);
+    let st = svc(nt_nr(NtHandlerId::Close), sec_handle, 0, 0, 0, 0, 0, 0, 0);
     check(b"NtClose section handle", st == STATUS_SUCCESS);
 }
 
@@ -657,7 +646,7 @@ unsafe fn test_event() {
     // Create manual-reset event (initially non-signaled)
     let mut evt_handle: u64 = 0;
     let st = svc(
-        NR_CREATE_EVENT,
+        nt_nr(NtHandlerId::CreateEvent),
         &mut evt_handle as *mut u64 as u64, // EventHandle out
         0x001F0003,                         // EVENT_ALL_ACCESS
         0,                                  // ObjectAttributes
@@ -673,7 +662,7 @@ unsafe fn test_event() {
     // Set event
     let mut prev_state: u64 = 0xFFFF;
     let st = svc(
-        NR_SET_EVENT,
+        nt_nr(NtHandlerId::SetEvent),
         evt_handle,
         &mut prev_state as *mut u64 as u64,
         0,
@@ -688,7 +677,7 @@ unsafe fn test_event() {
     // Reset event
     let mut prev_state2: u64 = 0xFFFF;
     let st = svc(
-        NR_RESET_EVENT,
+        nt_nr(NtHandlerId::ResetEvent),
         evt_handle,
         &mut prev_state2 as *mut u64 as u64,
         0,
@@ -701,7 +690,7 @@ unsafe fn test_event() {
     check(b"NtResetEvent returns SUCCESS", st == STATUS_SUCCESS);
 
     // Close
-    let st = svc(NR_CLOSE, evt_handle, 0, 0, 0, 0, 0, 0, 0);
+    let st = svc(nt_nr(NtHandlerId::Close), evt_handle, 0, 0, 0, 0, 0, 0, 0);
     check(b"NtClose event handle", st == STATUS_SUCCESS);
 }
 
@@ -711,7 +700,7 @@ unsafe fn test_event() {
 
 unsafe fn test_yield() {
     print(b"== Yield ==\r\n");
-    let st = svc(NR_YIELD_EXECUTION, 0, 0, 0, 0, 0, 0, 0, 0);
+    let st = svc(nt_nr(NtHandlerId::YieldExecution), 0, 0, 0, 0, 0, 0, 0, 0);
     // NtYieldExecution returns STATUS_SUCCESS or STATUS_NO_YIELD_PERFORMED
     check(b"NtYieldExecution does not crash", true);
     let _ = st;
@@ -727,7 +716,7 @@ unsafe fn test_duplicate_object() {
     // Create an event, then duplicate its handle
     let mut evt: u64 = 0;
     svc(
-        NR_CREATE_EVENT,
+        nt_nr(NtHandlerId::CreateEvent),
         &mut evt as *mut u64 as u64,
         0x001F0003,
         0,
@@ -740,7 +729,7 @@ unsafe fn test_duplicate_object() {
 
     let mut dup: u64 = 0;
     let st = svc(
-        NR_DUPLICATE_OBJECT,
+        nt_nr(NtHandlerId::DuplicateObject),
         0xFFFFFFFFFFFFFFFF,          // SourceProcessHandle
         evt,                         // SourceHandle
         0xFFFFFFFFFFFFFFFF,          // TargetProcessHandle
@@ -754,8 +743,8 @@ unsafe fn test_duplicate_object() {
     check(b"Duplicated handle is valid", dup != 0 && dup != evt);
 
     // Close both
-    svc(NR_CLOSE, evt, 0, 0, 0, 0, 0, 0, 0);
-    svc(NR_CLOSE, dup, 0, 0, 0, 0, 0, 0, 0);
+    svc(nt_nr(NtHandlerId::Close), evt, 0, 0, 0, 0, 0, 0, 0);
+    svc(nt_nr(NtHandlerId::Close), dup, 0, 0, 0, 0, 0, 0, 0);
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -772,7 +761,7 @@ unsafe fn test_multi_alloc() {
         let mut base: u64 = 0;
         let mut size: u64 = 0x1000; // 4KB each
         let st = svc(
-            NR_ALLOCATE_VIRTUAL_MEMORY,
+            nt_nr(NtHandlerId::AllocateVirtualMemory),
             0xFFFFFFFFFFFFFFFF,
             &mut base as *mut u64 as u64,
             0,
@@ -810,7 +799,7 @@ unsafe fn test_multi_alloc() {
             let mut fb = bases[i];
             let mut fs: u64 = 0;
             let st = svc(
-                NR_FREE_VIRTUAL_MEMORY,
+                nt_nr(NtHandlerId::FreeVirtualMemory),
                 0xFFFFFFFFFFFFFFFF,
                 &mut fb as *mut u64 as u64,
                 &mut fs as *mut u64 as u64,

@@ -5,6 +5,9 @@ name = "window_test"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+winemu-shared = { path = "../../crates/winemu-shared" }
+
 [[bin]]
 name = "window_test"
 path = "src/main.rs"

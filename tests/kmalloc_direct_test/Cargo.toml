@@ -5,6 +5,9 @@ name = "kmalloc_direct_test"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+winemu-shared = { path = "../../crates/winemu-shared" }
+
 [[bin]]
 name = "kmalloc_direct_test"
 path = "src/main.rs"

@@ -1,10 +1,14 @@
-// sched/topology.rs — vCPU affinity, set_thread_state_locked, reschedule hints
+// sched/topology.rs — vCPU affinity, state transitions, remote wake hints
 //
 // All functions require the scheduler lock to be held.
 
-use crate::sched::cpu::set_needs_reschedule;
 use crate::sched::cpu::{cpu_local, current_tid, vcpu_id};
 use crate::sched::global::{with_thread, with_thread_mut, SCHED};
+use crate::sched::ready::{dequeue_ready_thread_locked, enqueue_ready_thread_locked};
+use crate::sched::resched::{
+    request_local_trap_reschedule, request_remote_reschedule_for_ready_work_locked,
+    request_remote_vcpu_reschedule_locked,
+};
 use crate::sched::types::{ThreadState, MAX_VCPUS};
 use core::sync::atomic::Ordering;
 
@@ -13,8 +17,7 @@ use core::sync::atomic::Ordering;
 /// Transition a thread's state and update the ready queue accordingly.
 /// Must be called with the scheduler lock held.
 pub fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
-    let (old_state, old_priority, is_idle) =
-        match with_thread(tid, |t| (t.state, t.priority, t.is_idle_thread)) {
+    let (old_state, is_idle) = match with_thread(tid, |t| (t.state, t.is_idle_thread)) {
             Some(v) => v,
             None => return,
         };
@@ -32,7 +35,7 @@ pub fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
     // State transition uses a single queue mutation path:
     // remove old Ready link (if any), then reinsert only when becoming Ready.
     if old_state == ThreadState::Ready {
-        purge_tid_from_ready_queue_locked(tid, old_priority);
+        dequeue_ready_thread_locked(tid);
     }
 
     // Update state.
@@ -40,15 +43,14 @@ pub fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
 
     // Push to ready queue if becoming Ready.
     if new_state == ThreadState::Ready {
-        let priority = with_thread(tid, |t| t.priority).unwrap_or(8);
-        push_tid_to_ready_queue_locked(tid, priority);
+        enqueue_ready_thread_locked(tid);
 
         // Signal a vCPU that might be idle.
         hint_reschedule_any_idle();
         // Also force local unlock-edge evaluation so same-priority wake/create
         // paths do not get stuck behind "continue current" policy.
         if tid != crate::sched::cpu::current_tid() {
-            set_needs_reschedule();
+            request_local_trap_reschedule();
         }
     }
 
@@ -58,16 +60,10 @@ pub fn set_thread_state_locked(tid: u32, new_state: ThreadState) {
 
 // ── Reschedule hints ──────────────────────────────────────────────────────────
 
-/// Mark the current vCPU as needing a reschedule.
-#[inline]
-pub fn request_reschedule_self() {
-    cpu_local().needs_reschedule = true;
-}
-
 /// Mark a specific vCPU as needing a reschedule.
 pub fn request_reschedule_vcpu(vid: u32) {
     if (vid as usize) < MAX_VCPUS {
-        unsafe { SCHED.vcpu_raw_mut(vid as usize) }.needs_scheduling = true;
+        request_remote_vcpu_reschedule_locked(vid as usize);
     }
 }
 
@@ -80,16 +76,7 @@ fn vcpu_is_idle_locked(vid: usize) -> bool {
 
 /// Find an idle vCPU and mark it for reschedule (to pick up a newly ready thread).
 pub fn hint_reschedule_any_idle() {
-    for vid in 0..MAX_VCPUS {
-        if vcpu_is_idle_locked(vid) {
-            unsafe { SCHED.vcpu_raw_mut(vid) }.needs_scheduling = true;
-            return;
-        }
-    }
-    // No idle vCPU found — mark all for reschedule so preemption can occur.
-    for vid in 0..MAX_VCPUS {
-        unsafe { SCHED.vcpu_raw_mut(vid) }.needs_scheduling = true;
-    }
+    request_remote_reschedule_for_ready_work_locked(vcpu_is_idle_locked);
 }
 
 // ── Affinity helpers ──────────────────────────────────────────────────────────
@@ -115,39 +102,6 @@ fn active_vcpu_mask_locked() -> u32 {
 }
 
 #[inline]
-fn purge_tid_from_ready_queue_locked(tid: u32, priority: u8) {
-    if tid == 0 {
-        return;
-    }
-    if !with_thread(tid, |t| t.in_ready_queue).unwrap_or(false) {
-        return;
-    }
-    let queue = unsafe { SCHED.queue_raw_mut() };
-    let store = unsafe { SCHED.threads_raw() };
-    let _ = queue.remove(tid, priority, &|id| store.get_ptr(id));
-    with_thread_mut(tid, |t| {
-        t.in_ready_queue = false;
-        t.sched_next = 0;
-    });
-}
-
-#[inline]
-fn push_tid_to_ready_queue_locked(tid: u32, priority: u8) {
-    if tid == 0 {
-        return;
-    }
-    if with_thread(tid, |t| t.in_ready_queue).unwrap_or(false) {
-        return;
-    }
-    let queue = unsafe { SCHED.queue_raw_mut() };
-    let store = unsafe { SCHED.threads_raw_mut() } as *mut crate::sched::thread_store::ThreadStore;
-    queue.push_with_store(tid, priority, &mut |id| unsafe { (*store).get_mut(id) });
-    with_thread_mut(tid, |t| {
-        t.in_ready_queue = true;
-    });
-}
-
-#[inline]
 fn find_running_vcpu_for_tid_locked(tid: u32) -> Option<usize> {
     for vid in 0..MAX_VCPUS {
         if unsafe { SCHED.vcpu_raw(vid) }.current_tid == tid {
@@ -167,9 +121,8 @@ pub fn set_thread_affinity_mask_locked(tid: u32, requested_mask: u64) -> bool {
         return false;
     }
 
-    let (state, old_mask, is_idle, prio) = match with_thread(tid, |t| {
-        (t.state, t.affinity_mask, t.is_idle_thread, t.priority)
-    }) {
+    let (state, old_mask, is_idle) =
+        match with_thread(tid, |t| (t.state, t.affinity_mask, t.is_idle_thread)) {
         Some(v) => v,
         None => return false,
     };
@@ -182,22 +135,22 @@ pub fn set_thread_affinity_mask_locked(tid: u32, requested_mask: u64) -> bool {
     }
 
     if state == ThreadState::Ready {
-        purge_tid_from_ready_queue_locked(tid, prio);
+        dequeue_ready_thread_locked(tid);
     }
 
     with_thread_mut(tid, |t| t.affinity_mask = new_mask);
 
     if state == ThreadState::Ready {
-        push_tid_to_ready_queue_locked(tid, prio);
+        enqueue_ready_thread_locked(tid);
         hint_reschedule_any_idle();
         if tid != current_tid() {
-            set_needs_reschedule();
+            request_local_trap_reschedule();
         }
     } else if state == ThreadState::Running {
         if let Some(run_vid) = find_running_vcpu_for_tid_locked(tid) {
             if (new_mask & (1u32 << run_vid)) == 0 {
                 if run_vid == vcpu_id() as usize {
-                    set_needs_reschedule();
+                    request_local_trap_reschedule();
                 } else {
                     request_reschedule_vcpu(run_vid as u32);
                 }

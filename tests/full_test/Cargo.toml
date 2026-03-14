@@ -5,6 +5,9 @@ name = "full_test"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+winemu-shared = { path = "../../crates/winemu-shared" }
+
 [[bin]]
 name = "full_test"
 path = "src/main.rs"

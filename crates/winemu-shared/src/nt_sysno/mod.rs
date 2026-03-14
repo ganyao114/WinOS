@@ -18,3 +18,13 @@ pub fn nt_sysno_table_for_build(build: u32) -> Option<&'static [(u16, u8)]> {
         _ => None,
     }
 }
+
+/// Look up the concrete syscall number for a kernel-handled NT syscall on a
+/// specific Windows build.
+#[inline]
+pub fn nt_sysno_nr_for_build(build: u32, handler: NtHandlerId) -> Option<u16> {
+    let handler_id = handler as u8;
+    nt_sysno_table_for_build(build)?
+        .iter()
+        .find_map(|&(nr, id)| (id == handler_id).then_some(nr))
+}

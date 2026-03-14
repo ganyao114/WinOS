@@ -5,6 +5,8 @@ pub mod cpu;
 pub mod global;
 pub mod lock;
 pub mod queue;
+pub mod ready;
+pub mod resched;
 pub mod schedule;
 pub mod sync;
 pub mod thread_control;
@@ -23,7 +25,7 @@ pub use types::{ThreadState, WaitDeadline, MAX_VCPUS};
 pub use global::{init_scheduler, thread_exists, with_thread, with_thread_mut, SCHED};
 
 // Per-vCPU TLS
-pub use cpu::{current_tid, init_cpu_local, set_needs_reschedule, vcpu_id};
+pub use cpu::{current_tid, init_cpu_local, vcpu_id};
 
 // Scheduler lock
 pub use lock::{KSchedulerLock, SCHED_LOCK};
@@ -39,7 +41,7 @@ pub use context::{drain_deferred_kstacks, set_thread_in_kernel_locked};
 // Wait / unblock
 pub use wait::{
     block_thread_locked, check_wait_timeouts_locked, current_ticks, timeout_to_deadline,
-    unblock_thread_locked, STATUS_PENDING, STATUS_SUCCESS,
+    unblock_thread_locked, STATUS_PENDING,
 };
 
 // Thread control
@@ -56,6 +58,7 @@ pub use threads::{
 };
 
 // Scheduler core
+pub use resched::request_local_unlock_edge_schedule;
 pub use schedule::{
     enter_current_core_scheduler, enter_kernel_continuation_noreturn,
     execute_kernel_continuation_switch, schedule_core_locked, ScheduleDecision, ScheduleReason,
@@ -128,6 +131,7 @@ pub fn alert_thread_by_tid(tid: u32) -> u32 {
     .unwrap_or(false);
     if is_waiting {
         unblock_thread_locked(tid, winemu_shared::status::ALERTED);
+        request_local_unlock_edge_schedule(ScheduleReason::Wakeup);
     } else {
         with_thread_mut(tid, |t| {
             t.alerted = true;

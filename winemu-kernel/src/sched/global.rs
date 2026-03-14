@@ -12,7 +12,12 @@ use crate::sched::types::{KThread, MAX_VCPUS};
 pub struct KVcpuState {
     pub current_tid: u32,
     pub idle_tid: u32,
-    pub needs_scheduling: bool,
+    /// Explicit request that this vCPU rerun its scheduler core from a remote
+    /// state transition / wakeup path.
+    pub pending_remote_reschedule: bool,
+    /// Deferred local unlock-edge reason for the current vCPU.
+    /// `0` means "plain UnlockEdge" / no override.
+    pub pending_unlock_edge_reason_code: u8,
 }
 
 impl KVcpuState {
@@ -20,7 +25,8 @@ impl KVcpuState {
         Self {
             current_tid: 0,
             idle_tid: 0,
-            needs_scheduling: false,
+            pending_remote_reschedule: false,
+            pending_unlock_edge_reason_code: 0,
         }
     }
 }

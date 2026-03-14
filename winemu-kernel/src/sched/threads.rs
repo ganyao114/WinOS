@@ -12,17 +12,19 @@ use crate::sched::context::{
 };
 use crate::sched::cpu::current_vcpu_index;
 use crate::sched::global::{with_thread, with_thread_mut, SCHED};
+use crate::sched::request_local_unlock_edge_schedule;
+use crate::sched::ScheduleReason;
 use crate::sched::thread_control::terminate_thread_locked;
 use crate::sched::topology::{bind_running_thread_to_vcpu, set_thread_state_locked};
 use crate::sched::types::{KThread, ThreadState, MAX_VCPUS};
 
 // ── spawn ─────────────────────────────────────────────────────────────────────
 
-/// Insert a pre-built KThread into the thread store and make it Ready.
+/// Insert a pre-built KThread into the store and prepare its kernel continuation.
 /// Returns the TID on success.
 ///
 /// Must be called with the scheduler lock held.
-pub fn spawn_locked(mut thread: KThread) -> Option<u32> {
+pub fn register_thread_locked(mut thread: KThread) -> Option<u32> {
     let store = unsafe { SCHED.threads_raw_mut() };
     let tid = store.alloc(|id| {
         thread.tid = id;
@@ -32,8 +34,6 @@ pub fn spawn_locked(mut thread: KThread) -> Option<u32> {
     // Ensure the thread has a kernel continuation so it can be scheduled
     // by the unlock-edge or a secondary vCPU.
     ensure_user_entry_continuation_locked(tid);
-
-    set_thread_state_locked(tid, ThreadState::Ready);
     Some(tid)
 }
 
@@ -48,6 +48,8 @@ pub struct UserThreadParams {
     pub arg0: u64,
     pub arg1: u64,
     pub priority: u8,
+    pub start_suspended: bool,
+    pub request_wakeup_on_ready: bool,
 }
 
 /// Allocate and register a new user-mode thread.
@@ -66,6 +68,7 @@ pub fn create_user_thread_locked(p: UserThreadParams) -> Option<u32> {
     t.teb_va = p.teb_va;
     t.priority = p.priority;
     t.base_priority = p.priority;
+    t.suspend_count = u32::from(p.start_suspended);
     t.last_vcpu_hint = 0;
 
     crate::arch::context::initialize_user_thread_context(
@@ -79,7 +82,17 @@ pub fn create_user_thread_locked(p: UserThreadParams) -> Option<u32> {
         },
     );
 
-    let tid = spawn_locked(t)?;
+    let tid = register_thread_locked(t)?;
+    if p.start_suspended {
+        with_thread_mut(tid, |t| {
+            t.state = ThreadState::Suspended;
+        });
+    } else {
+        set_thread_state_locked(tid, ThreadState::Ready);
+        if p.request_wakeup_on_ready {
+            request_local_unlock_edge_schedule(ScheduleReason::Wakeup);
+        }
+    }
     if pid != 0 {
         crate::process::on_thread_created(pid, tid);
     }
@@ -100,6 +113,8 @@ pub fn create_boot_thread_for_current_vcpu_locked(priority: u8) -> Option<u32> {
         arg0: 0,
         arg1: 0,
         priority,
+        start_suspended: false,
+        request_wakeup_on_ready: false,
     })?;
     let vid = current_vcpu_index();
     set_thread_state_locked(tid, ThreadState::Running);

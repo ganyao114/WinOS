@@ -351,6 +351,7 @@ pub fn create_user_thread(
     stack_commit: u64,
     stack_reserve: u64,
     priority: u8,
+    start_suspended: bool,
 ) -> Result<u32, CreateThreadError> {
     let stack = crate::teb::alloc_thread_stack(pid, stack_reserve, stack_commit)
         .ok_or(CreateThreadError::NoMemory)?;
@@ -377,6 +378,8 @@ pub fn create_user_thread(
             stack_size: stack.reserve_size,
             teb_va,
             priority: win_to_sched_priority(priority),
+            start_suspended,
+            request_wakeup_on_ready: !start_suspended,
         };
         match create_user_thread_locked(params) {
             Some(tid) => tid,
@@ -476,20 +479,6 @@ pub fn set_thread_affinity_by_handle(handle: u64, affinity_mask: u64) -> u32 {
     status::SUCCESS
 }
 
-// ── yield ─────────────────────────────────────────────────────────────────────
-
-pub fn request_current_thread_yield() {
-    let tid = current_tid();
-    if tid == 0 {
-        return;
-    }
-    // Voluntary yield should request a reschedule, but keep the current thread
-    // in Running until schedule_core_locked decides whether to switch.
-    // This preserves Yield semantics: switch to peer if available, otherwise
-    // continue current without transiently self-selecting from ready-queue.
-    sched::set_needs_reschedule();
-}
-
 // ── thread_notify_terminated ──────────────────────────────────────────────────
 
 pub fn thread_notify_terminated(_tid: u32) {
@@ -573,7 +562,10 @@ pub(crate) fn handle_set_information_thread(frame: &mut SvcFrame) {
 }
 
 pub(crate) fn handle_yield(frame: &mut SvcFrame) {
-    request_current_thread_yield();
+    {
+        let _lock = KSchedulerLock::lock();
+        sched::request_local_unlock_edge_schedule(sched::ScheduleReason::Yield);
+    }
     frame.x[0] = status::SUCCESS as u64;
 }
 
@@ -625,6 +617,7 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
         stack_size_arg,
         max_stack_size_arg,
         8,
+        (create_flags & 0x1) != 0,
     ) {
         Ok(tid) => tid,
         Err(CreateThreadError::InvalidParameter) => {
@@ -645,11 +638,6 @@ pub(crate) fn handle_create_thread(frame: &mut SvcFrame) {
         let _ = terminate_thread_by_tid(tid);
         frame.x[0] = st as u64;
         return;
-    }
-    // NtCreateThreadEx: 0x1 = CREATE_SUSPENDED.
-    if (create_flags & 0x1) != 0 {
-        let _lock = KSchedulerLock::lock();
-        suspend_thread_locked(tid);
     }
     frame.x[0] = status::SUCCESS as u64;
 }

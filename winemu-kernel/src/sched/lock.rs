@@ -220,3 +220,7 @@ impl SchedLockAndSleep {
     #[inline]
     pub fn cancel(&mut self) {}
 }
+
+impl Drop for SchedLockAndSleep {
+    fn drop(&mut self) {}
+}

@@ -2,20 +2,15 @@
 #![no_main]
 
 use core::arch::asm;
+use winemu_shared::nt_sysno::{nt_sysno_nr_for_build, NtHandlerId};
 
 const STDOUT: u64 = 0xFFFF_FFFF_FFFF_FFF5;
+const WINDOWS_BUILD: u32 = 22631;
 
-const NR_WRITE_FILE: u64            = 0x0008;
-const NR_DELETE_KEY: u64            = 0x00DA;
-const NR_DELETE_VALUE_KEY: u64      = 0x00DD;
-const NR_ENUMERATE_VALUE_KEY: u64   = 0x0013;
-const NR_CLOSE: u64                 = 0x000F;
-const NR_OPEN_KEY: u64              = 0x0012;
-const NR_QUERY_VALUE_KEY: u64       = 0x0017;
-const NR_CREATE_KEY: u64            = 0x001D;
-const NR_TERMINATE_PROCESS: u64     = 0x002C;
-const NR_ENUMERATE_KEY: u64         = 0x0032;
-const NR_SET_VALUE_KEY: u64         = 0x0060;
+#[inline(always)]
+fn nt_nr(handler: NtHandlerId) -> u64 {
+    nt_sysno_nr_for_build(WINDOWS_BUILD, handler).expect("missing NT syscall") as u64
+}
 
 const STATUS_SUCCESS: u64 = 0x0000_0000;
 const STATUS_INVALID_HANDLE: u64 = 0xC000_0008;
@@ -126,7 +121,7 @@ unsafe fn svc10(
 unsafe fn nt_write_stdout(buf: *const u8, len: u32) -> u64 {
     let mut iosb = IoStatusBlock { status: 0, info: 0 };
     svc10(
-        NR_WRITE_FILE,
+        nt_nr(NtHandlerId::WriteFile),
         STDOUT,
         0,
         0,
@@ -175,7 +170,7 @@ unsafe fn check(name: &[u8], ok: bool) {
 
 unsafe fn exit(code: u32) -> ! {
     svc(
-        NR_TERMINATE_PROCESS,
+        nt_nr(NtHandlerId::TerminateProcess),
         0xFFFF_FFFF_FFFF_FFFF,
         code as u64,
         0,
@@ -247,7 +242,7 @@ fn init_oa(name: &mut UnicodeString, root: u64) -> ObjectAttributes {
 }
 
 unsafe fn nt_close(handle: u64) -> u64 {
-    svc(NR_CLOSE, handle, 0, 0, 0, 0, 0, 0, 0)
+    svc(nt_nr(NtHandlerId::Close), handle, 0, 0, 0, 0, 0, 0, 0)
 }
 
 unsafe fn test_registry_syscalls() {
@@ -262,7 +257,7 @@ unsafe fn test_registry_syscalls() {
     let mut parent_handle: u64 = 0;
     let mut disposition: u32 = 0;
     let st = svc(
-        NR_CREATE_KEY,
+        nt_nr(NtHandlerId::CreateKey),
         &mut parent_handle as *mut u64 as u64,
         0,
         &mut parent_oa as *mut _ as u64,
@@ -281,7 +276,7 @@ unsafe fn test_registry_syscalls() {
 
     let mut parent_open_handle: u64 = 0;
     let st = svc(
-        NR_OPEN_KEY,
+        nt_nr(NtHandlerId::OpenKey),
         &mut parent_open_handle as *mut u64 as u64,
         0,
         &mut parent_oa as *mut _ as u64,
@@ -303,7 +298,7 @@ unsafe fn test_registry_syscalls() {
     let mut sub_handle: u64 = 0;
     let mut sub_disp: u32 = 0;
     let st = svc(
-        NR_CREATE_KEY,
+        nt_nr(NtHandlerId::CreateKey),
         &mut sub_handle as *mut u64 as u64,
         0,
         &mut sub_oa as *mut _ as u64,
@@ -318,7 +313,7 @@ unsafe fn test_registry_syscalls() {
 
     let mut key_ret_len: u32 = 0;
     let st = svc(
-        NR_ENUMERATE_KEY,
+        nt_nr(NtHandlerId::EnumerateKey),
         parent_handle,
         0,
         0,
@@ -345,7 +340,7 @@ unsafe fn test_registry_syscalls() {
     let value_data: u32 = 0x1234_5678;
 
     let st = svc(
-        NR_DELETE_VALUE_KEY,
+        nt_nr(NtHandlerId::DeleteValueKey),
         0xFFFF_FFFF_FFFF_FF00,
         &mut value_us as *mut _ as u64,
         0,
@@ -361,7 +356,7 @@ unsafe fn test_registry_syscalls() {
     );
 
     let st = svc(
-        NR_SET_VALUE_KEY,
+        nt_nr(NtHandlerId::SetValueKey),
         sub_handle,
         &mut value_us as *mut _ as u64,
         0,
@@ -375,7 +370,7 @@ unsafe fn test_registry_syscalls() {
 
     let mut value_ret_len: u32 = 0;
     let st = svc(
-        NR_QUERY_VALUE_KEY,
+        nt_nr(NtHandlerId::QueryValueKey),
         sub_handle,
         &mut value_us as *mut _ as u64,
         2,
@@ -413,7 +408,7 @@ unsafe fn test_registry_syscalls() {
 
     let mut enum_value_ret_len: u32 = 0;
     let st = svc(
-        NR_ENUMERATE_VALUE_KEY,
+        nt_nr(NtHandlerId::EnumerateValueKey),
         sub_handle,
         0,
         0,
@@ -450,7 +445,7 @@ unsafe fn test_registry_syscalls() {
     check(b"Enumerated value name/type are correct", enum_value_ok);
 
     let st = svc(
-        NR_DELETE_VALUE_KEY,
+        nt_nr(NtHandlerId::DeleteValueKey),
         sub_handle,
         &mut value_us as *mut _ as u64,
         0,
@@ -464,7 +459,7 @@ unsafe fn test_registry_syscalls() {
 
     let mut deleted_value_ret_len: u32 = 0;
     let st = svc(
-        NR_QUERY_VALUE_KEY,
+        nt_nr(NtHandlerId::QueryValueKey),
         sub_handle,
         &mut value_us as *mut _ as u64,
         2,
@@ -480,7 +475,7 @@ unsafe fn test_registry_syscalls() {
     );
 
     let st = svc(
-        NR_DELETE_VALUE_KEY,
+        nt_nr(NtHandlerId::DeleteValueKey),
         sub_handle,
         &mut value_us as *mut _ as u64,
         0,
@@ -499,7 +494,7 @@ unsafe fn test_registry_syscalls() {
     let default_value_data: u32 = 0xA55A_5AA5;
 
     let st = svc(
-        NR_SET_VALUE_KEY,
+        nt_nr(NtHandlerId::SetValueKey),
         sub_handle,
         &mut empty_value_us as *mut _ as u64,
         0,
@@ -515,7 +510,7 @@ unsafe fn test_registry_syscalls() {
     );
 
     let st = svc(
-        NR_DELETE_VALUE_KEY,
+        nt_nr(NtHandlerId::DeleteValueKey),
         sub_handle,
         &mut empty_value_us as *mut _ as u64,
         0,
@@ -532,7 +527,7 @@ unsafe fn test_registry_syscalls() {
 
     let mut empty_value_ret_len: u32 = 0;
     let st = svc(
-        NR_QUERY_VALUE_KEY,
+        nt_nr(NtHandlerId::QueryValueKey),
         sub_handle,
         &mut empty_value_us as *mut _ as u64,
         2,
@@ -548,7 +543,7 @@ unsafe fn test_registry_syscalls() {
     );
 
     let st = svc(
-        NR_DELETE_VALUE_KEY,
+        nt_nr(NtHandlerId::DeleteValueKey),
         sub_handle,
         &mut empty_value_us as *mut _ as u64,
         0,
@@ -568,7 +563,7 @@ unsafe fn test_registry_syscalls() {
 
     let mut sub_delete_handle: u64 = 0;
     let st = svc(
-        NR_OPEN_KEY,
+        nt_nr(NtHandlerId::OpenKey),
         &mut sub_delete_handle as *mut u64 as u64,
         0,
         &mut sub_oa as *mut _ as u64,
@@ -580,12 +575,12 @@ unsafe fn test_registry_syscalls() {
     );
     check(b"NtOpenKey(subkey) before delete returns SUCCESS", st == STATUS_SUCCESS);
 
-    let st = svc(NR_DELETE_KEY, sub_delete_handle, 0, 0, 0, 0, 0, 0, 0);
+    let st = svc(nt_nr(NtHandlerId::DeleteKey), sub_delete_handle, 0, 0, 0, 0, 0, 0, 0);
     check(b"NtDeleteKey(subkey) returns SUCCESS", st == STATUS_SUCCESS);
 
     let mut sub_reopen: u64 = 0;
     let st = svc(
-        NR_OPEN_KEY,
+        nt_nr(NtHandlerId::OpenKey),
         &mut sub_reopen as *mut u64 as u64,
         0,
         &mut sub_oa as *mut _ as u64,
@@ -603,12 +598,12 @@ unsafe fn test_registry_syscalls() {
     let st = nt_close(parent_open_handle);
     check(b"NtClose(parent open handle) returns SUCCESS", st == STATUS_SUCCESS);
 
-    let st = svc(NR_DELETE_KEY, parent_handle, 0, 0, 0, 0, 0, 0, 0);
+    let st = svc(nt_nr(NtHandlerId::DeleteKey), parent_handle, 0, 0, 0, 0, 0, 0, 0);
     check(b"NtDeleteKey(parent) returns SUCCESS", st == STATUS_SUCCESS);
 
     let mut parent_reopen: u64 = 0;
     let st = svc(
-        NR_OPEN_KEY,
+        nt_nr(NtHandlerId::OpenKey),
         &mut parent_reopen as *mut u64 as u64,
         0,
         &mut parent_oa as *mut _ as u64,

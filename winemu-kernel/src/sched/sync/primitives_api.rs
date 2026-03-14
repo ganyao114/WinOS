@@ -3,6 +3,8 @@
 // All methods require the scheduler lock to be held.
 
 use crate::sched::global::with_thread;
+use crate::sched::request_local_unlock_edge_schedule;
+use crate::sched::ScheduleReason;
 use crate::sched::sync::wait_queue::WaitQueue;
 use crate::sched::thread_control::{boost_thread_priority_locked, set_thread_priority_locked};
 use crate::sched::types::WaitDeadline;
@@ -38,12 +40,17 @@ impl KEvent {
             // Wake exactly one waiter and consume the signal.
             if let Some(tid) = self.waiters.dequeue_highest() {
                 unblock_thread_locked(tid, STATUS_SUCCESS);
+                request_local_unlock_edge_schedule(ScheduleReason::Wakeup);
                 self.signaled = false;
             }
             // If no waiters, signal stays set for the next wait().
         } else {
             // Manual-reset: wake all waiters, signal stays set.
+            let had_waiters = !self.waiters.is_empty();
             self.waiters.wake_all();
+            if had_waiters {
+                request_local_unlock_edge_schedule(ScheduleReason::Wakeup);
+            }
         }
     }
 
@@ -139,6 +146,7 @@ impl KMutex {
             self.recursion = 1;
             self.saved_owner_priority = with_thread(next, |t| t.priority).unwrap_or(8);
             unblock_thread_locked(next, STATUS_SUCCESS);
+            request_local_unlock_edge_schedule(ScheduleReason::Wakeup);
         }
         STATUS_SUCCESS
     }
@@ -155,6 +163,7 @@ impl KMutex {
             self.owner_tid = next;
             self.recursion = 1;
             unblock_thread_locked(next, STATUS_ABANDONED_WAIT_0);
+            request_local_unlock_edge_schedule(ScheduleReason::Wakeup);
         }
     }
 }
@@ -182,12 +191,17 @@ impl KSemaphore {
             return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
         }
         self.count += count;
+        let mut woke_any = false;
         while self.count > 0 {
             let Some(tid) = self.waiters.dequeue_highest() else {
                 break;
             };
             self.count -= 1;
             unblock_thread_locked(tid, STATUS_SUCCESS);
+            woke_any = true;
+        }
+        if woke_any {
+            request_local_unlock_edge_schedule(ScheduleReason::Wakeup);
         }
         STATUS_SUCCESS
     }

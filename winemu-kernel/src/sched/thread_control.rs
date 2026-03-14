@@ -6,6 +6,9 @@ use core::sync::atomic::Ordering;
 
 use crate::sched::global::SCHED;
 use crate::sched::global::{with_thread, with_thread_mut};
+use crate::sched::ready::refresh_ready_thread_locked;
+use crate::sched::request_local_unlock_edge_schedule;
+use crate::sched::ScheduleReason;
 use crate::sched::topology::set_thread_state_locked;
 use crate::sched::types::ThreadState;
 use crate::sched::wait::{unblock_thread_locked, STATUS_SUCCESS};
@@ -13,37 +16,6 @@ use crate::sched::wait::{unblock_thread_locked, STATUS_SUCCESS};
 #[inline]
 fn notify_priority_changed_locked() {
     SCHED.scheduler_update_needed.store(true, Ordering::Relaxed);
-}
-
-fn purge_tid_from_ready_queue_locked(tid: u32, priority: u8) {
-    if tid == 0 {
-        return;
-    }
-    if !with_thread(tid, |t| t.in_ready_queue).unwrap_or(false) {
-        return;
-    }
-    let queue = unsafe { SCHED.queue_raw_mut() };
-    let store = unsafe { SCHED.threads_raw() };
-    let _ = queue.remove(tid, priority, &|id| store.get_ptr(id));
-    with_thread_mut(tid, |t| {
-        t.in_ready_queue = false;
-        t.sched_next = 0;
-    });
-}
-
-fn push_tid_to_ready_queue_locked(tid: u32, priority: u8) {
-    if tid == 0 {
-        return;
-    }
-    if with_thread(tid, |t| t.in_ready_queue).unwrap_or(false) {
-        return;
-    }
-    let queue = unsafe { SCHED.queue_raw_mut() };
-    let store = unsafe { SCHED.threads_raw_mut() } as *mut crate::sched::thread_store::ThreadStore;
-    queue.push_with_store(tid, priority, &mut |id| unsafe { (*store).get_mut(id) });
-    with_thread_mut(tid, |t| {
-        t.in_ready_queue = true;
-    });
 }
 
 // ── Priority ──────────────────────────────────────────────────────────────────
@@ -61,15 +33,12 @@ pub fn set_thread_priority_locked(tid: u32, priority: u8) {
         return;
     }
 
-    if old_state == ThreadState::Ready {
-        purge_tid_from_ready_queue_locked(tid, old_prio);
-    }
     with_thread_mut(tid, |t| {
         t.priority = priority;
         t.base_priority = priority;
     });
-    if old_state == ThreadState::Ready {
-        push_tid_to_ready_queue_locked(tid, priority);
+    if old_state == ThreadState::Ready && old_prio != priority {
+        refresh_ready_thread_locked(tid);
     }
     notify_priority_changed_locked();
 }
@@ -88,15 +57,12 @@ pub fn boost_thread_priority_locked(tid: u32, boost: u8) {
         return;
     }
 
-    if state == ThreadState::Ready {
-        purge_tid_from_ready_queue_locked(tid, old_priority);
-    }
     with_thread_mut(tid, |t| {
         t.priority = boosted;
         t.transient_boost = boost;
     });
-    if state == ThreadState::Ready {
-        push_tid_to_ready_queue_locked(tid, boosted);
+    if state == ThreadState::Ready && boosted != old_priority {
+        refresh_ready_thread_locked(tid);
     }
     notify_priority_changed_locked();
 }
@@ -116,15 +82,12 @@ pub fn decay_priority_boost_locked(tid: u32) {
     if !had_boost {
         return;
     }
-    if state == ThreadState::Ready && new_priority != old_priority {
-        purge_tid_from_ready_queue_locked(tid, old_priority);
-    }
     with_thread_mut(tid, |t| {
         t.transient_boost = new_boost;
         t.priority = new_priority;
     });
     if state == ThreadState::Ready && new_priority != old_priority {
-        push_tid_to_ready_queue_locked(tid, new_priority);
+        refresh_ready_thread_locked(tid);
     }
     if new_priority != old_priority {
         notify_priority_changed_locked();
@@ -172,6 +135,7 @@ pub fn resume_thread_locked(tid: u32) -> u32 {
         // Fully resumed.
         if state == ThreadState::Suspended {
             set_thread_state_locked(tid, ThreadState::Ready);
+            request_local_unlock_edge_schedule(ScheduleReason::Wakeup);
         }
     }
     prev_count

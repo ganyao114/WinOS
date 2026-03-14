@@ -100,6 +100,7 @@ fn ref_count_section(idx: u32) -> u32 {
 }
 
 fn close_sync_object(kind: KObjectKind, idx: u32) -> u32 {
+    let _lock = crate::sched::KSchedulerLock::lock();
     if object_handle_count_for_kind(kind, idx) != 0 {
         return status::SUCCESS;
     }

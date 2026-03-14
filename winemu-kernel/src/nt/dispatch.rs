@@ -1,5 +1,4 @@
-// Trap/syscall dispatch glue used by arch trap entry code.
-// This layer owns generic syscall dispatch and post-trap scheduling policy.
+// Arch trap entry glue for syscall dispatch.
 
 use crate::hypercall;
 
@@ -8,15 +7,14 @@ use super::constants::{
     KERNEL_FAULT_SYNDROME_TAG, SVC_TAG_NR_MASK, SVC_TAG_TABLE_MASK, SVC_TAG_TABLE_SHIFT,
     USER_FAULT_ADDRESS_TAG, USER_FAULT_PC_TAG, USER_FAULT_STATE_TAG, USER_FAULT_SYNDROME_TAG,
 };
-use super::sysno;
 use super::sysno_table::{lookup, NtHandlerId, HANDLER_NONE};
-use super::trap_schedule::{
-    begin_syscall_trap, finish_nt_syscall_trap, schedule_syscall_unlock_edge,
-};
+use super::trap_schedule::{begin_syscall_dispatch, finish_syscall_dispatch};
 use super::{
     file, loader, memory, object, process, registry, section, sync, system, thread, token, win32k,
     SvcFrame,
 };
+
+const WINEMU_LOAD_DLL_SYSCALL: u16 = 0x0F00;
 
 #[no_mangle]
 pub extern "C" fn svc_migrate_frame_to_thread_stack(_frame_ptr: u64, _frame_size: u64) -> u64 {
@@ -26,8 +24,7 @@ pub extern "C" fn svc_migrate_frame_to_thread_stack(_frame_ptr: u64, _frame_size
 
 #[no_mangle]
 pub extern "C" fn syscall_dispatch(frame: &mut SvcFrame) {
-    let cur = begin_syscall_trap();
-
+    let cur = begin_syscall_dispatch();
     let tag = frame.x8_orig;
     let table = ((tag >> SVC_TAG_TABLE_SHIFT) & SVC_TAG_TABLE_MASK) as u8;
     let nr = (tag & SVC_TAG_NR_MASK) as u16;
@@ -38,27 +35,18 @@ pub extern "C" fn syscall_dispatch(frame: &mut SvcFrame) {
         } else {
             forward_to_vmm(frame, nr, table);
         }
-        schedule_syscall_unlock_edge(frame);
-        return;
-    }
-
-    if nr == sysno::WINEMU_LOAD_DLL {
+    } else if nr == WINEMU_LOAD_DLL_SYSCALL {
         loader::handle_load_dll(frame);
-        schedule_syscall_unlock_edge(frame);
-        return;
-    }
-
-    let handler_id = lookup(nr);
-    let is_delay_execution = handler_id == NtHandlerId::DelayExecution as u8
-        || (handler_id == NtHandlerId::ResetEvent as u8
-            && system::should_dispatch_delay_execution(frame));
-    if handler_id == HANDLER_NONE {
-        forward_to_vmm(frame, nr, table);
     } else {
-        dispatch_nt_handler(frame, handler_id);
+        let handler_id = lookup(nr);
+        if handler_id == HANDLER_NONE {
+            forward_to_vmm(frame, nr, table);
+        } else {
+            dispatch_nt_handler(frame, handler_id);
+        }
     }
 
-    finish_nt_syscall_trap(frame, handler_id, cur, is_delay_execution);
+    finish_syscall_dispatch(cur);
 }
 
 fn dispatch_nt_handler(frame: &mut SvcFrame, handler_id: u8) {
@@ -149,7 +137,7 @@ fn dispatch_nt_handler(frame: &mut SvcFrame, handler_id: u8) {
         x if x == QueryObject as u8 => object::handle_query_object(frame),
         x if x == Close as u8 => {
             if !object::handle_close(frame) {
-                forward_to_vmm(frame, sysno::CLOSE, 0);
+                forward_to_vmm(frame, frame.x8_orig as u16, 0);
             }
         }
         x if x == DelayExecution as u8 => sync::handle_reset_event_or_delay(frame),
