@@ -313,7 +313,7 @@ pub fn resolve_thread_tid_from_handle(handle: u64) -> Option<u32> {
 pub fn thread_basic_info(tid: u32) -> Option<[u8; THREAD_BASIC_INFORMATION_SIZE]> {
     let _lock = KSchedulerLock::lock();
     let (state, pid, prio, affinity) = with_thread(tid, |t| {
-        (t.state, t.pid, t.priority, t.affinity_mask as u64)
+        (t.state, t.pid, t.priority, t.affinity_mask.to_low_u64())
     })?;
     let win_prio = sched_to_win_priority(prio);
     let exit_status: u32 = if state == ThreadState::Terminated {

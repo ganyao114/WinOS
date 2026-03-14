@@ -113,14 +113,7 @@ impl<'a> TrapScheduleContext<'a> {
         slice_remaining_100ns: u64,
     ) -> bool {
         self.save_frame_for(from_tid);
-        execute_kernel_continuation_switch(
-            from_tid,
-            to_tid,
-            now_100ns,
-            next_deadline_100ns,
-            slice_remaining_100ns,
-            "trap",
-        );
+        execute_kernel_continuation_switch(from_tid, to_tid);
 
         let cur = current_tid();
         if cur != 0 {

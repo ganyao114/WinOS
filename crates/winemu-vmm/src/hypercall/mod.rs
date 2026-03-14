@@ -354,6 +354,10 @@ impl HypercallManager {
                 self.sched.kick_vcpu_mask(args[0] as u32);
                 HypercallResult::Sync(0)
             }
+            nr::KICK_VCPU => {
+                self.sched.kick_vcpu(args[0] as u32);
+                HypercallResult::Sync(0)
+            }
             nr::QUERY_WINDOWS_BUILD => HypercallResult::Sync(self.windows_build as u64),
             nr::LOAD_DLL_IMAGE | nr::GET_PROC_ADDRESS => HypercallResult::Sync(u64::MAX),
             nr::PROCESS_CREATE => {

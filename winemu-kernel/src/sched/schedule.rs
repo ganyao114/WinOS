@@ -4,15 +4,13 @@
 // execute_kernel_continuation_switch(from, to, ...)
 // enter_kernel_continuation_noreturn(to) → !
 
-use core::arch::asm;
-
-use crate::arch::context::KernelContext;
+use crate::arch::context::{self, KernelContext};
 use crate::sched::context::drain_deferred_kstacks;
 use crate::sched::cpu::vcpu_id;
 use crate::sched::global::{with_thread, with_thread_mut, SCHED};
 use crate::sched::ready::{
-    dequeue_ready_thread_locked, peek_next_ready_thread_for_vcpu_locked,
-    take_next_ready_thread_for_vcpu_locked,
+    commit_ready_candidate_for_vcpu_locked, peek_next_ready_thread_for_vcpu_locked,
+    peek_ready_candidate_for_vcpu_locked,
 };
 use crate::sched::resched::{
     clear_remote_vcpu_reschedule_locked, remote_vcpu_reschedule_pending_locked,
@@ -22,7 +20,7 @@ use crate::sched::resched::{
 use crate::sched::thread_control::reset_quantum_locked;
 use crate::sched::threads::free_terminated_threads_locked;
 use crate::sched::topology::{bind_running_thread_to_vcpu, set_thread_state_locked};
-use crate::sched::types::ThreadState;
+use crate::sched::types::{CpuMask, ThreadState, MAX_VCPUS};
 use crate::sched::wait::check_wait_timeouts_locked;
 
 // ── ScheduleDecision ──────────────────────────────────────────────────────────
@@ -68,7 +66,7 @@ pub enum LocalSchedulePlan {
 }
 
 pub(crate) struct UnlockEdgeDispatch {
-    remote_reschedule_mask: u32,
+    remote_reschedule_mask: CpuMask,
     local_plan: LocalSchedulePlan,
 }
 
@@ -114,7 +112,7 @@ impl LocalSchedulePlan {
                 }
             }
             Self::SwitchKernelContext { from_tid, to_tid } => {
-                execute_kernel_continuation_switch(from_tid, to_tid, 0, u64::MAX, 0, "unlock-edge");
+                execute_kernel_continuation_switch(from_tid, to_tid);
             }
             Self::EnterContinuation { to_tid } => {
                 schedule_thread_timeslice_locked(to_tid);
@@ -170,7 +168,7 @@ impl LocalSchedulePlan {
 
 impl UnlockEdgeDispatch {
     #[inline]
-    fn new(remote_reschedule_mask: u32, local_plan: LocalSchedulePlan) -> Self {
+    fn new(remote_reschedule_mask: CpuMask, local_plan: LocalSchedulePlan) -> Self {
         Self {
             remote_reschedule_mask,
             local_plan,
@@ -235,7 +233,8 @@ fn continue_current_without_ready_candidate(
     if from_state == ThreadState::Ready {
         with_thread_mut(from_tid, |t| {
             t.state = ThreadState::Running;
-            t.last_vcpu_hint = vid as u8;
+            t.last_vcpu_hint = vid;
+            t.ready_home_vcpu_hint = vid;
         });
     }
     Some(continue_current_decision(
@@ -310,7 +309,8 @@ pub fn schedule_core_locked(
     let from_state = current_thread_state(from_tid);
     let cur_not_running = from_tid == 0 || from_state != ThreadState::Running;
 
-    let mut to_tid = peek_next_ready_thread_for_vcpu_locked(vid);
+    let candidate = peek_ready_candidate_for_vcpu_locked(vid);
+    let mut to_tid = candidate.map(|next| next.tid).unwrap_or(0);
 
     if to_tid == 0 {
         if let Some(decision) = continue_current_without_ready_candidate(
@@ -342,9 +342,15 @@ pub fn schedule_core_locked(
         return continue_current_decision(now_100ns, next_deadline_100ns, slice_remaining);
     }
 
-    // Commit selection: dequeue chosen ready thread only after policy decided.
-    if to_tid != 0 && !dequeue_ready_thread_locked(to_tid) {
-        to_tid = take_next_ready_thread_for_vcpu_locked(vid);
+    // Commit selection only after policy decided so the queue topology is
+    // updated exactly once, including any required cross-core migration.
+    if to_tid != 0 {
+        to_tid = candidate
+            .and_then(|next| {
+                let committed = commit_ready_candidate_for_vcpu_locked(next, vid);
+                (committed != 0).then_some(committed)
+            })
+            .unwrap_or(0);
         if to_tid == 0 {
             if from_tid != 0 && !cur_not_running {
                 return continue_current_decision(now_100ns, next_deadline_100ns, slice_remaining);
@@ -421,10 +427,6 @@ fn schedule_thread_timeslice_locked(tid: u32) {
 pub fn execute_kernel_continuation_switch(
     from_tid: u32,
     to_tid: u32,
-    _now_100ns: u64,
-    _next_deadline_100ns: u64,
-    _slice_remaining_100ns: u64,
-    _label: &str,
 ) {
     use crate::sched::context::__sched_switch_kernel_context;
 
@@ -460,19 +462,15 @@ pub unsafe fn enter_kernel_continuation_noreturn(to_tid: u32) -> ! {
     let vid = vcpu_id() as usize;
     bind_running_thread_to_vcpu(vid, to_tid);
 
-    let kctx = with_thread(to_tid, |t| t.kctx).unwrap_or_else(KernelContext::new);
+    let kctx = with_thread(to_tid, |t| &t.kctx as *const KernelContext)
+        .unwrap_or_else(|| panic!("enter_kernel_continuation_noreturn: missing tid={}", to_tid));
     crate::process::switch_to_thread_process(to_tid);
     crate::sched::lock::unlock_after_raw_or_scoped(vid);
 
-    unsafe {
-        asm!(
-            "mov sp, {sp}",
-            "br  {lr}",
-            sp = in(reg) kctx.stack_pointer(),
-            lr = in(reg) kctx.resume_pc(),
-            options(noreturn),
-        );
-    }
+    // SAFETY: `kctx` points to the selected thread's kernel continuation,
+    // chosen while holding the scheduler lock. Control is being transferred
+    // after unlocking, and the arch backend owns the restore sequence.
+    unsafe { context::enter_kernel_context(kctx) }
 }
 
 // ── peek_next_thread_for_vcpu ─────────────────────────────────────────────────
@@ -505,22 +503,18 @@ fn should_reschedule_remote_vcpu_locked(vid: usize, candidate_tid: u32) -> bool 
 
 // ── compute_remote_reschedule_mask_locked ────────────────────────────────────
 
-fn collect_explicit_reschedule_mask_locked() -> u32 {
-    use crate::sched::types::MAX_VCPUS;
-
-    let mut cores_needing_scheduling: u32 = 0;
+fn collect_explicit_reschedule_mask_locked() -> CpuMask {
+    let mut cores_needing_scheduling = CpuMask::empty();
     for vid in 0..MAX_VCPUS {
         let vs = unsafe { SCHED.vcpu_raw(vid) };
         if vs.idle_tid != 0 && remote_vcpu_reschedule_pending_locked(vid) {
-            cores_needing_scheduling |= 1u32 << vid;
+            cores_needing_scheduling.insert(vid);
         }
     }
     cores_needing_scheduling
 }
 
-fn refresh_remote_reschedule_mask_locked(mut mask: u32) -> u32 {
-    use crate::sched::types::MAX_VCPUS;
-
+fn refresh_remote_reschedule_mask_locked(mut mask: CpuMask) -> CpuMask {
     for vid in 0..MAX_VCPUS {
         let idle_tid = unsafe { SCHED.vcpu_raw(vid) }.idle_tid;
         if idle_tid == 0 {
@@ -529,7 +523,7 @@ fn refresh_remote_reschedule_mask_locked(mut mask: u32) -> u32 {
         let candidate = peek_next_thread_for_vcpu(vid as u32);
         if should_reschedule_remote_vcpu_locked(vid, candidate) {
             request_remote_vcpu_reschedule_locked(vid);
-            mask |= 1u32 << vid;
+            mask.insert(vid);
         }
     }
 
@@ -541,7 +535,7 @@ fn refresh_remote_reschedule_mask_locked(mut mask: u32) -> u32 {
 /// 2) a global ready-queue snapshot that detects higher-priority remote work.
 ///
 /// Must be called with the scheduler spinlock held.
-fn compute_remote_reschedule_mask_locked() -> u32 {
+fn compute_remote_reschedule_mask_locked() -> CpuMask {
     let cores_needing_scheduling = collect_explicit_reschedule_mask_locked();
 
     // Fast path: no scheduler topology update is pending; keep explicit flags.
@@ -560,12 +554,13 @@ fn compute_remote_reschedule_mask_locked() -> u32 {
 /// Send a reschedule IPI to every vCPU in `mask` except `current_vid`.
 /// Mirrors Atmosphere's RescheduleOtherCores / KInterruptManager::SendIpi.
 ///
-/// Uses the KICK_VCPU_MASK hypercall (nr=0x0003) which the VMM translates
-/// into a virtual SGI to the target vCPUs.
-fn reschedule_other_cores(mask: u32, current_vid: usize) {
-    let other_mask = mask & !(1u32 << current_vid);
-    if other_mask != 0 {
-        crate::hypercall::kick_vcpu_mask(other_mask);
+/// Uses the per-vCPU kick hypercall which the VMM translates into a virtual
+/// SGI / wakeup for each target vCPU.
+fn reschedule_other_cores(mask: CpuMask, current_vid: usize) {
+    for vid in mask.iter_set() {
+        if vid != current_vid {
+            crate::hypercall::kick_vcpu(vid);
+        }
     }
 }
 
@@ -575,7 +570,7 @@ fn reschedule_other_cores(mask: u32, current_vid: usize) {
 ///
 /// Called after the spinlock has been released to notify other vCPUs that they
 /// should re-enter the scheduler.
-pub(crate) fn enable_scheduling(cores_needing_scheduling: u32, current_vid: usize) {
+pub(crate) fn enable_scheduling(cores_needing_scheduling: CpuMask, current_vid: usize) {
     reschedule_other_cores(cores_needing_scheduling, current_vid);
 }
 
@@ -612,7 +607,7 @@ pub(crate) fn build_unlock_edge_dispatch_locked(vid: usize) -> UnlockEdgeDispatc
     // Collect remote-core reschedule mask from scheduler update flags and
     // current queue snapshot.
     let mut mask = compute_remote_reschedule_mask_locked();
-    mask &= !(1u32 << vid);
+    mask.remove(vid);
     clear_remote_vcpu_reschedule_locked(vid);
 
     let plan = LocalSchedulePlan::from_decision(vid, decision);

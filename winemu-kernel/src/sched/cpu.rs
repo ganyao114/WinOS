@@ -10,6 +10,7 @@ use crate::sched::types::MAX_VCPUS;
 // ── KCpuLocal ─────────────────────────────────────────────────────────────────
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct KCpuLocal {
     pub vcpu_id: u32,
     pub current_tid: u32,
@@ -42,19 +43,7 @@ impl KCpuLocal {
 
 // ── Static per-vCPU storage ───────────────────────────────────────────────────
 
-static mut CPU_LOCALS: [KCpuLocal; MAX_VCPUS] = {
-    // Can't use array repeat for non-Copy, so init manually.
-    [
-        KCpuLocal::new(0),
-        KCpuLocal::new(1),
-        KCpuLocal::new(2),
-        KCpuLocal::new(3),
-        KCpuLocal::new(4),
-        KCpuLocal::new(5),
-        KCpuLocal::new(6),
-        KCpuLocal::new(7),
-    ]
-};
+static mut CPU_LOCALS: [KCpuLocal; MAX_VCPUS] = [const { KCpuLocal::new(0) }; MAX_VCPUS];
 
 // ── CPU-local register accessors ─────────────────────────────────────────────
 
@@ -63,6 +52,11 @@ static mut CPU_LOCALS: [KCpuLocal; MAX_VCPUS] = {
 pub fn init_cpu_local(vcpu_id: u32) {
     debug_assert!((vcpu_id as usize) < MAX_VCPUS);
     let ptr = unsafe { &mut CPU_LOCALS[vcpu_id as usize] as *mut KCpuLocal };
+    // SAFETY: each vCPU owns its slot indexed by `vcpu_id`, initialized once
+    // during that vCPU thread's bootstrap before concurrent scheduler use.
+    unsafe {
+        (*ptr).vcpu_id = vcpu_id;
+    }
     crate::arch::cpu::set_current_cpu_local(ptr as u64);
 }
 

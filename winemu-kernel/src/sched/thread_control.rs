@@ -2,20 +2,17 @@
 //
 // All functions require the scheduler lock to be held.
 
-use core::sync::atomic::Ordering;
-
-use crate::sched::global::SCHED;
 use crate::sched::global::{with_thread, with_thread_mut};
-use crate::sched::ready::refresh_ready_thread_locked;
+use crate::sched::ready::{change_ready_thread_priority_locked, mark_scheduler_topology_changed_locked};
 use crate::sched::request_local_unlock_edge_schedule;
-use crate::sched::ScheduleReason;
 use crate::sched::topology::set_thread_state_locked;
 use crate::sched::types::ThreadState;
 use crate::sched::wait::{unblock_thread_locked, STATUS_SUCCESS};
+use crate::sched::ScheduleReason;
 
 #[inline]
 fn notify_priority_changed_locked() {
-    SCHED.scheduler_update_needed.store(true, Ordering::Relaxed);
+    mark_scheduler_topology_changed_locked();
 }
 
 // ── Priority ──────────────────────────────────────────────────────────────────
@@ -38,7 +35,8 @@ pub fn set_thread_priority_locked(tid: u32, priority: u8) {
         t.base_priority = priority;
     });
     if old_state == ThreadState::Ready && old_prio != priority {
-        refresh_ready_thread_locked(tid);
+        let changed = change_ready_thread_priority_locked(tid, old_prio);
+        debug_assert!(changed, "ready thread priority enqueue failed tid={tid}");
     }
     notify_priority_changed_locked();
 }
@@ -62,7 +60,8 @@ pub fn boost_thread_priority_locked(tid: u32, boost: u8) {
         t.transient_boost = boost;
     });
     if state == ThreadState::Ready && boosted != old_priority {
-        refresh_ready_thread_locked(tid);
+        let changed = change_ready_thread_priority_locked(tid, old_priority);
+        debug_assert!(changed, "ready thread boost enqueue failed tid={tid}");
     }
     notify_priority_changed_locked();
 }
@@ -87,7 +86,8 @@ pub fn decay_priority_boost_locked(tid: u32) {
         t.priority = new_priority;
     });
     if state == ThreadState::Ready && new_priority != old_priority {
-        refresh_ready_thread_locked(tid);
+        let changed = change_ready_thread_priority_locked(tid, old_priority);
+        debug_assert!(changed, "ready thread decay enqueue failed tid={tid}");
     }
     if new_priority != old_priority {
         notify_priority_changed_locked();

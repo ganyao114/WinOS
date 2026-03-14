@@ -1,8 +1,12 @@
 #![no_std]
 
+mod cpu_mask;
+
 pub mod nt_sysno;
 pub mod pe;
 pub mod win32k_sysno;
+
+pub use cpu_mask::{CpuMask, CpuMaskIter};
 
 /// Hypercall ABI — 所有编号和参数约定的唯一来源
 /// 同时被 winemu-kernel (bare-metal) 和 winemu-core (host) 使用
@@ -24,6 +28,9 @@ pub mod nr {
     /// 查询 guest Windows build 号
     /// args: [0, 0, 0, 0, 0, 0] → windows_build (u32)
     pub const QUERY_WINDOWS_BUILD: u64 = 0x0004;
+    /// 精确唤醒单个宿主调度线程
+    /// args: [vcpu_id, 0, 0, 0, 0, 0]
+    pub const KICK_VCPU: u64 = 0x0005;
     // ── 进程/线程: 0x0010 - 0x001F ───────────────────────────
     /// args: [image_base_gva, 0, 0, 0, 0, 0]
     pub const PROCESS_CREATE: u64 = 0x0010;

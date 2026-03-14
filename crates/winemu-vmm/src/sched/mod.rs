@@ -4,6 +4,17 @@ use std::sync::{
 };
 use std::time::Duration;
 
+const MAX_TRACKED_VCPUS: usize = 256;
+type CpuMask =
+    winemu_shared::CpuMask<{ (MAX_TRACKED_VCPUS + (u64::BITS as usize) - 1) / (u64::BITS as usize) }>;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MaskState {
+    idle_vcpu_mask: CpuMask,
+    kick_armed_mask: CpuMask,
+    external_irq_pending_mask: CpuMask,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SchedulerWakeStats {
     pub kick_requests: u64,
@@ -14,17 +25,15 @@ pub struct SchedulerWakeStats {
     pub unpark_mask_calls: u64,
     pub unpark_any_calls: u64,
     pub unpark_thread_wakes: u64,
-    pub pending_external_irq_mask: u32,
-    pub idle_vcpu_mask: u32,
+    pub pending_external_irq_mask: u64,
+    pub idle_vcpu_mask: u64,
 }
 
 pub struct Scheduler {
     pub vcpu_count: u32,
     vcpu_threads: Mutex<Vec<(u32, std::thread::Thread)>>,
-    idle_vcpu_mask: AtomicU32,
-    kick_armed_mask: AtomicU32,
+    masks: Mutex<MaskState>,
     wake_cursor: AtomicU32,
-    external_irq_pending_mask: AtomicU32,
     kick_requests: AtomicU64,
     kick_coalesced: AtomicU64,
     external_irq_requests: AtomicU64,
@@ -39,23 +48,18 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    #[inline(always)]
-    fn vcpu_bit(vcpu_id: u32) -> Option<u32> {
-        if vcpu_id < 32 {
-            Some(1u32 << vcpu_id)
-        } else {
-            None
-        }
-    }
-
     pub fn new(vcpu_count: u32) -> Arc<Self> {
+        assert!(
+            (vcpu_count as usize) <= MAX_TRACKED_VCPUS,
+            "vcpu_count {} exceeds MAX_TRACKED_VCPUS {}",
+            vcpu_count,
+            MAX_TRACKED_VCPUS
+        );
         Arc::new(Self {
             vcpu_count,
             vcpu_threads: Mutex::new(Vec::new()),
-            idle_vcpu_mask: AtomicU32::new(0),
-            kick_armed_mask: AtomicU32::new(0),
+            masks: Mutex::new(MaskState::default()),
             wake_cursor: AtomicU32::new(0),
-            external_irq_pending_mask: AtomicU32::new(0),
             kick_requests: AtomicU64::new(0),
             kick_coalesced: AtomicU64::new(0),
             external_irq_requests: AtomicU64::new(0),
@@ -70,15 +74,9 @@ impl Scheduler {
         })
     }
 
-    #[inline(always)]
-    fn valid_vcpu_mask(&self) -> u32 {
-        if self.vcpu_count == 0 {
-            return 0;
-        }
-        if self.vcpu_count >= 32 {
-            return u32::MAX;
-        }
-        (1u32 << self.vcpu_count) - 1
+    #[inline]
+    fn valid_vcpu_mask(&self) -> CpuMask {
+        CpuMask::prefix(self.vcpu_count as usize)
     }
 
     fn notify_idle_waiters(&self) {
@@ -103,30 +101,29 @@ impl Scheduler {
     }
 
     pub fn set_vcpu_idle(&self, vcpu_id: u32, idle: bool) {
-        let Some(bit) = Self::vcpu_bit(vcpu_id) else {
+        if vcpu_id as usize >= MAX_TRACKED_VCPUS {
             return;
-        };
+        }
+        let mut masks = self.masks.lock().unwrap();
         if idle {
-            self.idle_vcpu_mask.fetch_or(bit, Ordering::Release);
+            masks.idle_vcpu_mask.insert(vcpu_id as usize);
         } else {
-            self.idle_vcpu_mask.fetch_and(!bit, Ordering::Release);
-            self.kick_armed_mask.fetch_and(!bit, Ordering::Release);
+            masks.idle_vcpu_mask.remove(vcpu_id as usize);
+            masks.kick_armed_mask.remove(vcpu_id as usize);
         }
     }
 
-    pub fn unpark_vcpu_mask(&self, mask: u32) {
-        let valid = mask & self.valid_vcpu_mask();
-        if valid == 0 {
+    fn unpark_vcpu_mask(&self, mask: CpuMask) {
+        let valid = mask.intersection(self.valid_vcpu_mask());
+        if valid.is_empty() {
             return;
         }
         self.unpark_mask_calls.fetch_add(1, Ordering::Relaxed);
         let mut woke_threads = 0u64;
         for (id, thread) in self.vcpu_threads.lock().unwrap().iter() {
-            if let Some(bit) = Self::vcpu_bit(*id) {
-                if (valid & bit) != 0 {
-                    thread.unpark();
-                    woke_threads = woke_threads.saturating_add(1);
-                }
+            if valid.contains(*id as usize) {
+                thread.unpark();
+                woke_threads = woke_threads.saturating_add(1);
             }
         }
         if woke_threads != 0 {
@@ -149,21 +146,20 @@ impl Scheduler {
         self.notify_idle_waiters();
     }
 
-    fn choose_vcpu_from_mask(&self, mask: u32) -> Option<u32> {
-        if mask == 0 {
+    fn choose_vcpu_from_mask(&self, mask: CpuMask) -> Option<u32> {
+        let valid = mask.intersection(self.valid_vcpu_mask());
+        if valid.is_empty() {
             return None;
         }
-        let valid = mask & self.valid_vcpu_mask();
-        if valid == 0 {
+        let count = self.vcpu_count as usize;
+        if count == 0 {
             return None;
         }
-        let count = self.vcpu_count.min(32);
-        let start = self.wake_cursor.fetch_add(1, Ordering::Relaxed) % count;
+        let start = (self.wake_cursor.fetch_add(1, Ordering::Relaxed) as usize) % count;
         for off in 0..count {
             let vid = (start + off) % count;
-            let bit = 1u32 << vid;
-            if (valid & bit) != 0 {
-                return Some(vid);
+            if valid.contains(vid) {
+                return Some(vid as u32);
             }
         }
         None
@@ -171,10 +167,13 @@ impl Scheduler {
 
     fn choose_external_irq_target(&self) -> Option<u32> {
         let valid = self.valid_vcpu_mask();
-        if valid == 0 {
+        if valid.is_empty() {
             return None;
         }
-        let idle_mask = self.idle_vcpu_mask.load(Ordering::Acquire) & valid;
+        let idle_mask = {
+            let masks = self.masks.lock().unwrap();
+            masks.idle_vcpu_mask.intersection(valid)
+        };
         if let Some(vid) = self.choose_vcpu_from_mask(idle_mask) {
             return Some(vid);
         }
@@ -183,98 +182,113 @@ impl Scheduler {
 
     pub fn unpark_one_vcpu(&self) {
         if let Some(vid) = self.choose_external_irq_target() {
-            if let Some(bit) = Self::vcpu_bit(vid) {
-                self.unpark_vcpu_mask(bit);
-                return;
-            }
+            self.unpark_vcpu_mask(CpuMask::from_cpu(vid as usize));
+            return;
         }
-        let idle_mask = self.idle_vcpu_mask.load(Ordering::Acquire) & self.valid_vcpu_mask();
+        let idle_mask = {
+            let masks = self.masks.lock().unwrap();
+            masks.idle_vcpu_mask.intersection(self.valid_vcpu_mask())
+        };
         if let Some(vid) = self.choose_vcpu_from_mask(idle_mask) {
-            if let Some(bit) = Self::vcpu_bit(vid) {
-                self.unpark_vcpu_mask(bit);
-                return;
-            }
+            self.unpark_vcpu_mask(CpuMask::from_cpu(vid as usize));
             return;
         }
         self.unpark_any_vcpu();
     }
 
-    pub fn request_external_irq_mask(&self, mask: u32) {
-        let valid = mask & self.valid_vcpu_mask();
-        if valid == 0 {
+    fn request_external_irq_cpumask(&self, mask: CpuMask) {
+        let valid = mask.intersection(self.valid_vcpu_mask());
+        if valid.is_empty() {
             return;
         }
         self.external_irq_requests.fetch_add(1, Ordering::Relaxed);
-        let prev = self
-            .external_irq_pending_mask
-            .fetch_or(valid, Ordering::AcqRel);
-        let newly_armed = valid & !prev;
-        if newly_armed == 0 {
+        let newly_armed = {
+            let mut masks = self.masks.lock().unwrap();
+            let newly_armed = valid.difference(masks.external_irq_pending_mask);
+            masks.external_irq_pending_mask = masks.external_irq_pending_mask.union(valid);
+            newly_armed
+        };
+        if newly_armed.is_empty() {
             self.external_irq_coalesced.fetch_add(1, Ordering::Relaxed);
             return;
         }
         self.unpark_vcpu_mask(newly_armed);
     }
 
-    pub fn kick_vcpu_mask(&self, mask: u32) {
-        let valid = mask & self.valid_vcpu_mask();
-        if valid == 0 {
+    pub fn request_external_irq_mask(&self, mask: u32) {
+        self.request_external_irq_cpumask(CpuMask::from_low_u64(mask as u64));
+    }
+
+    fn kick_vcpu_cpumask(&self, mask: CpuMask) {
+        let valid = mask.intersection(self.valid_vcpu_mask());
+        if valid.is_empty() {
             return;
         }
         self.kick_requests.fetch_add(1, Ordering::Relaxed);
-        let idle_targets = self.idle_vcpu_mask.load(Ordering::Acquire) & valid;
-        if idle_targets == 0 {
-            self.kick_coalesced.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        let prev = self
-            .kick_armed_mask
-            .fetch_or(idle_targets, Ordering::AcqRel);
-        let newly_armed = idle_targets & !prev;
-        if newly_armed == 0 {
+        let newly_armed = {
+            let mut masks = self.masks.lock().unwrap();
+            let idle_targets = masks.idle_vcpu_mask.intersection(valid);
+            if idle_targets.is_empty() {
+                CpuMask::empty()
+            } else {
+                let newly_armed = idle_targets.difference(masks.kick_armed_mask);
+                masks.kick_armed_mask = masks.kick_armed_mask.union(idle_targets);
+                newly_armed
+            }
+        };
+        if newly_armed.is_empty() {
             self.kick_coalesced.fetch_add(1, Ordering::Relaxed);
             return;
         }
         self.unpark_vcpu_mask(newly_armed);
     }
 
+    pub fn kick_vcpu_mask(&self, mask: u32) {
+        self.kick_vcpu_cpumask(CpuMask::from_low_u64(mask as u64));
+    }
+
+    pub fn kick_vcpu(&self, vcpu_id: u32) {
+        if vcpu_id as usize >= MAX_TRACKED_VCPUS {
+            return;
+        }
+        self.kick_vcpu_cpumask(CpuMask::from_cpu(vcpu_id as usize));
+    }
+
     pub fn request_external_irq(&self) {
         if let Some(target) = self.choose_external_irq_target() {
-            if let Some(bit) = Self::vcpu_bit(target) {
-                self.request_external_irq_mask(bit);
-                return;
-            }
+            self.request_external_irq_cpumask(CpuMask::from_cpu(target as usize));
+            return;
         }
         let valid = self.valid_vcpu_mask();
-        if valid != 0 {
-            self.request_external_irq_mask(valid);
+        if !valid.is_empty() {
+            self.request_external_irq_cpumask(valid);
             return;
         }
         self.unpark_any_vcpu();
     }
 
     pub fn take_external_irq_request(&self, vcpu_id: u32) -> bool {
-        let Some(bit) = Self::vcpu_bit(vcpu_id) else {
+        if vcpu_id as usize >= MAX_TRACKED_VCPUS {
             return false;
+        }
+        let took = {
+            let mut masks = self.masks.lock().unwrap();
+            if masks.external_irq_pending_mask.contains(vcpu_id as usize) {
+                masks.external_irq_pending_mask.remove(vcpu_id as usize);
+                true
+            } else {
+                false
+            }
         };
-        self.external_irq_pending_mask
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                if (pending & bit) != 0 {
-                    Some(pending & !bit)
-                } else {
-                    None
-                }
-            })
-            .map(|_| {
-                self.external_irq_taken.fetch_add(1, Ordering::Relaxed);
-            })
-            .is_ok()
+        if took {
+            self.external_irq_taken.fetch_add(1, Ordering::Relaxed);
+        }
+        took
     }
 
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        self.external_irq_pending_mask
-            .store(self.valid_vcpu_mask(), Ordering::Release);
+        self.masks.lock().unwrap().external_irq_pending_mask = self.valid_vcpu_mask();
         for (_, thread) in self.vcpu_threads.lock().unwrap().iter() {
             thread.unpark();
         }
@@ -282,6 +296,7 @@ impl Scheduler {
     }
 
     pub fn wake_stats_snapshot(&self) -> SchedulerWakeStats {
+        let masks = *self.masks.lock().unwrap();
         SchedulerWakeStats {
             kick_requests: self.kick_requests.load(Ordering::Relaxed),
             kick_coalesced: self.kick_coalesced.load(Ordering::Relaxed),
@@ -291,8 +306,8 @@ impl Scheduler {
             unpark_mask_calls: self.unpark_mask_calls.load(Ordering::Relaxed),
             unpark_any_calls: self.unpark_any_calls.load(Ordering::Relaxed),
             unpark_thread_wakes: self.unpark_thread_wakes.load(Ordering::Relaxed),
-            pending_external_irq_mask: self.external_irq_pending_mask.load(Ordering::Acquire),
-            idle_vcpu_mask: self.idle_vcpu_mask.load(Ordering::Acquire),
+            pending_external_irq_mask: masks.external_irq_pending_mask.to_low_u64(),
+            idle_vcpu_mask: masks.idle_vcpu_mask.to_low_u64(),
         }
     }
 

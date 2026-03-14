@@ -4,9 +4,11 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch::context::{KernelContext, ThreadContext};
 
-pub const MAX_VCPUS: usize = 8;
+pub const MAX_VCPUS: usize = 64;
 pub const MAX_WAIT_HANDLES: usize = 64;
 pub const KERNEL_STACK_SIZE: usize = 64 * 1024;
+pub type CpuMask =
+    winemu_shared::CpuMask<{ (MAX_VCPUS + (u64::BITS as usize) - 1) / (u64::BITS as usize) }>;
 
 // ── ThreadState ──────────────────────────────────────────────────────────────
 
@@ -109,8 +111,9 @@ pub struct KThread {
     pub teb_va: u64,
 
     // scheduling
-    pub affinity_mask: u32,
-    pub last_vcpu_hint: u8,
+    pub affinity_mask: CpuMask,
+    pub last_vcpu_hint: u32,
+    pub ready_home_vcpu_hint: u32,
     pub slice_remaining_100ns: u64,
     pub last_start_100ns: u64,
     pub suspend_count: u32,
@@ -122,8 +125,9 @@ pub struct KThread {
     // wait state
     pub wait: WaitState,
 
-    // ready-queue intrusive link
-    pub sched_next: u32,
+    // ready-queue intrusive links
+    pub scheduled_next: u32,
+    pub suggested_next: [u32; MAX_VCPUS],
     pub in_ready_queue: bool,
 }
 
@@ -144,15 +148,17 @@ impl KThread {
             kstack_base: 0,
             kstack_size: 0,
             teb_va: 0,
-            affinity_mask: 0xFFFF_FFFF,
+            affinity_mask: CpuMask::prefix(MAX_VCPUS),
             last_vcpu_hint: 0,
+            ready_home_vcpu_hint: 0,
             slice_remaining_100ns: 0,
             last_start_100ns: 0,
             suspend_count: 0,
             transient_boost: 0,
             alerted: false,
             wait: WaitState::new(),
-            sched_next: 0,
+            scheduled_next: 0,
+            suggested_next: [0; MAX_VCPUS],
             in_ready_queue: false,
         }
     }
@@ -166,8 +172,27 @@ impl KThread {
     pub fn can_run_on_vcpu(&self, vid: u32) -> bool {
         !self.is_idle_thread
             && self.state == ThreadState::Ready
-            && (self.affinity_mask & (1u32 << vid)) != 0
-            && (!self.in_kernel || self.last_vcpu_hint as u32 == vid)
+            && self.affinity_mask.contains(vid as usize)
+            && (!self.in_kernel || self.last_vcpu_hint == vid)
+    }
+
+    #[inline]
+    pub fn ready_home_vcpu(&self) -> usize {
+        if self.affinity_mask.is_empty() {
+            return 0;
+        }
+
+        let hinted = self.ready_home_vcpu_hint as usize;
+        if hinted < MAX_VCPUS && self.affinity_mask.contains(hinted) {
+            hinted
+        } else {
+            self.affinity_mask.first().unwrap_or(0)
+        }
+    }
+
+    #[inline]
+    pub fn ready_allows_migration(&self) -> bool {
+        !self.in_kernel && self.affinity_mask.count() > 1
     }
 }
 

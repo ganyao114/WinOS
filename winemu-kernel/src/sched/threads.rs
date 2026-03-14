@@ -7,16 +7,15 @@
 
 use crate::sched::context::{
     alloc_kstack, defer_kstack_free, ensure_user_entry_continuation_locked,
-    set_thread_in_kernel_locked,
-    setup_idle_thread_continuation_locked,
+    set_thread_in_kernel_locked, setup_idle_thread_continuation_locked,
 };
 use crate::sched::cpu::current_vcpu_index;
 use crate::sched::global::{with_thread, with_thread_mut, SCHED};
 use crate::sched::request_local_unlock_edge_schedule;
-use crate::sched::ScheduleReason;
 use crate::sched::thread_control::terminate_thread_locked;
 use crate::sched::topology::{bind_running_thread_to_vcpu, set_thread_state_locked};
 use crate::sched::types::{KThread, ThreadState, MAX_VCPUS};
+use crate::sched::ScheduleReason;
 
 // ── spawn ─────────────────────────────────────────────────────────────────────
 
@@ -70,6 +69,7 @@ pub fn create_user_thread_locked(p: UserThreadParams) -> Option<u32> {
     t.base_priority = p.priority;
     t.suspend_count = u32::from(p.start_suspended);
     t.last_vcpu_hint = 0;
+    t.ready_home_vcpu_hint = 0;
 
     crate::arch::context::initialize_user_thread_context(
         &mut t.ctx,
@@ -158,7 +158,8 @@ pub fn register_idle_thread_for_vcpu(vcpu_id: u32) -> u32 {
             t.is_idle_thread = true;
             t.priority = 31; // lowest priority
             t.base_priority = 31;
-            t.last_vcpu_hint = vcpu_id as u8;
+            t.last_vcpu_hint = vcpu_id;
+            t.ready_home_vcpu_hint = vcpu_id;
             t.kstack_base = kstack_base;
             t.kstack_size = kstack_size as u64;
             t.state = ThreadState::Ready;

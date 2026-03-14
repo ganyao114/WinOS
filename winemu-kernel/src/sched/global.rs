@@ -9,6 +9,7 @@ use crate::sched::types::{KThread, MAX_VCPUS};
 
 // ── Per-vCPU state ────────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy)]
 pub struct KVcpuState {
     pub current_tid: u32,
     pub idle_tid: u32,
@@ -77,8 +78,6 @@ pub struct KGlobalScheduler {
     pub ready_queue: UnsafeCell<KReadyQueue>,
     pub vcpus: UnsafeCell<[KVcpuState; MAX_VCPUS]>,
     pub deferred_kstacks: UnsafeCell<DeferredKstacks>,
-    /// bitmask of vCPUs that need a reschedule IPI
-    pub reschedule_mask: AtomicU32,
     /// monotonic schedule-event counter (for debug)
     pub schedule_events: AtomicU32,
     /// Set when thread state changes; cleared by
@@ -96,18 +95,8 @@ impl KGlobalScheduler {
         Self {
             threads: UnsafeCell::new(None),
             ready_queue: UnsafeCell::new(KReadyQueue::new()),
-            vcpus: UnsafeCell::new([
-                KVcpuState::new(),
-                KVcpuState::new(),
-                KVcpuState::new(),
-                KVcpuState::new(),
-                KVcpuState::new(),
-                KVcpuState::new(),
-                KVcpuState::new(),
-                KVcpuState::new(),
-            ]),
+            vcpus: UnsafeCell::new([const { KVcpuState::new() }; MAX_VCPUS]),
             deferred_kstacks: UnsafeCell::new(DeferredKstacks::new()),
-            reschedule_mask: AtomicU32::new(0),
             schedule_events: AtomicU32::new(0),
             scheduler_update_needed: AtomicBool::new(false),
             initialized: AtomicU32::new(0),
