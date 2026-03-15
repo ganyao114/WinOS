@@ -367,6 +367,9 @@ pub fn create_user_thread(
         Some(thunk) => (thunk, entry_va, arg),
         None => (entry_va, arg, 0),
     };
+    // Keep the new thread non-runnable until its TEB/stack metadata is fully
+    // initialized. Otherwise unlock-edge scheduling can run it before
+    // `init_thread_teb()` completes.
     let tid = {
         let _lock = KSchedulerLock::lock();
         let params = sched::UserThreadParams {
@@ -378,8 +381,8 @@ pub fn create_user_thread(
             stack_size: stack.reserve_size,
             teb_va,
             priority: win_to_sched_priority(priority),
-            start_suspended,
-            request_wakeup_on_ready: !start_suspended,
+            start_suspended: true,
+            request_wakeup_on_ready: false,
         };
         match create_user_thread_locked(params) {
             Some(tid) => tid,
@@ -395,6 +398,10 @@ pub fn create_user_thread(
         let _ = crate::mm::vm_free_region(pid, teb_va);
         let _ = crate::mm::vm_free_region(pid, stack.reserve_base);
         return Err(CreateThreadError::NoMemory);
+    }
+    if !start_suspended {
+        let _lock = KSchedulerLock::lock();
+        resume_thread_locked(tid);
     }
     crate::kdebug!(
         "nt: user thread created pid={} tid={} entry={:#x} start={:#x} arg={:#x} stack_limit={:#x} stack_base={:#x} teb={:#x}",
