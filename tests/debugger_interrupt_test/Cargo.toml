@@ -1,0 +1,21 @@
+[workspace]
+
+[package]
+name = "debugger_interrupt_test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winemu-shared = { path = "../../crates/winemu-shared" }
+
+[[bin]]
+name = "debugger_interrupt_test"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+strip = true
