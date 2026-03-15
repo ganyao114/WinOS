@@ -20,6 +20,7 @@ pub const HV_MEMORY_EXEC: hv_memory_flags_t = 1 << 2;
 pub const HV_INTERRUPT_TYPE_IRQ: u32 = 0;
 
 // ARM64 system register IDs (from <Hypervisor/hv_vcpu_types.h>)
+pub const HV_SYS_REG_MDSCR_EL1: u16 = 0x8012;
 pub const HV_SYS_REG_MPIDR_EL1: u16 = 0xc005;
 pub const HV_SYS_REG_SCTLR_EL1: u16 = 0xc080;
 pub const HV_SYS_REG_TTBR0_EL1: u16 = 0xc100;
@@ -87,6 +88,10 @@ extern "C" {
         r#type: u32,
         pending: bool,
     ) -> hv_return_t;
+    pub fn hv_vcpu_get_trap_debug_exceptions(vcpu: hv_vcpuid_t, value: *mut bool) -> hv_return_t;
+    pub fn hv_vcpu_set_trap_debug_exceptions(vcpu: hv_vcpuid_t, value: bool) -> hv_return_t;
+    pub fn hv_vcpu_get_trap_debug_reg_accesses(vcpu: hv_vcpuid_t, value: *mut bool) -> hv_return_t;
+    pub fn hv_vcpu_set_trap_debug_reg_accesses(vcpu: hv_vcpuid_t, value: bool) -> hv_return_t;
     pub fn hv_vcpu_set_vtimer_mask(vcpu: hv_vcpuid_t, vtimer_is_masked: bool) -> hv_return_t;
     pub fn hv_vcpu_get_vtimer_offset(vcpu: hv_vcpuid_t, vtimer_offset: *mut u64) -> hv_return_t;
 

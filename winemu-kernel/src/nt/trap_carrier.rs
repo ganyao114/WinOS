@@ -129,6 +129,5 @@ pub fn should_restore_target_user_frame(
     current_not_running: bool,
 ) -> bool {
     from_tid == 0
-        || (from_tid == to_tid
-            && (current_not_running || pending_trap_reschedule || timeout_woke))
+        || (from_tid == to_tid && (current_not_running || pending_trap_reschedule || timeout_woke))
 }

@@ -3,12 +3,24 @@ use super::{
     timer::HvfVTimer,
 };
 use crate::{
-    types::{Regs, SpecialRegs, VmExit},
+    types::{DebugCaps, Regs, SpecialRegs, VmExit},
     Vcpu,
 };
 use std::sync::OnceLock;
 use std::time::Duration;
 use winemu_core::{Result, WinemuError};
+
+const ESR_EC_DEBUG_LOWER_EL: u64 = 0x30;
+const ESR_EC_DEBUG_CURRENT_EL: u64 = 0x31;
+const ESR_EC_SOFTWARE_STEP_LOWER_EL: u64 = 0x32;
+const ESR_EC_SOFTWARE_STEP_CURRENT_EL: u64 = 0x33;
+const ESR_EC_WATCHPOINT_LOWER_EL: u64 = 0x34;
+const ESR_EC_WATCHPOINT_CURRENT_EL: u64 = 0x35;
+const ESR_EC_BRK64: u64 = 0x3c;
+const PSTATE_SS: u64 = 1 << 21;
+const MDSCR_EL1_SS: u64 = 1 << 0;
+const MDSCR_EL1_KDE: u64 = 1 << 13;
+const MDSCR_EL1_MDE: u64 = 1 << 15;
 
 pub struct HvfVcpu {
     id: hv_vcpuid_t,
@@ -229,6 +241,30 @@ impl HvfVcpu {
                     args: [x[1], x[2], x[3], x[4], x[5], x[6]],
                 })
             }
+            ESR_EC_DEBUG_LOWER_EL
+            | ESR_EC_DEBUG_CURRENT_EL
+            | ESR_EC_SOFTWARE_STEP_LOWER_EL
+            | ESR_EC_SOFTWARE_STEP_CURRENT_EL
+            | ESR_EC_WATCHPOINT_LOWER_EL
+            | ESR_EC_WATCHPOINT_CURRENT_EL
+            | ESR_EC_BRK64 => {
+                let pc = self.get_reg(ffi::HV_REG_PC).unwrap_or(0);
+                let pstate = self.get_reg(ffi::HV_REG_CPSR).unwrap_or(0);
+                log::debug!(
+                    "hvf debug exit: ec={:#x} syndrome={:#x} pc={:#x} pstate={:#x} va={:#x} pa={:#x}",
+                    ec,
+                    exit.exception.syndrome,
+                    pc,
+                    pstate,
+                    exit.exception.virtual_address,
+                    exit.exception.physical_address
+                );
+                Ok(VmExit::DebugException {
+                    syndrome: exit.exception.syndrome,
+                    virtual_address: exit.exception.virtual_address,
+                    physical_address: exit.exception.physical_address,
+                })
+            }
             0x24 | 0x25 => {
                 // Data Abort — MMIO
                 let far = exit.exception.virtual_address;
@@ -306,6 +342,17 @@ impl HvfVcpu {
 }
 
 impl Vcpu for HvfVcpu {
+    fn debug_caps(&self) -> DebugCaps {
+        DebugCaps {
+            async_interrupt: true,
+            debug_exception_trap: true,
+            sw_breakpoint_candidate: true,
+            hw_single_step_candidate: true,
+            hw_breakpoint_candidate: false,
+            watchpoint_candidate: false,
+        }
+    }
+
     fn run(&mut self) -> Result<VmExit> {
         self.run_vcpu()
     }
@@ -403,6 +450,31 @@ impl Vcpu for HvfVcpu {
             )));
         }
         Ok(())
+    }
+
+    fn set_trap_debug_exceptions(&mut self, enabled: bool) -> Result<()> {
+        let ret = unsafe { ffi::hv_vcpu_set_trap_debug_exceptions(self.id, enabled) };
+        if ret != ffi::HV_SUCCESS {
+            return Err(WinemuError::Hypervisor(format!(
+                "hv_vcpu_set_trap_debug_exceptions({}) failed: {:#x}",
+                enabled, ret
+            )));
+        }
+        Ok(())
+    }
+
+    fn set_guest_single_step(&mut self, enabled: bool) -> Result<()> {
+        let mut pstate = self.get_reg(ffi::HV_REG_CPSR)?;
+        let mut mdscr = self.get_sys_reg(ffi::HV_SYS_REG_MDSCR_EL1)?;
+        if enabled {
+            pstate |= PSTATE_SS;
+            mdscr |= MDSCR_EL1_SS | MDSCR_EL1_KDE | MDSCR_EL1_MDE;
+        } else {
+            pstate &= !PSTATE_SS;
+            mdscr &= !(MDSCR_EL1_SS | MDSCR_EL1_KDE | MDSCR_EL1_MDE);
+        }
+        self.set_reg(ffi::HV_REG_CPSR, pstate)?;
+        self.set_sys_reg(ffi::HV_SYS_REG_MDSCR_EL1, mdscr)
     }
 
     fn wfi_idle_hint(&self) -> Option<Duration> {

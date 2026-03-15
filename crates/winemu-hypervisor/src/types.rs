@@ -3,13 +3,45 @@ pub struct VmConfig {
     pub vcpu_count: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DebugCaps {
+    pub async_interrupt: bool,
+    pub debug_exception_trap: bool,
+    pub sw_breakpoint_candidate: bool,
+    pub hw_single_step_candidate: bool,
+    pub hw_breakpoint_candidate: bool,
+    pub watchpoint_candidate: bool,
+}
+
 #[derive(Debug)]
 pub enum VmExit {
-    Hypercall { nr: u64, args: [u64; 6] },
-    MmioRead { addr: u64, size: u8 },
-    MmioWrite { addr: u64, data: u64, size: u8 },
-    IoRead { port: u16, size: u8 },
-    IoWrite { port: u16, data: u32, size: u8 },
+    Hypercall {
+        nr: u64,
+        args: [u64; 6],
+    },
+    DebugException {
+        syndrome: u64,
+        virtual_address: u64,
+        physical_address: u64,
+    },
+    MmioRead {
+        addr: u64,
+        size: u8,
+    },
+    MmioWrite {
+        addr: u64,
+        data: u64,
+        size: u8,
+    },
+    IoRead {
+        port: u16,
+        size: u8,
+    },
+    IoWrite {
+        port: u16,
+        data: u32,
+        size: u8,
+    },
     Timer,
     Wfi,
     Halt,

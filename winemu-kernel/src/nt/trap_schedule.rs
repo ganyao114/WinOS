@@ -1,13 +1,12 @@
 // Trap scheduling adapter.
 // Owns SvcFrame save/restore and trap-side ScheduleDecision application.
 
-use crate::sched::{
-    current_tid, drain_deferred_kstacks,
-    enter_kernel_continuation_noreturn, execute_kernel_continuation_switch, schedule_core_locked,
-    set_thread_in_kernel_locked, vcpu_id, with_thread, ScheduleDecision, ScheduleReason,
-    SCHED_LOCK,
-};
 use crate::sched::resched::{local_trap_reschedule_pending, request_local_trap_reschedule};
+use crate::sched::{
+    current_tid, drain_deferred_kstacks, enter_kernel_continuation_noreturn,
+    execute_kernel_continuation_switch, schedule_core_locked, set_thread_in_kernel_locked, vcpu_id,
+    with_thread, ScheduleDecision, ScheduleReason, SCHED_LOCK,
+};
 use crate::timer;
 
 use super::trap_carrier::{

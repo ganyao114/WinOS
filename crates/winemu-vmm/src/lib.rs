@@ -1,3 +1,4 @@
+pub mod debugger;
 pub mod file_io;
 pub mod gpa_alloc;
 pub mod host_file;
@@ -46,6 +47,7 @@ pub struct Vmm {
     memory: Arc<RwLock<GuestMemory>>,
     hypercall_mgr: Arc<HypercallManager>,
     sched: Arc<Scheduler>,
+    debugger: Option<Arc<debugger::DebugController>>,
     vcpu_count: u32,
 }
 
@@ -107,6 +109,9 @@ impl Vmm {
             phys_pool_end,
             phys_alloc_budget_bytes,
         ));
+        let debugger = debugger::server_addr_from_env().map(|_| {
+            debugger::DebugController::new(vcpu_count, Arc::clone(&sched), Arc::clone(&memory))
+        });
 
         Ok(Self {
             hypervisor,
@@ -114,6 +119,7 @@ impl Vmm {
             memory,
             hypercall_mgr,
             sched,
+            debugger,
             vcpu_count,
         })
     }
@@ -123,19 +129,26 @@ impl Vmm {
     }
 
     pub fn run(&mut self) -> Result<()> {
+        let debugger = self.debugger.as_ref().map(Arc::clone);
+        let vcpu0 = self.vm.create_vcpu(0)?;
+        if let Some(debugger) = debugger.as_ref() {
+            debugger.set_backend_caps(vcpu0.debug_caps());
+            if let Some(addr) = debugger::server_addr_from_env() {
+                debugger::spawn_server(Arc::clone(debugger), addr);
+            }
+        }
         if self.vcpu_count <= 1 {
-            let vcpu = self.vm.create_vcpu(0)?;
             vcpu::vcpu_thread(
                 0,
-                vcpu,
+                vcpu0,
                 Arc::clone(&self.hypercall_mgr),
                 Arc::clone(&self.sched),
+                debugger.as_ref().map(Arc::clone),
                 true,
             );
             return Ok(());
         }
 
-        let vcpu0 = self.vm.create_vcpu(0)?;
         let mut reset_regs = vcpu0.regs()?;
         set_kernel_boot_entry_pc(&mut reset_regs);
         let mut vcpu0 = vcpu0;
@@ -147,6 +160,7 @@ impl Vmm {
             let vm = Arc::clone(&self.vm);
             let hc_mgr = Arc::clone(&self.hypercall_mgr);
             let sched = Arc::clone(&self.sched);
+            let debugger = debugger.as_ref().map(Arc::clone);
             let reset_regs = reset_regs.clone();
             let reset_special = reset_special.clone();
             let (ready_tx, ready_rx) = mpsc::channel::<std::result::Result<(), String>>();
@@ -170,7 +184,14 @@ impl Vmm {
                         return Err(e);
                     }
                     let _ = ready_tx.send(Ok(()));
-                    vcpu::vcpu_thread(id, vcpu, hc_mgr, sched, false);
+                    vcpu::vcpu_thread(
+                        id,
+                        vcpu,
+                        hc_mgr,
+                        sched,
+                        debugger.as_ref().map(Arc::clone),
+                        false,
+                    );
                     Ok(())
                 })
                 .map_err(|e| WinemuError::Hypervisor(format!("spawn vcpu thread failed: {e}")))?;
@@ -197,6 +218,7 @@ impl Vmm {
             vcpu0,
             Arc::clone(&self.hypercall_mgr),
             Arc::clone(&self.sched),
+            debugger.as_ref().map(Arc::clone),
             true,
         );
 

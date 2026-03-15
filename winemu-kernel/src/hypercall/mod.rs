@@ -10,6 +10,10 @@ pub use hostcall::{
     hostcall_submit_tagged, HostCallCompletion,
 };
 
+pub const DEBUG_TRAP_KERNEL_PANIC: u64 = 1;
+pub const DEBUG_TRAP_KERNEL_FAULT: u64 = 2;
+pub const DEBUG_TRAP_USER_FAULT: u64 = 3;
+
 /// 6 引数 hypercall（HVC #0）
 /// x0 = nr, x1-x6 = args, 返回值在 x0
 #[inline(always)]
@@ -88,6 +92,11 @@ pub fn process_exit(code: u32) -> ! {
     loop {
         crate::arch::cpu::wait_for_interrupt();
     }
+}
+
+#[inline(always)]
+pub fn debug_trap(reason_code: u64, arg0: u64, arg1: u64) {
+    let _ = hypercall6(nr::DEBUG_TRAP, reason_code, arg0, arg1, 0, 0, 0);
 }
 
 pub fn alloc_virtual(hint: u64, size: u64, prot: u32) -> u64 {

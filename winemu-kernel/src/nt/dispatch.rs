@@ -160,6 +160,11 @@ pub extern "C" fn kernel_fault_dispatch(frame: &mut SvcFrame) {
     crate::log::debug_u64(KERNEL_FAULT_ADDRESS_TAG | fault.address);
     crate::log::debug_u64(KERNEL_FAULT_PC_TAG | frame.program_counter());
     crate::log::debug_u64(KERNEL_FAULT_STATE_TAG | frame.processor_state());
+    hypercall::debug_trap(
+        crate::hypercall::DEBUG_TRAP_KERNEL_FAULT,
+        fault.syndrome,
+        fault.address,
+    );
     hypercall::process_exit(0xE1);
 }
 
@@ -170,6 +175,11 @@ pub extern "C" fn user_fault_dispatch(frame: &mut SvcFrame) {
     crate::log::debug_u64(USER_FAULT_ADDRESS_TAG | fault.address);
     crate::log::debug_u64(USER_FAULT_PC_TAG | frame.program_counter());
     crate::log::debug_u64(USER_FAULT_STATE_TAG | frame.processor_state());
+    hypercall::debug_trap(
+        crate::hypercall::DEBUG_TRAP_USER_FAULT,
+        fault.syndrome,
+        fault.address,
+    );
     hypercall::process_exit(0xFF);
 }
 

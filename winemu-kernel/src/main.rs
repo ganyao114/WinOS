@@ -315,12 +315,14 @@ fn create_boot_user_task_or_exit(thread0_tid: u32, image: &InitialUserImage) -> 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     crate::log::debug_print("KERNEL_PANIC");
+    let mut line = 0u64;
     if let Some(loc) = info.location() {
         crate::log::debug_print(" at ");
         crate::log::debug_print(loc.file());
         crate::log::debug_print(":");
         let mut buf = [0u8; 32];
-        let s = fmt_u64_dec(&mut buf, loc.line() as u64);
+        line = loc.line() as u64;
+        let s = fmt_u64_dec(&mut buf, line);
         crate::log::debug_print(s);
     }
     crate::log::debug_print("\n");
@@ -336,6 +338,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         snap.alloc_fail_large_oom,
         snap.direct_alloc_failures
     );
+    crate::hypercall::debug_trap(crate::hypercall::DEBUG_TRAP_KERNEL_PANIC, line, 0);
     loop {
         core::hint::spin_loop();
     }

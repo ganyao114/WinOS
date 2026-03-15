@@ -1,3 +1,4 @@
+use super::debugger::{DebugController, RunOutcome};
 use super::hypercall::{HypercallManager, HypercallResult};
 use super::sched::Scheduler;
 use std::sync::atomic::Ordering;
@@ -9,20 +10,40 @@ use winemu_hypervisor::{types::VmExit, Vcpu};
 const HOSTCALL_MAIN_BUDGET: usize = 32;
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
+enum RunLoopOutcome {
+    VmExit(VmExit),
+    Retry,
+    Break,
+}
+
 pub fn vcpu_thread(
     vcpu_id: u32,
     mut vcpu: Box<dyn Vcpu>,
     hc_mgr: Arc<HypercallManager>,
     sched: Arc<Scheduler>,
+    debugger: Option<Arc<DebugController>>,
     main_executor: bool,
 ) {
     sched.register_vcpu_thread(vcpu_id);
+    if let Some(debugger) = debugger.as_ref() {
+        debugger.on_vcpu_thread_start(vcpu_id);
+        if debugger.debug_caps().debug_exception_trap {
+            if let Err(err) = vcpu.set_trap_debug_exceptions(true) {
+                log::warn!(
+                    "vcpu{} enable trap_debug_exceptions for debugger failed: {}",
+                    vcpu_id,
+                    err
+                );
+            }
+        }
+    }
     let mut external_irq_asserted = false;
 
     loop {
         pump_hostcall_main_thread(hc_mgr.as_ref(), main_executor);
 
         if sched.shutdown.load(Ordering::Acquire) {
+            notify_debugger_shutdown(debugger.as_deref(), sched.as_ref());
             log::info!("vcpu{} all threads terminated — shutting down", vcpu_id);
             break;
         }
@@ -34,13 +55,30 @@ pub fn vcpu_thread(
             &mut external_irq_asserted,
         );
 
-        let Some(exit) = run_vcpu_once(vcpu_id, &mut *vcpu, sched.as_ref()) else {
-            break;
+        if let Some(debugger) = debugger.as_ref() {
+            debugger.maybe_pause_before_run(vcpu_id, &mut *vcpu);
+        }
+
+        let exit = match run_vcpu_once(vcpu_id, &mut *vcpu, sched.as_ref(), debugger.as_deref()) {
+            RunLoopOutcome::VmExit(exit) => exit,
+            RunLoopOutcome::Retry => continue,
+            RunLoopOutcome::Break => {
+                notify_debugger_shutdown(debugger.as_deref(), sched.as_ref());
+                break;
+            }
         };
 
         maybe_clear_external_irq(vcpu_id, &mut *vcpu, &exit, &mut external_irq_asserted);
 
-        if !handle_vmexit(vcpu_id, &mut *vcpu, hc_mgr.as_ref(), sched.as_ref(), exit) {
+        if !handle_vmexit(
+            vcpu_id,
+            &mut *vcpu,
+            hc_mgr.as_ref(),
+            sched.as_ref(),
+            debugger.as_deref(),
+            exit,
+        ) {
+            notify_debugger_shutdown(debugger.as_deref(), sched.as_ref());
             break;
         }
     }
@@ -51,6 +89,7 @@ fn handle_vmexit(
     vcpu: &mut dyn Vcpu,
     hc_mgr: &HypercallManager,
     sched: &Scheduler,
+    debugger: Option<&DebugController>,
     exit: VmExit,
 ) -> bool {
     match exit {
@@ -61,13 +100,107 @@ fn handle_vmexit(
             true
         }
         VmExit::Timer => true,
+        VmExit::DebugException {
+            syndrome,
+            virtual_address,
+            physical_address,
+        } => {
+            let ec = (syndrome >> 26) & 0x3f;
+            match vcpu.regs() {
+                Ok(regs) => {
+                    log::debug!(
+                        "vcpu{} debug exception: ec={:#x} syndrome={:#x} pc={:#x} sp={:#x} pstate={:#x} va={:#x} pa={:#x}",
+                        vcpu_id,
+                        ec,
+                        syndrome,
+                        regs.pc,
+                        regs.sp,
+                        regs.pstate,
+                        virtual_address,
+                        physical_address
+                    );
+                }
+                Err(err) => {
+                    log::debug!(
+                        "vcpu{} debug exception: ec={:#x} syndrome={:#x} va={:#x} pa={:#x} (regs unavailable: {})",
+                        vcpu_id,
+                        ec,
+                        syndrome,
+                        virtual_address,
+                        physical_address,
+                        err
+                    );
+                }
+            }
+            if let Err(err) = vcpu.set_guest_single_step(false) {
+                log::warn!(
+                    "vcpu{} disable guest single-step after debug exception failed: {}",
+                    vcpu_id,
+                    err
+                );
+            }
+            if let Some(debugger) = debugger {
+                if let Err(err) = debugger.request_pause_from_vcpu(
+                    vcpu_id,
+                    vcpu,
+                    super::debugger::StopReason::DebugException {
+                        syndrome,
+                        virtual_address,
+                        physical_address,
+                    },
+                ) {
+                    log::warn!(
+                        "vcpu{} debug exception pause failed: {} syndrome={:#x} va={:#x} pa={:#x}",
+                        vcpu_id,
+                        err,
+                        syndrome,
+                        virtual_address,
+                        physical_address
+                    );
+                    return false;
+                }
+                return true;
+            }
+            log_unhandled_vmexit(
+                vcpu_id,
+                vcpu,
+                &VmExit::DebugException {
+                    syndrome,
+                    virtual_address,
+                    physical_address,
+                },
+            );
+            false
+        }
         VmExit::Hypercall { nr, args } => {
             let result = hc_mgr.dispatch(nr, args);
-            if let Some(code) = apply_hypercall_result_to_regs(vcpu, result) {
-                log::info!("vcpu{} exited: code={}", vcpu_id, code);
-                return false;
+            match result {
+                HypercallResult::Sync(ret) => {
+                    set_x0(vcpu, ret);
+                    true
+                }
+                HypercallResult::Sync2 { x0, x1 } => {
+                    set_x0_x1(vcpu, x0, x1);
+                    true
+                }
+                HypercallResult::DebugTrap { code, arg0, arg1 } => {
+                    if let Some(debugger) = debugger {
+                        if let Err(err) = debugger.request_pause_from_vcpu(
+                            vcpu_id,
+                            vcpu,
+                            super::debugger::StopReason::GuestDebugTrap { code, arg0, arg1 },
+                        ) {
+                            log::warn!("vcpu{} guest debug trap pause failed: {}", vcpu_id, err);
+                        }
+                    }
+                    set_x0(vcpu, 0);
+                    true
+                }
+                HypercallResult::Exit(code) => {
+                    log::info!("vcpu{} exited: code={}", vcpu_id, code);
+                    false
+                }
             }
-            true
         }
         VmExit::Halt | VmExit::Shutdown => {
             log::info!("vcpu{} halted", vcpu_id);
@@ -84,18 +217,41 @@ fn handle_vmexit(
     }
 }
 
-fn run_vcpu_once(vcpu_id: u32, vcpu: &mut dyn Vcpu, sched: &Scheduler) -> Option<VmExit> {
-    match vcpu.run() {
-        Ok(e) => Some(e),
-        Err(e) => {
-            let err_text = format!("{:?}", e);
+fn run_vcpu_once(
+    vcpu_id: u32,
+    vcpu: &mut dyn Vcpu,
+    sched: &Scheduler,
+    debugger: Option<&DebugController>,
+) -> RunLoopOutcome {
+    let run_result = vcpu.run();
+    if let Some(debugger) = debugger {
+        match debugger.intercept_run_result(
+            vcpu_id,
+            vcpu,
+            run_result,
+            sched.shutdown.load(Ordering::Acquire),
+        ) {
+            Ok(RunOutcome::VmExit(exit)) => return RunLoopOutcome::VmExit(exit),
+            Ok(RunOutcome::Retry) => return RunLoopOutcome::Retry,
+            Ok(RunOutcome::Shutdown) => return RunLoopOutcome::Break,
+            Err(err) => {
+                log::error!("vcpu{} run error: {}", vcpu_id, err);
+                return RunLoopOutcome::Break;
+            }
+        }
+    }
+
+    match run_result {
+        Ok(exit) => RunLoopOutcome::VmExit(exit),
+        Err(err) => {
+            let err_text = format!("{:?}", err);
             let canceled = err_text.contains("canceled");
             if sched.shutdown.load(Ordering::Acquire) || canceled {
                 log::debug!("vcpu{} run canceled on shutdown: {}", vcpu_id, err_text);
             } else {
                 log::error!("vcpu{} run error: {}", vcpu_id, err_text);
             }
-            None
+            RunLoopOutcome::Break
         }
     }
 }
@@ -154,20 +310,6 @@ fn maybe_clear_external_irq(
     }
 }
 
-fn apply_hypercall_result_to_regs(vcpu: &mut dyn Vcpu, result: HypercallResult) -> Option<u32> {
-    match result {
-        HypercallResult::Sync(ret) => {
-            set_x0(vcpu, ret);
-            None
-        }
-        HypercallResult::Sync2 { x0, x1 } => {
-            set_x0_x1(vcpu, x0, x1);
-            None
-        }
-        HypercallResult::Exit(code) => Some(code),
-    }
-}
-
 fn log_unhandled_vmexit(vcpu_id: u32, vcpu: &dyn Vcpu, exit: &VmExit) {
     if let Ok(r) = vcpu.regs() {
         log::warn!(
@@ -199,6 +341,14 @@ fn set_x0_x1(vcpu: &mut dyn Vcpu, x0: u64, x1: u64) {
     {
         let _ = x1;
         vcpu.set_return_value(x0).unwrap();
+    }
+}
+
+fn notify_debugger_shutdown(debugger: Option<&DebugController>, sched: &Scheduler) {
+    if sched.shutdown.load(Ordering::Acquire) {
+        if let Some(debugger) = debugger {
+            debugger.notify_shutdown();
+        }
     }
 }
 

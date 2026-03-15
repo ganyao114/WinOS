@@ -1,7 +1,7 @@
 use winemu_core::{addr::Gpa, mem::MemProt, Result};
 
 pub mod types;
-pub use types::{Regs, SpecialRegs, VmConfig, VmExit};
+pub use types::{DebugCaps, Regs, SpecialRegs, VmConfig, VmExit};
 
 #[cfg(target_os = "macos")]
 pub mod hvf;
@@ -20,6 +20,9 @@ pub trait Vm: Send + Sync {
 }
 
 pub trait Vcpu: Send {
+    fn debug_caps(&self) -> DebugCaps {
+        DebugCaps::default()
+    }
     fn run(&mut self) -> Result<VmExit>;
     fn regs(&self) -> Result<Regs>;
     fn set_regs(&mut self, r: &Regs) -> Result<()>;
@@ -36,6 +39,18 @@ pub trait Vcpu: Send {
     /// Request virtual IRQ pending state (best-effort; backend may ignore).
     fn set_pending_irq(&mut self, _pending: bool) -> Result<()> {
         Ok(())
+    }
+    /// Trap guest debug exceptions to the host when the backend supports it.
+    fn set_trap_debug_exceptions(&mut self, _enabled: bool) -> Result<()> {
+        Err(winemu_core::WinemuError::Hypervisor(
+            "guest debug exception trapping is not supported by this backend".to_string(),
+        ))
+    }
+    /// Enable or disable guest architectural single-step state.
+    fn set_guest_single_step(&mut self, _enabled: bool) -> Result<()> {
+        Err(winemu_core::WinemuError::Hypervisor(
+            "guest single-step is not supported by this backend".to_string(),
+        ))
     }
     /// Optional host-side idle hint for trapped WFI flows.
     /// When available, VMM can park host thread roughly until this deadline.

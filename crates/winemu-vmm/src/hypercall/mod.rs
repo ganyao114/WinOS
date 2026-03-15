@@ -17,6 +17,7 @@ use winemu_shared::status;
 // Keep that early mapping away from kernel image/heap region to avoid clobbering.
 const EARLY_HOST_MMAP_BASE: u64 = 0x5000_0000;
 const MAX_HOSTCALL_EXT_BUF: usize = 256;
+const DEBUG_TRAP_AUTO_PAUSE_KERNEL_READY: u64 = 0xffff_0001;
 
 fn encode_completion(cpl: &crate::hostcall::HostCallCompletion) -> [u8; hc::CPL_SIZE] {
     let mut out = [0u8; hc::CPL_SIZE];
@@ -155,6 +156,7 @@ fn encode_sched_wake_stats(snap: &crate::sched::SchedulerWakeStats, dst_cap: usi
 pub enum HypercallResult {
     Sync(u64),
     Sync2 { x0: u64, x1: u64 },
+    DebugTrap { code: u64, arg0: u64, arg1: u64 },
     Exit(u32),
 }
 
@@ -188,6 +190,7 @@ pub struct HypercallManager {
     hostcall: HostCallBroker,
     mono_start: Instant,
     windows_build: u32,
+    auto_pause_on_kernel_ready: bool,
     guest_exit_code: AtomicU32,
 }
 
@@ -246,6 +249,10 @@ impl HypercallManager {
         phys_alloc_budget_bytes: usize,
     ) -> Self {
         let windows_build = Self::parse_build_from_toml(&syscall_table_toml);
+        let auto_pause_on_kernel_ready = std::env::var("WINEMU_GUEST_DEBUG_AUTO_PAUSE")
+            .ok()
+            .map(|value| value.eq_ignore_ascii_case("kernel_ready"))
+            .unwrap_or(false);
         log::info!("windows_build from config: {}", windows_build);
         let exe_path: std::path::PathBuf = exe_path.into();
         let exe_image = std::fs::read(&exe_path).unwrap_or_default();
@@ -284,6 +291,7 @@ impl HypercallManager {
             hostcall,
             mono_start: Instant::now(),
             windows_build,
+            auto_pause_on_kernel_ready,
             guest_exit_code: AtomicU32::new(0),
         }
     }
@@ -309,7 +317,15 @@ impl HypercallManager {
                 if heap_start != 0 {
                     self.vaspace.lock().unwrap().set_base(heap_start);
                 }
-                HypercallResult::Sync(0)
+                if self.auto_pause_on_kernel_ready {
+                    HypercallResult::DebugTrap {
+                        code: DEBUG_TRAP_AUTO_PAUSE_KERNEL_READY,
+                        arg0: entry_va,
+                        arg1: teb_gva,
+                    }
+                } else {
+                    HypercallResult::Sync(0)
+                }
             }
             nr::DEBUG_PRINT => {
                 // args[0] = GPA of string, args[1] = length
@@ -323,6 +339,19 @@ impl HypercallManager {
                     }
                 }
                 HypercallResult::Sync(0)
+            }
+            nr::DEBUG_TRAP => {
+                log::info!(
+                    "DEBUG_TRAP: code={:#x} arg0={:#x} arg1={:#x}",
+                    args[0],
+                    args[1],
+                    args[2]
+                );
+                HypercallResult::DebugTrap {
+                    code: args[0],
+                    arg0: args[1],
+                    arg1: args[2],
+                }
             }
             nr::NT_SYSCALL => {
                 log::warn!("legacy NT_SYSCALL path is removed; handle in guest kernel");
