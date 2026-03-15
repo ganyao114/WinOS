@@ -50,12 +50,14 @@ fn maybe_request_kernel_shutdown() {
         return;
     }
     let encoded = compute_shutdown_exit_code().wrapping_add(1);
-    let _ = KERNEL_SHUTDOWN_EXIT_CODE_PLUS1.compare_exchange(
-        0,
-        encoded,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
+    let requested = KERNEL_SHUTDOWN_EXIT_CODE_PLUS1
+        .compare_exchange(0, encoded, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
+    if requested && crate::sched::vcpu_id() != 0 {
+        // Wake vCPU0 so its idle path can consume the pending shutdown code
+        // even when the final thread exits on a secondary core.
+        crate::hypercall::kick_vcpu(0);
+    }
 }
 
 pub fn take_kernel_shutdown_exit_code(current_vid: usize) -> Option<u32> {
@@ -271,6 +273,8 @@ pub fn terminate_process(pid: u32, exit_status: u32) -> u32 {
     crate::nt::file::cancel_pending_dir_notify_for_pid(pid);
 
     let tids = crate::sched::thread_ids_by_pid(pid);
+    let self_tid = crate::sched::current_tid();
+    let defer_self_termination = self_tid != 0 && crate::sched::thread_pid(self_tid) == pid;
     crate::ktrace!(
         "proc: terminate pid={} exit_status={:#x} tids={:?}",
         pid,
@@ -278,6 +282,9 @@ pub fn terminate_process(pid: u32, exit_status: u32) -> u32 {
         tids
     );
     for tid in tids {
+        if defer_self_termination && tid == self_tid {
+            continue;
+        }
         let _ = crate::sched::terminate_thread_by_tid(tid);
     }
 
